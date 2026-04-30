@@ -157,6 +157,17 @@ func Validate(cfg *v1.PlatformConfig) error {
 			return fmt.Errorf("config: module %q references unknown resource_type %q",
 				m.ID, m.ResourceType)
 		}
+		for depName, dep := range m.Dependencies {
+			// A module depending on its own resource type with an inheriting
+			// ID (empty or @-prefixed) regenerates a fresh node every graph
+			// expansion pass — guaranteed runaway. Real coprovisioned-replica
+			// use cases must spell out an explicit ID that doesn't depend on
+			// the parent.
+			if dep.Type == m.ResourceType && (dep.ID == "" || strings.HasPrefix(dep.ID, "@")) {
+				return fmt.Errorf("config: module %q dependency %q targets its own resource_type %q with inheriting id %q — this would expand infinitely; set an explicit id if you really want a sibling resource of the same type",
+					m.ID, depName, dep.Type, dep.ID)
+			}
+		}
 		for local, ref := range m.ProviderMapping {
 			// Expected form: "<provider_type>.<provider_id>"
 			parts := strings.SplitN(ref, ".", 2)
@@ -194,6 +205,9 @@ func Validate(cfg *v1.PlatformConfig) error {
 			return fmt.Errorf("config: runner rule %q references unknown runner %q",
 				r.ID, r.RunnerID)
 		}
+	}
+	if err := validateInlineModuleHCL(cfg); err != nil {
+		return err
 	}
 	return nil
 }

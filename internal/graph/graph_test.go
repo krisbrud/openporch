@@ -153,35 +153,60 @@ func TestTopoSort_cycleDetected(t *testing.T) {
 	}
 }
 
-// Regression: a module whose dependency regenerates the same resource type
-// with @-suffix would, without a guard, expand forever:
+// Regression: cross-recursion between two modules that each depend on the
+// other's resource type with an @-suffix expands forever:
 //
-//	parent="db1" → dep "db1-net" (same type) → "db1-net-net" → …
+//	postgres "db1" → cache "db1-c" → postgres "db1-c-p" → cache "db1-c-p-c" → …
 //
-// The fix is the maxPasses cap in Build. This test asserts the cap fires
-// and surfaces a meaningful error rather than hanging.
+// The config-time guard only catches a module depending on its OWN type with
+// inheriting id; a cross-module ping-pong slips past it, so the runtime
+// guard in Build must still fire and now must name the offending tuple.
 func TestBuild_runawayExpansionGuarded(t *testing.T) {
-	// Module says: postgres depends on another postgres at id "@-replica".
-	// Each pass produces a brand-new node, so expansion never converges.
-	mod := v1.Module{
-		ID: "postgres-self-recursive", ResourceType: "postgres",
+	pg := v1.Module{
+		ID: "postgres-x", ResourceType: "postgres",
 		Dependencies: map[string]v1.Dependency{
-			"replica": {Type: "postgres", ID: "@-r"},
+			"sidecar": {Type: "cache", ID: "@-c"},
 		},
+	}
+	cache := v1.Module{
+		ID: "cache-x", ResourceType: "cache",
+		Dependencies: map[string]v1.Dependency{
+			"backing": {Type: "postgres", ID: "@-p"},
+		},
+	}
+	mods := map[string]v1.Module{"postgres-x": pg, "cache-x": cache}
+	resolver := pingPongResolver{
+		byType: map[string]string{"postgres": "postgres-x", "cache": "cache-x"},
 	}
 	m := &v1.Manifest{
 		Workloads: map[string]v1.Workload{
 			"a": {Resources: map[string]v1.ResourceRef{"db": {Type: "postgres", ID: "db1"}}},
 		},
 	}
-	_, err := Build(m, map[string]v1.Module{"postgres-self-recursive": mod},
-		fakeResolver{"postgres-self-recursive", "postgres"})
+	_, err := Build(m, mods, resolver)
 	if err == nil {
 		t.Fatal("expected guard to surface error, got nil")
 	}
 	if !strings.Contains(err.Error(), "exceeded") {
 		t.Fatalf("expected exceeded-passes error, got: %v", err)
 	}
+	// The error must point at one of the two runaway tuples so users can
+	// pinpoint the problem instead of bisecting their platform config.
+	msg := err.Error()
+	mentionsTuple := (strings.Contains(msg, `"postgres-x"`) && strings.Contains(msg, "type=postgres")) ||
+		(strings.Contains(msg, `"cache-x"`) && strings.Contains(msg, "type=cache"))
+	if !mentionsTuple {
+		t.Fatalf("expected error to name an offending (module, type) tuple, got: %v", err)
+	}
+}
+
+type pingPongResolver struct{ byType map[string]string }
+
+func (p pingPongResolver) Resolve(n *Node) (string, error) {
+	if id, ok := p.byType[n.Type]; ok {
+		return id, nil
+	}
+	return "", ErrSkipModuleResolution
 }
 
 func TestResolveID(t *testing.T) {
