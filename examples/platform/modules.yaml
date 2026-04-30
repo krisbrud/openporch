@@ -1,0 +1,120 @@
+# All four modules are inline (no external provider) so the demo runs
+# without Docker/AWS credentials. Each emits the outputs declared by its
+# resource type. The v0 proof point is that env_type alone steers which
+# module gets picked — same manifest, different infra shape.
+
+apiVersion: openporch/v1alpha1
+kind: Module
+id: postgres-local
+resource_type: postgres
+module_source: inline
+module_params:
+  type: object
+  properties:
+    size: { type: string }
+module_source_code: |-
+  variable "size" {
+    type    = string
+    default = "small"
+  }
+  variable "res_id" {
+    type    = string
+    default = "db"
+  }
+  locals {
+    port = 5432
+    user = "demo"
+    pass = "localpass"
+  }
+  output "url"  { value = "postgres://${local.user}:${local.pass}@localhost:${local.port}/${var.res_id}_${var.size}" }
+  output "host" { value = "localhost" }
+  output "port" { value = local.port }
+module_inputs:
+  res_id: ${context.res_id}
+---
+apiVersion: openporch/v1alpha1
+kind: Module
+id: postgres-cloud
+resource_type: postgres
+module_source: inline
+module_params:
+  type: object
+  properties:
+    size: { type: string }
+module_source_code: |-
+  variable "size" {
+    type    = string
+    default = "small"
+  }
+  variable "res_id" {
+    type    = string
+    default = "db"
+  }
+  locals {
+    cluster = "aurora-${var.res_id}"
+    region  = "us-east-1"
+  }
+  output "url"  { value = "postgres://appuser:CHANGE_ME@${local.cluster}.${local.region}.rds.amazonaws.com:5432/main" }
+  output "host" { value = "${local.cluster}.${local.region}.rds.amazonaws.com" }
+  output "port" { value = 5432 }
+module_inputs:
+  res_id: ${context.res_id}
+---
+apiVersion: openporch/v1alpha1
+kind: Module
+id: workload-local-docker
+resource_type: workload
+module_source: inline
+module_params:
+  type: object
+  properties:
+    image: { type: string }
+    env:
+      type: object
+      additionalProperties: { type: string }
+module_source_code: |-
+  variable "image" {
+    type = string
+  }
+  variable "env" {
+    type    = map(string)
+    default = {}
+  }
+  variable "name" {
+    type = string
+  }
+  locals {
+    port = 8080
+  }
+  output "url"  { value = "http://localhost:${local.port}" }
+  output "name" { value = "local-${var.name}" }
+module_inputs:
+  name: ${context.res_id}
+---
+apiVersion: openporch/v1alpha1
+kind: Module
+id: workload-aws-lambda
+resource_type: workload
+module_source: inline
+module_params:
+  type: object
+  properties:
+    image: { type: string }
+    env:
+      type: object
+      additionalProperties: { type: string }
+module_source_code: |-
+  variable "image" {
+    type = string
+  }
+  variable "env" {
+    type    = map(string)
+    default = {}
+  }
+  variable "name" {
+    type = string
+  }
+  output "url"  { value = "https://lambda-${var.name}.execute-api.us-east-1.amazonaws.com/prod" }
+  output "name" { value = "lambda-${var.name}" }
+module_inputs:
+  name: ${context.res_id}

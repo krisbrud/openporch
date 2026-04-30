@@ -1,0 +1,19 @@
+apiVersion: openporch/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  project: demo
+workloads:
+  api:
+    type: workload
+    params:
+      image: myorg/api:1.0
+      env:
+        DATABASE_URL: ${resources.db.outputs.url}
+    resources:
+      db:
+        type: postgres
+        params:
+          size: small
+outputs:
+  api_url: ${workloads.api.outputs.url}

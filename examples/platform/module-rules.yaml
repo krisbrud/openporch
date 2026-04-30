@@ -1,0 +1,29 @@
+# Lowest weight (env_type only) is enough to pick local vs cloud variants.
+
+apiVersion: openporch/v1alpha1
+kind: ModuleRule
+id: postgres-local-by-envtype
+resource_type: postgres
+module_id: postgres-local
+env_type_id: local
+---
+apiVersion: openporch/v1alpha1
+kind: ModuleRule
+id: postgres-cloud-by-envtype
+resource_type: postgres
+module_id: postgres-cloud
+env_type_id: production
+---
+apiVersion: openporch/v1alpha1
+kind: ModuleRule
+id: workload-local-by-envtype
+resource_type: workload
+module_id: workload-local-docker
+env_type_id: local
+---
+apiVersion: openporch/v1alpha1
+kind: ModuleRule
+id: workload-cloud-by-envtype
+resource_type: workload
+module_id: workload-aws-lambda
+env_type_id: production

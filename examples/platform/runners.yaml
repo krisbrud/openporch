@@ -1,0 +1,10 @@
+apiVersion: openporch/v1alpha1
+kind: Runner
+id: local-tofu
+type: local-tofu
+description: Runs OpenTofu on the host.
+---
+apiVersion: openporch/v1alpha1
+kind: RunnerRule
+id: catchall
+runner_id: local-tofu
