@@ -1,0 +1,20 @@
+apiVersion: openporch/v1alpha1
+kind: ResourceType
+id: workload
+description: A user-runnable unit. Resolves to a runtime per env_type.
+output_schema:
+  type: object
+  properties:
+    url:  { type: string }
+    name: { type: string }
+---
+apiVersion: openporch/v1alpha1
+kind: ResourceType
+id: postgres
+description: A PostgreSQL database connection.
+output_schema:
+  type: object
+  properties:
+    url:  { type: string }
+    host: { type: string }
+    port: { type: integer }
