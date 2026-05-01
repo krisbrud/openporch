@@ -1,34 +1,97 @@
-# All four modules are inline (no external provider) so the demo runs
-# without Docker/AWS credentials. Each emits the outputs declared by its
-# resource type. The v0 proof point is that env_type alone steers which
-# module gets picked — same manifest, different infra shape.
+# Local-Docker modules use the kreuzwerker/docker provider against the
+# host's docker daemon. Cloud modules remain inline fakes so the
+# env_type=production path still demos rule-based selection without
+# requiring AWS credentials.
 
 apiVersion: openporch/v1alpha1
 kind: Module
 id: postgres-local
 resource_type: postgres
 module_source: inline
+provider_mapping:
+  docker: docker.docker-default
+  random: random.random-default
 module_params:
   type: object
   properties:
     size: { type: string }
+    host_port: { type: integer }
 module_source_code: |-
+  terraform {
+    required_providers {
+      docker = {
+        source = "kreuzwerker/docker"
+      }
+      random = {
+        source  = "hashicorp/random"
+        version = "~> 3.6"
+      }
+    }
+  }
+
   variable "size" {
     type    = string
     default = "small"
   }
   variable "res_id" {
-    type    = string
-    default = "db"
+    type = string
   }
-  locals {
-    port = 5432
-    user = "demo"
-    pass = "localpass"
+  variable "host_port" {
+    type    = number
+    default = 5433
   }
-  output "url"  { value = "postgres://${local.user}:${local.pass}@localhost:${local.port}/${var.res_id}_${var.size}" }
-  output "host" { value = "localhost" }
-  output "port" { value = local.port }
+
+  resource "random_password" "this" {
+    length  = 16
+    special = false
+  }
+
+  resource "docker_image" "postgres" {
+    name         = "postgres:16-alpine"
+    keep_locally = true
+  }
+
+  resource "docker_container" "this" {
+    name  = "openporch-${var.res_id}"
+    image = docker_image.postgres.image_id
+    env = [
+      "POSTGRES_USER=demo",
+      "POSTGRES_PASSWORD=${random_password.this.result}",
+      "POSTGRES_DB=${var.res_id}",
+    ]
+    ports {
+      internal = 5432
+      external = var.host_port
+      ip       = "0.0.0.0"
+    }
+    healthcheck {
+      test     = ["CMD-SHELL", "pg_isready -U demo -d ${var.res_id}"]
+      interval = "2s"
+      timeout  = "2s"
+      retries  = 30
+    }
+    wait         = true
+    wait_timeout = 60
+    restart      = "unless-stopped"
+    labels {
+      label = "openporch.managed"
+      value = "true"
+    }
+  }
+
+  # url contains the random password. v0 doesn't propagate `sensitive` from
+  # child outputs to the root module, so we use nonsensitive() to let the
+  # value flow through to the orchestrator. Treat outputs.json on disk as
+  # secret-equivalent.
+  output "url" {
+    value = "postgres://demo:${nonsensitive(random_password.this.result)}@host.docker.internal:${var.host_port}/${var.res_id}"
+  }
+  output "host" {
+    value = "host.docker.internal"
+  }
+  output "port" {
+    value = var.host_port
+  }
 module_inputs:
   res_id: ${context.res_id}
 ---
@@ -65,29 +128,68 @@ kind: Module
 id: workload-local-docker
 resource_type: workload
 module_source: inline
+provider_mapping:
+  docker: docker.docker-default
 module_params:
   type: object
   properties:
-    image: { type: string }
+    image:          { type: string }
+    host_port:      { type: integer }
+    container_port: { type: integer }
     env:
       type: object
       additionalProperties: { type: string }
 module_source_code: |-
+  terraform {
+    required_providers {
+      docker = {
+        source = "kreuzwerker/docker"
+      }
+    }
+  }
+
+  variable "name" {
+    type = string
+  }
   variable "image" {
     type = string
+  }
+  variable "host_port" {
+    type    = number
+    default = 8080
+  }
+  variable "container_port" {
+    type    = number
+    default = 8080
   }
   variable "env" {
     type    = map(string)
     default = {}
   }
-  variable "name" {
-    type = string
+
+  resource "docker_image" "this" {
+    name         = var.image
+    keep_locally = true
   }
-  locals {
-    port = 8080
+
+  resource "docker_container" "this" {
+    name  = "openporch-${var.name}"
+    image = docker_image.this.image_id
+    env   = [for k, v in var.env : "${k}=${v}"]
+    ports {
+      internal = var.container_port
+      external = var.host_port
+      ip       = "0.0.0.0"
+    }
+    restart = "unless-stopped"
+    labels {
+      label = "openporch.managed"
+      value = "true"
+    }
   }
-  output "url"  { value = "http://localhost:${local.port}" }
-  output "name" { value = "local-${var.name}" }
+
+  output "url"  { value = "http://localhost:${var.host_port}" }
+  output "name" { value = docker_container.this.name }
 module_inputs:
   name: ${context.res_id}
 ---
