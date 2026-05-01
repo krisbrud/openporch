@@ -1,0 +1,20 @@
+apiVersion: openporch/v1alpha1
+kind: Provider
+id: docker-default
+provider_type: docker
+source: kreuzwerker/docker
+version_constraint: "~> 3.0"
+description: |-
+  Local Docker daemon. Host left unset so the provider falls back to the
+  DOCKER_HOST env var (or unix:///var/run/docker.sock by default), which
+  works for Docker Desktop on macOS and standard Linux installs.
+---
+apiVersion: openporch/v1alpha1
+kind: Provider
+id: random-default
+provider_type: random
+source: hashicorp/random
+version_constraint: "~> 3.6"
+description: |-
+  Stateless random_* resources. Used for generating per-deploy secrets like
+  the postgres password.

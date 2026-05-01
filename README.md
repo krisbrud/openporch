@@ -24,6 +24,54 @@ go build -o bin/openporch ./cmd/openporch
 
 Requires `tofu` on PATH (`brew install opentofu`).
 
+### Real Docker deploy (FastAPI demo)
+
+`examples/apps/fastapi-demo/` is a runnable FastAPI app whose `/health`
+endpoint queries a real Postgres container. The local-Docker modules under
+`examples/platform/` provision both via `kreuzwerker/docker`.
+
+```bash
+docker build -t fastapi-demo:local examples/apps/fastapi-demo
+./bin/openporch deploy examples/apps/fastapi-demo/manifest.yaml \
+    --platform examples/platform --project demo --env dev --env-type local
+curl http://localhost:8080/health   # {"db":"ok"}
+./bin/openporch destroy examples/apps/fastapi-demo/manifest.yaml \
+    --platform examples/platform --project demo --env dev --env-type local
+```
+
+### Integration tests
+
+The end-to-end Docker test lives behind a build tag so the default
+`go test ./...` stays hermetic:
+
+```bash
+go test -tags=integration -timeout=5m ./internal/deploy/...
+```
+
+It is skipped automatically when `docker version` fails.
+
+## State layout
+
+Everything openporch writes lives under `--state-root` (default `.openporch/`):
+
+```
+.openporch/
+  state/<project>/<env>/<resource>/   # main.tf, module/main.tf, terraform.tfstate, outputs.json
+  logs/<project>/<env>/<deployment>/  # per-resource tofu apply/destroy logs
+  plugin-cache/                       # shared TF_PLUGIN_CACHE_DIR
+```
+
+Lifecycle:
+
+- **Apply** is idempotent — re-running `deploy` rerenders `main.tf` and lets
+  tofu reconcile.
+- **Destroy** (`openporch destroy --prune`) reverses the deploy in reverse
+  topo order, then removes the resource working directories. Logs are kept.
+- The `plugin-cache/` is shared across deploys; safe to delete to reclaim
+  disk, will be repopulated on next `init`.
+- `outputs.json` may contain secrets (e.g. generated DB passwords); treat
+  the state directory as secret-equivalent.
+
 ## Concepts
 
 - **ResourceType** — contract (output schema) for a class of provisioned thing.
