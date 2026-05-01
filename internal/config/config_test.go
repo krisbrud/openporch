@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 )
 
 func writeFile(t *testing.T, dir, name, body string) {
@@ -94,6 +97,135 @@ provider_mapping:
 `)
 	if _, err := Load(root); err == nil {
 		t.Fatal("expected error for provider type mismatch")
+	}
+}
+
+// baseCfg returns a PlatformConfig with one ResourceType so module-level
+// validation has something to reference. Each test mutates Modules.
+func baseCfg() *v1.PlatformConfig {
+	return &v1.PlatformConfig{
+		ResourceTypes: map[string]v1.ResourceType{
+			"postgres": {ID: "postgres"},
+		},
+		Modules:   map[string]v1.Module{},
+		Providers: map[string]v1.Provider{},
+		Runners:   map[string]v1.Runner{},
+	}
+}
+
+func TestValidate_rejectsBadInlineHCL(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Modules["postgres-bad"] = v1.Module{
+		ID: "postgres-bad", ResourceType: "postgres",
+		ModuleSource: "inline",
+		// Single-line block with multiple arguments — illegal HCL.
+		ModuleSourceCode: `variable "x" { type = string, default = "y" }`,
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for malformed inline HCL")
+	}
+	if !strings.Contains(err.Error(), "postgres-bad") {
+		t.Fatalf("error must name the offending module, got: %v", err)
+	}
+}
+
+func TestValidate_acceptsGoodInlineHCL(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Modules["postgres-ok"] = v1.Module{
+		ID: "postgres-ok", ResourceType: "postgres",
+		ModuleSource: "inline",
+		ModuleSourceCode: `variable "size" {
+  type    = string
+  default = "small"
+}
+variable "res_id" {
+  type    = string
+  default = "db"
+}
+output "url" { value = "postgres://localhost/${var.res_id}_${var.size}" }
+`,
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_inlineVarsMatchInputsAndParams(t *testing.T) {
+	t.Run("declared but unset", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.Modules["m"] = v1.Module{
+			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
+			ModuleSourceCode: `variable "missing" { type = string }
+`,
+		}
+		err := Validate(cfg)
+		if err == nil || !strings.Contains(err.Error(), "missing") {
+			t.Fatalf("want declared-but-unset error mentioning %q, got: %v", "missing", err)
+		}
+	})
+	t.Run("set but undeclared", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.Modules["m"] = v1.Module{
+			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
+			ModuleSourceCode: `variable "size" {
+  type    = string
+  default = "s"
+}
+`,
+			ModuleInputs: map[string]any{"phantom": "x"},
+		}
+		err := Validate(cfg)
+		if err == nil || !strings.Contains(err.Error(), "phantom") {
+			t.Fatalf("want set-but-undeclared error mentioning %q, got: %v", "phantom", err)
+		}
+	})
+	t.Run("satisfied by params property", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.Modules["m"] = v1.Module{
+			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
+			ModuleSourceCode: `variable "image" { type = string }
+`,
+			ModuleParams: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"image": map[string]any{"type": "string"}},
+			},
+		}
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestValidate_refusesSelfReferentialDep(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Modules["postgres-self"] = v1.Module{
+		ID: "postgres-self", ResourceType: "postgres",
+		ModuleSource: "x",
+		Dependencies: map[string]v1.Dependency{
+			"replica": {Type: "postgres", ID: "@-r"},
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for self-referential dependency")
+	}
+	if !strings.Contains(err.Error(), "postgres-self") {
+		t.Fatalf("error should name the module, got: %v", err)
+	}
+}
+
+func TestValidate_allowsExplicitSiblingDep(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Modules["postgres-primary"] = v1.Module{
+		ID: "postgres-primary", ResourceType: "postgres",
+		ModuleSource: "x",
+		Dependencies: map[string]v1.Dependency{
+			"replica": {Type: "postgres", ID: "explicit-replica-id"},
+		},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

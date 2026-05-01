@@ -211,6 +211,12 @@ func Build(m *v1.Manifest, modules map[string]v1.Module, moduleResolver ModuleRe
 	if moduleResolver != nil {
 		const maxPasses = 32
 		visited := map[string]bool{}
+		// expansionCounts tracks how many fresh nodes each (resourceType,
+		// moduleID) tuple has produced across passes. When the cap fires we
+		// name the worst offender so users can pinpoint a runaway module
+		// instead of bisecting a 50-module platform.
+		type tuple struct{ resType, moduleID string }
+		expansionCounts := map[tuple]int{}
 		for pass := 0; pass < maxPasses; pass++ {
 			pending := make([]*Node, 0, len(g.Nodes))
 			for _, n := range g.Nodes {
@@ -235,11 +241,26 @@ func Build(m *v1.Manifest, modules map[string]v1.Module, moduleResolver ModuleRe
 				if !ok {
 					return nil, fmt.Errorf("graph: module %q not found", modID)
 				}
+				before := len(g.Nodes)
 				if err := expandDeps(g, n, mod); err != nil {
 					return nil, err
 				}
+				if added := len(g.Nodes) - before; added > 0 {
+					expansionCounts[tuple{n.Type, modID}] += added
+				}
 			}
 			if pass == maxPasses-1 {
+				var worst tuple
+				worstCount := -1
+				for t, c := range expansionCounts {
+					if c > worstCount {
+						worst, worstCount = t, c
+					}
+				}
+				if worstCount > 0 {
+					return nil, fmt.Errorf("graph: dependency expansion exceeded %d passes — module %q keeps expanding type=%s each pass (likely a self-referential dependency; check Module.dependencies for IDs starting with \"@\" that resolve back to the same type)",
+						maxPasses, worst.moduleID, worst.resType)
+				}
 				return nil, fmt.Errorf("graph: dependency expansion exceeded %d passes (cycle in module deps?)", maxPasses)
 			}
 		}
