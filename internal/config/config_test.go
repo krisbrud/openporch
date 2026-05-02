@@ -43,6 +43,12 @@ id: docker-default
 provider_type: docker
 source: kreuzwerker/docker
 `)
+	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf", `variable "size" {
+  type    = string
+  default = "small"
+}
+output "url" { value = "x" }
+`)
 	writeFile(t, root, "modules.yaml", `
 apiVersion: openporch/v1alpha1
 kind: Module
@@ -91,7 +97,7 @@ apiVersion: openporch/v1alpha1
 kind: Module
 id: bad
 resource_type: postgres
-module_source: x
+module_source: git::https://example.com/repo.git
 provider_mapping:
   docker: docker.aws-default   # mismatch: provider type is aws, not docker
 `)
@@ -201,7 +207,7 @@ func TestValidate_refusesSelfReferentialDep(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Modules["postgres-self"] = v1.Module{
 		ID: "postgres-self", ResourceType: "postgres",
-		ModuleSource: "x",
+		ModuleSource: "git::https://example.com/repo.git",
 		Dependencies: map[string]v1.Dependency{
 			"replica": {Type: "postgres", ID: "@-r"},
 		},
@@ -219,13 +225,89 @@ func TestValidate_allowsExplicitSiblingDep(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Modules["postgres-primary"] = v1.Module{
 		ID: "postgres-primary", ResourceType: "postgres",
-		ModuleSource: "x",
+		ModuleSource: "git::https://example.com/repo.git",
 		Dependencies: map[string]v1.Dependency{
 			"replica": {Type: "postgres", ID: "explicit-replica-id"},
 		},
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_localModuleSource_acceptsGoodHCL(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
+		`variable "size" {
+  type    = string
+  default = "small"
+}
+variable "res_id" {
+  type = string
+}
+output "url" { value = "postgres://localhost/${var.res_id}" }
+`)
+	cfg := baseCfg()
+	cfg.RootDir = root
+	cfg.Modules["postgres-docker"] = v1.Module{
+		ID: "postgres-docker", ResourceType: "postgres",
+		ModuleSource: "./modules/postgres-docker",
+		ModuleInputs: map[string]any{"res_id": "demo"},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_localModuleSource_declaredButUnset(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
+		`variable "missing" { type = string }
+`)
+	cfg := baseCfg()
+	cfg.RootDir = root
+	cfg.Modules["postgres-docker"] = v1.Module{
+		ID: "postgres-docker", ResourceType: "postgres",
+		ModuleSource: "./modules/postgres-docker",
+	}
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("want declared-but-unset error mentioning %q, got: %v", "missing", err)
+	}
+}
+
+func TestValidate_localModuleSource_setButUndeclared(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
+		`variable "size" {
+  type    = string
+  default = "small"
+}
+`)
+	cfg := baseCfg()
+	cfg.RootDir = root
+	cfg.Modules["postgres-docker"] = v1.Module{
+		ID: "postgres-docker", ResourceType: "postgres",
+		ModuleSource: "./modules/postgres-docker",
+		ModuleInputs: map[string]any{"phantom": "x"},
+	}
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "phantom") {
+		t.Fatalf("want set-but-undeclared error mentioning %q, got: %v", "phantom", err)
+	}
+}
+
+func TestValidate_localModuleSource_missingDir(t *testing.T) {
+	root := t.TempDir()
+	cfg := baseCfg()
+	cfg.RootDir = root
+	cfg.Modules["postgres-docker"] = v1.Module{
+		ID: "postgres-docker", ResourceType: "postgres",
+		ModuleSource: "./modules/does-not-exist",
+	}
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), "postgres-docker") {
+		t.Fatalf("want error naming module, got: %v", err)
 	}
 }
 

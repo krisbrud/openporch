@@ -111,6 +111,9 @@ type RunnerRule struct {
 
 // PlatformConfig aggregates everything loaded from ./platform/.
 type PlatformConfig struct {
+	// RootDir is the absolute path of the directory the config was loaded
+	// from. Local module_source paths are resolved against this.
+	RootDir       string
 	ResourceTypes map[string]ResourceType
 	Modules       map[string]Module
 	ModuleRules   []ModuleRule

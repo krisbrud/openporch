@@ -21,13 +21,18 @@ import (
 // Load reads every .yaml/.yml file under root, splits on YAML document
 // boundaries, and dispatches each document by kind into the platform config.
 func Load(root string) (*v1.PlatformConfig, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("config: resolve root %s: %w", root, err)
+	}
 	cfg := &v1.PlatformConfig{
+		RootDir:       absRoot,
 		ResourceTypes: map[string]v1.ResourceType{},
 		Modules:       map[string]v1.Module{},
 		Providers:     map[string]v1.Provider{},
 		Runners:       map[string]v1.Runner{},
 	}
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -206,7 +211,7 @@ func Validate(cfg *v1.PlatformConfig) error {
 				r.ID, r.RunnerID)
 		}
 	}
-	if err := validateInlineModuleHCL(cfg); err != nil {
+	if err := validateModuleHCL(cfg); err != nil {
 		return err
 	}
 	return nil
