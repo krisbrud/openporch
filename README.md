@@ -72,11 +72,29 @@ Lifecycle:
 - `outputs.json` may contain secrets (e.g. generated DB passwords); treat
   the state directory as secret-equivalent.
 
+## Module layout
+
+Modules are real OpenTofu modules on disk (or referenced remotely). The
+example platform uses one directory per module under
+`examples/platform/modules/`:
+
+```
+examples/platform/
+  modules.yaml              # Module + ModuleRule registrations
+  modules/<id>/main.tf      # the actual OpenTofu code
+```
+
+`module_source` in `modules.yaml` accepts local paths
+(`./modules/postgres-local`), git URLs (`git::https://…`), and Terraform
+registry refs — `tofu init` fetches remote sources at apply time.
+
 ## Concepts
 
 - **ResourceType** — contract (output schema) for a class of provisioned thing.
-- **Module** — OpenTofu code that implements a resource type. Multiple modules
-  per type is the point: one for each environment variant.
+- **Module** — OpenTofu code that implements a resource type, referenced via
+  `module_source` (a local path under the platform directory, a git URL, or
+  a Terraform registry ref). Multiple modules per type is the point: one for
+  each environment variant.
 - **ModuleRule** — selector mapping `(resource_type, env_matchers) → module`.
 - **Provider** — central OpenTofu provider config, injected at the root TF.
 - **Runner** — execution backend. v0 ships only `local-tofu`.

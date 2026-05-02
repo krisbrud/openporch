@@ -174,11 +174,17 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		outNames := outputNamesForType(o.Platform.ResourceTypes[n.Type])
 
 		moduleSource := mod.ModuleSource
-		if mod.ModuleSourceCode != "" {
+		if mod.ModuleSource == "inline" || mod.ModuleSourceCode != "" {
 			if err := o.Store.WriteInlineModule(o.ProjectID, o.EnvID, n.Key, mod.ModuleSourceCode); err != nil {
 				return nil, err
 			}
 			moduleSource = "./module"
+		} else {
+			resolved, err := tofu.ResolveSource(mod.ModuleSource, o.Platform.RootDir)
+			if err != nil {
+				return nil, fmt.Errorf("deploy: resolve module source for %s: %w", n.Key, err)
+			}
+			moduleSource = resolved
 		}
 		hcl, err := tofu.Render(tofu.Plan{
 			ModuleSource:    moduleSource,
