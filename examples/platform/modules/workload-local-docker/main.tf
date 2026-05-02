@@ -39,6 +39,12 @@ resource "docker_container" "this" {
     external = var.host_port
     ip       = "0.0.0.0"
   }
+  # Ensure host.docker.internal resolves from inside the container on Linux
+  # (Docker Desktop on macOS/Windows provides this automatically).
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
   restart = "unless-stopped"
   labels {
     label = "openporch.managed"
