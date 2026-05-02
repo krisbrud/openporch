@@ -14,6 +14,7 @@ import (
 	"github.com/krbrudeli/openporch/internal/manifest"
 	"github.com/krbrudeli/openporch/internal/runner"
 	"github.com/krbrudeli/openporch/internal/store"
+	"github.com/krbrudeli/openporch/internal/store/db"
 )
 
 func newDeployCmd() *cobra.Command {
@@ -52,10 +53,16 @@ func newDeployCmd() *cobra.Command {
 				BinaryPath:     tofuBinary,
 				PluginCacheDir: filepath.Join(stateRoot, "plugin-cache"),
 			}
+			d, err := db.Open(stateRoot)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
 
 			res, err := deploy.Run(ctx, deploy.Options{
 				Manifest: m, Platform: cfg, Store: s, Runner: r,
 				ProjectID: project, EnvID: env, EnvTypeID: envType,
+				Recorder: db.NewRecorder(d),
 			})
 			if err != nil {
 				return err

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/krbrudeli/openporch/internal/graph"
 	"github.com/krbrudeli/openporch/internal/match"
 )
@@ -51,6 +53,17 @@ func Destroy(ctx context.Context, o DestroyOptions) (*DestroyResult, error) {
 		reversed[len(ordered)-1-i] = n
 	}
 
+	if o.Recorder != nil {
+		manifestYAML, _ := yaml.Marshal(o.Manifest)
+		graphJSON, _ := serializeGraph(g)
+		_ = o.Recorder.StartDeployment(ctx, DeploymentRecord{
+			ID: o.DeploymentID, Project: o.ProjectID, Env: o.EnvID,
+			EnvType: o.EnvTypeID, Mode: "destroy", StartedAt: time.Now().UTC(),
+			ManifestYAML: string(manifestYAML), GraphJSON: graphJSON,
+		})
+	}
+	rid := runnerID(o.Runner)
+
 	res := &DestroyResult{DeploymentID: o.DeploymentID}
 	var firstErr error
 	for _, n := range reversed {
@@ -67,18 +80,46 @@ func Destroy(ctx context.Context, o DestroyOptions) (*DestroyResult, error) {
 		}
 		log := o.Store.LogFile(o.ProjectID, o.EnvID, n.Key, o.DeploymentID)
 		fmt.Fprintf(os.Stderr, "[openporch] destroying %s\n", n.Key)
+		if o.Recorder != nil {
+			_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+				ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, RunnerID: rid, Status: "destroying",
+				LogPath: log,
+			})
+		}
 		if err := o.Runner.Destroy(ctx, workdir, log); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("destroy: %s: %w (see %s)", n.Key, err, log)
 			}
+			if o.Recorder != nil {
+				_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+					ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+					ModuleID: n.ModuleID, RunnerID: rid, Status: "failed",
+					LogPath: log,
+				})
+			}
 			continue
 		}
 		res.Destroyed = append(res.Destroyed, n.Key)
+		if o.Recorder != nil {
+			_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+				ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, RunnerID: rid, Status: "destroyed",
+				LogPath: log,
+			})
+		}
 		if o.Prune {
 			if err := os.RemoveAll(workdir); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("destroy: prune %s: %w", workdir, err)
 			}
 		}
+	}
+	if o.Recorder != nil {
+		status := "succeeded"
+		if firstErr != nil {
+			status = "failed"
+		}
+		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, status, time.Now().UTC())
 	}
 	return res, firstErr
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/krbrudeli/openporch/internal/manifest"
 	"github.com/krbrudeli/openporch/internal/runner"
 	"github.com/krbrudeli/openporch/internal/store"
+	"github.com/krbrudeli/openporch/internal/store/db"
 )
 
 func newDestroyCmd() *cobra.Command {
@@ -52,11 +53,17 @@ func newDestroyCmd() *cobra.Command {
 				BinaryPath:     tofuBinary,
 				PluginCacheDir: filepath.Join(stateRoot, "plugin-cache"),
 			}
+			d, err := db.Open(stateRoot)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
 
 			res, err := deploy.Destroy(ctx, deploy.DestroyOptions{
 				Options: deploy.Options{
 					Manifest: m, Platform: cfg, Store: s, Runner: r,
 					ProjectID: project, EnvID: env, EnvTypeID: envType,
+					Recorder: db.NewRecorder(d),
 				},
 				Prune: prune,
 			})
