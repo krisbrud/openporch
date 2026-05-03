@@ -1,0 +1,4 @@
+apiVersion: openporch/v1alpha1
+kind: RunnerRule
+id: catchall
+runner_id: local-tofu

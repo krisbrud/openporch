@@ -12,7 +12,6 @@ import (
 	"github.com/krbrudeli/openporch/internal/config"
 	"github.com/krbrudeli/openporch/internal/deploy"
 	"github.com/krbrudeli/openporch/internal/manifest"
-	"github.com/krbrudeli/openporch/internal/runner"
 	"github.com/krbrudeli/openporch/internal/store"
 	"github.com/krbrudeli/openporch/internal/store/db"
 )
@@ -48,11 +47,11 @@ func newDeployCmd() *cobra.Command {
 				return fmt.Errorf("project not set: pass --project or set metadata.project")
 			}
 
-			s := &store.FS{Root: stateRoot}
-			r := &runner.LocalTofu{
-				BinaryPath:     tofuBinary,
-				PluginCacheDir: filepath.Join(stateRoot, "plugin-cache"),
+			runnerID, r, err := resolveRunner(cfg, project, env, envType, stateRoot, tofuBinary)
+			if err != nil {
+				return err
 			}
+			s := &store.FS{Root: stateRoot}
 			d, err := db.Open(stateRoot)
 			if err != nil {
 				return err
@@ -60,7 +59,7 @@ func newDeployCmd() *cobra.Command {
 			defer d.Close()
 
 			res, err := deploy.Run(ctx, deploy.Options{
-				Manifest: m, Platform: cfg, Store: s, Runner: r,
+				Manifest: m, Platform: cfg, Store: s, Runner: r, RunnerID: runnerID,
 				ProjectID: project, EnvID: env, EnvTypeID: envType,
 				Recorder: db.NewRecorder(d),
 			})
