@@ -43,6 +43,7 @@ type DeploymentDetail struct {
 	FinishedAt   string        `json:"finished_at,omitempty" yaml:"finished_at,omitempty"`
 	Mode         string        `json:"mode" yaml:"mode"`
 	ManifestYAML string        `json:"manifest_yaml" yaml:"manifest_yaml"`
+	GraphJSON    string        `json:"graph_json" yaml:"graph_json"`
 	Resources    []ResourceRow `json:"resources" yaml:"resources"`
 }
 
@@ -105,6 +106,12 @@ func (r *Reader) GetDeployment(ctx context.Context, id string) (*DeploymentDetai
 		`SELECT manifest_yaml FROM deployment_manifest WHERE deployment_id = ?`, id)
 	if err := mRow.Scan(&d.ManifestYAML); err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("db: get deployment manifest: %w", err)
+	}
+
+	gRow := r.db.QueryRowContext(ctx,
+		`SELECT graph_json FROM deployment_graph WHERE deployment_id = ?`, id)
+	if err := gRow.Scan(&d.GraphJSON); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("db: get deployment graph: %w", err)
 	}
 
 	resRows, err := r.db.QueryContext(ctx,

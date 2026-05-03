@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +66,110 @@ func mustSeedDB(t *testing.T, stateRoot string) (depID, manifestYAML string) {
 		t.Fatalf("FinishDeployment: %v", err)
 	}
 	return depID, manifestYAML
+}
+
+func mustWriteTFPlatform(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	modDir := filepath.Join(root, "modules", "service")
+	if err := os.MkdirAll(modDir, 0o755); err != nil {
+		t.Fatalf("mkdir module dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "main.tf"), []byte(`
+variable "database_url" {
+  type = string
+}
+
+output "url" {
+  value = var.database_url
+}
+`), 0o644); err != nil {
+		t.Fatalf("write module HCL: %v", err)
+	}
+	platform := `
+apiVersion: openporch/v1alpha1
+kind: ResourceType
+id: database
+output_schema:
+  type: object
+  properties:
+    url:
+      type: string
+---
+apiVersion: openporch/v1alpha1
+kind: ResourceType
+id: service
+output_schema:
+  type: object
+  properties:
+    url:
+      type: string
+---
+apiVersion: openporch/v1alpha1
+kind: Module
+id: database-mod
+resource_type: database
+module_source: inline
+module_source_code: |
+  output "url" {
+    value = "postgres://db"
+  }
+---
+apiVersion: openporch/v1alpha1
+kind: Module
+id: service-mod
+resource_type: service
+module_source: ./modules/service
+module_inputs:
+  database_url: ${shared.db.outputs.url}
+`
+	if err := os.WriteFile(filepath.Join(root, "platform.yaml"), []byte(platform), 0o644); err != nil {
+		t.Fatalf("write platform config: %v", err)
+	}
+	return root
+}
+
+func mustSeedTFDeployment(t *testing.T, stateRoot string) string {
+	t.Helper()
+	d, err := db.Open(stateRoot)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer d.Close()
+
+	ctx := context.Background()
+	rec := db.NewRecorder(d)
+	depID := "dep-tf123"
+	graphJSON := `{"nodes":[` +
+		`{"key":"database|default|shared.db","type":"database","class":"default","id":"shared.db","module_id":"database-mod","aliases":["shared.db"]},` +
+		`{"key":"service|default|api","type":"service","class":"default","id":"api","module_id":"service-mod","aliases":["workloads.api"],"edges":["database|default|shared.db"]}` +
+		`]}`
+	started := time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC)
+	if err := rec.StartDeployment(ctx, deploy.DeploymentRecord{
+		ID: depID, Project: "myproj", Env: "dev", EnvType: "local",
+		Mode: "deploy", StartedAt: started,
+		ManifestYAML: "apiVersion: openporch/v1alpha1\nkind: Application\n", GraphJSON: graphJSON,
+	}); err != nil {
+		t.Fatalf("StartDeployment: %v", err)
+	}
+	if err := rec.RecordResource(ctx, depID, deploy.ResourceRecord{
+		ResourceKey: "database|default|shared.db", Type: "database", Class: "default",
+		ID: "shared.db", ModuleID: "database-mod", RunnerID: "local-tofu",
+		Status: "applied", OutputsJSON: `{"url":"postgres://db"}`, LogPath: "/tmp/db.log",
+	}); err != nil {
+		t.Fatalf("RecordResource database: %v", err)
+	}
+	if err := rec.RecordResource(ctx, depID, deploy.ResourceRecord{
+		ResourceKey: "service|default|api", Type: "service", Class: "default",
+		ID: "api", ModuleID: "service-mod", RunnerID: "local-tofu",
+		Status: "applied", OutputsJSON: `{"url":"http://api"}`, LogPath: "/tmp/api.log",
+	}); err != nil {
+		t.Fatalf("RecordResource service: %v", err)
+	}
+	if err := rec.FinishDeployment(ctx, depID, "succeeded", started.Add(2*time.Minute)); err != nil {
+		t.Fatalf("FinishDeployment: %v", err)
+	}
+	return depID
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +450,72 @@ func TestGetDeployment_InvalidOutput(t *testing.T) {
 		t.Fatal("expected invalid output format error, got nil")
 	}
 	if !strings.Contains(err.Error(), `unsupported output format "xml"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// get tf <deployment-id>
+// ---------------------------------------------------------------------------
+
+func TestGetTF_PrintsRenderedHCL(t *testing.T) {
+	root := t.TempDir()
+	platform := mustWriteTFPlatform(t)
+	depID := mustSeedTFDeployment(t, root)
+
+	out, err := runGet(t, root, "tf", depID, "--platform", platform)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{
+		"===== database|default|shared.db/main.tf =====",
+		"===== service|default|api/main.tf =====",
+		`source = "./module"`,
+		`source = "` + filepath.Join(platform, "modules", "service") + `"`,
+		`database_url = "postgres://db"`,
+		`output "url"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output:\n%s", want, out)
+		}
+	}
+}
+
+func TestGetTF_OutWritesMainTFPerResource(t *testing.T) {
+	root := t.TempDir()
+	platform := mustWriteTFPlatform(t)
+	depID := mustSeedTFDeployment(t, root)
+	outDir := t.TempDir()
+
+	_, err := runGet(t, root, "tf", depID, "--platform", platform, "--out", outDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	serviceMain := filepath.Join(outDir, "service|default|api", "main.tf")
+	b, err := os.ReadFile(serviceMain)
+	if err != nil {
+		t.Fatalf("read service main.tf: %v", err)
+	}
+	if !strings.Contains(string(b), `database_url = "postgres://db"`) {
+		t.Errorf("rendered service HCL missing resolved input:\n%s", string(b))
+	}
+	dbMain := filepath.Join(outDir, "database|default|shared.db", "main.tf")
+	if _, err := os.Stat(dbMain); err != nil {
+		t.Fatalf("database main.tf not written: %v", err)
+	}
+	dbModule := filepath.Join(outDir, "database|default|shared.db", "module", "main.tf")
+	if _, err := os.Stat(dbModule); err != nil {
+		t.Fatalf("inline database module not written: %v", err)
+	}
+}
+
+func TestGetTF_NotFound(t *testing.T) {
+	platform := mustWriteTFPlatform(t)
+	_, err := runGet(t, t.TempDir(), "tf", "no-such-id", "--platform", platform)
+	if err == nil {
+		t.Fatal("expected error for nonexistent deployment ID, got nil")
+	}
+	if !strings.Contains(err.Error(), `deployment "no-such-id" not found`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
