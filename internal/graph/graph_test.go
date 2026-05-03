@@ -23,6 +23,7 @@ func (f fakeResolver) Resolve(n *Node) (string, error) {
 }
 
 func TestBuild_workloadAndSharedNodesCreated(t *testing.T) {
+	t.Parallel()
 	m := &v1.Manifest{
 		APIVersion: v1.APIVersion,
 		Kind:       v1.KindApplication,
@@ -55,6 +56,7 @@ func TestBuild_workloadAndSharedNodesCreated(t *testing.T) {
 }
 
 func TestBuild_dedupesByTypeClassID(t *testing.T) {
+	t.Parallel()
 	m := &v1.Manifest{
 		Workloads: map[string]v1.Workload{
 			"a": {
@@ -93,6 +95,7 @@ func TestBuild_dedupesByTypeClassID(t *testing.T) {
 }
 
 func TestBuild_moduleDependenciesExpanded(t *testing.T) {
+	t.Parallel()
 	mod := v1.Module{
 		ID: "postgres-docker", ResourceType: "postgres",
 		Dependencies: map[string]v1.Dependency{
@@ -119,6 +122,7 @@ func TestBuild_moduleDependenciesExpanded(t *testing.T) {
 }
 
 func TestTopoSort_dependenciesBeforeDependents(t *testing.T) {
+	t.Parallel()
 	g := New()
 	a := &Node{Key: "a", Type: "x", Class: "default", ID: "a"}
 	b := &Node{Key: "b", Type: "x", Class: "default", ID: "b", Edges: []string{"a"}}
@@ -140,6 +144,7 @@ func TestTopoSort_dependenciesBeforeDependents(t *testing.T) {
 }
 
 func TestTopoSort_cycleDetected(t *testing.T) {
+	t.Parallel()
 	g := New()
 	g.Nodes["a"] = &Node{Key: "a", Edges: []string{"b"}}
 	g.Nodes["b"] = &Node{Key: "b", Edges: []string{"a"}}
@@ -162,6 +167,7 @@ func TestTopoSort_cycleDetected(t *testing.T) {
 // inheriting id; a cross-module ping-pong slips past it, so the runtime
 // guard in Build must still fire and now must name the offending tuple.
 func TestBuild_runawayExpansionGuarded(t *testing.T) {
+	t.Parallel()
 	pg := v1.Module{
 		ID: "postgres-x", ResourceType: "postgres",
 		Dependencies: map[string]v1.Dependency{
@@ -210,6 +216,7 @@ func (p pingPongResolver) Resolve(n *Node) (string, error) {
 }
 
 func TestResolveID(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ parent, dep, want string }{
 		{"main", "", "main"},
 		{"main", "@-primary", "main-primary"},

@@ -20,6 +20,7 @@ func writeFile(t *testing.T, dir, name, body string) {
 }
 
 func TestLoad_aggregatesAcrossFiles(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, root, "types.yaml", `
 apiVersion: openporch/v1alpha1
@@ -81,6 +82,7 @@ module_id: postgres-docker
 }
 
 func TestLoad_validatesProviderMappingType(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, root, "x.yaml", `
 apiVersion: openporch/v1alpha1
@@ -120,6 +122,7 @@ func baseCfg() *v1.PlatformConfig {
 }
 
 func TestValidate_rejectsBadInlineHCL(t *testing.T) {
+	t.Parallel()
 	cfg := baseCfg()
 	cfg.Modules["postgres-bad"] = v1.Module{
 		ID: "postgres-bad", ResourceType: "postgres",
@@ -137,6 +140,7 @@ func TestValidate_rejectsBadInlineHCL(t *testing.T) {
 }
 
 func TestValidate_acceptsGoodInlineHCL(t *testing.T) {
+	t.Parallel()
 	cfg := baseCfg()
 	cfg.Modules["postgres-ok"] = v1.Module{
 		ID: "postgres-ok", ResourceType: "postgres",
@@ -158,7 +162,9 @@ output "url" { value = "postgres://localhost/${var.res_id}_${var.size}" }
 }
 
 func TestValidate_inlineVarsMatchInputsAndParams(t *testing.T) {
+	t.Parallel()
 	t.Run("declared but unset", func(t *testing.T) {
+		t.Parallel()
 		cfg := baseCfg()
 		cfg.Modules["m"] = v1.Module{
 			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
@@ -171,6 +177,7 @@ func TestValidate_inlineVarsMatchInputsAndParams(t *testing.T) {
 		}
 	})
 	t.Run("set but undeclared", func(t *testing.T) {
+		t.Parallel()
 		cfg := baseCfg()
 		cfg.Modules["m"] = v1.Module{
 			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
@@ -187,6 +194,7 @@ func TestValidate_inlineVarsMatchInputsAndParams(t *testing.T) {
 		}
 	})
 	t.Run("satisfied by params property", func(t *testing.T) {
+		t.Parallel()
 		cfg := baseCfg()
 		cfg.Modules["m"] = v1.Module{
 			ID: "m", ResourceType: "postgres", ModuleSource: "inline",
@@ -204,6 +212,7 @@ func TestValidate_inlineVarsMatchInputsAndParams(t *testing.T) {
 }
 
 func TestValidate_refusesSelfReferentialDep(t *testing.T) {
+	t.Parallel()
 	cfg := baseCfg()
 	cfg.Modules["postgres-self"] = v1.Module{
 		ID: "postgres-self", ResourceType: "postgres",
@@ -222,6 +231,7 @@ func TestValidate_refusesSelfReferentialDep(t *testing.T) {
 }
 
 func TestValidate_allowsExplicitSiblingDep(t *testing.T) {
+	t.Parallel()
 	cfg := baseCfg()
 	cfg.Modules["postgres-primary"] = v1.Module{
 		ID: "postgres-primary", ResourceType: "postgres",
@@ -236,6 +246,7 @@ func TestValidate_allowsExplicitSiblingDep(t *testing.T) {
 }
 
 func TestValidate_localModuleSource_acceptsGoodHCL(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
 		`variable "size" {
@@ -260,6 +271,7 @@ output "url" { value = "postgres://localhost/${var.res_id}" }
 }
 
 func TestValidate_localModuleSource_declaredButUnset(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
 		`variable "missing" { type = string }
@@ -277,6 +289,7 @@ func TestValidate_localModuleSource_declaredButUnset(t *testing.T) {
 }
 
 func TestValidate_localModuleSource_setButUndeclared(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "modules", "postgres-docker"), "main.tf",
 		`variable "size" {
@@ -298,6 +311,7 @@ func TestValidate_localModuleSource_setButUndeclared(t *testing.T) {
 }
 
 func TestValidate_localModuleSource_missingDir(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	cfg := baseCfg()
 	cfg.RootDir = root
@@ -312,6 +326,7 @@ func TestValidate_localModuleSource_missingDir(t *testing.T) {
 }
 
 func TestLoad_unknownKindIsError(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	writeFile(t, root, "x.yaml", `
 apiVersion: openporch/v1alpha1

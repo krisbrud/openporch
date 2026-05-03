@@ -8,6 +8,7 @@ import (
 )
 
 func TestRender_smoke(t *testing.T) {
+	t.Parallel()
 	p := Plan{
 		ModuleSource: "./module",
 		Inputs: map[string]any{
@@ -55,6 +56,7 @@ func TestRender_smoke(t *testing.T) {
 }
 
 func TestHclValue_quotesNonIdentKeys(t *testing.T) {
+	t.Parallel()
 	got := hclValue(map[string]any{"with space": "v"}, "")
 	if !strings.Contains(got, `"with space" = "v"`) {
 		t.Errorf("got %q", got)
@@ -67,6 +69,7 @@ func TestHclValue_quotesNonIdentKeys(t *testing.T) {
 // renderer doesn't generate variable blocks, but we still want a
 // machine-checked guarantee that what *it* writes parses.
 func TestRender_parsesAsValidHCL(t *testing.T) {
+	t.Parallel()
 	plans := []Plan{
 		{ // minimal — no providers, no inputs, no outputs
 			ModuleSource: "./module",
@@ -109,6 +112,7 @@ func TestRender_parsesAsValidHCL(t *testing.T) {
 }
 
 func TestRender_deterministicOrder(t *testing.T) {
+	t.Parallel()
 	p := Plan{
 		ModuleSource: "x",
 		Inputs:       map[string]any{"b": 1, "a": 2, "c": 3},

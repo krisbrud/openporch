@@ -10,6 +10,7 @@ import (
 )
 
 func TestOpenAppliesSchema(t *testing.T) {
+	t.Parallel()
 	d, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -41,6 +42,7 @@ func TestOpenAppliesSchema(t *testing.T) {
 }
 
 func TestOpenIsIdempotent(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	d1, err := Open(root)
 	if err != nil {
@@ -64,6 +66,7 @@ func TestOpenIsIdempotent(t *testing.T) {
 }
 
 func TestRecorderLifecycle(t *testing.T) {
+	t.Parallel()
 	d, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -159,6 +162,7 @@ func TestRecorderLifecycle(t *testing.T) {
 }
 
 func TestRecorderPlanOnly(t *testing.T) {
+	t.Parallel()
 	d, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -213,6 +217,7 @@ func TestRecorderPlanOnly(t *testing.T) {
 }
 
 func TestRecorderDestroyMode(t *testing.T) {
+	t.Parallel()
 	d, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("Open: %v", err)

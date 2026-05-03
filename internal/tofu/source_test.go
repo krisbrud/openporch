@@ -6,6 +6,7 @@ import (
 )
 
 func TestResolveSource_inline(t *testing.T) {
+	t.Parallel()
 	got, err := ResolveSource("inline", "/anywhere")
 	if err != nil {
 		t.Fatal(err)
@@ -16,6 +17,7 @@ func TestResolveSource_inline(t *testing.T) {
 }
 
 func TestResolveSource_localRelative(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	got, err := ResolveSource("./modules/postgres", root)
 	if err != nil {
@@ -28,6 +30,7 @@ func TestResolveSource_localRelative(t *testing.T) {
 }
 
 func TestResolveSource_localParent(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	got, err := ResolveSource("../shared/postgres", root)
 	if err != nil {
@@ -40,6 +43,7 @@ func TestResolveSource_localParent(t *testing.T) {
 }
 
 func TestResolveSource_remoteVerbatim(t *testing.T) {
+	t.Parallel()
 	cases := []string{
 		"git::https://example.com/foo.git//modules/postgres",
 		"registry.terraform.io/hashicorp/consul/aws",
@@ -59,6 +63,7 @@ func TestResolveSource_remoteVerbatim(t *testing.T) {
 }
 
 func TestResolveSource_bareAsLocal(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	got, err := ResolveSource("modules/postgres", root)
 	if err != nil {
@@ -71,21 +76,22 @@ func TestResolveSource_bareAsLocal(t *testing.T) {
 }
 
 func TestIsLocalSource(t *testing.T) {
+	t.Parallel()
 	cases := map[string]bool{
-		"./foo":                      true,
-		"../foo":                     true,
-		"/abs/foo":                   true,
-		"foo/bar":                    true,
-		"inline":                     false,
-		"":                           false,
-		"git::https://x/y.git":       false,
-		"github.com/org/repo":        false,
-		"bitbucket.org/org/repo":     false,
-		"registry.terraform.io/x/y":  false,
-		"app.terraform.io/x/y":       false,
-		"https://example.com/x.zip":  false,
-		"http://example.com/x.zip":   false,
-		"git@github.com:org/repo":    false,
+		"./foo":                     true,
+		"../foo":                    true,
+		"/abs/foo":                  true,
+		"foo/bar":                   true,
+		"inline":                    false,
+		"":                          false,
+		"git::https://x/y.git":      false,
+		"github.com/org/repo":       false,
+		"bitbucket.org/org/repo":    false,
+		"registry.terraform.io/x/y": false,
+		"app.terraform.io/x/y":      false,
+		"https://example.com/x.zip": false,
+		"http://example.com/x.zip":  false,
+		"git@github.com:org/repo":   false,
 	}
 	for in, want := range cases {
 		if got := IsLocalSource(in); got != want {
