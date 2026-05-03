@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -24,6 +25,8 @@ func newDeployCmd() *cobra.Command {
 		envType     string
 		stateRoot   string
 		tofuBinary  string
+		dryRun      bool
+		renderDir   string
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy <manifest.yaml>",
@@ -51,20 +54,43 @@ func newDeployCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			s := &store.FS{Root: stateRoot}
-			d, err := db.Open(stateRoot)
+
+			opts := deploy.Options{
+				Manifest: m, Platform: cfg, Store: &store.FS{Root: stateRoot},
+				Runner: r, RunnerID: runnerID,
+				ProjectID: project, EnvID: env, EnvTypeID: envType,
+				DryRun: dryRun, RenderDir: renderDir,
+			}
+			if !dryRun {
+				d, err := db.Open(stateRoot)
+				if err != nil {
+					return err
+				}
+				defer d.Close()
+				opts.Recorder = db.NewRecorder(d)
+			}
+
+			res, err := deploy.Run(ctx, opts)
 			if err != nil {
 				return err
 			}
-			defer d.Close()
 
-			res, err := deploy.Run(ctx, deploy.Options{
-				Manifest: m, Platform: cfg, Store: s, Runner: r, RunnerID: runnerID,
-				ProjectID: project, EnvID: env, EnvTypeID: envType,
-				Recorder: db.NewRecorder(d),
-			})
-			if err != nil {
-				return err
+			if dryRun {
+				fmt.Printf("Dry-run complete. %d resource(s) would be deployed:\n\n", len(res.DryRunResources))
+				for _, r := range res.DryRunResources {
+					fmt.Printf("  %-40s  module=%-30s  type=%s", r.Key, r.ModuleID, r.Type)
+					if r.Class != "" {
+						fmt.Printf("  class=%s", r.Class)
+					}
+					if len(r.Providers) > 0 {
+						fmt.Printf("  providers=%s", strings.Join(r.Providers, ","))
+					}
+					fmt.Println()
+				}
+				if renderDir != "" {
+					fmt.Printf("\nRendered HCL written to: %s\n", renderDir)
+				}
+				return nil
 			}
 
 			fmt.Printf("\nDeployment %s succeeded.\n\n", res.DeploymentID)
@@ -111,5 +137,9 @@ func newDeployCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateRoot, "state-root", ".openporch",
 		"directory under which TF state and openporch metadata live")
 	cmd.Flags().StringVar(&tofuBinary, "tofu", "", "path to tofu binary (default: $PATH lookup)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
+		"validate and render HCL without invoking tofu; prints a per-resource summary")
+	cmd.Flags().StringVar(&renderDir, "render-dir", "",
+		"with --dry-run: write rendered main.tf files here so you can run `tofu plan` manually")
 	return cmd
 }
