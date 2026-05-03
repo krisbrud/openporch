@@ -32,9 +32,10 @@ These are the properties every test must satisfy. The skill explains *how*.
    is a documented reason not to (e.g. `t.Setenv` in a parent test).
 3. **Failures are actionable.** A failing assertion must show the agent what
    changed, not just that something changed. Use `cmp.Diff` for non-trivial
-   structs; use golden files for generated text (HCL, JSON, CLI output) with
-   a `-update` flag to regenerate. Substring matches against generated output
-   are not acceptable for new code.
+   equality, and require it for any struct or slice comparison larger than
+   two fields; use golden files for generated text (HCL, JSON, CLI output)
+   with a `-update` flag to regenerate. Substring matches against generated
+   output are not acceptable for new code.
 4. **Every exported behavior in `internal/` and `api/` has a unit test** in
    the same package, file `<thing>_test.go`. Prefer table-driven tests when
    covering more than two cases of the same shape.

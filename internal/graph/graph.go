@@ -77,6 +77,7 @@ func (g *Graph) AddOrMerge(n *Node) error {
 			if !contains(existing.Aliases, a) {
 				existing.Aliases = append(existing.Aliases, a)
 			}
+			g.AliasIndex[a] = existing.Key
 		}
 		// Merge edges (deduped).
 		for _, e := range n.Edges {
