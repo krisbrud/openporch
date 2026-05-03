@@ -33,7 +33,7 @@ type Options struct {
 	EnvID        string
 	EnvTypeID    string
 	OrgID        string // optional, surfaced via ${context.org_id}
-	Store        *store.FS
+	Store        store.Store
 	Runner       runner.Runner
 	RunnerID     string // config-level runner ID for recording; overrides the type-derived fallback
 	DeploymentID string // identifier used for log paths; auto-set if empty

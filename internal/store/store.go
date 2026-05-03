@@ -12,6 +12,18 @@ import (
 	"sort"
 )
 
+// Store is the interface satisfied by any deployment state backend.
+type Store interface {
+	ResourceDir(project, env, key string) string
+	LogFile(project, env, key, deploymentID string) string
+	PluginCacheDir() string
+	SaveOutputs(project, env, key string, outputs map[string]any) error
+	LoadOutputs(project, env, key string) (map[string]any, bool, error)
+	WriteRootTF(project, env, key, hcl string) (string, error)
+	WriteInlineModule(project, env, key, src string) error
+	ListResourceDirs(project, env string) ([]string, error)
+}
+
 // FS is a filesystem-backed store rooted at .openporch/.
 type FS struct {
 	Root string // e.g. ".openporch"
