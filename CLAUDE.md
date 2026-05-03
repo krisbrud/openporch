@@ -1,33 +1,63 @@
 # CLAUDE.md
 
-Mandatory practices for development and testing in this repo.
+Mandatory rules. Detailed how-tos and templates live in
+`.claude/skills/testing/SKILL.md` — invoke that skill when adding or
+substantially changing tests.
 
 ## Development
 
-- Target the Go toolchain in `go.mod` (currently `go 1.25`). Run `go build ./...` and `go vet ./...` before committing.
-- Format with `gofmt` (tabs, standard imports). No new external deps without a clear reason — the stdlib + the modules already in `go.mod` cover most needs.
-- Keep packages under `internal/` cohesive: one responsibility per package, exported surface minimal. Wire dependencies via small interfaces (see `runner.Runner`, `store.Store`) so they can be faked in tests.
-- Return errors with `fmt.Errorf("...: %w", err)`; never `panic` on user input or I/O.
+- Target the Go toolchain in `go.mod` (currently `go 1.25`). `go build ./...`,
+  `go vet ./...`, and `go vet -tags=integration ./...` must pass before
+  committing. The integration-tagged vet catches breakage in tests that the
+  default lane skips.
+- Format with `gofmt` (tabs, standard imports). Don't add external deps without
+  a clear reason — the stdlib + the modules already in `go.mod` cover most
+  needs. Allowed test-only additions: `github.com/google/go-cmp/cmp` for
+  diffs, `rsc.io/script/scripttest` for CLI tests.
+- Keep packages under `internal/` cohesive: one responsibility per package,
+  exported surface minimal. Wire dependencies via small interfaces (see
+  `runner.Runner`, `store.Store`) so they can be faked in tests.
+- Return errors with `fmt.Errorf("...: %w", err)`; never `panic` on user input
+  or I/O.
 
-## Unit tests (mandatory)
+## Testing — required outcomes
 
-- Every exported function or behavior in `internal/` and `api/` must have a unit test in the same package, file `<thing>_test.go`.
-- Use the standard library `testing` package only — **do not** add `testify`, `gomega`, or other assertion libs. Use `t.Fatalf` for setup/precondition failures and `t.Errorf` to keep going on independent assertions.
-- Prefer table-driven tests (`tests := []struct{...}{...}` + `t.Run(tc.name, ...)`) when covering more than two cases of the same shape.
-- Put filesystem state under `t.TempDir()`. Mark helpers with `t.Helper()`. Never read or write outside the temp dir or the repo's own `examples/`.
-- Tests must be hermetic and parallel-safe: no network, no `time.Sleep` for synchronization, no reliance on `$HOME`, ambient env, or current working directory. Set env via `t.Setenv`.
-- Default `go test ./...` must pass on a clean machine with only the Go toolchain installed.
+These are the properties every test must satisfy. The skill explains *how*.
 
-## Integration tests (mandatory rules)
+1. **Defaults stay green and fast.** `go test -race -count=1 ./...` on a clean
+   machine with only the Go toolchain must pass. No network, no ambient env,
+   no current-working-dir assumptions, no `time.Sleep` for synchronization,
+   no writes outside `t.TempDir()`. Set env via `t.Setenv`.
+2. **Parallel-safe by default.** Every test calls `t.Parallel()` unless there
+   is a documented reason not to (e.g. `t.Setenv` in a parent test).
+3. **Failures are actionable.** A failing assertion must show the agent what
+   changed, not just that something changed. Use `cmp.Diff` for non-trivial
+   structs; use golden files for generated text (HCL, JSON, CLI output) with
+   a `-update` flag to regenerate. Substring matches against generated output
+   are not acceptable for new code.
+4. **Every exported behavior in `internal/` and `api/` has a unit test** in
+   the same package, file `<thing>_test.go`. Prefer table-driven tests when
+   covering more than two cases of the same shape.
+5. **CLI behavior is tested at the CLI.** Changes to `cmd/openporch/` must be
+   covered by a testscript (`*.txtar`) case, not only by package-level tests.
+6. **Integration tests cover the contract with the outside world.** They live
+   next to the code under test and must:
+   - start with `//go:build integration` so default `go test ./...` skips them;
+   - probe their prereq (`docker`, `tofu`) and `t.Skipf` when missing locally,
+     but **fail** when `CI=true` and the prereq is missing — silent skips in CI
+     are a bug;
+   - exercise the package's public API as a black-box (`package <pkg>_test`);
+   - put all state under `t.TempDir()`, use non-default ports/names to avoid
+     collisions, and register teardown with `t.Cleanup` that runs even on
+     failure;
+   - wrap the operation in `context.WithTimeout` and finish within the suite's
+     `-timeout` ceiling;
+   - build any image/module they need from `examples/` inside the test rather
+     than depending on machine state.
+7. **Assertion libraries are limited.** Allowed: stdlib `testing`, `go-cmp`,
+   `scripttest`. Banned: `testify` (its `require` hides control flow) and any
+   library that swallows the `*testing.T` API.
 
-Integration tests cover real behavior against external systems we depend on: the OpenTofu CLI (`tofu`), Docker, and the on-disk state layout end-to-end. They live next to the code under test and follow these rules:
-
-1. **Build tag.** First line is `//go:build integration`. They never run under the default `go test ./...`. Run with `go test -tags=integration -timeout=5m ./...`.
-2. **Skip, don't fail, when prerequisites are missing.** Probe the dependency at the top of the test (e.g. `exec.Command("docker", "version").Run()`, `exec.LookPath("tofu")`) and call `t.Skipf` if absent. CI without Docker must still go green on `-tags=integration` for unrelated suites.
-3. **Black-box package.** Use `package <pkg>_test` and exercise the public API (`deploy.Run`, `store.FS`, `runner.LocalTofu`) — not internals. The integration test should resemble how `cmd/openporch` uses the package.
-4. **Isolated state.** Always use `t.TempDir()` as the state root. Never write to `.openporch/` in the repo. Pick non-default ports/names (see `host_port: 18080` in `internal/deploy/integration_test.go`) so the test doesn't collide with a developer's running stack.
-5. **Always tear down.** Register cleanup with `t.Cleanup` (or `defer`) that runs `destroy` even when the test fails partway. Leaking Docker containers or `tofu` state breaks the next run.
-6. **Bounded.** Wrap the operation in `context.WithTimeout`; the whole test must finish within `-timeout=5m`. Long-running suites get their own `_slow_test.go` behind an additional tag.
-7. **Real artifacts only.** If the test needs an image/module, build it from `examples/` inside the test — don't depend on something that "should already be on the machine".
-
-When adding a new external integration (a new runner, a new provider), add an integration test alongside the unit tests; the unit tests cover logic, the integration test covers the contract with the outside world.
+When adding a new external integration (a new runner, a new provider), add an
+integration test alongside the unit tests; the unit tests cover logic, the
+integration test covers the contract with the outside world.
