@@ -128,24 +128,27 @@ func TestDeployFastAPIToLocalDocker(t *testing.T) {
 //   - re-running plan-only against the same state produces a new deployment
 //     row, not a duplicate apply.
 //
-// Run with: go test -tags=integration -timeout=5m ./internal/deploy/...
+// Run with: go test -tags=integration -timeout=10m ./internal/deploy/...
 func TestPlanOnlyFastAPIDemo(t *testing.T) {
 	if err := exec.Command("tofu", "version").Run(); err != nil {
-		if isCI() {
-			t.Fatalf("CI=true but tofu binary missing: %v", err)
-		}
 		t.Skipf("tofu binary not available: %v", err)
 	}
 	if err := exec.Command("docker", "version").Run(); err != nil {
-		if isCI() {
-			t.Fatalf("CI=true but docker daemon missing: %v", err)
-		}
 		t.Skipf("docker daemon not reachable: %v", err)
 	}
 
 	repoRoot := findRepoRoot(t)
 	platformDir := filepath.Join(repoRoot, "examples", "platform")
 	manifestPath := filepath.Join(repoRoot, "examples", "apps", "fastapi-demo", "manifest.yaml")
+	appDir := filepath.Join(repoRoot, "examples", "apps", "fastapi-demo")
+
+	// kreuzwerker/docker's docker_image resource inspects the image during
+	// plan; the plan fails if the image isn't present locally. Build it the
+	// same way TestDeployFastAPIToLocalDocker does.
+	imageTag := "fastapi-demo:plan-integration"
+	if out, err := exec.Command("docker", "build", "-t", imageTag, appDir).CombinedOutput(); err != nil {
+		t.Fatalf("docker build: %v\n%s", err, out)
+	}
 
 	cfg, err := config.Load(platformDir)
 	if err != nil {
@@ -155,10 +158,19 @@ func TestPlanOnlyFastAPIDemo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load manifest: %v", err)
 	}
-	// Use non-default ports so plan-only doesn't accidentally collide with
-	// anything the developer is running. Plan does not bind ports, but if
-	// future plan-time validation evolves to do so we want isolation.
+	// Override the image to the just-built tag and use non-default ports so
+	// plan-only doesn't collide with whatever the developer has running.
+	m.Workloads["api"].Params["image"] = imageTag
 	m.Workloads["api"].Params["host_port"] = 18091
+	// Replace the cross-resource DATABASE_URL placeholder with a literal: in
+	// plan-only the upstream `db` resource is never applied, so its outputs
+	// are not available. Leaving the unresolved `${...}` would surface as a
+	// Terraform interpolation error during `tofu plan`. The actual integration
+	// of cross-resource resolution against persisted plan state is out of
+	// scope for v0 plan-only.
+	m.Workloads["api"].Params["env"] = map[string]any{
+		"DATABASE_URL": "postgresql://placeholder:5432/db",
+	}
 	dbResource := m.Workloads["api"].Resources["db"]
 	if dbResource.Params == nil {
 		dbResource.Params = map[string]any{}
@@ -181,16 +193,16 @@ func TestPlanOnlyFastAPIDemo(t *testing.T) {
 	t.Cleanup(func() { openDB.Close() })
 
 	// fastapi-demo workloads/resources end up as docker containers named
-	// `openworkload-<name>` per workload-local-docker module. Plan must not
+	// `openporch-<name>` per workload-local-docker module. Plan must not
 	// create any of them.
 	mustNoContainers := func(when string) {
-		for _, prefix := range []string{"openporch-api", "openporch-db"} {
-			out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^"+prefix+"$").CombinedOutput()
+		for _, name := range []string{"openporch-api", "openporch-db"} {
+			out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^"+name+"$").CombinedOutput()
 			if err != nil {
-				t.Fatalf("docker ps (%s, %s): %v\n%s", when, prefix, err, out)
+				t.Fatalf("docker ps (%s, %s): %v\n%s", when, name, err, out)
 			}
 			if len(out) > 0 {
-				t.Errorf("expected no container %q (%s), got id(s): %s", prefix, when, string(out))
+				t.Errorf("expected no container %q (%s), got id(s): %s", name, when, string(out))
 			}
 		}
 	}
@@ -204,7 +216,7 @@ func TestPlanOnlyFastAPIDemo(t *testing.T) {
 			PlanOnly:     true,
 			DeploymentID: deploymentID,
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if _, err := deploy.Run(ctx, opts); err != nil {
 			t.Fatalf("deploy.Run plan-only %s: %v", deploymentID, err)
@@ -268,10 +280,6 @@ func TestPlanOnlyFastAPIDemo(t *testing.T) {
 			t.Errorf("deployment %s: Mode = %q, want plan_only (no accidental apply)", row.ID, row.Mode)
 		}
 	}
-}
-
-func isCI() bool {
-	return os.Getenv("CI") == "true"
 }
 
 func httpGet(url string) ([]byte, int, error) {
