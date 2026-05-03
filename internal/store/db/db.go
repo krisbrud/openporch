@@ -87,6 +87,7 @@ var migrations = []string{
 		deployment_id TEXT PRIMARY KEY REFERENCES deployments(id),
 		graph_json    TEXT NOT NULL
 	);`,
+	`ALTER TABLE deployment_resources ADD COLUMN plan_path TEXT NOT NULL DEFAULT '';`,
 }
 
 func migrate(db *sql.DB) error {

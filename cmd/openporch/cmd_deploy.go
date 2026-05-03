@@ -27,6 +27,7 @@ func newDeployCmd() *cobra.Command {
 		tofuBinary  string
 		dryRun      bool
 		renderDir   string
+		planOnly    bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy <manifest.yaml>",
@@ -55,11 +56,15 @@ func newDeployCmd() *cobra.Command {
 				return err
 			}
 
+			if dryRun && planOnly {
+				return fmt.Errorf("--dry-run and --plan-only are mutually exclusive")
+			}
 			opts := deploy.Options{
 				Manifest: m, Platform: cfg, Store: &store.FS{Root: stateRoot},
 				Runner: r, RunnerID: runnerID,
 				ProjectID: project, EnvID: env, EnvTypeID: envType,
 				DryRun: dryRun, RenderDir: renderDir,
+				PlanOnly: planOnly,
 			}
 			if !dryRun {
 				d, err := db.Open(stateRoot)
@@ -73,6 +78,12 @@ func newDeployCmd() *cobra.Command {
 			res, err := deploy.Run(ctx, opts)
 			if err != nil {
 				return err
+			}
+
+			if planOnly {
+				fmt.Printf("\nPlan-only deployment %s complete (status=planned).\n", res.DeploymentID)
+				fmt.Println("Run `opo get deployment` to review captured plans.")
+				return nil
 			}
 
 			if dryRun {
@@ -141,5 +152,7 @@ func newDeployCmd() *cobra.Command {
 		"validate and render HCL without invoking tofu; prints a per-resource summary")
 	cmd.Flags().StringVar(&renderDir, "render-dir", "",
 		"with --dry-run: write rendered main.tf files here so you can run `tofu plan` manually")
+	cmd.Flags().BoolVar(&planOnly, "plan-only", false,
+		"run `tofu init` and `tofu plan` per resource, persisting the plan and a deployment record with mode=plan_only; no apply is invoked")
 	return cmd
 }

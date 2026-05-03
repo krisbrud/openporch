@@ -50,6 +50,12 @@ type Options struct {
 	// main.tf files so the caller can run `tofu plan` manually.
 	// Layout: <RenderDir>/<safe-resource-key>/main.tf
 	RenderDir string
+
+	// PlanOnly runs `tofu init` and `tofu plan` per resource, persisting the
+	// plan-file path on each deployment_resources row. The deployment is
+	// recorded with mode=plan_only and a terminal status of `planned` (or
+	// `plan_failed`). No `tofu apply` is invoked; no outputs are produced.
+	PlanOnly bool
 }
 
 // runnerID returns a stable identifier for the runner type so it can be
@@ -179,11 +185,15 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 
 	startedAt := time.Now().UTC()
 	if o.Recorder != nil && !o.DryRun {
+		mode := "deploy"
+		if o.PlanOnly {
+			mode = "plan_only"
+		}
 		manifestYAML, _ := yaml.Marshal(o.Manifest)
 		graphJSON, _ := serializeGraph(g)
 		_ = o.Recorder.StartDeployment(ctx, DeploymentRecord{
 			ID: o.DeploymentID, Project: o.ProjectID, Env: o.EnvID,
-			EnvType: o.EnvTypeID, Mode: "deploy", StartedAt: startedAt,
+			EnvType: o.EnvTypeID, Mode: mode, StartedAt: startedAt,
 			ManifestYAML: string(manifestYAML), GraphJSON: graphJSON,
 		})
 	}
@@ -219,7 +229,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		if rerr != nil && !errors.Is(rerr, expr.ErrUnresolved) {
 			return nil, fmt.Errorf("deploy: resolve inputs for %s: %w", n.Key, rerr)
 		}
-		if !o.DryRun && errors.Is(rerr, expr.ErrUnresolved) {
+		if !o.DryRun && !o.PlanOnly && errors.Is(rerr, expr.ErrUnresolved) {
 			return nil, fmt.Errorf("deploy: unresolved placeholder in inputs of %s (likely a missing dependency edge): %w",
 				n.Key, rerr)
 		}
@@ -282,6 +292,40 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 		log := o.Store.LogFile(o.ProjectID, o.EnvID, n.Key, o.DeploymentID)
 
+		if o.PlanOnly {
+			fmt.Fprintf(os.Stderr, "[openporch] planning %s via module=%s\n", n.Key, n.ModuleID)
+			n.Status = "planning"
+			if o.Recorder != nil {
+				_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+					ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+					ModuleID: n.ModuleID, RunnerID: rid, Status: "planning",
+					LogPath: log,
+				})
+			}
+			planPath, perr := o.Runner.Plan(ctx, workdir, log)
+			if perr != nil {
+				n.Status = "plan_failed"
+				if o.Recorder != nil {
+					_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+						ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+						ModuleID: n.ModuleID, RunnerID: rid, Status: "plan_failed",
+						LogPath: log,
+					})
+					_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, "plan_failed", time.Now().UTC())
+				}
+				return nil, fmt.Errorf("deploy: plan %s: %w (see %s)", n.Key, perr, log)
+			}
+			n.Status = "planned"
+			if o.Recorder != nil {
+				_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+					ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+					ModuleID: n.ModuleID, RunnerID: rid, Status: "planned",
+					LogPath: log, PlanPath: planPath,
+				})
+			}
+			continue
+		}
+
 		fmt.Fprintf(os.Stderr, "[openporch] applying %s via module=%s\n", n.Key, n.ModuleID)
 		n.Status = "applying"
 		if o.Recorder != nil {
@@ -328,14 +372,18 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 			OrgID: o.OrgID, ProjectID: o.ProjectID, EnvID: o.EnvID, EnvTypeID: o.EnvTypeID,
 		}
 		s, err := expr.Resolve(v, ectx, stateView{g: g}, envVars{})
-		if err != nil && (!o.DryRun || !errors.Is(err, expr.ErrUnresolved)) {
+		if err != nil && (!(o.DryRun || o.PlanOnly) || !errors.Is(err, expr.ErrUnresolved)) {
 			return nil, fmt.Errorf("deploy: resolve manifest output %q: %w", k, err)
 		}
 		manifestOutputs[k] = s
 	}
 
 	if o.Recorder != nil && !o.DryRun {
-		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, "succeeded", time.Now().UTC())
+		status := "succeeded"
+		if o.PlanOnly {
+			status = "planned"
+		}
+		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, status, time.Now().UTC())
 	}
 	return &Result{
 		DeploymentID:    o.DeploymentID,

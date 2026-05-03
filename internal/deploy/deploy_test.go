@@ -17,11 +17,21 @@ import (
 type stubRunner struct {
 	outputs  map[string]any
 	applyCnt int
+	planCnt  int
+	planPath string
 }
 
 func (s *stubRunner) Apply(_ context.Context, _, _ string) (*runner.Result, error) {
 	s.applyCnt++
 	return &runner.Result{Outputs: s.outputs}, nil
+}
+
+func (s *stubRunner) Plan(_ context.Context, workdir, _ string) (string, error) {
+	s.planCnt++
+	if s.planPath != "" {
+		return s.planPath, nil
+	}
+	return filepath.Join(workdir, "tfplan.bin"), nil
 }
 
 func (s *stubRunner) Destroy(_ context.Context, _, _ string) error {
@@ -108,10 +118,10 @@ func TestRun_runnerIDFallsBackToTypeDerivedStringWhenUnset(t *testing.T) {
 	stub := &stubRunner{}
 	rec := &captureRecorder{}
 	_, err := Run(context.Background(), Options{
-		Manifest:  minimalManifest(),
-		Platform:  minimalPlatform(t),
-		Store:     &store.FS{Root: t.TempDir()},
-		Runner:    stub,
+		Manifest: minimalManifest(),
+		Platform: minimalPlatform(t),
+		Store:    &store.FS{Root: t.TempDir()},
+		Runner:   stub,
 		// RunnerID intentionally not set; pipeline falls back to runnerID(o.Runner).
 		ProjectID: "proj",
 		EnvID:     "test",
@@ -189,6 +199,114 @@ func TestRun_DryRunNoStateFiles(t *testing.T) {
 	if _, err := os.Stat(stateDir); err == nil {
 		t.Errorf("dry-run created state directory %s; want none", stateDir)
 	}
+}
+
+// captureFinish captures every FinishDeployment status to assert on plan-only finals.
+type captureFinish struct {
+	captureRecorder
+	finishStatus string
+}
+
+func (c *captureFinish) FinishDeployment(_ context.Context, _ string, status string, _ time.Time) error {
+	c.finishStatus = status
+	return nil
+}
+
+func TestRun_PlanOnlyCallsPlanNotApply(t *testing.T) {
+	t.Parallel()
+	stub := &stubRunner{}
+	rec := &captureFinish{}
+	stateRoot := t.TempDir()
+
+	_, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  minimalPlatform(t),
+		Store:     &store.FS{Root: stateRoot},
+		Runner:    stub,
+		RunnerID:  "local-tofu",
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		Recorder:  rec,
+		PlanOnly:  true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stub.applyCnt != 0 {
+		t.Errorf("Runner.Apply called %d time(s); want 0 in plan-only", stub.applyCnt)
+	}
+	if stub.planCnt != 1 {
+		t.Errorf("Runner.Plan called %d time(s); want 1", stub.planCnt)
+	}
+	if rec.finishStatus != "planned" {
+		t.Errorf("FinishDeployment status = %q, want planned", rec.finishStatus)
+	}
+	// Last record per resource must be status=planned with non-empty PlanPath.
+	last := map[string]ResourceRecord{}
+	for _, r := range rec.resources {
+		last[r.ResourceKey] = r
+	}
+	if len(last) == 0 {
+		t.Fatal("no resources recorded")
+	}
+	for k, r := range last {
+		if r.Status != "planned" {
+			t.Errorf("resource %q: final Status = %q, want planned", k, r.Status)
+		}
+		if r.PlanPath == "" {
+			t.Errorf("resource %q: PlanPath is empty", k)
+		}
+	}
+}
+
+func TestRun_PlanOnlyRecordsPlanOnlyMode(t *testing.T) {
+	t.Parallel()
+	stub := &stubRunner{}
+	started := false
+	rec := &startCapturingRecorder{
+		onStart: func(d DeploymentRecord) {
+			started = true
+			if d.Mode != "plan_only" {
+				t.Errorf("StartDeployment Mode = %q, want plan_only", d.Mode)
+			}
+		},
+	}
+	if _, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  minimalPlatform(t),
+		Store:     &store.FS{Root: t.TempDir()},
+		Runner:    stub,
+		RunnerID:  "local-tofu",
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		Recorder:  rec,
+		PlanOnly:  true,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !started {
+		t.Error("StartDeployment was not invoked")
+	}
+}
+
+// startCapturingRecorder is a Recorder that invokes a callback on StartDeployment.
+type startCapturingRecorder struct {
+	onStart func(DeploymentRecord)
+}
+
+func (s *startCapturingRecorder) StartDeployment(_ context.Context, d DeploymentRecord) error {
+	if s.onStart != nil {
+		s.onStart(d)
+	}
+	return nil
+}
+func (s *startCapturingRecorder) RecordResource(_ context.Context, _ string, _ ResourceRecord) error {
+	return nil
+}
+func (s *startCapturingRecorder) FinishDeployment(_ context.Context, _ string, _ string, _ time.Time) error {
+	return nil
 }
 
 func TestRun_DryRunWritesRenderDir(t *testing.T) {

@@ -86,7 +86,7 @@ func TestRecorderLifecycle(t *testing.T) {
 
 	var (
 		project, env, envType, status, mode string
-		finished                             sql.NullString
+		finished                            sql.NullString
 	)
 	if err := d.QueryRow(
 		`SELECT project, env, env_type, status, mode, finished_at FROM deployments WHERE id = ?`,
@@ -155,6 +155,60 @@ func TestRecorderLifecycle(t *testing.T) {
 	}
 	if !finFinished.Valid {
 		t.Errorf("finished_at should be set")
+	}
+}
+
+func TestRecorderPlanOnly(t *testing.T) {
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	rec := NewRecorder(d)
+	rdr := NewReader(d)
+	ctx := context.Background()
+	started := time.Now().UTC().Truncate(time.Second)
+
+	if err := rec.StartDeployment(ctx, deploy.DeploymentRecord{
+		ID: "plan-1", Project: "p", Env: "e", EnvType: "local",
+		Mode: "plan_only", StartedAt: started,
+		ManifestYAML: "kind: Manifest\n", GraphJSON: `{}`,
+	}); err != nil {
+		t.Fatalf("StartDeployment: %v", err)
+	}
+	if err := rec.RecordResource(ctx, "plan-1", deploy.ResourceRecord{
+		ResourceKey: "service|default|api", Type: "service", Class: "default", ID: "api",
+		ModuleID: "mod-svc", RunnerID: "local-tofu", Status: "planned",
+		LogPath: "/tmp/api.log", PlanPath: "/tmp/api/tfplan.bin",
+	}); err != nil {
+		t.Fatalf("RecordResource: %v", err)
+	}
+	if err := rec.FinishDeployment(ctx, "plan-1", "planned", started.Add(time.Minute)); err != nil {
+		t.Fatalf("FinishDeployment: %v", err)
+	}
+
+	det, err := rdr.GetDeployment(ctx, "plan-1")
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if det == nil {
+		t.Fatal("expected non-nil detail")
+	}
+	if det.Mode != "plan_only" {
+		t.Errorf("Mode = %q, want plan_only", det.Mode)
+	}
+	if det.Status != "planned" {
+		t.Errorf("Status = %q, want planned", det.Status)
+	}
+	if len(det.Resources) != 1 {
+		t.Fatalf("Resources len = %d, want 1", len(det.Resources))
+	}
+	if got := det.Resources[0].PlanPath; got != "/tmp/api/tfplan.bin" {
+		t.Errorf("PlanPath = %q, want /tmp/api/tfplan.bin", got)
+	}
+	if got := det.Resources[0].Status; got != "planned" {
+		t.Errorf("resource Status = %q, want planned", got)
 	}
 }
 
