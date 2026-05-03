@@ -47,6 +47,11 @@ jobs:
         with:
           tofu_wrapper: false
 
+      - name: Verify Docker daemon
+        run: |
+          docker version
+          docker info
+
       - name: Integration tests
         id: integration
         run: go test -tags=integration -timeout=10m -v ./...
