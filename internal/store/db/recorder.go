@@ -62,10 +62,10 @@ func (r *SQLiteRecorder) RecordResource(ctx context.Context, deploymentID string
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE deployment_resources
 		 SET type = ?, class = ?, id = ?, module_id = ?, runner_id = ?,
-		     status = ?, outputs_json = ?, log_path = ?
+		     status = ?, outputs_json = ?, log_path = ?, plan_path = ?
 		 WHERE deployment_id = ? AND resource_key = ?`,
 		rec.Type, rec.Class, rec.ID, rec.ModuleID, rec.RunnerID,
-		rec.Status, outputs, rec.LogPath,
+		rec.Status, outputs, rec.LogPath, rec.PlanPath,
 		deploymentID, rec.ResourceKey)
 	if err != nil {
 		return fmt.Errorf("db: update resource: %w", err)
@@ -79,10 +79,10 @@ func (r *SQLiteRecorder) RecordResource(ctx context.Context, deploymentID string
 	}
 	if _, err := r.db.ExecContext(ctx,
 		`INSERT INTO deployment_resources
-		 (deployment_id, resource_key, type, class, id, module_id, runner_id, status, outputs_json, log_path)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (deployment_id, resource_key, type, class, id, module_id, runner_id, status, outputs_json, log_path, plan_path)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		deploymentID, rec.ResourceKey, rec.Type, rec.Class, rec.ID,
-		rec.ModuleID, rec.RunnerID, rec.Status, outputs, rec.LogPath); err != nil {
+		rec.ModuleID, rec.RunnerID, rec.Status, outputs, rec.LogPath, rec.PlanPath); err != nil {
 		return fmt.Errorf("db: insert resource: %w", err)
 	}
 	return nil

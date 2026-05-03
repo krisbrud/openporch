@@ -29,6 +29,7 @@ type ResourceRow struct {
 	Status      string `json:"status" yaml:"status"`
 	OutputsJSON string `json:"outputs_json,omitempty" yaml:"outputs_json,omitempty"`
 	LogPath     string `json:"log_path" yaml:"log_path"`
+	PlanPath    string `json:"plan_path,omitempty" yaml:"plan_path,omitempty"`
 }
 
 // DeploymentDetail is a full deployment record including manifest and resources.
@@ -108,7 +109,7 @@ func (r *Reader) GetDeployment(ctx context.Context, id string) (*DeploymentDetai
 
 	resRows, err := r.db.QueryContext(ctx,
 		`SELECT resource_key, type, class, id, module_id, runner_id, status,
-		        COALESCE(outputs_json, ''), log_path
+		        COALESCE(outputs_json, ''), log_path, plan_path
 		 FROM deployment_resources WHERE deployment_id = ?
 		 ORDER BY resource_key`, id)
 	if err != nil {
@@ -118,7 +119,7 @@ func (r *Reader) GetDeployment(ctx context.Context, id string) (*DeploymentDetai
 	for resRows.Next() {
 		var res ResourceRow
 		if err := resRows.Scan(&res.ResourceKey, &res.Type, &res.Class, &res.ID,
-			&res.ModuleID, &res.RunnerID, &res.Status, &res.OutputsJSON, &res.LogPath); err != nil {
+			&res.ModuleID, &res.RunnerID, &res.Status, &res.OutputsJSON, &res.LogPath, &res.PlanPath); err != nil {
 			return nil, fmt.Errorf("db: scan resource row: %w", err)
 		}
 		d.Resources = append(d.Resources, res)

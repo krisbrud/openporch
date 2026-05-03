@@ -95,6 +95,25 @@ func (l *LocalTofu) Apply(ctx context.Context, workdir, logfile string) (*Result
 	return &Result{Outputs: out}, nil
 }
 
+// Plan implements Runner. It runs `tofu init` followed by `tofu plan -out`,
+// writing the binary plan file to <workdir>/tfplan.bin and returning that path.
+func (l *LocalTofu) Plan(ctx context.Context, workdir, logfile string) (string, error) {
+	tf, closer, err := l.newTF(workdir, logfile)
+	if err != nil {
+		return "", err
+	}
+	defer closer.Close()
+
+	if err := tf.Init(ctx, tfexec.Upgrade(false)); err != nil {
+		return "", fmt.Errorf("runner/local: tofu init in %s: %w", workdir, err)
+	}
+	planPath := filepath.Join(workdir, "tfplan.bin")
+	if _, err := tf.Plan(ctx, tfexec.Out(planPath)); err != nil {
+		return "", fmt.Errorf("runner/local: tofu plan in %s: %w", workdir, err)
+	}
+	return planPath, nil
+}
+
 // Destroy implements Runner.
 func (l *LocalTofu) Destroy(ctx context.Context, workdir, logfile string) error {
 	tf, closer, err := l.newTF(workdir, logfile)

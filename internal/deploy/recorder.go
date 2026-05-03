@@ -44,4 +44,5 @@ type ResourceRecord struct {
 	Status      string
 	OutputsJSON string
 	LogPath     string
+	PlanPath    string
 }

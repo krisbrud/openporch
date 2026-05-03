@@ -16,6 +16,11 @@ type Runner interface {
 	// from tofu are streamed to the supplied logfile.
 	Apply(ctx context.Context, workdir, logfile string) (*Result, error)
 
+	// Plan initialises and plans the root module written to `workdir`,
+	// writing the binary plan file inside the workdir and returning its
+	// path. Stdout/stderr are streamed to logfile. No state is mutated.
+	Plan(ctx context.Context, workdir, logfile string) (planPath string, err error)
+
 	// Destroy reverses an apply. (Not used in v0 deploy path; reserved.)
 	Destroy(ctx context.Context, workdir, logfile string) error
 }
