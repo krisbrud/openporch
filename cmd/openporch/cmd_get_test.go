@@ -130,6 +130,36 @@ func TestGetDeployments_ProjectFilter(t *testing.T) {
 	}
 }
 
+func TestGetDeployments_EnvFilter(t *testing.T) {
+	root := t.TempDir()
+	mustSeedDB(t, root)
+
+	d, err := db.Open(root)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	rec := db.NewRecorder(d)
+	if err := rec.StartDeployment(context.Background(), deploy.DeploymentRecord{
+		ID: "dep-prod", Project: "myproj", Env: "prod", EnvType: "remote",
+		Mode: "deploy", StartedAt: time.Now().UTC(),
+		ManifestYAML: "kind: Manifest\n", GraphJSON: `{}`,
+	}); err != nil {
+		t.Fatalf("StartDeployment: %v", err)
+	}
+	d.Close()
+
+	out, err := runGet(t, root, "deployments", "--env", "dev")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "dep-abc123") {
+		t.Errorf("dev deployment missing from output:\n%s", out)
+	}
+	if strings.Contains(out, "dep-prod") {
+		t.Errorf("prod deployment should be filtered out:\n%s", out)
+	}
+}
+
 func TestGetDeployments_NonexistentProject(t *testing.T) {
 	root := t.TempDir()
 	mustSeedDB(t, root)
@@ -219,6 +249,16 @@ func TestGetDeployments_Limit(t *testing.T) {
 	}
 }
 
+func TestGetDeployments_InvalidOutput(t *testing.T) {
+	_, err := runGet(t, t.TempDir(), "deployments", "-o", "xml")
+	if err == nil {
+		t.Fatal("expected invalid output format error, got nil")
+	}
+	if !strings.Contains(err.Error(), `unsupported output format "xml"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // get deployment <id>
 // ---------------------------------------------------------------------------
@@ -292,5 +332,18 @@ func TestGetDeployment_JSONOutput(t *testing.T) {
 	}
 	if det.Resources[0].RunnerID != "local-tofu" {
 		t.Errorf("Resources[0].RunnerID = %q, want local-tofu", det.Resources[0].RunnerID)
+	}
+}
+
+func TestGetDeployment_InvalidOutput(t *testing.T) {
+	root := t.TempDir()
+	depID, _ := mustSeedDB(t, root)
+
+	_, err := runGet(t, root, "deployment", depID, "-o", "xml")
+	if err == nil {
+		t.Fatal("expected invalid output format error, got nil")
+	}
+	if !strings.Contains(err.Error(), `unsupported output format "xml"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
