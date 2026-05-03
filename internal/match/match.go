@@ -34,6 +34,14 @@ const (
 // Module returns the best-matching module ID for the given resource type and
 // context. Returns ErrNoMatch if no rule applies.
 func Module(rules []v1.ModuleRule, ctx Context) (string, error) {
+	rule, err := moduleRule(rules, ctx)
+	if err != nil {
+		return "", err
+	}
+	return rule.ModuleID, nil
+}
+
+func moduleRule(rules []v1.ModuleRule, ctx Context) (v1.ModuleRule, error) {
 	type scored struct {
 		rule  v1.ModuleRule
 		score int
@@ -56,15 +64,23 @@ func Module(rules []v1.ModuleRule, ctx Context) (string, error) {
 		}
 	}
 	if len(best) == 0 {
-		return "", fmt.Errorf("%w: no module rule matched resource_type=%s ctx=%+v",
+		return v1.ModuleRule{}, fmt.Errorf("%w: no module rule matched resource_type=%s ctx=%+v",
 			ErrNoMatch, ctx.ResourceType, ctx)
 	}
 	sort.Slice(best, func(i, j int) bool { return best[i].rule.ID < best[j].rule.ID })
-	return best[0].rule.ModuleID, nil
+	return best[0].rule, nil
 }
 
 // Runner returns the best-matching runner ID for the given context.
 func Runner(rules []v1.RunnerRule, ctx Context) (string, error) {
+	rule, err := runnerRule(rules, ctx)
+	if err != nil {
+		return "", err
+	}
+	return rule.RunnerID, nil
+}
+
+func runnerRule(rules []v1.RunnerRule, ctx Context) (v1.RunnerRule, error) {
 	type scored struct {
 		rule  v1.RunnerRule
 		score int
@@ -84,10 +100,10 @@ func Runner(rules []v1.RunnerRule, ctx Context) (string, error) {
 		}
 	}
 	if len(best) == 0 {
-		return "", fmt.Errorf("%w: no runner rule matched ctx=%+v", ErrNoMatch, ctx)
+		return v1.RunnerRule{}, fmt.Errorf("%w: no runner rule matched ctx=%+v", ErrNoMatch, ctx)
 	}
 	sort.Slice(best, func(i, j int) bool { return best[i].rule.ID < best[j].rule.ID })
-	return best[0].rule.RunnerID, nil
+	return best[0].rule, nil
 }
 
 func scoreModuleRule(r v1.ModuleRule, c Context) (int, bool) {

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 )
 
@@ -43,14 +45,42 @@ func TestBuild_workloadAndSharedNodesCreated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := g.AliasIndex["workloads.api"]; !ok {
-		t.Errorf("missing workload alias")
+	want := &Graph{
+		Nodes: map[string]*Node{
+			NodeKey("workload", v1.DefaultClass, "api"): {
+				Key:     NodeKey("workload", v1.DefaultClass, "api"),
+				Type:    "workload",
+				Class:   v1.DefaultClass,
+				ID:      "api",
+				Aliases: []string{"workloads.api"},
+				Edges:   []string{NodeKey("postgres", v1.DefaultClass, "workloads.api.db")},
+				Status:  "pending",
+			},
+			NodeKey("postgres", v1.DefaultClass, "workloads.api.db"): {
+				Key:     NodeKey("postgres", v1.DefaultClass, "workloads.api.db"),
+				Type:    "postgres",
+				Class:   v1.DefaultClass,
+				ID:      "workloads.api.db",
+				Aliases: []string{"workloads.api.db"},
+				Status:  "pending",
+			},
+			NodeKey("s3", v1.DefaultClass, "shared.bucket"): {
+				Key:     NodeKey("s3", v1.DefaultClass, "shared.bucket"),
+				Type:    "s3",
+				Class:   v1.DefaultClass,
+				ID:      "shared.bucket",
+				Aliases: []string{"shared.bucket"},
+				Status:  "pending",
+			},
+		},
+		AliasIndex: map[string]string{
+			"workloads.api":    NodeKey("workload", v1.DefaultClass, "api"),
+			"workloads.api.db": NodeKey("postgres", v1.DefaultClass, "workloads.api.db"),
+			"shared.bucket":    NodeKey("s3", v1.DefaultClass, "shared.bucket"),
+		},
 	}
-	if _, ok := g.AliasIndex["workloads.api.db"]; !ok {
-		t.Errorf("missing workload-scoped resource alias")
-	}
-	if _, ok := g.AliasIndex["shared.bucket"]; !ok {
-		t.Errorf("missing shared alias")
+	if diff := graphDiff(want, g); diff != "" {
+		t.Errorf("Build() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -75,20 +105,45 @@ func TestBuild_dedupesByTypeClassID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	count := 0
-	for _, n := range g.Nodes {
-		if n.Type == "postgres" {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("expected 1 postgres node, got %d", count)
-	}
-	// Both workloads alias the same node.
 	postgresKey := NodeKey("postgres", v1.DefaultClass, "shared-db")
-	n := g.Nodes[postgresKey]
-	if len(n.Aliases) != 2 {
-		t.Errorf("expected 2 aliases, got %v", n.Aliases)
+	want := &Graph{
+		Nodes: map[string]*Node{
+			NodeKey("workload", v1.DefaultClass, "a"): {
+				Key:     NodeKey("workload", v1.DefaultClass, "a"),
+				Type:    "workload",
+				Class:   v1.DefaultClass,
+				ID:      "a",
+				Aliases: []string{"workloads.a"},
+				Edges:   []string{postgresKey},
+				Status:  "pending",
+			},
+			NodeKey("workload", v1.DefaultClass, "b"): {
+				Key:     NodeKey("workload", v1.DefaultClass, "b"),
+				Type:    "workload",
+				Class:   v1.DefaultClass,
+				ID:      "b",
+				Aliases: []string{"workloads.b"},
+				Edges:   []string{postgresKey},
+				Status:  "pending",
+			},
+			postgresKey: {
+				Key:     postgresKey,
+				Type:    "postgres",
+				Class:   v1.DefaultClass,
+				ID:      "shared-db",
+				Aliases: []string{"workloads.a.db", "workloads.b.db"},
+				Status:  "pending",
+			},
+		},
+		AliasIndex: map[string]string{
+			"workloads.a":    NodeKey("workload", v1.DefaultClass, "a"),
+			"workloads.a.db": postgresKey,
+			"workloads.b":    NodeKey("workload", v1.DefaultClass, "b"),
+			"workloads.b.db": postgresKey,
+		},
+	}
+	if diff := graphDiff(want, g); diff != "" {
+		t.Errorf("Build() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -109,12 +164,44 @@ func TestBuild_moduleDependenciesExpanded(t *testing.T) {
 		t.Fatal(err)
 	}
 	netKey := NodeKey("docker-network", v1.DefaultClass, "db1-net")
-	if _, ok := g.Nodes[netKey]; !ok {
-		t.Fatalf("expected docker-network node %s, got %v", netKey, mapKeys(g.Nodes))
-	}
 	dbKey := NodeKey("postgres", v1.DefaultClass, "db1")
-	if !contains(g.Nodes[dbKey].Edges, netKey) {
-		t.Errorf("expected db to depend on net; edges: %v", g.Nodes[dbKey].Edges)
+	workloadKey := NodeKey("workload", v1.DefaultClass, "a")
+	want := &Graph{
+		Nodes: map[string]*Node{
+			workloadKey: {
+				Key:     workloadKey,
+				Type:    "workload",
+				Class:   v1.DefaultClass,
+				ID:      "a",
+				Aliases: []string{"workloads.a"},
+				Edges:   []string{dbKey},
+				Status:  "pending",
+			},
+			dbKey: {
+				Key:      dbKey,
+				Type:     "postgres",
+				Class:    v1.DefaultClass,
+				ID:       "db1",
+				Aliases:  []string{"workloads.a.db"},
+				Edges:    []string{netKey},
+				ModuleID: "postgres-docker",
+				Status:   "pending",
+			},
+			netKey: {
+				Key:    netKey,
+				Type:   "docker-network",
+				Class:  v1.DefaultClass,
+				ID:     "db1-net",
+				Status: "pending",
+			},
+		},
+		AliasIndex: map[string]string{
+			"workloads.a":    workloadKey,
+			"workloads.a.db": dbKey,
+		},
+	}
+	if diff := graphDiff(want, g); diff != "" {
+		t.Errorf("Build() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -130,12 +217,13 @@ func TestTopoSort_dependenciesBeforeDependents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 3 || out[0].Key != "a" || out[1].Key != "b" || out[2].Key != "c" {
-		var ks []string
-		for _, n := range out {
-			ks = append(ks, n.Key)
-		}
-		t.Fatalf("got order %v want a,b,c", ks)
+	var got []string
+	for _, n := range out {
+		got = append(got, n.Key)
+	}
+	want := []string{"a", "b", "c"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("TopoSort() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -223,10 +311,8 @@ func TestResolveID(t *testing.T) {
 	}
 }
 
-func mapKeys[V any](m map[string]V) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
+func graphDiff(want, got *Graph) string {
+	return cmp.Diff(want, got, cmpopts.SortSlices(func(a, b string) bool {
+		return a < b
+	}))
 }

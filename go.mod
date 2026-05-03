@@ -3,6 +3,7 @@ module github.com/krbrudeli/openporch
 go 1.25.0
 
 require (
+	github.com/google/go-cmp v0.7.0
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/hashicorp/terraform-exec v0.25.2
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1

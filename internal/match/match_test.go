@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 )
 
@@ -11,12 +12,13 @@ func TestModule_emptyRuleIsCatchAll(t *testing.T) {
 	rules := []v1.ModuleRule{
 		{ID: "catchall", ResourceType: "postgres", ModuleID: "postgres-default"},
 	}
-	got, err := Module(rules, Context{ResourceType: "postgres", EnvTypeID: "any"})
+	got, err := moduleRule(rules, Context{ResourceType: "postgres", EnvTypeID: "any"})
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if got != "postgres-default" {
-		t.Fatalf("got %q", got)
+	want := v1.ModuleRule{ID: "catchall", ResourceType: "postgres", ModuleID: "postgres-default"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("moduleRule() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -27,12 +29,13 @@ func TestModule_higherSpecificityWins(t *testing.T) {
 		{ID: "byProject", ResourceType: "postgres", ModuleID: "by-project", ProjectID: "demo"},
 	}
 	// byProject has weight 2, byEnvType has weight 1, catchall has 0.
-	got, err := Module(rules, Context{ResourceType: "postgres", ProjectID: "demo", EnvTypeID: "production"})
+	got, err := moduleRule(rules, Context{ResourceType: "postgres", ProjectID: "demo", EnvTypeID: "production"})
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if got != "by-project" {
-		t.Fatalf("got %q want by-project", got)
+	want := v1.ModuleRule{ID: "byProject", ResourceType: "postgres", ModuleID: "by-project", ProjectID: "demo"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("moduleRule() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -43,15 +46,16 @@ func TestModule_resourceClassDominates(t *testing.T) {
 		{ID: "byClass", ResourceType: "postgres", ModuleID: "class", ResourceClass: "premium"},
 	}
 	// byEverything = 1+2+4+8 = 15. byClass = 16. byClass wins.
-	got, err := Module(rules, Context{
+	got, err := moduleRule(rules, Context{
 		ResourceType: "postgres", EnvTypeID: "production", ProjectID: "demo",
 		EnvID: "prod", ResourceID: "db", ResourceClass: "premium",
 	})
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if got != "class" {
-		t.Fatalf("got %q want class", got)
+	want := v1.ModuleRule{ID: "byClass", ResourceType: "postgres", ModuleID: "class", ResourceClass: "premium"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("moduleRule() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -80,12 +84,13 @@ func TestModule_tieBreakByID(t *testing.T) {
 		{ID: "z-rule", ResourceType: "postgres", ModuleID: "z", EnvTypeID: "prod"},
 		{ID: "a-rule", ResourceType: "postgres", ModuleID: "a", EnvTypeID: "prod"},
 	}
-	got, err := Module(rules, Context{ResourceType: "postgres", EnvTypeID: "prod"})
+	got, err := moduleRule(rules, Context{ResourceType: "postgres", EnvTypeID: "prod"})
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if got != "a" {
-		t.Fatalf("got %q want a (lex tie-break)", got)
+	want := v1.ModuleRule{ID: "a-rule", ResourceType: "postgres", ModuleID: "a", EnvTypeID: "prod"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("moduleRule() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -96,11 +101,12 @@ func TestRunner_specificityOrder(t *testing.T) {
 		{ID: "byProject", RunnerID: "r-project", ProjectID: "demo"},
 		{ID: "both", RunnerID: "r-both", ProjectID: "demo", EnvTypeID: "production"},
 	}
-	got, err := Runner(rules, Context{ProjectID: "demo", EnvTypeID: "production"})
+	got, err := runnerRule(rules, Context{ProjectID: "demo", EnvTypeID: "production"})
 	if err != nil {
 		t.Fatalf("unexpected: %v", err)
 	}
-	if got != "r-both" {
-		t.Fatalf("got %q want r-both", got)
+	want := v1.RunnerRule{ID: "both", RunnerID: "r-both", ProjectID: "demo", EnvTypeID: "production"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("runnerRule() mismatch (-want +got):\n%s", diff)
 	}
 }

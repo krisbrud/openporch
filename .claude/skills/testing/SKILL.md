@@ -87,9 +87,16 @@ A fake should:
 
 ### Diffs over equality
 
-Use `github.com/google/go-cmp/cmp` for any struct or slice comparison larger
-than two fields. Write the diff message as `"X mismatch (-want +got):\n%s"`
-so the agent reading the failure can immediately see which field changed.
+Use `github.com/google/go-cmp/cmp` for non-trivial equality, and require it
+for any struct or slice comparison larger than two fields. Write the diff
+message as `"X mismatch (-want +got):\n%s"` so the agent reading the failure
+can immediately see which field changed.
+
+```go
+if diff := cmp.Diff(want, got); diff != "" {
+    t.Errorf("Load() mismatch (-want +got):\n%s", diff)
+}
+```
 
 For unexported fields, use `cmp.AllowUnexported(MyType{})` rather than
 exporting fields just for tests.

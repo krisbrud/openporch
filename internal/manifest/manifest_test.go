@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -39,8 +42,30 @@ shared:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Metadata.Name != "my-app" || m.Workloads["api"].Resources["db"].Type != "postgres" {
-		t.Errorf("got %+v", m)
+	want := &v1.Manifest{
+		APIVersion: v1.APIVersion,
+		Kind:       v1.KindApplication,
+		Metadata: v1.ManifestMetadata{
+			Name:    "my-app",
+			Project: "demo",
+		},
+		Workloads: map[string]v1.Workload{
+			"api": {
+				Type: "workload",
+				Params: map[string]any{
+					"image": "hello:latest",
+				},
+				Resources: map[string]v1.ResourceRef{
+					"db": {Type: "postgres"},
+				},
+			},
+		},
+		Shared: map[string]v1.ResourceRef{
+			"bucket": {Type: "s3-bucket"},
+		},
+	}
+	if diff := cmp.Diff(want, m); diff != "" {
+		t.Errorf("Load() mismatch (-want +got):\n%s", diff)
 	}
 }
 
