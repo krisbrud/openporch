@@ -91,6 +91,59 @@ type Result struct {
 	DryRunResources []DryRunResource          // populated when Options.DryRun is true
 }
 
+// RenderedResource is one root OpenTofu module rendered for a graph node.
+type RenderedResource struct {
+	Key                string
+	HCL                string
+	InlineModuleSource string
+}
+
+// RenderOptions drives a render-only pass over an already-resolved graph.
+type RenderOptions struct {
+	Platform  *v1.PlatformConfig
+	Graph     *graph.Graph
+	ProjectID string
+	EnvID     string
+	EnvTypeID string
+	OrgID     string
+
+	// AllowUnresolvedInputs leaves unresolved output placeholders in place.
+	// This matches dry-run/plan-only behavior in Run.
+	AllowUnresolvedInputs bool
+}
+
+// RenderGraph renders root main.tf content for every node in apply order
+// without invoking tofu or mutating deployment state.
+func RenderGraph(o RenderOptions) ([]RenderedResource, error) {
+	if o.Platform == nil {
+		return nil, fmt.Errorf("deploy: platform config is required")
+	}
+	if o.Graph == nil {
+		return nil, fmt.Errorf("deploy: graph is required")
+	}
+	if err := validateParams(o.Graph, o.Platform.Modules); err != nil {
+		return nil, err
+	}
+	ordered, err := o.Graph.TopoSort()
+	if err != nil {
+		return nil, fmt.Errorf("deploy: topo sort: %w", err)
+	}
+	rendered := make([]RenderedResource, 0, len(ordered))
+	for _, n := range ordered {
+		hcl, inlineModuleSrc, _, err := renderNodeHCL(
+			o.Graph, n, o.Platform, o.ProjectID, o.EnvID, o.EnvTypeID, o.OrgID,
+			o.AllowUnresolvedInputs,
+		)
+		if err != nil {
+			return nil, err
+		}
+		rendered = append(rendered, RenderedResource{
+			Key: n.Key, HCL: hcl, InlineModuleSource: inlineModuleSrc,
+		})
+	}
+	return rendered, nil
+}
+
 // envVars implements expr.Vars over os.Getenv with TF_VAR_ prefix. This is
 // the minimum needed to support ${var.NAME} for provider configs.
 type envVars struct{}
@@ -207,66 +260,12 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	resolved := map[string]map[string]any{}
 	var dryRunResources []DryRunResource
 	for _, n := range ordered {
-		mod := o.Platform.Modules[n.ModuleID]
-		ectx := expr.Context{
-			OrgID: o.OrgID, ProjectID: o.ProjectID, EnvID: o.EnvID,
-			EnvTypeID: o.EnvTypeID, ResType: n.Type, ResClass: n.Class, ResID: n.ID,
-			WorkloadName: workloadFromAliases(n.Aliases),
-		}
-
-		// Merge module_inputs (static) with manifest params (dev-supplied).
-		// Manifest params win on key collisions because the module config
-		// already forbids same-key in inputs+params at validation time.
-		inputs := map[string]any{}
-		for k, v := range mod.ModuleInputs {
-			inputs[k] = v
-		}
-		for k, v := range n.Params {
-			inputs[k] = v
-		}
-		st := stateView{g: g}
-		resolvedInputs, rerr := expr.ResolveAny(inputs, ectx, st, envVars{})
-		if rerr != nil && !errors.Is(rerr, expr.ErrUnresolved) {
-			return nil, fmt.Errorf("deploy: resolve inputs for %s: %w", n.Key, rerr)
-		}
-		if !o.DryRun && !o.PlanOnly && errors.Is(rerr, expr.ErrUnresolved) {
-			return nil, fmt.Errorf("deploy: unresolved placeholder in inputs of %s (likely a missing dependency edge): %w",
-				n.Key, rerr)
-		}
-
-		providers, providerMap, err := assembleProviders(mod, o.Platform.Providers, ectx, st)
+		hcl, inlineModuleSrc, providers, err := renderNodeHCL(
+			g, n, o.Platform, o.ProjectID, o.EnvID, o.EnvTypeID, o.OrgID,
+			o.DryRun || o.PlanOnly,
+		)
 		if err != nil {
-			return nil, fmt.Errorf("deploy: providers for %s: %w", n.Key, err)
-		}
-
-		outNames := outputNamesForType(o.Platform.ResourceTypes[n.Type])
-
-		moduleSource := mod.ModuleSource
-		var inlineModuleSrc string
-		if mod.ModuleSource == "inline" || mod.ModuleSourceCode != "" {
-			inlineModuleSrc = mod.ModuleSourceCode
-			if !o.DryRun {
-				if err := o.Store.WriteInlineModule(o.ProjectID, o.EnvID, n.Key, mod.ModuleSourceCode); err != nil {
-					return nil, err
-				}
-			}
-			moduleSource = "./module"
-		} else {
-			resolved, err := tofu.ResolveSource(mod.ModuleSource, o.Platform.RootDir)
-			if err != nil {
-				return nil, fmt.Errorf("deploy: resolve module source for %s: %w", n.Key, err)
-			}
-			moduleSource = resolved
-		}
-		hcl, err := tofu.Render(tofu.Plan{
-			ModuleSource:    moduleSource,
-			Inputs:          resolvedInputs.(map[string]any),
-			Providers:       providers,
-			ProviderMapping: providerMap,
-			OutputNames:     outNames,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("deploy: render %s: %w", n.Key, err)
+			return nil, err
 		}
 		if o.DryRun {
 			providerTypes := make([]string, 0, len(providers))
@@ -286,6 +285,11 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 			continue
 		}
 
+		if inlineModuleSrc != "" {
+			if err := o.Store.WriteInlineModule(o.ProjectID, o.EnvID, n.Key, inlineModuleSrc); err != nil {
+				return nil, err
+			}
+		}
 		workdir, err := o.Store.WriteRootTF(o.ProjectID, o.EnvID, n.Key, hcl)
 		if err != nil {
 			return nil, err
@@ -391,6 +395,73 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		Outputs:         manifestOutputs,
 		DryRunResources: dryRunResources,
 	}, nil
+}
+
+func renderNodeHCL(
+	g *graph.Graph,
+	n *graph.Node,
+	platform *v1.PlatformConfig,
+	projectID, envID, envTypeID, orgID string,
+	allowUnresolvedInputs bool,
+) (string, string, []tofu.ProviderUsage, error) {
+	mod, ok := platform.Modules[n.ModuleID]
+	if !ok {
+		return "", "", nil, fmt.Errorf("deploy: module %q for %s not found", n.ModuleID, n.Key)
+	}
+	ectx := expr.Context{
+		OrgID: orgID, ProjectID: projectID, EnvID: envID,
+		EnvTypeID: envTypeID, ResType: n.Type, ResClass: n.Class, ResID: n.ID,
+		WorkloadName: workloadFromAliases(n.Aliases),
+	}
+
+	// Merge module_inputs (static) with manifest params (dev-supplied).
+	// Manifest params win on key collisions because the module config
+	// already forbids same-key in inputs+params at validation time.
+	inputs := map[string]any{}
+	for k, v := range mod.ModuleInputs {
+		inputs[k] = v
+	}
+	for k, v := range n.Params {
+		inputs[k] = v
+	}
+	st := stateView{g: g}
+	resolvedInputs, rerr := expr.ResolveAny(inputs, ectx, st, envVars{})
+	if rerr != nil && !errors.Is(rerr, expr.ErrUnresolved) {
+		return "", "", nil, fmt.Errorf("deploy: resolve inputs for %s: %w", n.Key, rerr)
+	}
+	if !allowUnresolvedInputs && errors.Is(rerr, expr.ErrUnresolved) {
+		return "", "", nil, fmt.Errorf("deploy: unresolved placeholder in inputs of %s (likely a missing dependency edge): %w",
+			n.Key, rerr)
+	}
+
+	providers, providerMap, err := assembleProviders(mod, platform.Providers, ectx, st)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("deploy: providers for %s: %w", n.Key, err)
+	}
+
+	moduleSource := mod.ModuleSource
+	var inlineModuleSrc string
+	if mod.ModuleSource == "inline" || mod.ModuleSourceCode != "" {
+		inlineModuleSrc = mod.ModuleSourceCode
+		moduleSource = "./module"
+	} else {
+		resolved, err := tofu.ResolveSource(mod.ModuleSource, platform.RootDir)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("deploy: resolve module source for %s: %w", n.Key, err)
+		}
+		moduleSource = resolved
+	}
+	hcl, err := tofu.Render(tofu.Plan{
+		ModuleSource:    moduleSource,
+		Inputs:          resolvedInputs.(map[string]any),
+		Providers:       providers,
+		ProviderMapping: providerMap,
+		OutputNames:     outputNamesForType(platform.ResourceTypes[n.Type]),
+	})
+	if err != nil {
+		return "", "", nil, fmt.Errorf("deploy: render %s: %w", n.Key, err)
+	}
+	return hcl, inlineModuleSrc, providers, nil
 }
 
 func validateParams(g *graph.Graph, modules map[string]v1.Module) error {
