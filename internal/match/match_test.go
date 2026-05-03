@@ -8,6 +8,7 @@ import (
 )
 
 func TestModule_emptyRuleIsCatchAll(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "catchall", ResourceType: "postgres", ModuleID: "postgres-default"},
 	}
@@ -21,6 +22,7 @@ func TestModule_emptyRuleIsCatchAll(t *testing.T) {
 }
 
 func TestModule_higherSpecificityWins(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "catchall", ResourceType: "postgres", ModuleID: "default"},
 		{ID: "byEnvType", ResourceType: "postgres", ModuleID: "by-envtype", EnvTypeID: "production"},
@@ -37,6 +39,7 @@ func TestModule_higherSpecificityWins(t *testing.T) {
 }
 
 func TestModule_resourceClassDominates(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "byEverything", ResourceType: "postgres", ModuleID: "everything",
 			EnvTypeID: "production", ProjectID: "demo", EnvID: "prod", ResourceID: "db"},
@@ -56,6 +59,7 @@ func TestModule_resourceClassDominates(t *testing.T) {
 }
 
 func TestModule_nonMatchingValueDisqualifies(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "specific", ResourceType: "postgres", ModuleID: "specific", EnvTypeID: "production"},
 	}
@@ -66,6 +70,7 @@ func TestModule_nonMatchingValueDisqualifies(t *testing.T) {
 }
 
 func TestModule_resourceTypeFilters(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "wrongType", ResourceType: "redis", ModuleID: "redis"},
 	}
@@ -76,6 +81,7 @@ func TestModule_resourceTypeFilters(t *testing.T) {
 }
 
 func TestModule_tieBreakByID(t *testing.T) {
+	t.Parallel()
 	rules := []v1.ModuleRule{
 		{ID: "z-rule", ResourceType: "postgres", ModuleID: "z", EnvTypeID: "prod"},
 		{ID: "a-rule", ResourceType: "postgres", ModuleID: "a", EnvTypeID: "prod"},
@@ -90,6 +96,7 @@ func TestModule_tieBreakByID(t *testing.T) {
 }
 
 func TestRunner_specificityOrder(t *testing.T) {
+	t.Parallel()
 	rules := []v1.RunnerRule{
 		{ID: "any", RunnerID: "r-any"},
 		{ID: "byEnvType", RunnerID: "r-envtype", EnvTypeID: "production"},

@@ -17,6 +17,7 @@ func writeTemp(t *testing.T, content string) string {
 }
 
 func TestLoad_validManifest(t *testing.T) {
+	t.Parallel()
 	p := writeTemp(t, `
 apiVersion: openporch/v1alpha1
 kind: Application
@@ -45,6 +46,7 @@ shared:
 }
 
 func TestLoad_rejectsBadAPIVersion(t *testing.T) {
+	t.Parallel()
 	p := writeTemp(t, `
 apiVersion: bogus
 kind: Application
@@ -57,6 +59,7 @@ metadata:
 }
 
 func TestLoad_requiresResourceType(t *testing.T) {
+	t.Parallel()
 	p := writeTemp(t, `
 apiVersion: openporch/v1alpha1
 kind: Application

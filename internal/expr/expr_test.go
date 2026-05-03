@@ -17,6 +17,7 @@ type fakeVars map[string]string
 func (v fakeVars) Var(n string) (string, bool) { x, ok := v[n]; return x, ok }
 
 func TestResolve_context(t *testing.T) {
+	t.Parallel()
 	got, err := Resolve("hello ${context.env_id}!", Context{EnvID: "prod"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -27,6 +28,7 @@ func TestResolve_context(t *testing.T) {
 }
 
 func TestResolve_resourcesAndShared(t *testing.T) {
+	t.Parallel()
 	st := fakeState{
 		"workloads.api.db": {"url": "postgres://db", "host": "db.local"},
 		"shared.bucket":    {"name": "my-bucket"},
@@ -43,6 +45,7 @@ func TestResolve_resourcesAndShared(t *testing.T) {
 }
 
 func TestResolve_unresolvedLeavesPlaceholder(t *testing.T) {
+	t.Parallel()
 	st := fakeState{}
 	got, err := Resolve("DB=${resources.db.outputs.url}", Context{WorkloadName: "api"}, st, nil)
 	if !errors.Is(err, ErrUnresolved) {
@@ -54,6 +57,7 @@ func TestResolve_unresolvedLeavesPlaceholder(t *testing.T) {
 }
 
 func TestResolve_var(t *testing.T) {
+	t.Parallel()
 	got, err := Resolve("X=${var.MY_KEY}", Context{}, nil, fakeVars{"MY_KEY": "v"})
 	if err != nil {
 		t.Fatal(err)
@@ -64,6 +68,7 @@ func TestResolve_var(t *testing.T) {
 }
 
 func TestResolveAny_walksMaps(t *testing.T) {
+	t.Parallel()
 	in := map[string]any{
 		"a": "${context.env_id}",
 		"b": []any{"${context.project_id}", 42},
