@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v5"
+	"gopkg.in/yaml.v3"
 
 	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 	"github.com/krbrudeli/openporch/internal/expr"
@@ -34,6 +35,25 @@ type Options struct {
 	Store        *store.FS
 	Runner       runner.Runner
 	DeploymentID string // identifier used for log paths; auto-set if empty
+
+	// Recorder optionally persists deployment history. When nil, the
+	// pipeline runs without writing to any history store.
+	Recorder Recorder
+}
+
+// runnerID returns a stable identifier for the runner type so it can be
+// recorded against each resource. Until we have multiple runner backends
+// this is essentially a label.
+func runnerID(r runner.Runner) string {
+	if r == nil {
+		return ""
+	}
+	switch r.(type) {
+	case *runner.LocalTofu:
+		return "local-tofu"
+	default:
+		return fmt.Sprintf("%T", r)
+	}
 }
 
 // Result summarises a deploy.
@@ -135,6 +155,18 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		return nil, fmt.Errorf("deploy: topo sort: %w", err)
 	}
 
+	startedAt := time.Now().UTC()
+	if o.Recorder != nil {
+		manifestYAML, _ := yaml.Marshal(o.Manifest)
+		graphJSON, _ := serializeGraph(g)
+		_ = o.Recorder.StartDeployment(ctx, DeploymentRecord{
+			ID: o.DeploymentID, Project: o.ProjectID, Env: o.EnvID,
+			EnvType: o.EnvTypeID, Mode: "deploy", StartedAt: startedAt,
+			ManifestYAML: string(manifestYAML), GraphJSON: graphJSON,
+		})
+	}
+	rid := runnerID(o.Runner)
+
 	// Apply each resource in order. v0 = sequential; concurrency-per-wave
 	// arrives in v0.5 once we have a second runner type to test against.
 	resolved := map[string]map[string]any{}
@@ -204,14 +236,37 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 
 		fmt.Fprintf(os.Stderr, "[openporch] applying %s via module=%s\n", n.Key, n.ModuleID)
 		n.Status = "applying"
+		if o.Recorder != nil {
+			_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+				ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, RunnerID: rid, Status: "applying",
+				LogPath: log,
+			})
+		}
 		result, err := o.Runner.Apply(ctx, workdir, log)
 		if err != nil {
 			n.Status = "failed"
+			if o.Recorder != nil {
+				_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+					ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+					ModuleID: n.ModuleID, RunnerID: rid, Status: "failed",
+					LogPath: log,
+				})
+				_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, "failed", time.Now().UTC())
+			}
 			return nil, fmt.Errorf("deploy: apply %s: %w (see %s)", n.Key, err, log)
 		}
 		n.Status = "applied"
 		n.Outputs = result.Outputs
 		resolved[n.Key] = result.Outputs
+		if o.Recorder != nil {
+			outputsJSON, _ := json.Marshal(result.Outputs)
+			_ = o.Recorder.RecordResource(ctx, o.DeploymentID, ResourceRecord{
+				ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, RunnerID: rid, Status: "applied",
+				OutputsJSON: string(outputsJSON), LogPath: log,
+			})
+		}
 		if err := o.Store.SaveOutputs(o.ProjectID, o.EnvID, n.Key, result.Outputs); err != nil {
 			return nil, err
 		}
@@ -230,6 +285,9 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		manifestOutputs[k] = s
 	}
 
+	if o.Recorder != nil {
+		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, "succeeded", time.Now().UTC())
+	}
 	return &Result{
 		DeploymentID: o.DeploymentID,
 		Resolved:     resolved,
