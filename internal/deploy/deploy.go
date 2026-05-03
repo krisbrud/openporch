@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,15 @@ type Options struct {
 	// Recorder optionally persists deployment history. When nil, the
 	// pipeline runs without writing to any history store.
 	Recorder Recorder
+
+	// DryRun stops the pipeline after HCL render. No tofu init/apply is
+	// invoked, no state files are written, and no deployment row is recorded.
+	DryRun bool
+
+	// RenderDir, when non-empty and DryRun is true, receives the rendered
+	// main.tf files so the caller can run `tofu plan` manually.
+	// Layout: <RenderDir>/<safe-resource-key>/main.tf
+	RenderDir string
 }
 
 // runnerID returns a stable identifier for the runner type so it can be
@@ -57,11 +67,22 @@ func runnerID(r runner.Runner) string {
 	}
 }
 
+// DryRunResource summarises one resource in a dry-run pass.
+type DryRunResource struct {
+	Key       string
+	Type      string
+	Class     string
+	ID        string
+	ModuleID  string
+	Providers []string // provider types required (e.g. "docker", "random")
+}
+
 // Result summarises a deploy.
 type Result struct {
-	DeploymentID string
-	Resolved     map[string]map[string]any // graph-key -> outputs
-	Outputs      map[string]string         // manifest outputs
+	DeploymentID    string
+	Resolved        map[string]map[string]any // graph-key -> outputs
+	Outputs         map[string]string         // manifest outputs
+	DryRunResources []DryRunResource          // populated when Options.DryRun is true
 }
 
 // envVars implements expr.Vars over os.Getenv with TF_VAR_ prefix. This is
@@ -157,7 +178,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	}
 
 	startedAt := time.Now().UTC()
-	if o.Recorder != nil {
+	if o.Recorder != nil && !o.DryRun {
 		manifestYAML, _ := yaml.Marshal(o.Manifest)
 		graphJSON, _ := serializeGraph(g)
 		_ = o.Recorder.StartDeployment(ctx, DeploymentRecord{
@@ -174,6 +195,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 	// Apply each resource in order. v0 = sequential; concurrency-per-wave
 	// arrives in v0.5 once we have a second runner type to test against.
 	resolved := map[string]map[string]any{}
+	var dryRunResources []DryRunResource
 	for _, n := range ordered {
 		mod := o.Platform.Modules[n.ModuleID]
 		ectx := expr.Context{
@@ -197,7 +219,7 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		if rerr != nil && !errors.Is(rerr, expr.ErrUnresolved) {
 			return nil, fmt.Errorf("deploy: resolve inputs for %s: %w", n.Key, rerr)
 		}
-		if errors.Is(rerr, expr.ErrUnresolved) {
+		if !o.DryRun && errors.Is(rerr, expr.ErrUnresolved) {
 			return nil, fmt.Errorf("deploy: unresolved placeholder in inputs of %s (likely a missing dependency edge): %w",
 				n.Key, rerr)
 		}
@@ -210,9 +232,13 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		outNames := outputNamesForType(o.Platform.ResourceTypes[n.Type])
 
 		moduleSource := mod.ModuleSource
+		var inlineModuleSrc string
 		if mod.ModuleSource == "inline" || mod.ModuleSourceCode != "" {
-			if err := o.Store.WriteInlineModule(o.ProjectID, o.EnvID, n.Key, mod.ModuleSourceCode); err != nil {
-				return nil, err
+			inlineModuleSrc = mod.ModuleSourceCode
+			if !o.DryRun {
+				if err := o.Store.WriteInlineModule(o.ProjectID, o.EnvID, n.Key, mod.ModuleSourceCode); err != nil {
+					return nil, err
+				}
 			}
 			moduleSource = "./module"
 		} else {
@@ -232,6 +258,24 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		if err != nil {
 			return nil, fmt.Errorf("deploy: render %s: %w", n.Key, err)
 		}
+		if o.DryRun {
+			providerTypes := make([]string, 0, len(providers))
+			for _, p := range providers {
+				providerTypes = append(providerTypes, p.Type)
+			}
+			sort.Strings(providerTypes)
+			dryRunResources = append(dryRunResources, DryRunResource{
+				Key: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, Providers: providerTypes,
+			})
+			if o.RenderDir != "" {
+				if err := writeDryRunHCL(o.RenderDir, n.Key, hcl, inlineModuleSrc); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+
 		workdir, err := o.Store.WriteRootTF(o.ProjectID, o.EnvID, n.Key, hcl)
 		if err != nil {
 			return nil, err
@@ -276,26 +320,28 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	// Resolve manifest-level outputs.
+	// Resolve manifest-level outputs. In dry-run, cross-resource placeholders
+	// can't be resolved (no outputs available), so ErrUnresolved is tolerated.
 	manifestOutputs := map[string]string{}
 	for k, v := range o.Manifest.Outputs {
 		ectx := expr.Context{
 			OrgID: o.OrgID, ProjectID: o.ProjectID, EnvID: o.EnvID, EnvTypeID: o.EnvTypeID,
 		}
 		s, err := expr.Resolve(v, ectx, stateView{g: g}, envVars{})
-		if err != nil {
+		if err != nil && (!o.DryRun || !errors.Is(err, expr.ErrUnresolved)) {
 			return nil, fmt.Errorf("deploy: resolve manifest output %q: %w", k, err)
 		}
 		manifestOutputs[k] = s
 	}
 
-	if o.Recorder != nil {
+	if o.Recorder != nil && !o.DryRun {
 		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, "succeeded", time.Now().UTC())
 	}
 	return &Result{
-		DeploymentID: o.DeploymentID,
-		Resolved:     resolved,
-		Outputs:      manifestOutputs,
+		DeploymentID:    o.DeploymentID,
+		Resolved:        resolved,
+		Outputs:         manifestOutputs,
+		DryRunResources: dryRunResources,
 	}, nil
 }
 
@@ -392,6 +438,35 @@ func assembleProviders(
 func toJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// writeDryRunHCL writes the rendered main.tf (and optional inline module
+// source) under renderDir/<safe-key>/ so the user can run `tofu plan`.
+func writeDryRunHCL(renderDir, key, hcl, inlineModuleSrc string) error {
+	safe := strings.Map(func(r rune) rune {
+		switch r {
+		case '|', '/', ' ':
+			return '_'
+		}
+		return r
+	}, key)
+	dir := filepath.Join(renderDir, safe)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("deploy: dry-run mkdir %s: %w", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(hcl), 0o644); err != nil {
+		return fmt.Errorf("deploy: dry-run write HCL for %s: %w", key, err)
+	}
+	if inlineModuleSrc != "" {
+		modDir := filepath.Join(dir, "module")
+		if err := os.MkdirAll(modDir, 0o755); err != nil {
+			return fmt.Errorf("deploy: dry-run mkdir module for %s: %w", key, err)
+		}
+		if err := os.WriteFile(filepath.Join(modDir, "main.tf"), []byte(inlineModuleSrc), 0o644); err != nil {
+			return fmt.Errorf("deploy: dry-run write inline module for %s: %w", key, err)
+		}
+	}
+	return nil
 }
 
 func safeAlias(id string) string {

@@ -3,6 +3,8 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,10 +15,12 @@ import (
 
 // stubRunner satisfies runner.Runner without invoking tofu.
 type stubRunner struct {
-	outputs map[string]any
+	outputs  map[string]any
+	applyCnt int
 }
 
 func (s *stubRunner) Apply(_ context.Context, _, _ string) (*runner.Result, error) {
+	s.applyCnt++
 	return &runner.Result{Outputs: s.outputs}, nil
 }
 
@@ -125,5 +129,95 @@ func TestRun_runnerIDFallsBackToTypeDerivedStringWhenUnset(t *testing.T) {
 		if r.RunnerID != wantID {
 			t.Errorf("resource %q: RunnerID = %q, want %q (type-derived fallback)", r.ResourceKey, r.RunnerID, wantID)
 		}
+	}
+}
+
+func TestRun_DryRunSkipsRunner(t *testing.T) {
+	t.Parallel()
+	stub := &stubRunner{}
+	rec := &captureRecorder{}
+	stateRoot := t.TempDir()
+
+	res, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  minimalPlatform(t),
+		Store:     &store.FS{Root: stateRoot},
+		Runner:    stub,
+		RunnerID:  "local-tofu",
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		Recorder:  rec,
+		DryRun:    true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stub.applyCnt != 0 {
+		t.Errorf("Runner.Apply called %d time(s); want 0 in dry-run", stub.applyCnt)
+	}
+	if len(rec.resources) != 0 {
+		t.Errorf("recorder captured %d resource(s); want 0 in dry-run", len(rec.resources))
+	}
+	if len(res.DryRunResources) != 1 {
+		t.Fatalf("DryRunResources len = %d, want 1", len(res.DryRunResources))
+	}
+	got := res.DryRunResources[0]
+	if got.ModuleID != "workload-stub" {
+		t.Errorf("DryRunResources[0].ModuleID = %q, want workload-stub", got.ModuleID)
+	}
+}
+
+func TestRun_DryRunNoStateFiles(t *testing.T) {
+	t.Parallel()
+	stateRoot := t.TempDir()
+
+	_, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  minimalPlatform(t),
+		Store:     &store.FS{Root: stateRoot},
+		Runner:    &stubRunner{},
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		DryRun:    true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	stateDir := filepath.Join(stateRoot, "state")
+	if _, err := os.Stat(stateDir); err == nil {
+		t.Errorf("dry-run created state directory %s; want none", stateDir)
+	}
+}
+
+func TestRun_DryRunWritesRenderDir(t *testing.T) {
+	t.Parallel()
+	renderDir := t.TempDir()
+
+	_, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  minimalPlatform(t),
+		Store:     &store.FS{Root: t.TempDir()},
+		Runner:    &stubRunner{},
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		DryRun:    true,
+		RenderDir: renderDir,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// At least one main.tf should have been written under renderDir.
+	var found bool
+	_ = filepath.WalkDir(renderDir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "main.tf" {
+			found = true
+		}
+		return nil
+	})
+	if !found {
+		t.Errorf("no main.tf found under render-dir %s", renderDir)
 	}
 }
