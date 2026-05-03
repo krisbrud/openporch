@@ -56,7 +56,7 @@ func newGetDeploymentsCmd() *cobra.Command {
 				enc := yaml.NewEncoder(out)
 				enc.SetIndent(2)
 				return enc.Encode(rows)
-			default:
+			case "table", "":
 				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 				fmt.Fprintln(w, "ID\tPROJECT\tENV\tSTATUS\tSTARTED_AT\tMODE")
 				for _, row := range rows {
@@ -64,6 +64,8 @@ func newGetDeploymentsCmd() *cobra.Command {
 						row.ID, row.Project, row.Env, row.Status, row.StartedAt, row.Mode)
 				}
 				return w.Flush()
+			default:
+				return fmt.Errorf("unsupported output format %q (want table, yaml, or json)", output)
 			}
 		},
 	}
@@ -110,9 +112,11 @@ func newGetDeploymentCmd() *cobra.Command {
 				enc := json.NewEncoder(out)
 				enc.SetIndent("", "  ")
 				return enc.Encode(det)
-			default:
+			case "", "summary":
 				printDeploymentSummary(out, det)
 				return nil
+			default:
+				return fmt.Errorf("unsupported output format %q (want yaml or json)", output)
 			}
 		},
 	}
