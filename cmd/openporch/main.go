@@ -18,7 +18,7 @@ platform-engineer-authored library of OpenTofu modules and rules, picks the
 right module for each (project, env, env_type), and runs OpenTofu to converge.`,
 		SilenceUsage: true,
 	}
-	root.AddCommand(newDeployCmd(), newDestroyCmd(), newValidateCmd(), newVersionCmd())
+	root.AddCommand(newDeployCmd(), newDestroyCmd(), newValidateCmd(), newGetCmd(), newVersionCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
