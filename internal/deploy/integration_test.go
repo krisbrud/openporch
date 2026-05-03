@@ -16,6 +16,7 @@ import (
 
 	"github.com/krbrudeli/openporch/internal/config"
 	"github.com/krbrudeli/openporch/internal/deploy"
+	"github.com/krbrudeli/openporch/internal/integrationtest"
 	"github.com/krbrudeli/openporch/internal/manifest"
 	"github.com/krbrudeli/openporch/internal/runner"
 	"github.com/krbrudeli/openporch/internal/store"
@@ -28,9 +29,8 @@ import (
 //
 // Run with: go test -tags=integration -timeout=5m ./internal/deploy/...
 func TestDeployFastAPIToLocalDocker(t *testing.T) {
-	if err := exec.Command("docker", "version").Run(); err != nil {
-		t.Skipf("docker daemon not reachable: %v", err)
-	}
+	integrationtest.RequireDocker(t)
+	integrationtest.RequireTofu(t)
 
 	repoRoot := findRepoRoot(t)
 	platformDir := filepath.Join(repoRoot, "examples", "platform")
@@ -130,12 +130,8 @@ func TestDeployFastAPIToLocalDocker(t *testing.T) {
 //
 // Run with: go test -tags=integration -timeout=10m ./internal/deploy/...
 func TestPlanOnlyFastAPIDemo(t *testing.T) {
-	if err := exec.Command("tofu", "version").Run(); err != nil {
-		t.Skipf("tofu binary not available: %v", err)
-	}
-	if err := exec.Command("docker", "version").Run(); err != nil {
-		t.Skipf("docker daemon not reachable: %v", err)
-	}
+	integrationtest.RequireTofu(t)
+	integrationtest.RequireDocker(t)
 
 	repoRoot := findRepoRoot(t)
 	platformDir := filepath.Join(repoRoot, "examples", "platform")

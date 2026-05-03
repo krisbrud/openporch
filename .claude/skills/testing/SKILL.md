@@ -199,24 +199,15 @@ package deploy_test
 
 import (
     "context"
-    "os"
-    "os/exec"
     "testing"
     "time"
+
+    "github.com/krbrudeli/openporch/internal/integrationtest"
 )
 
-func requireDocker(t *testing.T) {
-    t.Helper()
-    if err := exec.Command("docker", "version").Run(); err != nil {
-        if os.Getenv("CI") == "true" {
-            t.Fatalf("docker required in CI: %v", err)
-        }
-        t.Skipf("docker not available locally: %v", err)
-    }
-}
-
 func TestDeploy_endToEnd(t *testing.T) {
-    requireDocker(t)
+    integrationtest.RequireDocker(t)
+    integrationtest.RequireTofu(t)
     // Do NOT t.Parallel() integration tests that bind host resources.
 
     ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -243,10 +234,12 @@ func TestDeploy_endToEnd(t *testing.T) {
 
 Critical points:
 
-- **CI-vs-local skip asymmetry.** `t.Skipf` is fine on a developer's laptop
-  without Docker. In CI it must `t.Fatalf` — silent skips are how broken
-  integration tests stay green for weeks. The `requireDocker` helper above
-  encodes this; copy it for `tofu` and any future prereq.
+- **Prerequisites fail, never skip.** Integration tests are already guarded
+  behind `-tags=integration`, so missing Docker/OpenTofu means the opted-in
+  test environment is broken. Use
+  `internal/integrationtest.RequireDocker` and
+  `internal/integrationtest.RequireTofu` rather than inlining prerequisite
+  checks or calling `t.Skipf`.
 - **Non-default ports/names.** Pick something unlikely to collide with a
   developer's running stack. `host_port: 18080` and `host_port: 15433` in
   `internal/deploy/integration_test.go` are the existing convention.
@@ -259,9 +252,8 @@ Critical points:
   Don't assume an image is already on the machine.
 
 When adding a new external integration (a new runner, a new provider),
-template a new integration test from the deploy one. Keep `requireDocker` /
-`requireTofu` helpers in a shared `internal/integrationtest/` package once
-you have more than one.
+template a new integration test from the deploy one and keep any new
+CI-sensitive prerequisite checks in `internal/integrationtest/`.
 
 ## Anti-patterns to flag in review
 
@@ -274,4 +266,5 @@ you have more than one.
   `internal/<pkg>/testdata/` instead.
 - `time.Sleep` for synchronization. Use channels, `context`, or polling with
   a deadline.
-- Integration tests that `t.Skipf` unconditionally — they're dead code.
+- Integration tests that `t.Skipf` for missing prerequisites — the build tag is
+  the opt-in guard, so missing prerequisites should fail.
