@@ -34,6 +34,7 @@ type Options struct {
 	OrgID        string // optional, surfaced via ${context.org_id}
 	Store        *store.FS
 	Runner       runner.Runner
+	RunnerID     string // config-level runner ID for recording; overrides the type-derived fallback
 	DeploymentID string // identifier used for log paths; auto-set if empty
 
 	// Recorder optionally persists deployment history. When nil, the
@@ -165,7 +166,10 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 			ManifestYAML: string(manifestYAML), GraphJSON: graphJSON,
 		})
 	}
-	rid := runnerID(o.Runner)
+	rid := o.RunnerID
+	if rid == "" {
+		rid = runnerID(o.Runner)
+	}
 
 	// Apply each resource in order. v0 = sequential; concurrency-per-wave
 	// arrives in v0.5 once we have a second runner type to test against.
