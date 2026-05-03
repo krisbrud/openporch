@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -46,17 +46,18 @@ func newGetDeploymentsCmd() *cobra.Command {
 				return err
 			}
 
+			out := cmd.OutOrStdout()
 			switch output {
 			case "json":
-				enc := json.NewEncoder(os.Stdout)
+				enc := json.NewEncoder(out)
 				enc.SetIndent("", "  ")
 				return enc.Encode(rows)
 			case "yaml":
-				enc := yaml.NewEncoder(os.Stdout)
+				enc := yaml.NewEncoder(out)
 				enc.SetIndent(2)
 				return enc.Encode(rows)
 			default:
-				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 				fmt.Fprintln(w, "ID\tPROJECT\tENV\tSTATUS\tSTARTED_AT\tMODE")
 				for _, row := range rows {
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -100,35 +101,17 @@ func newGetDeploymentCmd() *cobra.Command {
 				return fmt.Errorf("deployment %q not found", args[0])
 			}
 
+			out := cmd.OutOrStdout()
 			switch output {
 			case "yaml":
-				fmt.Print(det.ManifestYAML)
+				fmt.Fprint(out, det.ManifestYAML)
 				return nil
 			case "json":
-				enc := json.NewEncoder(os.Stdout)
+				enc := json.NewEncoder(out)
 				enc.SetIndent("", "  ")
 				return enc.Encode(det)
 			default:
-				fmt.Printf("ID:         %s\n", det.ID)
-				fmt.Printf("Project:    %s\n", det.Project)
-				fmt.Printf("Env:        %s\n", det.Env)
-				fmt.Printf("EnvType:    %s\n", det.EnvType)
-				fmt.Printf("Status:     %s\n", det.Status)
-				fmt.Printf("Mode:       %s\n", det.Mode)
-				fmt.Printf("StartedAt:  %s\n", det.StartedAt)
-				if det.FinishedAt != "" {
-					fmt.Printf("FinishedAt: %s\n", det.FinishedAt)
-				}
-				if len(det.Resources) > 0 {
-					fmt.Println("\nResources:")
-					w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-					fmt.Fprintln(w, "  KEY\tTYPE\tSTATUS\tRUNNER\tLOG")
-					for _, res := range det.Resources {
-						fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
-							res.ResourceKey, res.Type, res.Status, res.RunnerID, res.LogPath)
-					}
-					w.Flush()
-				}
+				printDeploymentSummary(out, det)
 				return nil
 			}
 		},
@@ -137,4 +120,27 @@ func newGetDeploymentCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateRoot, "state-root", ".openporch",
 		"directory under which openporch metadata lives")
 	return cmd
+}
+
+func printDeploymentSummary(out io.Writer, det *db.DeploymentDetail) {
+	fmt.Fprintf(out, "ID:         %s\n", det.ID)
+	fmt.Fprintf(out, "Project:    %s\n", det.Project)
+	fmt.Fprintf(out, "Env:        %s\n", det.Env)
+	fmt.Fprintf(out, "EnvType:    %s\n", det.EnvType)
+	fmt.Fprintf(out, "Status:     %s\n", det.Status)
+	fmt.Fprintf(out, "Mode:       %s\n", det.Mode)
+	fmt.Fprintf(out, "StartedAt:  %s\n", det.StartedAt)
+	if det.FinishedAt != "" {
+		fmt.Fprintf(out, "FinishedAt: %s\n", det.FinishedAt)
+	}
+	if len(det.Resources) > 0 {
+		fmt.Fprintln(out, "\nResources:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  KEY\tTYPE\tSTATUS\tRUNNER\tLOG")
+		for _, res := range det.Resources {
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
+				res.ResourceKey, res.Type, res.Status, res.RunnerID, res.LogPath)
+		}
+		w.Flush()
+	}
 }
