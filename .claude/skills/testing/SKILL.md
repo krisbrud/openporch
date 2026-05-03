@@ -74,16 +74,72 @@ Templates and conventions:
 Prefer in-memory fakes for unit tests; reserve real implementations
 (`store.FS`, `runner.LocalTofu`) for integration tests.
 
-If a fake doesn't exist for an interface you're testing against, add one
-under `internal/<pkg>/<pkg>test/` (e.g. `storetest.Fake`, `runnertest.Recording`).
-Keep the fake minimal: just enough to satisfy the interface and let the test
-assert against recorded calls.
+Two fakes ship in the repo:
 
-A fake should:
+| Interface      | Fake                              | Package                                  |
+|----------------|-----------------------------------|------------------------------------------|
+| `store.Store`  | `storetest.Fake`                  | `internal/store/storetest`               |
+| `runner.Runner`| `runnertest.Recording`            | `internal/runner/runnertest`             |
+
+#### `storetest.Fake`
+
+Drop-in replacement for `store.FS` that keeps all state in memory. Use it
+whenever a unit test would otherwise need to seed or inspect files on disk.
+
+```go
+fake := &storetest.Fake{}
+// fake satisfies store.Store; pass it wherever *store.FS is accepted.
+```
+
+Recording fields the test can read:
+
+- `fake.Writes []storetest.FileWrite` — every `WriteRootTF` / `WriteInlineModule`
+  call in order. Each entry carries `Project`, `Env`, `Key`, `Filename`, and
+  `Content`.
+- `fake.Reads []string` — every `LoadOutputs` call as `"<project>/<env>/<key>"`.
+
+`ResourceDir` returns a deterministic path (`/fake/state/<project>/<env>/<safekey>`),
+so you can pre-compute the workdir a runner will receive without touching the
+filesystem:
+
+```go
+fake := &storetest.Fake{}
+workdir := fake.ResourceDir("proj", "env", "workload|default|api")
+// workdir == "/fake/state/proj/env/workload_default_api"
+```
+
+#### `runnertest.Recording`
+
+Records every `Apply`, `Plan`, and `Destroy` call in `Calls []runnertest.Call`.
+Each `Call` carries `Op` (`"Apply"`, `"Plan"`, or `"Destroy"`), `Workdir`, and
+`Logfile`.
+
+Stub fields (all keyed by the workdir the runner receives):
+
+```go
+rec := &runnertest.Recording{
+    // Make Apply fail for a specific resource:
+    ApplyErr: map[string]error{
+        fake.ResourceDir("proj", "env", "workload|default|api"): fmt.Errorf("boom"),
+    },
+    // Return specific outputs from Apply:
+    OutputsByResource: map[string]map[string]any{
+        fake.ResourceDir("proj", "env", "database|default|workloads.api.db"): {
+            "url": "postgres://localhost:5432/db",
+        },
+    },
+}
+```
+
+The zero value of `Recording` applies successfully with empty outputs — no
+setup required for the common case.
+
+If a fake doesn't exist for an interface you're testing against, add one
+under `internal/<pkg>/<pkg>test/` following the same pattern. A fake should:
 
 1. Implement the full interface so calling code compiles against either.
-2. Record calls in fields the test can read (`Calls []ApplyCall`).
-3. Allow stubbed return values via fields (`ApplyErr error`).
+2. Record calls in fields the test can read.
+3. Allow stubbed return values via fields keyed by a stable, predictable key.
 
 ### Diffs over equality
 
