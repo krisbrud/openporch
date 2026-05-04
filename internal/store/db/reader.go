@@ -47,6 +47,18 @@ type DeploymentDetail struct {
 	Resources    []ResourceRow `json:"resources" yaml:"resources"`
 }
 
+// ActiveResourceRow is a single row from the active_resources table.
+type ActiveResourceRow struct {
+	ResourceKey  string `json:"resource_key" yaml:"resource_key"`
+	Type         string `json:"type" yaml:"type"`
+	Class        string `json:"class" yaml:"class"`
+	ID           string `json:"id" yaml:"id"`
+	ModuleID     string `json:"module_id" yaml:"module_id"`
+	DeploymentID string `json:"deployment_id" yaml:"deployment_id"`
+	OutputsJSON  string `json:"outputs_json,omitempty" yaml:"outputs_json,omitempty"`
+	UpdatedAt    string `json:"updated_at" yaml:"updated_at"`
+}
+
 // Reader queries the deployment history stored in DB.
 type Reader struct {
 	db *DB
@@ -138,4 +150,36 @@ func (r *Reader) GetDeployment(ctx context.Context, id string) (*DeploymentDetai
 		d.Resources = []ResourceRow{}
 	}
 	return &d, nil
+}
+
+// ListActiveResources returns the active resources for (project, env),
+// ordered by resource_key.
+func (r *Reader) ListActiveResources(ctx context.Context, project, env string) ([]ActiveResourceRow, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT resource_key, type, class, id, module_id, deployment_id,
+		        COALESCE(outputs_json, ''), updated_at
+		 FROM active_resources
+		 WHERE project = ? AND env = ?
+		 ORDER BY resource_key`,
+		project, env)
+	if err != nil {
+		return nil, fmt.Errorf("db: list active resources: %w", err)
+	}
+	defer rows.Close()
+	var out []ActiveResourceRow
+	for rows.Next() {
+		var ar ActiveResourceRow
+		if err := rows.Scan(&ar.ResourceKey, &ar.Type, &ar.Class, &ar.ID,
+			&ar.ModuleID, &ar.DeploymentID, &ar.OutputsJSON, &ar.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("db: scan active resource row: %w", err)
+		}
+		out = append(out, ar)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: list active resources: %w", err)
+	}
+	if out == nil {
+		out = []ActiveResourceRow{}
+	}
+	return out, nil
 }

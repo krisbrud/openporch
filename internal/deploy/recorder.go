@@ -17,6 +17,24 @@ type Recorder interface {
 	StartDeployment(ctx context.Context, d DeploymentRecord) error
 	RecordResource(ctx context.Context, deploymentID string, r ResourceRecord) error
 	FinishDeployment(ctx context.Context, deploymentID string, status string, finishedAt time.Time) error
+	// SetActiveResources atomically replaces the active resource set for
+	// (project, env) with the provided slice, tagging each row with
+	// deploymentID. Resources previously active but absent from the new
+	// slice are removed.
+	SetActiveResources(ctx context.Context, project, env, deploymentID string, resources []ActiveResourceRecord) error
+	// ClearActiveResources removes all active resources for (project, env).
+	ClearActiveResources(ctx context.Context, project, env string) error
+}
+
+// ActiveResourceRecord captures the identity and outputs of one resource
+// in the live set for an environment.
+type ActiveResourceRecord struct {
+	ResourceKey string
+	Type        string
+	Class       string
+	ID          string
+	ModuleID    string
+	OutputsJSON string
 }
 
 // DeploymentRecord is the snapshot written when a deployment starts.

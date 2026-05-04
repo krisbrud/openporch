@@ -27,6 +27,10 @@ func (c *captureRecorder) RecordResource(_ context.Context, _ string, r Resource
 func (c *captureRecorder) FinishDeployment(_ context.Context, _ string, _ string, _ time.Time) error {
 	return nil
 }
+func (c *captureRecorder) SetActiveResources(_ context.Context, _, _, _ string, _ []ActiveResourceRecord) error {
+	return nil
+}
+func (c *captureRecorder) ClearActiveResources(_ context.Context, _, _ string) error { return nil }
 
 // captureFinish captures every FinishDeployment status.
 type captureFinish struct {
@@ -56,6 +60,12 @@ func (s *startCapturingRecorder) RecordResource(_ context.Context, _ string, _ R
 func (s *startCapturingRecorder) FinishDeployment(_ context.Context, _ string, _ string, _ time.Time) error {
 	return nil
 }
+func (s *startCapturingRecorder) SetActiveResources(_ context.Context, _, _, _ string, _ []ActiveResourceRecord) error {
+	return nil
+}
+func (s *startCapturingRecorder) ClearActiveResources(_ context.Context, _, _ string) error {
+	return nil
+}
 
 // recorderFunc is a Recorder backed by function fields for precise event capture.
 type recorderFunc struct {
@@ -82,6 +92,10 @@ func (r *recorderFunc) FinishDeployment(_ context.Context, _ string, status stri
 	}
 	return nil
 }
+func (r *recorderFunc) SetActiveResources(_ context.Context, _, _, _ string, _ []ActiveResourceRecord) error {
+	return nil
+}
+func (r *recorderFunc) ClearActiveResources(_ context.Context, _, _ string) error { return nil }
 
 // minimalPlatform returns a PlatformConfig with one resource type and one
 // inline module wired up by a catch-all rule. No providers are needed.

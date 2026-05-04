@@ -97,3 +97,47 @@ func (r *SQLiteRecorder) FinishDeployment(ctx context.Context, deploymentID stri
 	}
 	return nil
 }
+
+// SetActiveResources atomically replaces the active resource set for
+// (project, env): it deletes all existing rows for that pair then inserts
+// the new slice. The whole operation runs inside a single transaction.
+func (r *SQLiteRecorder) SetActiveResources(ctx context.Context, project, env, deploymentID string, resources []deploy.ActiveResourceRecord) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("db: set active resources: begin: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM active_resources WHERE project = ? AND env = ?`, project, env); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("db: set active resources: delete: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, res := range resources {
+		var outputs sql.NullString
+		if res.OutputsJSON != "" {
+			outputs = sql.NullString{String: res.OutputsJSON, Valid: true}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO active_resources
+			 (project, env, resource_key, type, class, id, module_id, deployment_id, outputs_json, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			project, env, res.ResourceKey, res.Type, res.Class, res.ID,
+			res.ModuleID, deploymentID, outputs, now); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("db: set active resources: insert %s: %w", res.ResourceKey, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("db: set active resources: commit: %w", err)
+	}
+	return nil
+}
+
+// ClearActiveResources removes all active resources for (project, env).
+func (r *SQLiteRecorder) ClearActiveResources(ctx context.Context, project, env string) error {
+	if _, err := r.db.ExecContext(ctx,
+		`DELETE FROM active_resources WHERE project = ? AND env = ?`, project, env); err != nil {
+		return fmt.Errorf("db: clear active resources: %w", err)
+	}
+	return nil
+}

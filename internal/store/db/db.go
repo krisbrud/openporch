@@ -88,6 +88,19 @@ var migrations = []string{
 		graph_json    TEXT NOT NULL
 	);`,
 	`ALTER TABLE deployment_resources ADD COLUMN plan_path TEXT NOT NULL DEFAULT '';`,
+	`CREATE TABLE active_resources (
+		project       TEXT NOT NULL,
+		env           TEXT NOT NULL,
+		resource_key  TEXT NOT NULL,
+		type          TEXT NOT NULL,
+		class         TEXT NOT NULL,
+		id            TEXT NOT NULL,
+		module_id     TEXT NOT NULL,
+		deployment_id TEXT NOT NULL,
+		outputs_json  TEXT,
+		updated_at    TEXT NOT NULL,
+		PRIMARY KEY (project, env, resource_key)
+	);`,
 }
 
 func migrate(db *sql.DB) error {

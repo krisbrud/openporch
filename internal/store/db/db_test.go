@@ -22,6 +22,7 @@ func TestOpenAppliesSchema(t *testing.T) {
 		"deployment_resources",
 		"deployment_manifest",
 		"deployment_graph",
+		"active_resources",
 		"_schema_version",
 	}
 	for _, name := range expected {
@@ -240,5 +241,162 @@ func TestRecorderDestroyMode(t *testing.T) {
 	}
 	if mode != "destroy" {
 		t.Errorf("mode = %q, want destroy", mode)
+	}
+}
+
+func TestSetActiveResources_UpsertAndReplace(t *testing.T) {
+	t.Parallel()
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	rec := NewRecorder(d)
+	rdr := NewReader(d)
+	ctx := context.Background()
+
+	first := []deploy.ActiveResourceRecord{
+		{ResourceKey: "service|default|api", Type: "service", Class: "default", ID: "api", ModuleID: "mod-svc", OutputsJSON: `{"url":"http://x"}`},
+		{ResourceKey: "postgres|default|db", Type: "postgres", Class: "default", ID: "db", ModuleID: "mod-pg"},
+	}
+	if err := rec.SetActiveResources(ctx, "proj", "dev", "dep-1", first); err != nil {
+		t.Fatalf("SetActiveResources (first): %v", err)
+	}
+
+	rows, err := rdr.ListActiveResources(ctx, "proj", "dev")
+	if err != nil {
+		t.Fatalf("ListActiveResources: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows after first set, got %d", len(rows))
+	}
+	// ordered by resource_key: postgres first, then service
+	if rows[0].ResourceKey != "postgres|default|db" {
+		t.Errorf("rows[0].ResourceKey = %q, want postgres|default|db", rows[0].ResourceKey)
+	}
+	if rows[1].ResourceKey != "service|default|api" {
+		t.Errorf("rows[1].ResourceKey = %q, want service|default|api", rows[1].ResourceKey)
+	}
+	if rows[1].OutputsJSON != `{"url":"http://x"}` {
+		t.Errorf("rows[1].OutputsJSON = %q, want {\"url\":\"http://x\"}", rows[1].OutputsJSON)
+	}
+	if rows[1].DeploymentID != "dep-1" {
+		t.Errorf("rows[1].DeploymentID = %q, want dep-1", rows[1].DeploymentID)
+	}
+
+	// Second set: removes postgres, keeps service, changes deployment_id.
+	second := []deploy.ActiveResourceRecord{
+		{ResourceKey: "service|default|api", Type: "service", Class: "default", ID: "api", ModuleID: "mod-svc"},
+	}
+	if err := rec.SetActiveResources(ctx, "proj", "dev", "dep-2", second); err != nil {
+		t.Fatalf("SetActiveResources (second): %v", err)
+	}
+
+	rows, err = rdr.ListActiveResources(ctx, "proj", "dev")
+	if err != nil {
+		t.Fatalf("ListActiveResources after second set: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row after second set, got %d", len(rows))
+	}
+	if rows[0].ResourceKey != "service|default|api" {
+		t.Errorf("rows[0].ResourceKey = %q, want service|default|api", rows[0].ResourceKey)
+	}
+	if rows[0].DeploymentID != "dep-2" {
+		t.Errorf("rows[0].DeploymentID = %q, want dep-2", rows[0].DeploymentID)
+	}
+}
+
+func TestSetActiveResources_IsolatedByProjectEnv(t *testing.T) {
+	t.Parallel()
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	rec := NewRecorder(d)
+	rdr := NewReader(d)
+	ctx := context.Background()
+
+	res := []deploy.ActiveResourceRecord{
+		{ResourceKey: "service|default|api", Type: "service", Class: "default", ID: "api", ModuleID: "mod-svc"},
+	}
+	if err := rec.SetActiveResources(ctx, "proj-a", "dev", "dep-a", res); err != nil {
+		t.Fatalf("SetActiveResources proj-a: %v", err)
+	}
+	if err := rec.SetActiveResources(ctx, "proj-b", "dev", "dep-b", res); err != nil {
+		t.Fatalf("SetActiveResources proj-b: %v", err)
+	}
+
+	// Replacing proj-a/prod should not touch proj-a/dev or proj-b/dev.
+	if err := rec.SetActiveResources(ctx, "proj-a", "prod", "dep-c", nil); err != nil {
+		t.Fatalf("SetActiveResources proj-a/prod: %v", err)
+	}
+
+	rows, err := rdr.ListActiveResources(ctx, "proj-a", "dev")
+	if err != nil {
+		t.Fatalf("ListActiveResources proj-a/dev: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("proj-a/dev: expected 1 row, got %d", len(rows))
+	}
+
+	rows, err = rdr.ListActiveResources(ctx, "proj-b", "dev")
+	if err != nil {
+		t.Fatalf("ListActiveResources proj-b/dev: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("proj-b/dev: expected 1 row, got %d", len(rows))
+	}
+
+	rows, err = rdr.ListActiveResources(ctx, "proj-a", "prod")
+	if err != nil {
+		t.Fatalf("ListActiveResources proj-a/prod: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("proj-a/prod: expected 0 rows, got %d", len(rows))
+	}
+}
+
+func TestClearActiveResources(t *testing.T) {
+	t.Parallel()
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	rec := NewRecorder(d)
+	rdr := NewReader(d)
+	ctx := context.Background()
+
+	res := []deploy.ActiveResourceRecord{
+		{ResourceKey: "service|default|api", Type: "service", Class: "default", ID: "api", ModuleID: "mod-svc"},
+	}
+	if err := rec.SetActiveResources(ctx, "proj", "dev", "dep-1", res); err != nil {
+		t.Fatalf("SetActiveResources: %v", err)
+	}
+	if err := rec.SetActiveResources(ctx, "proj", "prod", "dep-2", res); err != nil {
+		t.Fatalf("SetActiveResources prod: %v", err)
+	}
+
+	if err := rec.ClearActiveResources(ctx, "proj", "dev"); err != nil {
+		t.Fatalf("ClearActiveResources: %v", err)
+	}
+
+	rows, err := rdr.ListActiveResources(ctx, "proj", "dev")
+	if err != nil {
+		t.Fatalf("ListActiveResources dev after clear: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows after clear, got %d", len(rows))
+	}
+
+	// prod must be untouched.
+	rows, err = rdr.ListActiveResources(ctx, "proj", "prod")
+	if err != nil {
+		t.Fatalf("ListActiveResources prod: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("prod: expected 1 row, got %d", len(rows))
 	}
 }
