@@ -301,6 +301,122 @@ func TestGetDeployment_NoResources(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// GetLastSuccessfulDeployment
+// ---------------------------------------------------------------------------
+
+func TestGetLastSuccessfulDeployment_Empty(t *testing.T) {
+	_, _, rdr := openTestDB(t)
+	det, err := rdr.GetLastSuccessfulDeployment(context.Background(), "p", "e")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if det != nil {
+		t.Errorf("expected nil for empty store, got %+v", det)
+	}
+}
+
+func TestGetLastSuccessfulDeployment_PicksLatestSucceeded(t *testing.T) {
+	_, rec, rdr := openTestDB(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// Older succeeded.
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "old", Project: "p", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt: base, ManifestYAML: "old: 1\n", GraphJSON: `{}`,
+	}, true, nil)
+	// Newer succeeded — should win.
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "newer", Project: "p", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt: base.Add(time.Hour), ManifestYAML: "newer: 1\n", GraphJSON: `{}`,
+	}, true, nil)
+	// Newest but still running — should be ignored.
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "running", Project: "p", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt: base.Add(2 * time.Hour), ManifestYAML: "running: 1\n", GraphJSON: `{}`,
+	}, false, nil)
+
+	det, err := rdr.GetLastSuccessfulDeployment(context.Background(), "p", "e")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if det == nil {
+		t.Fatal("expected non-nil")
+	}
+	if det.ID != "newer" {
+		t.Errorf("ID = %q, want newer", det.ID)
+	}
+	if det.ManifestYAML != "newer: 1\n" {
+		t.Errorf("ManifestYAML = %q, want newer: 1", det.ManifestYAML)
+	}
+}
+
+func TestGetLastSuccessfulDeployment_FilteredByEnv(t *testing.T) {
+	_, rec, rdr := openTestDB(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "stg", Project: "p", Env: "staging", EnvType: "local", Mode: "deploy",
+		StartedAt: base, ManifestYAML: "stg\n", GraphJSON: `{}`,
+	}, true, nil)
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "prd", Project: "p", Env: "prod", EnvType: "local", Mode: "deploy",
+		StartedAt: base.Add(time.Hour), ManifestYAML: "prd\n", GraphJSON: `{}`,
+	}, true, nil)
+
+	det, err := rdr.GetLastSuccessfulDeployment(context.Background(), "p", "staging")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if det == nil || det.ID != "stg" {
+		t.Errorf("expected stg, got %+v", det)
+	}
+}
+
+func TestGetLastSuccessfulDeployment_FilteredByProject(t *testing.T) {
+	_, rec, rdr := openTestDB(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "alpha", Project: "alpha", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt: base, ManifestYAML: "a\n", GraphJSON: `{}`,
+	}, true, nil)
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "beta", Project: "beta", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt: base.Add(time.Hour), ManifestYAML: "b\n", GraphJSON: `{}`,
+	}, true, nil)
+
+	det, err := rdr.GetLastSuccessfulDeployment(context.Background(), "alpha", "e")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if det == nil || det.ID != "alpha" {
+		t.Errorf("expected alpha, got %+v", det)
+	}
+}
+
+func TestGetLastSuccessfulDeployment_OnlyFailedDeployments(t *testing.T) {
+	_, rec, rdr := openTestDB(t)
+	ctx := context.Background()
+	if err := rec.StartDeployment(ctx, deploy.DeploymentRecord{
+		ID: "fail", Project: "p", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ManifestYAML: "x\n", GraphJSON: `{}`,
+	}); err != nil {
+		t.Fatalf("StartDeployment: %v", err)
+	}
+	if err := rec.FinishDeployment(ctx, "fail", "failed",
+		time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("FinishDeployment: %v", err)
+	}
+
+	det, err := rdr.GetLastSuccessfulDeployment(ctx, "p", "e")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if det != nil {
+		t.Errorf("expected nil when only failed deployments exist, got %+v", det)
+	}
+}
+
 func TestGetDeployment_FinishedAtEmpty(t *testing.T) {
 	_, rec, rdr := openTestDB(t)
 	mustSeed(t, rec, deploy.DeploymentRecord{
