@@ -368,6 +368,27 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
+	// After a successful (non-dry-run, non-plan-only) apply pass, persist the
+	// current active resource set for this (project, env).
+	if o.Recorder != nil && !o.DryRun && !o.PlanOnly {
+		activeRecs := make([]ActiveResourceRecord, 0, len(ordered))
+		for _, n := range ordered {
+			if n.Status != "applied" {
+				continue
+			}
+			outputsJSON := ""
+			if out, ok := resolved[n.Key]; ok {
+				b, _ := json.Marshal(out)
+				outputsJSON = string(b)
+			}
+			activeRecs = append(activeRecs, ActiveResourceRecord{
+				ResourceKey: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
+				ModuleID: n.ModuleID, OutputsJSON: outputsJSON,
+			})
+		}
+		_ = o.Recorder.SetActiveResources(ctx, o.ProjectID, o.EnvID, o.DeploymentID, activeRecs)
+	}
+
 	// Resolve manifest-level outputs. In dry-run, cross-resource placeholders
 	// can't be resolved (no outputs available), so ErrUnresolved is tolerated.
 	manifestOutputs := map[string]string{}

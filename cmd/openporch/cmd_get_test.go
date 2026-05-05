@@ -519,3 +519,145 @@ func TestGetTF_NotFound(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// mustSeedActiveResources seeds active_resources directly via the recorder.
+// ---------------------------------------------------------------------------
+
+func mustSeedActiveResources(t *testing.T, stateRoot string) {
+	t.Helper()
+	d, err := db.Open(stateRoot)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer d.Close()
+	rec := db.NewRecorder(d)
+	ctx := context.Background()
+	if err := rec.SetActiveResources(ctx, "myproj", "dev", "dep-abc123", []deploy.ActiveResourceRecord{
+		{
+			ResourceKey: "postgres|default|db", Type: "postgres", Class: "default",
+			ID: "db", ModuleID: "mod-pg", OutputsJSON: `{"url":"postgres://db"}`,
+		},
+		{
+			ResourceKey: "service|default|api", Type: "service", Class: "default",
+			ID: "api", ModuleID: "mod-svc", OutputsJSON: `{"url":"http://api"}`,
+		},
+	}); err != nil {
+		t.Fatalf("SetActiveResources: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// get active-resources
+// ---------------------------------------------------------------------------
+
+func TestGetActiveResources_EmptyTable(t *testing.T) {
+	t.Parallel()
+	out, err := runGet(t, t.TempDir(), "active-resources", "myproj", "dev")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "KEY") || !strings.Contains(out, "TYPE") {
+		t.Errorf("expected table header in output, got:\n%s", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 1 {
+		t.Errorf("expected 1 line (header only), got %d:\n%s", len(lines), out)
+	}
+}
+
+func TestGetActiveResources_ListsResources(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustSeedActiveResources(t, root)
+
+	out, err := runGet(t, root, "active-resources", "myproj", "dev")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{"service|default|api", "postgres|default|db", "dep-abc123"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output:\n%s", want, out)
+		}
+	}
+	// rows ordered by resource_key: postgres first
+	posPostgres := strings.Index(out, "postgres|default|db")
+	posService := strings.Index(out, "service|default|api")
+	if posPostgres > posService {
+		t.Errorf("expected postgres row before service row in output:\n%s", out)
+	}
+}
+
+func TestGetActiveResources_JSONOutput(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustSeedActiveResources(t, root)
+
+	out, err := runGet(t, root, "active-resources", "myproj", "dev", "-o", "json")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var rows []db.ActiveResourceRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if rows[0].ResourceKey != "postgres|default|db" {
+		t.Errorf("rows[0].ResourceKey = %q, want postgres|default|db", rows[0].ResourceKey)
+	}
+	if rows[0].OutputsJSON != `{"url":"postgres://db"}` {
+		t.Errorf("rows[0].OutputsJSON = %q", rows[0].OutputsJSON)
+	}
+	if rows[1].ResourceKey != "service|default|api" {
+		t.Errorf("rows[1].ResourceKey = %q, want service|default|api", rows[1].ResourceKey)
+	}
+	if rows[1].DeploymentID != "dep-abc123" {
+		t.Errorf("rows[1].DeploymentID = %q, want dep-abc123", rows[1].DeploymentID)
+	}
+}
+
+func TestGetActiveResources_YAMLOutput(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustSeedActiveResources(t, root)
+
+	out, err := runGet(t, root, "active-resources", "myproj", "dev", "-o", "yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var rows []db.ActiveResourceRow
+	if err := yaml.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n%s", err, out)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+}
+
+func TestGetActiveResources_WrongProject(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustSeedActiveResources(t, root)
+
+	out, err := runGet(t, root, "active-resources", "other-proj", "dev")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 1 {
+		t.Errorf("expected header only for nonexistent project, got %d lines:\n%s", len(lines), out)
+	}
+}
+
+func TestGetActiveResources_InvalidOutput(t *testing.T) {
+	t.Parallel()
+	_, err := runGet(t, t.TempDir(), "active-resources", "p", "e", "-o", "xml")
+	if err == nil {
+		t.Fatal("expected invalid output format error, got nil")
+	}
+	if !strings.Contains(err.Error(), `unsupported output format "xml"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

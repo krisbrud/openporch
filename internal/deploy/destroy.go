@@ -119,6 +119,9 @@ func Destroy(ctx context.Context, o DestroyOptions) (*DestroyResult, error) {
 		if firstErr != nil {
 			status = "failed"
 		}
+		if firstErr == nil {
+			_ = o.Recorder.ClearActiveResources(ctx, o.ProjectID, o.EnvID)
+		}
 		_ = o.Recorder.FinishDeployment(ctx, o.DeploymentID, status, time.Now().UTC())
 	}
 	return res, firstErr

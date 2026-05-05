@@ -24,7 +24,7 @@ func newGetCmd() *cobra.Command {
 		Use:   "get",
 		Short: "Read deployment history",
 	}
-	cmd.AddCommand(newGetDeploymentsCmd(), newGetDeploymentCmd(), newGetTFCmd())
+	cmd.AddCommand(newGetDeploymentsCmd(), newGetDeploymentCmd(), newGetTFCmd(), newGetActiveResourcesCmd())
 	return cmd
 }
 
@@ -285,4 +285,57 @@ func tfResourceDirName(key string) string {
 		return "_"
 	}
 	return out
+}
+
+func newGetActiveResourcesCmd() *cobra.Command {
+	var (
+		output    string
+		stateRoot string
+	)
+	cmd := &cobra.Command{
+		Use:   "active-resources <project> <env>",
+		Short: "List active resources for a (project, env) pair",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			project, env := args[0], args[1]
+			ctx := context.Background()
+			d, err := db.Open(stateRoot)
+			if err != nil {
+				return err
+			}
+			defer d.Close()
+
+			rows, err := db.NewReader(d).ListActiveResources(ctx, project, env)
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			switch output {
+			case "json":
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(rows)
+			case "yaml":
+				enc := yaml.NewEncoder(out)
+				enc.SetIndent(2)
+				return enc.Encode(rows)
+			case "table", "":
+				w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "KEY\tTYPE\tCLASS\tID\tMODULE\tDEPLOYMENT\tUPDATED_AT")
+				for _, row := range rows {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						row.ResourceKey, row.Type, row.Class, row.ID,
+						row.ModuleID, row.DeploymentID, row.UpdatedAt)
+				}
+				return w.Flush()
+			default:
+				return fmt.Errorf("unsupported output format %q (want table, yaml, or json)", output)
+			}
+		},
+	}
+	cmd.Flags().StringVarP(&output, "output", "o", "table", "output format: table, yaml, json")
+	cmd.Flags().StringVar(&stateRoot, "state-root", ".openporch",
+		"directory under which openporch metadata lives")
+	return cmd
 }
