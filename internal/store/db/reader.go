@@ -152,6 +152,26 @@ func (r *Reader) GetDeployment(ctx context.Context, id string) (*DeploymentDetai
 	return &d, nil
 }
 
+// GetLastSuccessfulDeployment returns the most recent successful deployment
+// for (project, env), or nil if none exists. Both project and env are
+// required — there is no notion of a "latest deployment" across environments.
+func (r *Reader) GetLastSuccessfulDeployment(ctx context.Context, project, env string) (*DeploymentDetail, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id FROM deployments
+		 WHERE project = ? AND env = ? AND status = 'succeeded'
+		 ORDER BY started_at DESC LIMIT 1`,
+		project, env)
+	var id string
+	err := row.Scan(&id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: get last successful deployment: %w", err)
+	}
+	return r.GetDeployment(ctx, id)
+}
+
 // ListActiveResources returns the active resources for (project, env),
 // ordered by resource_key.
 func (r *Reader) ListActiveResources(ctx context.Context, project, env string) ([]ActiveResourceRow, error) {

@@ -16,12 +16,23 @@ func Load(path string) (*v1.Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("manifest: read %s: %w", path, err)
 	}
+	m, err := LoadBytes(b)
+	if err != nil {
+		return nil, fmt.Errorf("manifest: %s: %w", path, err)
+	}
+	return m, nil
+}
+
+// LoadBytes parses and validates a manifest from a byte slice. It is the
+// in-memory equivalent of Load for callers that already hold the YAML bytes
+// (e.g. after retrieving them from SQLite history).
+func LoadBytes(b []byte) (*v1.Manifest, error) {
 	var m v1.Manifest
 	if err := yaml.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("manifest: parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse: %w", err)
 	}
 	if err := Validate(&m); err != nil {
-		return nil, fmt.Errorf("manifest: validate %s: %w", path, err)
+		return nil, fmt.Errorf("validate: %w", err)
 	}
 	return &m, nil
 }

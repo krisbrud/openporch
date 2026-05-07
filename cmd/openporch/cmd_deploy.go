@@ -12,7 +12,6 @@ import (
 
 	"github.com/krbrudeli/openporch/internal/config"
 	"github.com/krbrudeli/openporch/internal/deploy"
-	"github.com/krbrudeli/openporch/internal/manifest"
 	"github.com/krbrudeli/openporch/internal/store"
 	"github.com/krbrudeli/openporch/internal/store/db"
 )
@@ -30,7 +29,7 @@ func newDeployCmd() *cobra.Command {
 		planOnly    bool
 	)
 	cmd := &cobra.Command{
-		Use:   "deploy <manifest.yaml>",
+		Use:   "deploy <manifest.yaml | deployment://HEAD | deployment://<id> | environment://<env>>",
 		Short: "Deploy a manifest end-to-end",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -40,10 +39,33 @@ func newDeployCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			m, err := manifest.Load(args[0])
+
+			src, err := parseManifestSource(args[0])
 			if err != nil {
 				return err
 			}
+
+			// Open the SQLite store once if either history-source resolution
+			// or deployment recording needs it.
+			needDB := src.File == "" || !dryRun
+			var d *db.DB
+			if needDB {
+				d, err = db.Open(stateRoot)
+				if err != nil {
+					return err
+				}
+				defer d.Close()
+			}
+
+			var rdr *db.Reader
+			if d != nil {
+				rdr = db.NewReader(d)
+			}
+			m, err := resolveManifestSource(ctx, rdr, src, project, env)
+			if err != nil {
+				return err
+			}
+
 			if project == "" {
 				project = m.Metadata.Project
 			}
@@ -67,11 +89,6 @@ func newDeployCmd() *cobra.Command {
 				PlanOnly: planOnly,
 			}
 			if !dryRun {
-				d, err := db.Open(stateRoot)
-				if err != nil {
-					return err
-				}
-				defer d.Close()
 				opts.Recorder = db.NewRecorder(d)
 			}
 
@@ -80,59 +97,60 @@ func newDeployCmd() *cobra.Command {
 				return err
 			}
 
+			out := cmd.OutOrStdout()
 			if planOnly {
-				fmt.Printf("\nPlan-only deployment %s complete (status=planned).\n", res.DeploymentID)
-				fmt.Println("Run `opo get deployment` to review captured plans.")
+				fmt.Fprintf(out, "\nPlan-only deployment %s complete (status=planned).\n", res.DeploymentID)
+				fmt.Fprintln(out, "Run `opo get deployment` to review captured plans.")
 				return nil
 			}
 
 			if dryRun {
-				fmt.Printf("Dry-run complete. %d resource(s) would be deployed:\n\n", len(res.DryRunResources))
+				fmt.Fprintf(out, "Dry-run complete. %d resource(s) would be deployed:\n\n", len(res.DryRunResources))
 				for _, r := range res.DryRunResources {
-					fmt.Printf("  %-40s  module=%-30s  type=%s", r.Key, r.ModuleID, r.Type)
+					fmt.Fprintf(out, "  %-40s  module=%-30s  type=%s", r.Key, r.ModuleID, r.Type)
 					if r.Class != "" {
-						fmt.Printf("  class=%s", r.Class)
+						fmt.Fprintf(out, "  class=%s", r.Class)
 					}
 					if len(r.Providers) > 0 {
-						fmt.Printf("  providers=%s", strings.Join(r.Providers, ","))
+						fmt.Fprintf(out, "  providers=%s", strings.Join(r.Providers, ","))
 					}
-					fmt.Println()
+					fmt.Fprintln(out)
 				}
 				if renderDir != "" {
-					fmt.Printf("\nRendered HCL written to: %s\n", renderDir)
+					fmt.Fprintf(out, "\nRendered HCL written to: %s\n", renderDir)
 				}
 				return nil
 			}
 
-			fmt.Printf("\nDeployment %s succeeded.\n\n", res.DeploymentID)
+			fmt.Fprintf(out, "\nDeployment %s succeeded.\n\n", res.DeploymentID)
 			if len(res.Resolved) > 0 {
-				fmt.Println("Resource outputs:")
+				fmt.Fprintln(out, "Resource outputs:")
 				keys := make([]string, 0, len(res.Resolved))
 				for k := range res.Resolved {
 					keys = append(keys, k)
 				}
 				sort.Strings(keys)
 				for _, k := range keys {
-					fmt.Printf("  %s\n", k)
+					fmt.Fprintf(out, "  %s\n", k)
 					oks := make([]string, 0, len(res.Resolved[k]))
 					for ok := range res.Resolved[k] {
 						oks = append(oks, ok)
 					}
 					sort.Strings(oks)
 					for _, ok := range oks {
-						fmt.Printf("    %s = %v\n", ok, res.Resolved[k][ok])
+						fmt.Fprintf(out, "    %s = %v\n", ok, res.Resolved[k][ok])
 					}
 				}
 			}
 			if len(res.Outputs) > 0 {
-				fmt.Println("\nManifest outputs:")
+				fmt.Fprintln(out, "\nManifest outputs:")
 				keys := make([]string, 0, len(res.Outputs))
 				for k := range res.Outputs {
 					keys = append(keys, k)
 				}
 				sort.Strings(keys)
 				for _, k := range keys {
-					fmt.Printf("  %s = %s\n", k, res.Outputs[k])
+					fmt.Fprintf(out, "  %s = %s\n", k, res.Outputs[k])
 				}
 			}
 			return nil
