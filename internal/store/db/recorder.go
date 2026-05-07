@@ -30,7 +30,7 @@ func (r *SQLiteRecorder) StartDeployment(ctx context.Context, d deploy.Deploymen
 		`INSERT INTO deployments (id, project, env, env_type, status, started_at, finished_at, mode)
 		 VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
 		d.ID, d.Project, d.Env, d.EnvType, "running",
-		d.StartedAt.UTC().Format(time.RFC3339), d.Mode); err != nil {
+		d.StartedAt.UTC().Format(time.RFC3339Nano), d.Mode); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("db: insert deployment: %w", err)
 	}
@@ -92,7 +92,7 @@ func (r *SQLiteRecorder) RecordResource(ctx context.Context, deploymentID string
 func (r *SQLiteRecorder) FinishDeployment(ctx context.Context, deploymentID string, status string, finishedAt time.Time) error {
 	if _, err := r.db.ExecContext(ctx,
 		`UPDATE deployments SET status = ?, finished_at = ? WHERE id = ?`,
-		status, finishedAt.UTC().Format(time.RFC3339), deploymentID); err != nil {
+		status, finishedAt.UTC().Format(time.RFC3339Nano), deploymentID); err != nil {
 		return fmt.Errorf("db: finish deployment: %w", err)
 	}
 	return nil
@@ -111,7 +111,7 @@ func (r *SQLiteRecorder) SetActiveResources(ctx context.Context, project, env, d
 		tx.Rollback()
 		return fmt.Errorf("db: set active resources: delete: %w", err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, res := range resources {
 		var outputs sql.NullString
 		if res.OutputsJSON != "" {

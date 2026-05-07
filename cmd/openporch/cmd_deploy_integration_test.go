@@ -37,8 +37,13 @@ id: workload-noop
 resource_type: workload
 module_source: inline
 module_source_code: |
-  variable "name" { type = string, default = "noop" }
-  output "name" { value = var.name }
+  variable "name" {
+    type    = string
+    default = "noop"
+  }
+  output "name" {
+    value = var.name
+  }
 ---
 apiVersion: openporch/v1alpha1
 kind: ModuleRule
