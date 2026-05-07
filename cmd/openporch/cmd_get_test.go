@@ -4,18 +4,43 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
 	"github.com/krbrudeli/openporch/internal/deploy"
 	"github.com/krbrudeli/openporch/internal/store/db"
 )
+
+var update = flag.Bool("update", false, "update golden files")
+
+// goldenCLITest compares got against testdata/<name>.golden.txt, rewriting on -update.
+func goldenCLITest(t *testing.T, got, name string) {
+	t.Helper()
+	path := filepath.Join("testdata", name+".golden.txt")
+	if *update {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir testdata: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden %s: %v", path, err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden %s (run with -update to create): %v", path, err)
+	}
+	if diff := cmp.Diff(string(want), got); diff != "" {
+		t.Errorf("CLI output mismatch (-want +got):\n%s", diff)
+	}
+}
 
 // runGet executes "openporch get <args...> --state-root <stateRoot>" and
 // returns captured stdout plus any error.
@@ -517,6 +542,38 @@ func TestGetTF_NotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `deployment "no-such-id" not found`) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGetTF_ResourceFilter(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	platform := mustWriteTFPlatform(t)
+	depID := mustSeedTFDeployment(t, root)
+
+	// Request only the inline database resource (no absolute path in output).
+	out, err := runGet(t, root, "tf", depID, "--platform", platform,
+		"--resource", "database|default|shared.db")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	goldenCLITest(t, out, "get_tf_resource_filter")
+}
+
+func TestGetTF_ResourceFilter_NotFound(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	platform := mustWriteTFPlatform(t)
+	depID := mustSeedTFDeployment(t, root)
+
+	_, err := runGet(t, root, "tf", depID, "--platform", platform,
+		"--resource", "nonexistent|default|missing")
+	if err == nil {
+		t.Fatal("expected error for unknown resource key, got nil")
+	}
+	wantErr := `resource "nonexistent|default|missing" not found in deployment "dep-tf123"`
+	if diff := cmp.Diff(wantErr, err.Error()); diff != "" {
+		t.Errorf("error message mismatch (-want +got):\n%s", diff)
 	}
 }
 

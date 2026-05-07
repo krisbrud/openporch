@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krbrudeli/openporch/internal/graph"
+
 	"github.com/google/go-cmp/cmp"
 	v1 "github.com/krbrudeli/openporch/api/v1alpha1"
 	"github.com/krbrudeli/openporch/internal/runner/runnertest"
@@ -526,5 +528,100 @@ func TestRun_RecorderSideEffects(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, events); diff != "" {
 		t.Errorf("recorder event sequence mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestRenderGraph_Basic verifies that RenderGraph returns one RenderedResource
+// per node, in topological order, with the correct resource keys.
+func TestRenderGraph_Basic(t *testing.T) {
+	t.Parallel()
+	plat := twoTypePlatform(t)
+
+	g := graph.New()
+	dbNode := &graph.Node{
+		Key: "database|default|shared.db", Type: "database", Class: "default",
+		ID: "shared.db", ModuleID: "database-stub",
+		Aliases: []string{"shared.db"}, Params: map[string]any{},
+	}
+	wlNode := &graph.Node{
+		Key: "workload|default|api", Type: "workload", Class: "default",
+		ID: "api", ModuleID: "workload-stub",
+		Aliases: []string{"workloads.api"}, Edges: []string{"database|default|shared.db"},
+		Params: map[string]any{},
+	}
+	if err := g.AddOrMerge(dbNode); err != nil {
+		t.Fatalf("AddOrMerge db: %v", err)
+	}
+	if err := g.AddOrMerge(wlNode); err != nil {
+		t.Fatalf("AddOrMerge workload: %v", err)
+	}
+
+	got, err := RenderGraph(RenderOptions{
+		Platform: plat, Graph: g,
+		ProjectID: "proj", EnvID: "env", EnvTypeID: "local",
+	})
+	if err != nil {
+		t.Fatalf("RenderGraph: %v", err)
+	}
+
+	wantKeys := []string{"database|default|shared.db", "workload|default|api"}
+	gotKeys := make([]string, len(got))
+	for i, r := range got {
+		gotKeys[i] = r.Key
+	}
+	if diff := cmp.Diff(wantKeys, gotKeys); diff != "" {
+		t.Errorf("rendered keys (-want +got):\n%s", diff)
+	}
+	for _, r := range got {
+		if r.HCL == "" {
+			t.Errorf("resource %q: rendered HCL is empty", r.Key)
+		}
+	}
+}
+
+// TestRenderGraph_SingleNode verifies that RenderGraph works for a graph with
+// a single node.
+func TestRenderGraph_SingleNode(t *testing.T) {
+	t.Parallel()
+	plat := minimalPlatform(t)
+
+	g := graph.New()
+	if err := g.AddOrMerge(&graph.Node{
+		Key: "workload|default|api", Type: "workload", Class: "default",
+		ID: "api", ModuleID: "workload-stub", Params: map[string]any{},
+	}); err != nil {
+		t.Fatalf("AddOrMerge: %v", err)
+	}
+
+	got, err := RenderGraph(RenderOptions{
+		Platform: plat, Graph: g,
+		ProjectID: "proj", EnvID: "env", EnvTypeID: "local",
+	})
+	if err != nil {
+		t.Fatalf("RenderGraph: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("RenderGraph returned %d resources, want 1", len(got))
+	}
+	if diff := cmp.Diff("workload|default|api", got[0].Key); diff != "" {
+		t.Errorf("resource key (-want +got):\n%s", diff)
+	}
+	if got[0].HCL == "" {
+		t.Error("rendered HCL is empty")
+	}
+}
+
+// TestRenderGraph_NilInputs verifies that RenderGraph returns errors for
+// missing required inputs.
+func TestRenderGraph_NilInputs(t *testing.T) {
+	t.Parallel()
+	plat := minimalPlatform(t)
+	g := graph.New()
+
+	if _, err := RenderGraph(RenderOptions{Platform: nil, Graph: g}); err == nil {
+		t.Error("expected error for nil platform, got nil")
+	}
+	if _, err := RenderGraph(RenderOptions{Platform: plat, Graph: nil}); err == nil {
+		t.Error("expected error for nil graph, got nil")
 	}
 }

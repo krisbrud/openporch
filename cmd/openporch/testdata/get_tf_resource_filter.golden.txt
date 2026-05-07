@@ -1,0 +1,14 @@
+===== database|default|shared.db/main.tf =====
+terraform {
+  required_providers {
+  }
+}
+
+module "main" {
+  source = "./module"
+}
+
+output "url" {
+  value = module.main.url
+}
+
