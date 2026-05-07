@@ -137,6 +137,7 @@ func newGetTFCmd() *cobra.Command {
 		platformDir string
 		outDir      string
 		stateRoot   string
+		resource    string
 	)
 	cmd := &cobra.Command{
 		Use:   "tf <deployment-id>",
@@ -179,6 +180,19 @@ func newGetTFCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if resource != "" {
+				var filtered []deploy.RenderedResource
+				for _, r := range rendered {
+					if r.Key == resource {
+						filtered = append(filtered, r)
+						break
+					}
+				}
+				if len(filtered) == 0 {
+					return fmt.Errorf("resource %q not found in deployment %q", resource, deploymentID)
+				}
+				rendered = filtered
+			}
 			if outDir != "" {
 				return writeRenderedTF(outDir, rendered)
 			}
@@ -193,6 +207,8 @@ func newGetTFCmd() *cobra.Command {
 		"write rendered files under this directory instead of stdout")
 	cmd.Flags().StringVar(&stateRoot, "state-root", ".openporch",
 		"directory under which openporch metadata lives")
+	cmd.Flags().StringVar(&resource, "resource", "",
+		"show TF for a single resource only (by resource key, e.g. database|default|mydb)")
 	return cmd
 }
 
