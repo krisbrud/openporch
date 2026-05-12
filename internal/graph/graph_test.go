@@ -208,6 +208,69 @@ func TestBuild_moduleDependenciesExpanded(t *testing.T) {
 	}
 }
 
+func TestBuild_coprovisionedSelfPlaceholderForcesDependency(t *testing.T) {
+	t.Parallel()
+	mod := v1.Module{
+		ID: "postgres-docker", ResourceType: "postgres",
+		Coprovisioned: []v1.Coprovisioned{
+			// is_dependent_on_current is false here; the ${self.*} reference
+			// must still flip the edge so the monitor applies AFTER the db.
+			{Type: "monitor", Params: map[string]any{"conn": "${self.outputs.url}"}},
+		},
+	}
+	m := &v1.Manifest{
+		Workloads: map[string]v1.Workload{
+			"a": {Resources: map[string]v1.ResourceRef{"db": {Type: "postgres", ID: "db1"}}},
+		},
+	}
+	g, err := Build(m, map[string]v1.Module{"postgres-docker": mod}, fakeResolver{"postgres-docker", "postgres"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workloadKey := NodeKey("workload", v1.DefaultClass, "a")
+	dbKey := NodeKey("postgres", v1.DefaultClass, "db1")
+	monitorKey := NodeKey("monitor", v1.DefaultClass, "db1")
+	want := &Graph{
+		Nodes: map[string]*Node{
+			workloadKey: {
+				Key:     workloadKey,
+				Type:    "workload",
+				Class:   v1.DefaultClass,
+				ID:      "a",
+				Aliases: []string{"workloads.a"},
+				Edges:   []string{dbKey},
+				Status:  "pending",
+			},
+			dbKey: {
+				Key:      dbKey,
+				Type:     "postgres",
+				Class:    v1.DefaultClass,
+				ID:       "db1",
+				Aliases:  []string{"workloads.a.db"},
+				ModuleID: "postgres-docker",
+				Status:   "pending",
+			},
+			monitorKey: {
+				Key:       monitorKey,
+				Type:      "monitor",
+				Class:     v1.DefaultClass,
+				ID:        "db1",
+				Params:    map[string]any{"conn": "${self.outputs.url}"},
+				SelfAlias: "workloads.a.db",
+				Edges:     []string{dbKey},
+				Status:    "pending",
+			},
+		},
+		AliasIndex: map[string]string{
+			"workloads.a":    workloadKey,
+			"workloads.a.db": dbKey,
+		},
+	}
+	if diff := graphDiff(want, g); diff != "" {
+		t.Errorf("Build() mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestTopoSort_dependenciesBeforeDependents(t *testing.T) {
 	t.Parallel()
 	g := New()

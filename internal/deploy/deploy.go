@@ -433,6 +433,7 @@ func renderNodeHCL(
 		OrgID: orgID, ProjectID: projectID, EnvID: envID,
 		EnvTypeID: envTypeID, ResType: n.Type, ResClass: n.Class, ResID: n.ID,
 		WorkloadName: workloadFromAliases(n.Aliases),
+		SelfAlias:    n.SelfAlias,
 	}
 
 	// Merge module_inputs (static) with manifest params (dev-supplied).

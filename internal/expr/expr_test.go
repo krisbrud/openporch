@@ -2,6 +2,7 @@ package expr
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -52,6 +53,47 @@ func TestResolve_unresolvedLeavesPlaceholder(t *testing.T) {
 		t.Fatalf("want ErrUnresolved, got %v", err)
 	}
 	if got != "DB=${resources.db.outputs.url}" {
+		t.Errorf("expected placeholder retained, got %q", got)
+	}
+}
+
+func TestResolve_self(t *testing.T) {
+	t.Parallel()
+	st := fakeState{
+		"workloads.api.db": {"url": "postgres://db", "creds": map[string]any{"user": "app"}},
+	}
+	got, err := Resolve(
+		"DB=${self.outputs.url} USER=${self.outputs.creds.user}",
+		Context{SelfAlias: "workloads.api.db"}, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "DB=postgres://db USER=app" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolve_selfOutsideCoprovisionedIsError(t *testing.T) {
+	t.Parallel()
+	_, err := Resolve("X=${self.outputs.url}", Context{}, fakeState{}, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrUnresolved) {
+		t.Fatalf("want a hard error, got ErrUnresolved: %v", err)
+	}
+	if !strings.Contains(err.Error(), "coprovisioned") {
+		t.Errorf("error should mention coprovisioned context, got %q", err)
+	}
+}
+
+func TestResolve_selfUnresolvedLeavesPlaceholder(t *testing.T) {
+	t.Parallel()
+	got, err := Resolve("X=${self.outputs.url}", Context{SelfAlias: "workloads.api.db"}, fakeState{}, nil)
+	if !errors.Is(err, ErrUnresolved) {
+		t.Fatalf("want ErrUnresolved, got %v", err)
+	}
+	if got != "X=${self.outputs.url}" {
 		t.Errorf("expected placeholder retained, got %q", got)
 	}
 }

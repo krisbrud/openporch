@@ -17,14 +17,15 @@ type graphSnapshot struct {
 }
 
 type nodeSnapshot struct {
-	Key      string         `json:"key"`
-	Type     string         `json:"type"`
-	Class    string         `json:"class"`
-	ID       string         `json:"id"`
-	ModuleID string         `json:"module_id,omitempty"`
-	Aliases  []string       `json:"aliases,omitempty"`
-	Edges    []string       `json:"edges,omitempty"`
-	Params   map[string]any `json:"params,omitempty"`
+	Key       string         `json:"key"`
+	Type      string         `json:"type"`
+	Class     string         `json:"class"`
+	ID        string         `json:"id"`
+	ModuleID  string         `json:"module_id,omitempty"`
+	Aliases   []string       `json:"aliases,omitempty"`
+	SelfAlias string         `json:"self_alias,omitempty"`
+	Edges     []string       `json:"edges,omitempty"`
+	Params    map[string]any `json:"params,omitempty"`
 }
 
 // serializeGraph returns the JSON text of the graph snapshot. Errors are
@@ -37,8 +38,8 @@ func serializeGraph(g *graph.Graph) (string, error) {
 	for _, n := range g.Nodes {
 		snap.Nodes = append(snap.Nodes, nodeSnapshot{
 			Key: n.Key, Type: n.Type, Class: n.Class, ID: n.ID,
-			ModuleID: n.ModuleID, Aliases: n.Aliases, Edges: n.Edges,
-			Params: n.Params,
+			ModuleID: n.ModuleID, Aliases: n.Aliases, SelfAlias: n.SelfAlias,
+			Edges: n.Edges, Params: n.Params,
 		})
 	}
 	b, err := json.Marshal(snap)
@@ -61,21 +62,35 @@ func GraphFromSnapshot(snapshot string) (*graph.Graph, error) {
 	g := graph.New()
 	for _, n := range snap.Nodes {
 		node := &graph.Node{
-			Key:      n.Key,
-			Type:     n.Type,
-			Class:    n.Class,
-			ID:       n.ID,
-			ModuleID: n.ModuleID,
-			Aliases:  n.Aliases,
-			Edges:    n.Edges,
-			Params:   n.Params,
-			Status:   "pending",
+			Key:       n.Key,
+			Type:      n.Type,
+			Class:     n.Class,
+			ID:        n.ID,
+			ModuleID:  n.ModuleID,
+			Aliases:   n.Aliases,
+			SelfAlias: n.SelfAlias,
+			Edges:     n.Edges,
+			Params:    n.Params,
+			Status:    "pending",
 		}
 		if node.Params == nil {
 			node.Params = map[string]any{}
 		}
 		if err := g.AddOrMerge(node); err != nil {
 			return nil, fmt.Errorf("deploy: graph snapshot node %q: %w", n.Key, err)
+		}
+	}
+	// Coprovisioned nodes whose parent has no manifest alias carry the
+	// parent's node key as their self-alias; make those resolvable again.
+	for _, n := range g.Nodes {
+		if n.SelfAlias == "" {
+			continue
+		}
+		if _, ok := g.AliasIndex[n.SelfAlias]; ok {
+			continue
+		}
+		if _, ok := g.Nodes[n.SelfAlias]; ok {
+			g.AliasIndex[n.SelfAlias] = n.SelfAlias
 		}
 	}
 	return g, nil
