@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -608,6 +609,50 @@ func TestRenderGraph_SingleNode(t *testing.T) {
 	}
 	if got[0].HCL == "" {
 		t.Error("rendered HCL is empty")
+	}
+}
+
+// TestRenderNodeHCL_SelfPlaceholderResolvesParentOutputs verifies that a
+// coprovisioned node's ${self.outputs.*} placeholder resolves to the parent
+// (current) resource's outputs during render.
+func TestRenderNodeHCL_SelfPlaceholderResolvesParentOutputs(t *testing.T) {
+	t.Parallel()
+	plat := &v1.PlatformConfig{
+		RootDir: t.TempDir(),
+		ResourceTypes: map[string]v1.ResourceType{
+			"postgres": {ID: "postgres"},
+			"monitor":  {ID: "monitor"},
+		},
+		Modules: map[string]v1.Module{
+			"postgres-stub": {ID: "postgres-stub", ResourceType: "postgres", ModuleSource: "inline", ModuleSourceCode: ``},
+			"monitor-stub":  {ID: "monitor-stub", ResourceType: "monitor", ModuleSource: "inline", ModuleSourceCode: ``},
+		},
+		Providers: map[string]v1.Provider{},
+		Runners:   map[string]v1.Runner{},
+	}
+	g := graph.New()
+	if err := g.AddOrMerge(&graph.Node{
+		Key: "postgres|default|db1", Type: "postgres", Class: "default", ID: "db1",
+		ModuleID: "postgres-stub", Aliases: []string{"workloads.api.db"},
+		Params: map[string]any{}, Outputs: map[string]any{"url": "postgres://db"},
+	}); err != nil {
+		t.Fatalf("AddOrMerge parent: %v", err)
+	}
+	if err := g.AddOrMerge(&graph.Node{
+		Key: "monitor|default|db1", Type: "monitor", Class: "default", ID: "db1",
+		ModuleID: "monitor-stub", SelfAlias: "workloads.api.db",
+		Params: map[string]any{"conn": "${self.outputs.url}"},
+		Edges:  []string{"postgres|default|db1"},
+	}); err != nil {
+		t.Fatalf("AddOrMerge monitor: %v", err)
+	}
+
+	hcl, _, _, err := renderNodeHCL(g, g.Nodes["monitor|default|db1"], plat, "proj", "env", "local", "", false)
+	if err != nil {
+		t.Fatalf("renderNodeHCL: %v", err)
+	}
+	if !strings.Contains(hcl, "postgres://db") {
+		t.Errorf("expected resolved self output in rendered HCL, got:\n%s", hcl)
 	}
 }
 

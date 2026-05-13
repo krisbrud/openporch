@@ -1,8 +1,8 @@
 // Package expr resolves placeholder expressions of the form ${path.parts}.
 // v0 supports: ${context.*}, ${resources.<alias>.outputs.<key>},
 // ${shared.<alias>.outputs.<key>}, ${workloads.<name>.outputs.<key>},
-// ${var.NAME}. Unresolved references return ErrUnresolved so the deploy
-// pipeline can re-render in a later wave.
+// ${self.outputs.<key>}, ${var.NAME}. Unresolved references return
+// ErrUnresolved so the deploy pipeline can re-render in a later wave.
 package expr
 
 import (
@@ -27,6 +27,11 @@ type Context struct {
 	ResClass     string
 	ResID        string
 	WorkloadName string // local context: name of enclosing workload, if any
+
+	// SelfAlias names the current (parent) resource for ${self.outputs.*}.
+	// Only set when resolving params of a coprovisioned resource; empty
+	// elsewhere, in which case ${self.*} is a hard error.
+	SelfAlias string
 }
 
 // AsMap returns the context as a flat map keyed by the suffix after "context.".
@@ -155,6 +160,17 @@ func lookup(expr string, ctx Context, st State, vars Vars) (any, error) {
 			alias = parts[1] // best-effort fallback
 		}
 		return outputLookup(st, alias, parts[3:])
+	case "self":
+		// self.outputs.<key>... — the current (parent) resource's outputs.
+		// Valid only inside coprovisioned resource params, where SelfAlias
+		// is populated; anywhere else this is a configuration error.
+		if len(parts) < 3 || parts[1] != "outputs" {
+			return nil, fmt.Errorf("malformed self reference: %s", expr)
+		}
+		if ctx.SelfAlias == "" {
+			return nil, fmt.Errorf("${self.*} is only valid in coprovisioned resource params: %s", expr)
+		}
+		return outputLookup(st, ctx.SelfAlias, parts[2:])
 	case "shared":
 		if len(parts) < 4 || parts[2] != "outputs" {
 			return nil, fmt.Errorf("malformed shared reference: %s", expr)

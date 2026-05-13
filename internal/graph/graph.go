@@ -27,6 +27,11 @@ type Node struct {
 	// e.g. for a workload-scoped resource: workloads.<workload>.<alias>
 	Aliases []string
 
+	// SelfAlias is set when this node was produced by coprovisioning and its
+	// params reference ${self.*}; it names the parent resource (an entry in
+	// Graph.AliasIndex) whose outputs back the self placeholder.
+	SelfAlias string
+
 	// Edges names other nodes (by Key) that must apply before this one.
 	Edges []string
 
@@ -84,6 +89,10 @@ func (g *Graph) AddOrMerge(n *Node) error {
 			if !contains(existing.Edges, e) {
 				existing.Edges = append(existing.Edges, e)
 			}
+		}
+		// Adopt a self-alias if we don't already have one.
+		if existing.SelfAlias == "" && n.SelfAlias != "" {
+			existing.SelfAlias = n.SelfAlias
 		}
 		// Merge params (no conflict tolerated except identical).
 		for k, v := range n.Params {
@@ -298,13 +307,21 @@ func expandDeps(g *Graph, parent *Node, mod v1.Module) error {
 		}
 		id := resolveID(parent.ID, cp.ID)
 		key := NodeKey(cp.Type, class, id)
-		if err := g.AddOrMerge(&Node{
+		// Referencing ${self.*} in the coprovisioned params makes the
+		// coprovisioned resource depend on the current one, regardless of
+		// the is_dependent_on_current flag (per spec).
+		usesSelf := referencesSelf(cp.Params)
+		node := &Node{
 			Key: key, Type: cp.Type, Class: class, ID: id,
 			Params: cp.Params, Status: "pending",
-		}); err != nil {
+		}
+		if usesSelf {
+			node.SelfAlias = selfAliasFor(g, parent)
+		}
+		if err := g.AddOrMerge(node); err != nil {
 			return err
 		}
-		if cp.IsDependentOnCurrent {
+		if cp.IsDependentOnCurrent || usesSelf {
 			// Coprovisioned applies AFTER parent.
 			g.Nodes[key].Edges = appendUnique(g.Nodes[key].Edges, parent.Key)
 		} else {
@@ -313,6 +330,39 @@ func expandDeps(g *Graph, parent *Node, mod v1.Module) error {
 		}
 	}
 	return nil
+}
+
+// selfAliasFor returns an alias that resolves to parent via Graph.AliasIndex.
+// Workload/shared resources already carry a manifest alias; resources produced
+// by expansion don't, so we register their canonical key as a self-alias.
+func selfAliasFor(g *Graph, parent *Node) string {
+	if len(parent.Aliases) > 0 {
+		return parent.Aliases[0]
+	}
+	g.AliasIndex[parent.Key] = parent.Key
+	return parent.Key
+}
+
+// referencesSelf reports whether any string nested in v contains a ${self.*}
+// placeholder.
+func referencesSelf(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return strings.Contains(x, "${self.")
+	case map[string]any:
+		for _, vv := range x {
+			if referencesSelf(vv) {
+				return true
+			}
+		}
+	case []any:
+		for _, vv := range x {
+			if referencesSelf(vv) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ModuleResolver picks a module for a node. Implemented by the deploy
