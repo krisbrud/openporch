@@ -436,3 +436,53 @@ func TestGetDeployment_FinishedAtEmpty(t *testing.T) {
 		t.Errorf("Status = %q, want running", det.Status)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// GetDeploymentModuleAssignments
+// ---------------------------------------------------------------------------
+
+func TestGetDeploymentModuleAssignments_ReturnsKeyedMap(t *testing.T) {
+	t.Parallel()
+	_, rec, rdr := openTestDB(t)
+	mustSeed(t, rec, deploy.DeploymentRecord{
+		ID: "dep-1", Project: "p", Env: "e", EnvType: "local", Mode: "deploy",
+		StartedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		ManifestYAML: "kind: Manifest\n", GraphJSON: `{}`,
+	}, true, []deploy.ResourceRecord{
+		{ResourceKey: "workload|default|api", Type: "workload", Class: "default",
+			ID: "api", ModuleID: "mod-svc-v1", RunnerID: "local-tofu",
+			Status: "applied", LogPath: "/tmp/api.log"},
+		{ResourceKey: "database|default|db", Type: "database", Class: "default",
+			ID: "db", ModuleID: "mod-pg-v2", RunnerID: "local-tofu",
+			Status: "applied", LogPath: "/tmp/db.log"},
+	})
+
+	got, err := rdr.GetDeploymentModuleAssignments(context.Background(), "dep-1")
+	if err != nil {
+		t.Fatalf("GetDeploymentModuleAssignments: %v", err)
+	}
+	want := map[string]string{
+		"workload|default|api": "mod-svc-v1",
+		"database|default|db":  "mod-pg-v2",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestGetDeploymentModuleAssignments_EmptyForUnknownDeployment(t *testing.T) {
+	t.Parallel()
+	_, _, rdr := openTestDB(t)
+	got, err := rdr.GetDeploymentModuleAssignments(context.Background(), "no-such")
+	if err != nil {
+		t.Fatalf("GetDeploymentModuleAssignments: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty map for unknown deployment, got %v", got)
+	}
+}

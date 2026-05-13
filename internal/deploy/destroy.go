@@ -135,7 +135,10 @@ func buildGraph(o Options) (*graph.Graph, error) {
 		EnvID:     o.EnvID,
 		EnvTypeID: o.EnvTypeID,
 	}
-	res := resolverFromMatcher{rules: o.Platform.ModuleRules, known: o.Platform.ResourceTypes, ctx: mctx}
+	res := resolverFromMatcher{
+		rules: o.Platform.ModuleRules, known: o.Platform.ResourceTypes,
+		ctx: mctx, overrides: o.ModuleOverrides,
+	}
 	g, err := graph.Build(o.Manifest, o.Platform.Modules, res)
 	if err != nil {
 		return nil, err

@@ -172,6 +172,33 @@ func (r *Reader) GetLastSuccessfulDeployment(ctx context.Context, project, env s
 	return r.GetDeployment(ctx, id)
 }
 
+// GetDeploymentModuleAssignments returns a resource_key -> module_id map for
+// the given deployment. Used by `opo rollback` to pin module selection to
+// what a past deployment resolved, bypassing the current rule set. Returns an
+// empty map if the deployment has no resources or doesn't exist; callers
+// should verify the deployment via GetDeployment first if presence matters.
+func (r *Reader) GetDeploymentModuleAssignments(ctx context.Context, deploymentID string) (map[string]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT resource_key, module_id FROM deployment_resources
+		 WHERE deployment_id = ?`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("db: get deployment module assignments: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, m string
+		if err := rows.Scan(&k, &m); err != nil {
+			return nil, fmt.Errorf("db: scan module assignment row: %w", err)
+		}
+		out[k] = m
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: get deployment module assignments: %w", err)
+	}
+	return out, nil
+}
+
 // ListActiveResources returns the active resources for (project, env),
 // ordered by resource_key.
 func (r *Reader) ListActiveResources(ctx context.Context, project, env string) ([]ActiveResourceRow, error) {

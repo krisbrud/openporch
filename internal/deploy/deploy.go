@@ -56,6 +56,19 @@ type Options struct {
 	// recorded with mode=plan_only and a terminal status of `planned` (or
 	// `plan_failed`). No `tofu apply` is invoked; no outputs are produced.
 	PlanOnly bool
+
+	// ModuleOverrides pins module selection per resource key, bypassing
+	// platform rule matching for any node whose key has an entry here.
+	// Used by rollback to freeze module IDs to a past deployment's
+	// resolved set so module-rule changes after that deployment do not
+	// affect the rollback's module selection. Nodes not in the map fall
+	// back to rule matching as usual.
+	ModuleOverrides map[string]string
+
+	// Mode optionally overrides the deployment mode recorded on the row.
+	// When empty the pipeline picks "deploy" (or "plan_only" when
+	// PlanOnly is set). Used by rollback to record mode="rollback".
+	Mode string
 }
 
 // runnerID returns a stable identifier for the runner type so it can be
@@ -170,13 +183,19 @@ func (s stateView) AliasOutputs(alias string) (map[string]any, bool) {
 }
 
 // resolverFromMatcher adapts the rule engine into graph.ModuleResolver.
+// Overrides, when non-nil, take precedence over rule matching: any node whose
+// Key is present returns its pinned module ID without consulting the rules.
 type resolverFromMatcher struct {
-	rules []v1.ModuleRule
-	known map[string]v1.ResourceType
-	ctx   match.Context
+	rules     []v1.ModuleRule
+	known     map[string]v1.ResourceType
+	ctx       match.Context
+	overrides map[string]string
 }
 
 func (r resolverFromMatcher) Resolve(n *graph.Node) (string, error) {
+	if id, ok := r.overrides[n.Key]; ok {
+		return id, nil
+	}
 	if _, ok := r.known[n.Type]; !ok {
 		// Unknown resource type — likely an unintended dep target. Skip.
 		return "", graph.ErrSkipModuleResolution
@@ -202,7 +221,10 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		EnvID:     o.EnvID,
 		EnvTypeID: o.EnvTypeID,
 	}
-	res := resolverFromMatcher{rules: o.Platform.ModuleRules, known: o.Platform.ResourceTypes, ctx: mctx}
+	res := resolverFromMatcher{
+		rules: o.Platform.ModuleRules, known: o.Platform.ResourceTypes,
+		ctx: mctx, overrides: o.ModuleOverrides,
+	}
 	g, err := graph.Build(o.Manifest, o.Platform.Modules, res)
 	if err != nil {
 		return nil, fmt.Errorf("deploy: build graph: %w", err)
@@ -238,9 +260,12 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 
 	startedAt := time.Now().UTC()
 	if o.Recorder != nil && !o.DryRun {
-		mode := "deploy"
-		if o.PlanOnly {
-			mode = "plan_only"
+		mode := o.Mode
+		if mode == "" {
+			mode = "deploy"
+			if o.PlanOnly {
+				mode = "plan_only"
+			}
 		}
 		manifestYAML, _ := yaml.Marshal(o.Manifest)
 		graphJSON, _ := serializeGraph(g)

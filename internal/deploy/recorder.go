@@ -43,7 +43,7 @@ type DeploymentRecord struct {
 	Project      string
 	Env          string
 	EnvType      string
-	Mode         string // "deploy" or "destroy"
+	Mode         string // "deploy", "destroy", "plan_only", or "rollback"
 	StartedAt    time.Time
 	ManifestYAML string
 	GraphJSON    string
