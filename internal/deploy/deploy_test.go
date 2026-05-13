@@ -625,3 +625,127 @@ func TestRenderGraph_NilInputs(t *testing.T) {
 		t.Error("expected error for nil graph, got nil")
 	}
 }
+
+// twoModulePlatform has two modules for the same resource type. The rule
+// picks "current"; tests use ModuleOverrides to force "frozen" instead so we
+// can verify rollback's pin overrides the current rules.
+func twoModulePlatform(t *testing.T) *v1.PlatformConfig {
+	t.Helper()
+	return &v1.PlatformConfig{
+		RootDir: t.TempDir(),
+		ResourceTypes: map[string]v1.ResourceType{
+			"workload": {ID: "workload"},
+		},
+		Modules: map[string]v1.Module{
+			"current": {
+				ID: "current", ResourceType: "workload",
+				ModuleSource: "inline", ModuleSourceCode: ``,
+			},
+			"frozen": {
+				ID: "frozen", ResourceType: "workload",
+				ModuleSource: "inline", ModuleSourceCode: ``,
+			},
+		},
+		ModuleRules: []v1.ModuleRule{
+			{ID: "catchall", ResourceType: "workload", ModuleID: "current"},
+		},
+		Providers: map[string]v1.Provider{},
+		Runners:   map[string]v1.Runner{},
+	}
+}
+
+func TestRun_ModuleOverridesPinModuleID(t *testing.T) {
+	t.Parallel()
+	capRec := &captureRecorder{}
+	_, err := Run(context.Background(), Options{
+		Manifest:  minimalManifest(),
+		Platform:  twoModulePlatform(t),
+		Store:     &storetest.Fake{},
+		Runner:    &runnertest.Recording{},
+		RunnerID:  "local-tofu",
+		ProjectID: "proj",
+		EnvID:     "test",
+		EnvTypeID: "local",
+		Recorder:  capRec,
+		ModuleOverrides: map[string]string{
+			"workload|default|api": "frozen",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	last := map[string]ResourceRecord{}
+	for _, r := range capRec.resources {
+		last[r.ResourceKey] = r
+	}
+	got, ok := last["workload|default|api"]
+	if !ok {
+		t.Fatalf("workload|default|api was not recorded; got keys: %v", keys(last))
+	}
+	if got.ModuleID != "frozen" {
+		t.Errorf("ModuleID = %q, want frozen (override should bypass rules)", got.ModuleID)
+	}
+}
+
+func TestRun_ModuleOverridesFallBackToRulesForUnpinnedNodes(t *testing.T) {
+	t.Parallel()
+	capRec := &captureRecorder{}
+	// Overrides intentionally empty — pipeline must still use rule matching.
+	_, err := Run(context.Background(), Options{
+		Manifest:        minimalManifest(),
+		Platform:        twoModulePlatform(t),
+		Store:           &storetest.Fake{},
+		Runner:          &runnertest.Recording{},
+		RunnerID:        "local-tofu",
+		ProjectID:       "proj",
+		EnvID:           "test",
+		EnvTypeID:       "local",
+		Recorder:        capRec,
+		ModuleOverrides: map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	last := map[string]ResourceRecord{}
+	for _, r := range capRec.resources {
+		last[r.ResourceKey] = r
+	}
+	got := last["workload|default|api"]
+	if got.ModuleID != "current" {
+		t.Errorf("ModuleID = %q, want current (rules should apply when overrides empty)", got.ModuleID)
+	}
+}
+
+func TestRun_RollbackModeIsRecorded(t *testing.T) {
+	t.Parallel()
+	gotMode := ""
+	rec := &startCapturingRecorder{
+		onStart: func(d DeploymentRecord) { gotMode = d.Mode },
+	}
+	if _, err := Run(context.Background(), Options{
+		Manifest:        minimalManifest(),
+		Platform:        twoModulePlatform(t),
+		Store:           &storetest.Fake{},
+		Runner:          &runnertest.Recording{},
+		RunnerID:        "local-tofu",
+		ProjectID:       "proj",
+		EnvID:           "test",
+		EnvTypeID:       "local",
+		Recorder:        rec,
+		Mode:            "rollback",
+		ModuleOverrides: map[string]string{"workload|default|api": "frozen"},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if gotMode != "rollback" {
+		t.Errorf("StartDeployment Mode = %q, want rollback", gotMode)
+	}
+}
+
+func keys(m map[string]ResourceRecord) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
