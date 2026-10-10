@@ -1439,3 +1439,61 @@ async fn application_deletion_is_rechecked_with_the_change() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn creation_and_revocation_are_rechecked_with_the_change() {
+    let s = server().await;
+    s.member("carol", "member").await;
+    s.member("ci", "member").await;
+    s.token_for("ci").await;
+    let as_carol =
+        |method: &str, path: &str| AuditIntent::accepted("acme", "carol", method, path, "test");
+    let store = &s.state.store;
+    let forbidden = |e: openporch_store::StoreError| {
+        assert!(
+            matches!(e, openporch_store::StoreError::Forbidden(_)),
+            "{e}"
+        );
+    };
+    // carol was demoted from manager after her requests passed the route checks.
+    forbidden(
+        store
+            .create_app(
+                "acme",
+                "shop",
+                "Shop",
+                "carol",
+                as_carol("POST", "/orgs/acme/apps"),
+            )
+            .await
+            .unwrap_err(),
+    );
+    forbidden(
+        store
+            .create_env_type(
+                "acme",
+                "staging",
+                "",
+                as_carol("POST", "/orgs/acme/env-types"),
+            )
+            .await
+            .unwrap_err(),
+    );
+    let (_, tokens) = s.get("/orgs/acme/users/ci/tokens", &s.admin).await;
+    let token = tokens[0]["id"].as_str().unwrap().to_owned();
+    forbidden(
+        store
+            .revoke_token(
+                "acme",
+                "ci",
+                &token,
+                as_carol("DELETE", "/orgs/acme/users/ci/tokens"),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        s.get("/orgs/acme/apps/shop", &s.admin).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

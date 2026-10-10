@@ -497,3 +497,21 @@ pub(crate) async fn check_admin_authority(
         )))
     }
 }
+
+/// Creating applications needs administrator or manager, checked inside the
+/// transaction.
+pub(crate) async fn check_create_app_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    match roles_in(conn, org, actor).await?.org {
+        Some(OrgRole::Administrator | OrgRole::Manager) => Ok(()),
+        _ => Err(StoreError::Forbidden(format!(
+            "`{actor}` is not an administrator or manager"
+        ))),
+    }
+}

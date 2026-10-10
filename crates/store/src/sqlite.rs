@@ -288,6 +288,7 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        crate::identity::check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
             "INSERT INTO env_types (org_id, id, description, created_at, created_by) \
              VALUES (?, ?, ?, ?, ?)",
@@ -323,6 +324,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let now = now_ms();
         let mut tx = self.begin().await?;
+        crate::identity::check_create_app_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
             "INSERT INTO apps (org_id, id, name, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
         )

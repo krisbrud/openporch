@@ -553,6 +553,23 @@ impl IdentityStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        // Everyone may revoke their own tokens and administrators anyone's; managers
+        // only those of service users within their delegation ceiling.
+        if let Some(actor) = audit.actor.as_deref()
+            && actor != principal
+        {
+            let target = require_principal(&mut tx, org, principal).await?;
+            let issuer = roles_in(&mut tx, org, actor).await?;
+            if issuer.org != Some(OrgRole::Administrator) {
+                if target.kind != "service" {
+                    return Err(StoreError::Forbidden(
+                        "tokens of a user can only be revoked by that user or an administrator"
+                            .into(),
+                    ));
+                }
+                check_authority(&mut tx, org, Some(actor), Some(principal), None).await?;
+            }
+        }
         let n = sqlx::query(
             "UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) \
              WHERE org_id = ? AND principal_id = ? AND id = ?",
