@@ -40,11 +40,19 @@ Placeholders of the form `${resources.<key>.<output>}` in container variables an
 
 ### Requirement: Extension file
 
-An optional extension file with `apiVersion: openporch.dev/v1` MAY set `profile` (default `openporch/default`), `deploy` (`status: deploy|available`, `timeout`), and `spec` fragments (pod annotations, labels, replicas, service account) merged into the workload. The file SHALL be environment-agnostic and SHALL NOT contain placeholders bound to a specific environment.
+An optional extension file with `apiVersion: openporch.dev/v1` MAY set `profile` (`openporch/default` for Kubernetes, the default, or `openporch/none`), `deploy` (`status: deploy|available`, `timeout`), and `spec` fragments (pod annotations, labels, replicas, service account) merged into the workload. The file SHALL be environment-agnostic and SHALL NOT contain placeholders bound to a specific environment.
 
 #### Scenario: Pod annotation
 - **WHEN** the extension file sets `spec.pod.annotations.billing-code: X`
 - **THEN** the rendered pod template carries that annotation
+
+### Requirement: Target-less workload profile
+
+Profile `openporch/none` SHALL provision the workload without a runtime target: the orchestrator resolves every placeholder in the workload spec and stores the rendered containers (variables, files, ports) as the workload's outputs, with secret values tainted. It exists so an environment's AWS resources can be deployed and verified before a cluster exists.
+
+#### Scenario: Resolved outputs without a cluster
+- **WHEN** a workload with profile `openporch/none` and a `postgres` dependency is deployed
+- **THEN** the deployment succeeds, the postgres is provisioned, and reading the workload's active resource shows its variables with the database host filled in and the password marked secret
 
 ### Requirement: Deploy properties and overrides
 

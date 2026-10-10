@@ -8,7 +8,7 @@ Workloads run on Kubernetes: the implicit workload resource is rendered into man
 
 ### Requirement: Cluster and namespace selection
 
-Every environment's graph SHALL include `k8s-cluster#k8s-cluster` and `k8s-namespace#k8s-namespace`, each resolved through resource definitions like any other type. Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, `ca_data`, secrets `token` or `client_cert`/`client_key`) and `openporch/k8s-cluster-eks` (inputs `name`, `region`, `loadbalancer`, with a `driver_account`).
+The graph of every environment with a workload of profile `openporch/default` SHALL include `k8s-cluster#k8s-cluster` and `k8s-namespace#k8s-namespace`, each resolved through resource definitions like any other type. Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, `ca_data`, secrets `token` or `client_cert`/`client_key`) and `openporch/k8s-cluster-eks` (inputs `name`, `region`, `loadbalancer`, with a `driver_account`).
 
 #### Scenario: EKS cluster
 - **WHEN** the `k8s-cluster` definition uses `openporch/k8s-cluster-eks` with `driver_account: aws-dev`

@@ -8,11 +8,15 @@ The resource graph is the per-environment directed acyclic graph of every resour
 
 ### Requirement: Graph construction
 
-For a deployment the orchestrator SHALL build a graph with one node per resource descriptor `<type>.<class>#<res_id>`. Nodes come from: the implicit `workload` node `modules.<id>` per workload, each workload's private and shared dependencies, the implicit `base-env`, `k8s-cluster` and `k8s-namespace` nodes, resource references found in matched definitions, and co-provisioned resources. The graph SHALL be rejected if it contains a cycle.
+For a deployment the orchestrator SHALL build a graph with one node per resource descriptor `<type>.<class>#<res_id>`. Nodes come from: the implicit `workload` node `modules.<id>` per workload, each workload's dependencies, the implicit `base-env` node, resource references in matched definitions, and co-provisioned resources. Implicit `k8s-cluster` and `k8s-namespace` nodes are added only for Kubernetes workload profiles. The graph SHALL be rejected if it contains a cycle.
 
 #### Scenario: Workload with a database
-- **WHEN** workload `web` requests `postgres` as `db` and the postgres definition references `${resources.postgres-instance.outputs.host}`
-- **THEN** the graph is `workload#modules.web -> postgres#modules.web.externals.db -> postgres-instance#modules.web.externals.db`, plus `base-env`, `k8s-cluster` and `k8s-namespace`
+- **WHEN** workload `web` with profile `openporch/none` requests `postgres` as `db` and the postgres definition references `${resources.postgres-instance.outputs.host}`
+- **THEN** the graph is `workload#modules.web -> postgres#modules.web.externals.db -> postgres-instance#modules.web.externals.db`, plus `base-env`
+
+#### Scenario: Kubernetes profile adds cluster nodes
+- **WHEN** workload `web` uses profile `openporch/default`
+- **THEN** the graph also contains `k8s-cluster#k8s-cluster` and `k8s-namespace#k8s-namespace`, and the workload depends on both
 
 #### Scenario: Cycle
 - **WHEN** definition A references outputs of type B and B's definition references outputs of type A for the same context

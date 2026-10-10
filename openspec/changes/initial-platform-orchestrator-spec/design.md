@@ -76,6 +76,8 @@ Alternatives: pulling and pushing state files with `tofu state pull/push` (rejec
 
 `kube` with `k8s-openapi` and server-side apply (field manager `openporch`). Cluster credentials come from the `k8s-cluster` resource's outputs: the static driver echoes server, CA and token or client certificate; the EKS driver describes the cluster with `aws-sdk-eks` using the cloud account's credentials and mints a token by presigning STS `GetCallerIdentity` the way `aws-iam-authenticator` does. Namespaces are created with the same client. No operator or agent is installed in the cluster.
 
+Kubernetes is the last phase of the milestone. Until it lands, the `openporch/none` workload profile makes the whole AWS path (cloud accounts, OpenTofu driver, RDS, S3, SQS, rollback, deprovisioning) deployable and testable without any cluster; the `k8s-cluster` and `k8s-namespace` implicit nodes are only added to the graph for the `openporch/default` profile.
+
 Alternatives: shelling out to `kubectl` (rejected: binary dependency and weaker typing); an in-cluster operator like Humanitec's (rejected: non-goal, adds a second component).
 
 ### D7. Placeholder engine
@@ -102,7 +104,7 @@ Paths are `/orgs/{org}/apps/{app}/envs/{env}/...`, `/orgs/{org}/resources/{defs,
 
 ## Risks / Trade-offs
 
-- [Scope is large for a first milestone] → tasks are grouped into phases that each leave a usable subset (API and pure core first, then echo/template drivers, then OpenTofu, then Kubernetes, then provider); each phase has its own tests and can ship alone.
+- [Scope is large for a first milestone] → tasks are grouped into phases that each leave a usable subset (pure core and API first, then echo/template and OpenTofu drivers, the engine, the CLI, the provider, an AWS-only reference platform, and Kubernetes last so the AWS resource path is proven first); each phase has its own tests and can ship alone.
 - [Running `tofu` inside the server exposes the server's filesystem and network to module code] → runs use a dedicated working dir per GUResID, a sanitized environment, and a documented recommendation to run the server as an unprivileged user; a remote runner is the follow-up.
 - [EKS token minting and AWS SDK details are easy to get subtly wrong] → an opt-in e2e test against a real EKS cluster, plus unit tests of the presigned URL against known-good vectors.
 - [Secret leakage through logs and errors] → single redaction layer applied before persistence, tested with secrets embedded in OpenTofu output and error text.

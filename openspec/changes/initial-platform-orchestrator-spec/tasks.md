@@ -39,32 +39,34 @@
 - [ ] 5.3 Implement active resource bookkeeping: GUResID allocation and reuse, outputs and cookies stored, usage tracking, unreferenced persistence, scheduled deletion, deprovision ordering, detach; verify engine tests cover every scenario in `active-resources`
 - [ ] 5.4 Implement deployment logs with the redaction layer and the logs and graph inspection endpoints; verify tests show `[REDACTED]` for secret values in captured driver output
 - [ ] 5.5 Implement environment and application deletion through the engine (reverse-order deprovisioning, failure leaves the environment with the error); verify engine tests cover both scenarios in `applications-and-environments`
-- [ ] 5.6 Run an in-memory end-to-end test: definitions using echo and template, a Score workload with a postgres dependency, deploy, roll back with `+1`; verify the set IDs and active resources match `deployments` and `deployment-sets-and-deltas` scenarios
+- [ ] 5.6 Implement the `openporch/none` workload profile (resolve the workload's placeholders, store the rendered container config as the workload's outputs, no runtime target); verify engine tests show resolved variables and secret tainting from `score-workloads`
+- [ ] 5.7 Run an in-memory end-to-end test: definitions using echo and template, a Score workload with a postgres dependency, deploy, roll back with `+1`; verify the set IDs and active resources match `deployments` and `deployment-sets-and-deltas` scenarios using the `openporch/none` profile
 
-## 6. Kubernetes workloads
-- [ ] 6.1 Implement `openporch/k8s-cluster-static` and `openporch/k8s-cluster-eks` (describe cluster, presigned STS token) drivers; verify unit tests for the token against known vectors and a kind-based test for the static driver
-- [ ] 6.2 Implement workload rendering for the `openporch/default` profile (Deployment, Service, ConfigMap, Secret, probes, resources, labels, extension file merges, `pod.*` field refs); verify golden-file tests cover the render scenario in `kubernetes-workloads`
-- [ ] 6.3 Implement namespace creation, manifest placement by `location`, server-side apply, readiness waiting with timeout, workload removal and namespace deletion; verify integration tests against kind cover apply, crash-loop failure, removal and environment deletion
-- [ ] 6.4 Implement the runtime status endpoint; verify a kind test reports replica counts for a deployed workload
-- [ ] 6.5 Write `docs/kubernetes.md` describing cluster definitions for static and EKS clusters; verify the EKS example validates against the server
+## 6. CLI
+- [ ] 6.1 Implement the typed API client crate and `porch` configuration (flags, env vars, config file, `login`); verify tests cover precedence and the env-var scenario in `cli`
+- [ ] 6.2 Implement `get|create|delete` object commands with table, YAML and JSON output and `kind: Definition` file input; verify tests against a dev server cover creating a definition from YAML
+- [ ] 6.3 Implement `score deploy` (extensions, `--image`, `--property`, `--comment`, `--wait` with status streaming and non-zero exit on failure), `deploy delta`, `deploy deploy`, `diff sets` with `deploy/.` and `deploy/+n`, `get deploys`, `logs deploy`, `resources graph`, and `api`; verify CLI tests against a dev server cover every scenario in `cli` and the Score deploy scenarios in `deployment-sets-and-deltas`
+- [ ] 6.4 Write `docs/cli.md` generated from clap help plus a developer quickstart; verify the quickstart commands run as written against a dev server
 
-## 7. CLI
-- [ ] 7.1 Implement the typed API client crate and `porch` configuration (flags, env vars, config file, `login`); verify tests cover precedence and the env-var scenario in `cli`
-- [ ] 7.2 Implement `get|create|delete` object commands with table, YAML and JSON output and `kind: Definition` file input; verify tests against a dev server cover creating a definition from YAML
-- [ ] 7.3 Implement `score deploy` (extensions, `--image`, `--property`, `--comment`, `--wait` with status streaming and non-zero exit on failure), `deploy delta`, `deploy deploy`, `diff sets` with `deploy/.` and `deploy/+n`, `get deploys`, `logs deploy`, `resources graph`, and `api`; verify CLI tests against a dev server cover every scenario in `cli` and the Score deploy scenarios in `deployment-sets-and-deltas`
-- [ ] 7.4 Write `docs/cli.md` generated from clap help plus a developer quickstart; verify the quickstart commands run as written against a dev server
+## 7. OpenTofu provider
+- [ ] 7.1 Scaffold `provider/` as a Go module on terraform-plugin-framework with provider configuration from arguments and `OPENPORCH_*` env vars; verify `go test` passes and `tofu init` loads a locally built provider through a dev override
+- [ ] 7.2 Implement resources `openporch_application`, `openporch_environment_type`, `openporch_environment`, `openporch_resource_type`, `openporch_resource_class`, `openporch_cloud_account`, `openporch_driver`, `openporch_value` with import; verify acceptance tests against a local server cover create, update, delete and import for each
+- [ ] 7.3 Implement `openporch_resource_definition` (dynamic `driver_inputs`, sensitive secrets, key-set drift detection) and `openporch_resource_definition_criteria`; verify acceptance tests cover the definition-with-criteria scenario, the `$${}` escaping scenario and a no-op second plan
+- [ ] 7.4 Generate provider docs with `tfplugindocs` and add a CI job for the Go module; verify docs are committed and the job is green
 
-## 8. OpenTofu provider
-- [ ] 8.1 Scaffold `provider/` as a Go module on terraform-plugin-framework with provider configuration from arguments and `OPENPORCH_*` env vars; verify `go test` passes and `tofu init` loads a locally built provider through a dev override
-- [ ] 8.2 Implement resources `openporch_application`, `openporch_environment_type`, `openporch_environment`, `openporch_resource_type`, `openporch_resource_class`, `openporch_cloud_account`, `openporch_driver`, `openporch_value` with import; verify acceptance tests against a local server cover create, update, delete and import for each
-- [ ] 8.3 Implement `openporch_resource_definition` (dynamic `driver_inputs`, sensitive secrets, key-set drift detection) and `openporch_resource_definition_criteria`; verify acceptance tests cover the definition-with-criteria scenario, the `$${}` escaping scenario and a no-op second plan
-- [ ] 8.4 Generate provider docs with `tfplugindocs` and add a CI job for the Go module; verify docs are committed and the job is green
+## 8. AWS reference platform and end-to-end (no cluster)
+- [ ] 8.1 Write `examples/aws-platform/` in OpenTofu: env types, an `aws-role` cloud account, `postgres` on RDS, `s3` and `sqs` via the OpenTofu driver, `dns` via echo, with no Kubernetes definitions; verify `tofu validate` passes and a doc test applies it against a dev server
+- [ ] 8.2 Write `examples/score-web/` with a Score file using postgres, s3 and sqs and an extension file selecting profile `openporch/none`; verify the in-memory e2e from 5.7 is repeated with these files
+- [ ] 8.3 Add an opt-in e2e job (`just e2e-aws`) that applies the example platform against a real AWS account, runs `porch score deploy --wait`, asserts the RDS instance, bucket and queue exist and the workload outputs carry their connection details, rolls back with `+1`, and deletes the environment so `tofu destroy` removes everything; verify it passes once manually and its results are documented in `docs/e2e.md`
+- [ ] 8.4 Write `docs/getting-started.md` covering server install, master key, state bucket, first token, provider setup and the first AWS-only deployment; verify a fresh reader can follow it on a clean machine using only the docs
 
-## 9. Reference platform and end-to-end
-- [ ] 9.1 Write `examples/aws-platform/` in OpenTofu: env types, cloud account, k8s-cluster (EKS) and k8s-namespace definitions, `postgres` on RDS and `s3` via the OpenTofu driver, `dns` via echo; verify `tofu validate` passes and a doc test applies it against a dev server
-- [ ] 9.2 Write `examples/score-web/` with a Score file and extension file for a web workload using postgres and s3; verify the in-memory e2e from 5.6 is repeated with these files
-- [ ] 9.3 Add an opt-in e2e job (`just e2e`) that applies the example platform against a real AWS account and EKS cluster, runs `porch score deploy --wait`, checks runtime status, rolls back, and deletes the environment; verify it passes once manually and its results are documented in `docs/e2e.md`
-- [ ] 9.4 Write `docs/getting-started.md` covering server install, master key, state bucket, first token, provider setup and the first deployment; verify a fresh reader can follow it on a clean machine using only the docs
+## 9. Kubernetes workloads
+- [ ] 9.1 Implement `openporch/k8s-cluster-static` and `openporch/k8s-cluster-eks` (describe cluster, presigned STS token) drivers; verify unit tests for the token against known vectors and a kind-based test for the static driver
+- [ ] 9.2 Implement workload rendering for the `openporch/default` profile (Deployment, Service, ConfigMap, Secret, probes, resources, labels, extension file merges, `pod.*` field refs) and the implicit `k8s-cluster`/`k8s-namespace` graph nodes for that profile; verify golden-file tests cover the render scenario in `kubernetes-workloads` and graph tests show the nodes appear only for that profile
+- [ ] 9.3 Implement namespace creation, manifest placement by `location`, server-side apply, readiness waiting with timeout, workload removal and namespace deletion; verify integration tests against kind cover apply, crash-loop failure, removal and environment deletion
+- [ ] 9.4 Implement the runtime status endpoint; verify a kind test reports replica counts for a deployed workload
+- [ ] 9.5 Extend `examples/aws-platform/` with EKS `k8s-cluster` and `k8s-namespace` definitions, switch `examples/score-web/` to profile `openporch/default`, and extend the e2e job (`just e2e-eks`) to check runtime status on the cluster; verify it passes once manually and `docs/e2e.md` is updated
+- [ ] 9.6 Write `docs/kubernetes.md` describing cluster definitions for static and EKS clusters and the getting-started section for deploying to EKS; verify the EKS example validates against the server
 
 ## Workflow follow-up
 - Archive the change once the milestone is implemented and the specs above are promoted to `openspec/specs/`.
