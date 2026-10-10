@@ -109,6 +109,11 @@ impl ResourceType {
             output: output.to_owned(),
             problem,
         };
+        // A name in both maps would be stored and shown once as plaintext, so it is
+        // rejected whether or not the type declares it.
+        if let Some(name) = values.keys().find(|k| secrets.contains(*k)) {
+            return Err(err(name, "must be a secret output, not a value".to_owned()));
+        }
         for (name, schema, required) in self.declared(OutputKind::Value) {
             match values.get(name) {
                 Some(v) => {
@@ -616,6 +621,15 @@ mod tests {
             .validate_outputs(&leaked, &secrets(&["username", "password"]))
             .unwrap_err();
         assert_eq!(e.output, "password");
+
+        // Open types reject an undeclared name present in both maps too.
+        let config = builtin_type("config").unwrap();
+        let both: Map<String, Value> = serde_json::from_value(json!({"token": "x"})).unwrap();
+        let e = config
+            .validate_outputs(&both, &secrets(&["token"]))
+            .unwrap_err();
+        assert_eq!(e.output, "token");
+        assert!(e.problem.contains("must be a secret"));
     }
 
     #[test]

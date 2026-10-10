@@ -523,6 +523,21 @@ fn shared_resources_from_the_set() {
 }
 
 #[test]
+fn numerically_equal_params_do_not_conflict() {
+    let shared = |params: Value| crate::sets::SharedResource {
+        ty: "dns".parse().unwrap(),
+        class: ClassId::default(),
+        params: Some(params),
+    };
+    let with_params = DNS_A.replace("id: api-dns}", "id: api-dns, params: {ttl: 1}}");
+    let mut set = set_of(&[&with_params]);
+    set.shared
+        .insert("api-dns".into(), shared(json!({"ttl": 1.0})));
+    let g = Fixture::new(base_defs()).build(&set).unwrap();
+    assert_eq!(g.nodes[&d("dns.default#shared.api-dns")].requests.len(), 2);
+}
+
+#[test]
 fn omitted_params_conflict_with_supplied_params() {
     let with_params = DNS_A
         .replace("name: alpha", "name: beta")

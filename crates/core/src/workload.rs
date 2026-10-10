@@ -31,8 +31,16 @@ pub const SCORE_API_VERSION: &str = "score.dev/v1b1";
     extend("$id" = "https://openporch.dev/schemas/workload-v1.json"),
     // A workload is either containers or a function.
     extend("oneOf" = [
-        {"required": ["containers"], "not": {"required": ["function"]}},
-        {"required": ["function"], "not": {"required": ["containers"]}}
+        {
+            "required": ["containers"],
+            "properties": {"containers": {"type": "object"}},
+            "anyOf": [{"not": {"required": ["function"]}}, {"properties": {"function": {"type": "null"}}}]
+        },
+        {
+            "required": ["function"],
+            "properties": {"function": {"type": "object"}},
+            "anyOf": [{"not": {"required": ["containers"]}}, {"properties": {"containers": {"type": "null"}}}]
+        }
     ])
 )]
 pub struct Workload {
@@ -792,7 +800,9 @@ impl Workload {
             ));
         }
         // Placeholders: only `resources`, `values` and `pod` roots, and never `context`.
-        let json = serde_json::to_value(self).expect("workloads serialize");
+        // File content with `noExpand` is kept literally.
+        let mut json = serde_json::to_value(self).expect("workloads serialize");
+        set_aside(&mut json, &self.no_expand_pointers(""));
         check_placeholders(&json, "")?;
         Ok(())
     }
@@ -860,7 +870,13 @@ impl Workload {
         }
         let mut secret_paths = Vec::new();
         let mut spec = Value::Object(spec);
+        let kept = set_aside(&mut spec, &self.no_expand_pointers(""));
         translate(&mut spec, "", &self.resources, types, &mut secret_paths)?;
+        for (pointer, content) in kept {
+            *spec
+                .pointer_mut(&pointer)
+                .expect("set-aside content exists") = content;
+        }
         let Value::Object(spec) = spec else {
             unreachable!()
         };
@@ -873,6 +889,23 @@ impl Workload {
             },
             secret_paths,
         })
+    }
+
+    /// JSON pointers to the content of files with `noExpand: true`.
+    fn no_expand_pointers(&self, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, c) in self.containers.iter().flatten() {
+            for (target, f) in &c.files {
+                if f.no_expand == Some(true) && f.content.is_some() {
+                    out.push(format!(
+                        "{prefix}/containers/{}/files/{}/content",
+                        escape_pointer(id),
+                        escape_pointer(target)
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// The published JSON Schema of the workload document.
@@ -957,6 +990,33 @@ fn check_placeholders(v: &Value, path: &str) -> Result<(), WorkloadError> {
     Ok(())
 }
 
+fn escape_pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Replaces the values at `pointers` with `null` and returns them.
+fn set_aside(v: &mut Value, pointers: &[String]) -> Vec<(String, Value)> {
+    pointers
+        .iter()
+        .filter_map(|p| {
+            v.pointer_mut(p)
+                .map(|slot| (p.clone(), std::mem::take(slot)))
+        })
+        .collect()
+}
+
+/// Whether a spec pointer is a workload secret sink: a container or function
+/// variable, or container file content.
+fn is_secret_sink(pointer: &str) -> bool {
+    let segs: Vec<&str> = pointer.trim_start_matches('/').split('/').collect();
+    matches!(
+        segs.as_slice(),
+        ["containers", _, "variables", _]
+            | ["containers", _, "files", _, "content"]
+            | ["function", "variables", _]
+    )
+}
+
 fn translate(
     v: &mut Value,
     pointer: &str,
@@ -972,20 +1032,31 @@ fn translate(
                 return Ok(());
             }
             let mut out = String::new();
-            let mut secret = false;
+            let mut secret: Option<&str> = None;
             for part in &t.parts {
                 match part {
                     Part::Literal(l) => out.push_str(&l.replace("${", "$\\{")),
                     Part::Placeholder(p) if p.root() == "resources" => {
                         let (text, is_secret) = translate_resource_placeholder(p, resources, types)
                             .map_err(|m| WorkloadError::new(&path, m))?;
-                        secret |= is_secret;
+                        if is_secret && secret.is_none() {
+                            secret = Some(&p.text);
+                        }
                         out.push_str(&text);
                     }
                     Part::Placeholder(p) => out.push_str(&p.text),
                 }
             }
-            if secret {
+            if let Some(placeholder) = secret {
+                if !is_secret_sink(pointer) {
+                    return Err(WorkloadError::new(
+                        &path,
+                        format!(
+                            "`{placeholder}` is a secret output; secrets can only be used in \
+                             variables and file content"
+                        ),
+                    ));
+                }
                 secret_paths.push(pointer.to_owned());
             }
             *s = out;
@@ -1003,7 +1074,7 @@ fn translate(
         }
         Value::Object(m) => {
             for (k, item) in m.iter_mut() {
-                let escaped = k.replace('~', "~0").replace('/', "~1");
+                let escaped = escape_pointer(k);
                 translate(
                     item,
                     &format!("{pointer}/{escaped}"),

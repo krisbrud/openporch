@@ -93,24 +93,56 @@
   ],
   "oneOf": [
     {
+      "properties": {
+        "containers": {
+          "type": "object"
+        }
+      },
       "required": [
         "containers"
       ],
-      "not": {
-        "required": [
-          "function"
-        ]
-      }
+      "anyOf": [
+        {
+          "not": {
+            "required": [
+              "function"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "function": {
+              "type": "null"
+            }
+          }
+        }
+      ]
     },
     {
+      "properties": {
+        "function": {
+          "type": "object"
+        }
+      },
       "required": [
         "function"
       ],
-      "not": {
-        "required": [
-          "containers"
-        ]
-      }
+      "anyOf": [
+        {
+          "not": {
+            "required": [
+              "containers"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "containers": {
+              "type": "null"
+            }
+          }
+        }
+      ]
     }
   ],
   "$defs": {

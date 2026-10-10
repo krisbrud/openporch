@@ -280,6 +280,59 @@ resources:
 }
 
 #[test]
+fn secrets_are_only_allowed_in_variables_and_file_content() {
+    let doc = |field: &str| {
+        format!(
+            r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {{name: web}}
+containers:
+  web:
+    image: nginx
+    {field}
+resources:
+  db: {{type: postgres}}
+"#
+        )
+    };
+    let w = parse(&doc(r#"args: ["--password=${resources.db.password}"]"#)).unwrap();
+    let e = w.to_module(&builtin_types()).unwrap_err();
+    assert_eq!(e.path, "containers.web.args.0");
+    assert!(e.message.contains("is a secret output"), "{e}");
+
+    let w = parse(&doc(
+        r#"files: {/etc/pw: {content: "${resources.db.password}"}}"#,
+    ))
+    .unwrap();
+    let c = w.to_module(&builtin_types()).unwrap();
+    assert_eq!(c.secret_paths, ["/containers/web/files/~1etc~1pw/content"]);
+}
+
+#[test]
+fn no_expand_file_content_is_kept_literally() {
+    let w = parse(
+        r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web:
+    image: nginx
+    files:
+      /etc/tpl: {content: "${context.env.id} ${resources.nope.x} ${", noExpand: true}
+"#,
+    )
+    .unwrap();
+    let c = w.to_module(&builtin_types()).unwrap();
+    assert_eq!(
+        c.module.spec["containers"]["web"]["files"]["/etc/tpl"]["content"],
+        "${context.env.id} ${resources.nope.x} ${"
+    );
+    assert!(c.secret_paths.is_empty());
+}
+
+#[test]
 fn context_placeholders_are_rejected() {
     let e = parse(
         r#"
@@ -463,11 +516,12 @@ fn json_schema_rejects_unknown_fields_and_requires_core_fields() {
     assert_eq!(s["additionalProperties"], json!(false));
     assert_eq!(s["required"], json!(["apiVersion", "kind", "metadata"]));
     assert!(s["$defs"]["Trigger"].is_object());
+    // Each branch requires its own kind and allows the other to be absent or null,
+    // matching what the parser accepts.
+    assert_eq!(s["oneOf"][0]["required"], json!(["containers"]));
+    assert_eq!(s["oneOf"][1]["required"], json!(["function"]));
     assert_eq!(
-        s["oneOf"],
-        json!([
-            {"required": ["containers"], "not": {"required": ["function"]}},
-            {"required": ["function"], "not": {"required": ["containers"]}}
-        ])
+        s["oneOf"][1]["anyOf"][1],
+        json!({"properties": {"containers": {"type": "null"}}})
     );
 }

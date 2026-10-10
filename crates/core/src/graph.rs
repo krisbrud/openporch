@@ -164,7 +164,7 @@ struct Builder<'a> {
     input: GraphInput<'a>,
     nodes: BTreeMap<Descriptor, Node>,
     /// The request that fixed each node's params, for conflict messages.
-    explicit: BTreeMap<Descriptor, (String, Value)>,
+    explicit: BTreeMap<Descriptor, (String, String)>,
     queue: VecDeque<Descriptor>,
     co: BTreeSet<CoProvision>,
 }
@@ -264,9 +264,10 @@ impl Builder<'_> {
         }
         let canonical = params.as_ref().map(crate::canonical::to_canonical_string);
         if let Some(node) = self.nodes.get_mut(d) {
-            if let Some(p) = &params {
+            if let (Some(p), Some(c)) = (&params, &canonical) {
+                // Compare canonical forms so `1` and `1.0` count as the same params.
                 match self.explicit.get(d) {
-                    Some((first, existing)) if existing != p => {
+                    Some((first, existing)) if existing != c => {
                         let mut paths = [first.clone(), path.to_owned()];
                         paths.sort();
                         let [first, second] = paths;
@@ -280,7 +281,7 @@ impl Builder<'_> {
                     None => {
                         node.params = Some(p.clone()).filter(|p| !p.is_null());
                         self.explicit
-                            .insert(d.clone(), (path.to_owned(), p.clone()));
+                            .insert(d.clone(), (path.to_owned(), c.clone()));
                     }
                 }
             }
@@ -306,9 +307,9 @@ impl Builder<'_> {
                 source,
             }
         })?;
-        if let Some(p) = &params {
+        if let Some(c) = &canonical {
             self.explicit
-                .insert(d.clone(), (path.to_owned(), p.clone()));
+                .insert(d.clone(), (path.to_owned(), c.clone()));
         }
         self.nodes.insert(
             d.clone(),
