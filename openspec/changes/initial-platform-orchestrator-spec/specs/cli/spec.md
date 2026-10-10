@@ -14,13 +14,17 @@ The `porch` command line is the day-to-day interface for developers and platform
 - **WHEN** `OPENPORCH_URL`, `OPENPORCH_ORG` and `OPENPORCH_TOKEN` are set and `porch get apps` runs
 - **THEN** it lists the organization's applications
 
-### Requirement: Score deploy
+### Requirement: Workload deploy
 
-`porch score deploy -f score.yaml --app A --env E [--extensions file] [--image name=ref] [--property path=value] [--comment text] [--wait]` SHALL convert the file, create a delta, trigger a deployment and, with `--wait`, follow it until it finishes and exit non-zero on failure.
+`porch workload deploy -f workload.yaml --app A --env E [--overlay file] [--image name=ref] [--artifact name=uri] [--property path=value] [--comment text] [--wait]` SHALL accept an openporch workload document or a Score file, convert it, create a delta, trigger a deployment and, with `--wait`, follow it until it finishes and exit non-zero on failure. `porch score deploy` SHALL be an alias that requires a Score file.
 
 #### Scenario: Deploy and wait
-- **WHEN** a developer runs `porch score deploy -f score.yaml --app shop --env dev --wait`
+- **WHEN** a developer runs `porch workload deploy -f workload.yaml --app shop --env dev --wait`
 - **THEN** the command prints the deployment ID, streams per-resource status lines, and exits 0 when the deployment succeeds
+
+#### Scenario: Score alias
+- **WHEN** a developer runs `porch score deploy -f score.yaml --app shop --env dev`
+- **THEN** the Score file is imported and deployed exactly as `porch workload deploy` would
 
 ### Requirement: Object commands
 

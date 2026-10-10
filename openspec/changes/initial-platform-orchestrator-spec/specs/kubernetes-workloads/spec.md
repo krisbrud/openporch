@@ -28,7 +28,15 @@ Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, 
 
 ### Requirement: Workload rendering
 
-The `openporch/kubernetes` driver SHALL render a workload into a `Deployment` (one container per Score container, env vars from variables, files as a ConfigMap or Secret mounted at their paths, probes and resource requests), a `Service` when `service.ports` is set, and a `Secret` for secret variables. Labels SHALL identify app, env, workload and deployment ID.
+The `openporch/kubernetes` driver SHALL render a container workload into a `Deployment` (containers, env from variables, files as ConfigMap or Secret mounts, probes, resource requests), a `Service` when `service.ports` is set, and a `Secret` for secret variables, labelled with app, env, workload and deployment ID. A `schedule` trigger renders a `CronJob` instead. Function workloads and `queue`, `topic` or `stream` triggers SHALL fail naming the unsupported kind.
+
+#### Scenario: Function workload on Kubernetes
+- **WHEN** a function workload is matched to an `openporch/kubernetes` definition
+- **THEN** provisioning fails stating the Kubernetes driver supports container workloads only
+
+#### Scenario: Scheduled container
+- **WHEN** a container workload declares `triggers.nightly.schedule.cron: "0 3 * * *"`
+- **THEN** a CronJob with that schedule runs the container
 
 #### Scenario: Render a web workload
 - **WHEN** workload `web` has a container `main` with image `nginx`, a non-secret variable, a secret variable and port `80 -> 8080`

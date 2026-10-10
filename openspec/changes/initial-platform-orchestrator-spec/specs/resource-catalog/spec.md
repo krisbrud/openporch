@@ -16,7 +16,7 @@ The orchestrator SHALL ship with built-in resource types compatible in ID, use (
 
 #### Scenario: Workload type
 - **WHEN** a client reads type `workload`
-- **THEN** its inputs are `id`, `class`, `spec` (resolved containers, variables, files, service ports and extension spec) and `dependencies` (outputs of its direct dependencies), and its outputs schema is open so targets can publish what they create, such as `url`
+- **THEN** its inputs are `id`, `class`, `spec` (the resolved workload document: containers or function, triggers, service, deploy, target) and `dependencies` (outputs of its direct dependencies), and its outputs schema is open so targets can publish what they create, such as `url`
 
 #### Scenario: Postgres outputs
 - **WHEN** a client reads type `postgres`
@@ -28,7 +28,7 @@ Clients SHALL be able to create resource types with an ID prefixed by the org ID
 
 #### Scenario: Create a custom type
 - **WHEN** a client creates type `acme/feature-flags` with outputs schema `{sdk_key: secret string}`
-- **THEN** resource definitions may target `acme/feature-flags` and workloads may request it in Score
+- **THEN** resource definitions may target `acme/feature-flags` and workloads may request it under `resources`
 
 #### Scenario: Modify a built-in type
 - **WHEN** a client tries to update type `postgres`
@@ -44,7 +44,7 @@ A resource class SHALL be defined per resource type with an ID and description. 
 
 ### Requirement: Output schema enforcement
 
-When a driver returns outputs for a resource, the orchestrator SHALL verify that every output named in the type's output schema is present and of the declared kind (value or secret). Extra outputs are allowed but SHALL NOT be usable from Score.
+When a driver returns outputs for a resource, the orchestrator SHALL verify that every output named in the type's output schema is present and of the declared kind (value or secret). Extra outputs are allowed but SHALL NOT be usable from workload documents.
 
 #### Scenario: Missing required output
 - **WHEN** the definition for `postgres` returns no `host`

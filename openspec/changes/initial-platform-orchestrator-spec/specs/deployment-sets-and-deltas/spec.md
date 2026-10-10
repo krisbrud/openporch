@@ -34,12 +34,12 @@ Applying a delta to a set SHALL process `modules.remove`, then `modules.add`, th
 - **WHEN** a delta adding workload `web` is applied to an environment with no deployments
 - **THEN** the resulting set contains only `web`
 
-### Requirement: Delta from Score
+### Requirement: Delta from a workload document
 
-`POST /orgs/{org}/apps/{app}/deltas` SHALL accept either a raw delta or a Score conversion request, and `porch score deploy` SHALL build a delta whose `modules.add` or `modules.update` brings the named workload to the Score file's content relative to the environment's current set.
+`POST /orgs/{org}/apps/{app}/deltas` SHALL accept either a raw delta or a workload conversion request (an openporch workload document or a Score file plus overlay), and `porch workload deploy` SHALL build a delta whose `modules.add` or `modules.update` brings the named workload to the document's content relative to the environment's current set.
 
-#### Scenario: Redeploy unchanged Score
-- **WHEN** the same Score file is deployed twice to the same environment
+#### Scenario: Redeploy unchanged workload
+- **WHEN** the same workload document is deployed twice to the same environment
 - **THEN** the second delta applied yields the same set ID as the first deployment
 
 ### Requirement: Set diff

@@ -5,7 +5,8 @@ context: |
   openporch is an open source platform orchestrator written in Rust, modeled on
   the Humanitec Platform Orchestrator (https://developer.humanitec.com/platform-orchestrator/docs/).
   Platform teams configure it with OpenTofu (never Terraform) through an
-  openporch OpenTofu provider; developers describe workloads with Score.
+  openporch OpenTofu provider; developers describe workloads with the openporch
+  workload document (containers or functions), with Score files accepted as an import.
   When a cloud must be chosen, AWS compatibility comes first.
   Humanitec's public docs and example repositories may inspire the design, but
   their licenses must be respected: no code is copied from them.
