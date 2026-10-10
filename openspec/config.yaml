@@ -1,0 +1,22 @@
+schema: spec-driven
+
+# Project context: constraints that guide every OpenSpec artifact in this repo.
+context: |
+  openporch is an open source platform orchestrator written in Rust, modeled on
+  the Humanitec Platform Orchestrator (https://developer.humanitec.com/platform-orchestrator/docs/).
+  Platform teams configure it with OpenTofu (never Terraform) through an
+  openporch OpenTofu provider; developers describe workloads with Score.
+  When a cloud must be chosen, AWS compatibility comes first.
+  Humanitec's public docs and example repositories may inspire the design, but
+  their licenses must be respected: no code is copied from them.
+  Specs describe observable behavior of the orchestrator API, CLI and provider;
+  Rust crate layout and library choices belong in design.md only.
+
+rules:
+  proposal:
+    - Always state what is out of scope for the milestone
+  specs:
+    - Use Humanitec's vocabulary (application, environment, resource definition,
+      driver, deployment set, delta, resource graph) unless the design renames it
+  tasks:
+    - Each task group lands its own tests
