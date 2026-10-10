@@ -1,0 +1,19 @@
+[package]
+name = "openporch-cli"
+description = "The porch command-line interface for openporch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "porch"
+path = "src/main.rs"
+
+[dependencies]
+openporch-client.workspace = true
+
+[lints]
+workspace = true
