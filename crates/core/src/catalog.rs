@@ -272,6 +272,18 @@ fn ty(
     }
 }
 
+/// The built-in drivers of milestone 1. The Kubernetes drivers join this list when
+/// they are implemented.
+pub const BUILTIN_DRIVERS: &[&str] = &[
+    "openporch/echo",
+    "openporch/none",
+    "openporch/template",
+    "openporch/opentofu",
+];
+
+/// The driver namespace reserved for built-in drivers.
+pub const BUILTIN_DRIVER_NAMESPACE: &str = "openporch";
+
 /// The built-in resource types.
 pub fn builtin_types() -> Vec<ResourceType> {
     use ResourceUse::{Direct, Implicit, Indirect};

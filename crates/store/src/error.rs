@@ -41,6 +41,9 @@ pub enum StoreError {
     /// The idempotency key was used before with different content.
     #[error("idempotency key `{0}` was already used for a different request")]
     IdempotencyMismatch(String),
+    /// The request refers to something that does not exist or is malformed.
+    #[error("{0}")]
+    Invalid(String),
     /// A conflict with the object's current state.
     #[error("{0}")]
     Conflict(String),

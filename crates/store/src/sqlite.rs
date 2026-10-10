@@ -283,7 +283,7 @@ async fn ensure_env_type(conn: &mut SqliteConnection, org: &str, id: &str) -> Re
     Ok(())
 }
 
-fn unique_violation(e: &sqlx::Error) -> bool {
+pub(crate) fn unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }
 

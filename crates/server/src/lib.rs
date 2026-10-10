@@ -8,6 +8,7 @@ mod handlers;
 pub mod identity;
 pub mod login;
 pub mod rbac;
+mod secret_inputs;
 pub mod state;
 
 #[cfg(test)]
