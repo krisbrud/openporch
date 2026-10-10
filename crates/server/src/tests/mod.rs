@@ -24,6 +24,7 @@ struct Server {
     admin: String,
 }
 
+mod envs;
 mod github;
 
 async fn server_in(dir: TempDir) -> Server {

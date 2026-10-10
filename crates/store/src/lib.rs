@@ -18,9 +18,9 @@ mod sqlite_identity;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
-    Acceptance, ActiveResource, CheckpointResult, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, EnvRecord, OperationKind, OperationStart, OperationStarted, Provisioned,
-    RecoveryReport, UncertainOperation,
+    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
+    DeploymentStatus, DraftDelta, EnvRecord, OperationKind, OperationStart, OperationStarted,
+    Provisioned, RecoveryReport, UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -86,7 +86,8 @@ pub trait Store: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Creates an empty environment.
+    /// Creates an environment, empty or with a draft delta. The actor must hold
+    /// `developer` or `owner` on the application and `deployer` on the type.
     fn create_env(
         &self,
         org: &str,
@@ -94,8 +95,63 @@ pub trait Store: Send + Sync {
         id: &str,
         name: &str,
         env_type: &str,
+        draft: Option<DraftDelta>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Lists an application's environments.
+    fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
+
+    /// Deletes an environment that has never been deployed, with its drafts and
+    /// values. `development` stays while its application exists, and deployed
+    /// environments are rejected until deprovisioning on delete exists.
+    fn delete_env(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Deletes an environment type no environment uses.
+    fn delete_env_type(
+        &self,
+        org: &str,
+        id: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The latest deployment attempt in an environment.
+    fn latest_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+    ) -> impl Future<Output = Result<Option<DeploymentRecord>>> + Send;
+
+    /// Finds a deployment by ID in any environment of an application.
+    fn app_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<DeploymentRecord>>> + Send;
+
+    /// Reads a delta.
+    fn delta(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<DeltaRecord>>> + Send;
+
+    /// Reads a stored deployment set.
+    fn set(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<openporch_core::sets::DeploymentSet>>> + Send;
 
     /// Reads an environment's runtime summary.
     fn env(
