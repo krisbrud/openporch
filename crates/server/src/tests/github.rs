@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -113,12 +113,20 @@ async fn user(State(m): State<Shared>, headers: HeaderMap) -> Result<Json<Value>
     Ok(Json(account_json(&a)))
 }
 
-async fn emails(State(m): State<Shared>, headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
+async fn emails(
+    State(m): State<Shared>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
     let m = m.lock().unwrap();
     let a = bearer_account(&m, &headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let per_page: usize = q.get("per_page").map_or(30, |v| v.parse().unwrap());
+    let page: usize = q.get("page").map_or(1, |v| v.parse().unwrap());
     Ok(Json(Value::Array(
         a.emails
             .iter()
+            .skip((page - 1) * per_page)
+            .take(per_page)
             .map(|(e, p, v)| json!({"email": e, "primary": p, "verified": v, "visibility": null}))
             .collect(),
     )))
@@ -356,17 +364,14 @@ async fn email_invitations_need_a_verified_github_email() {
         .await;
     let (status, b) = s.github_login(&gh, 8, Some(&code)).await;
     assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
-    // Once GitHub has verified it, the same code works, also as a secondary address,
-    // and the member gets the invited address.
-    gh.account(
-        8,
-        "bob",
-        &[
-            ("bob@personal.example", true, true),
-            ("bob@example.com", false, true),
-            ("bob@unverified.example", false, false),
-        ],
-    );
+    // Once GitHub has verified it, the same code works, also as a secondary address
+    // on a later page, and the member gets the invited address.
+    let others: Vec<String> = (0..150).map(|i| format!("old{i}@example.org")).collect();
+    let mut emails = vec![("bob@personal.example", true, true)];
+    emails.extend(others.iter().map(|e| (e.as_str(), false, true)));
+    emails.push(("bob@unverified.example", false, false));
+    emails.push(("bob@example.com", false, true));
+    gh.account(8, "bob", &emails);
     let (status, b) = s.github_login(&gh, 8, Some(&code)).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     let (_, me) = s

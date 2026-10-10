@@ -141,6 +141,9 @@ pub struct Github {
 
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const SCOPES: &str = "read:user user:email";
+/// GitHub's largest page of email addresses, and a bound on how many pages are read.
+const EMAIL_PAGE_SIZE: usize = 100;
+const EMAIL_PAGES: usize = 10;
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -224,10 +227,22 @@ impl Github {
             .api_get("user", Some(token))
             .await?
             .ok_or_else(|| unavailable("GitHub did not return the user"))?;
-        let emails: Vec<GithubEmail> = self
-            .api_get("user/emails", Some(token))
-            .await?
-            .unwrap_or_default();
+        // Every page of addresses, so an invited address on a later page still counts.
+        let mut emails: Vec<GithubEmail> = Vec::new();
+        for page in 1..=EMAIL_PAGES {
+            let batch: Vec<GithubEmail> = self
+                .api_get(
+                    &format!("user/emails?per_page={EMAIL_PAGE_SIZE}&page={page}"),
+                    Some(token),
+                )
+                .await?
+                .unwrap_or_default();
+            let last = batch.len() < EMAIL_PAGE_SIZE;
+            emails.extend(batch);
+            if last {
+                break;
+            }
+        }
         // Only addresses GitHub has verified, primary first.
         let mut verified: Vec<GithubEmail> = emails.into_iter().filter(|e| e.verified).collect();
         verified.sort_by_key(|e| !e.primary);
