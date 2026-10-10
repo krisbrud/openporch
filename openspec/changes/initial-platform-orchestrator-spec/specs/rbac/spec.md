@@ -16,7 +16,7 @@ Roles SHALL exist at three levels with Humanitec-compatible IDs: organization (`
 
 ### Requirement: Organization permissions
 
-`administrator` may do everything and is the only role that manages resource types, classes, definitions, drivers, cloud accounts, secret stores and environment type roles. `manager` may invite and remove non-administrators and create applications. `orgViewer` may read everything. `member` sees only applications where they hold a role.
+The orchestrator SHALL grant `administrator` every permission and SHALL reserve management of resource types, classes, definitions, drivers, cloud accounts, secret stores and environment type roles to it. `manager` SHALL be able to invite and remove non-administrators and create applications. `orgViewer` SHALL be able to read everything. `member` SHALL see only applications where they hold a role.
 
 #### Scenario: Manager creates a definition
 - **WHEN** a `manager` posts a resource definition
@@ -24,7 +24,7 @@ Roles SHALL exist at three levels with Humanitec-compatible IDs: organization (`
 
 ### Requirement: Application permissions
 
-`viewer` reads the application. `developer` also edits sets, deltas, values and environments. `owner` also manages application users and deletes the application.
+`viewer` SHALL be able to read the application. `developer` SHALL additionally be able to edit sets, deltas, values and environments. `owner` SHALL additionally be able to manage application users and delete the application.
 
 #### Scenario: Developer edits definitions
 - **WHEN** a `developer` without an organization administrator role posts a resource definition
