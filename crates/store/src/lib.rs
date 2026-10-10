@@ -19,8 +19,8 @@ mod sqlite_identity;
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, DraftDelta, EnvRecord, OperationKind, OperationStart, OperationStarted,
-    Provisioned, RecoveryReport, UncertainOperation,
+    DeploymentStatus, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
+    OperationStarted, Provisioned, RecoveryReport, UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -92,10 +92,7 @@ pub trait Store: Send + Sync {
         &self,
         org: &str,
         app: &str,
-        id: &str,
-        name: &str,
-        env_type: &str,
-        draft: Option<DraftDelta>,
+        env: NewEnv,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 

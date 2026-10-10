@@ -33,6 +33,19 @@ pub struct EnvRecord {
     pub state: String,
 }
 
+/// A new environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEnv {
+    /// Environment ID.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Environment type.
+    pub env_type: String,
+    /// A draft delta created with it, for a clone.
+    pub draft: Option<DraftDelta>,
+}
+
 /// A draft delta created together with an environment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DraftDelta {

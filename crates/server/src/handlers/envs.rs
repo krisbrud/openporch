@@ -6,7 +6,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::sets::{DeploymentSet, diff_sets};
 use openporch_store::{
-    DeploymentRecord, DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, OrgRole, Store,
+    DeploymentRecord, DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, NewEnv, OrgRole,
+    Store,
 };
 use serde::{Deserialize, Serialize};
 
@@ -182,10 +183,12 @@ pub async fn create(
         .create_env(
             org,
             &app,
-            &body.id,
-            body.name.as_deref().unwrap_or(&body.id),
-            &body.env_type,
-            draft,
+            NewEnv {
+                id: body.id.clone(),
+                name: body.name.clone().unwrap_or_else(|| body.id.clone()),
+                env_type: body.env_type.clone(),
+                draft,
+            },
             ctx.audit(org, "env.create", format!("{app}/{}", body.id)),
         )
         .await?;

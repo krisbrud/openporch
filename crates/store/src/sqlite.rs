@@ -403,13 +403,17 @@ impl Store for SqliteStore {
         &self,
         org: &str,
         app: &str,
-        id: &str,
-        name: &str,
-        env_type: &str,
-        draft: Option<DraftDelta>,
+        env: NewEnv,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
+        let NewEnv {
+            id,
+            name,
+            env_type,
+            draft,
+        } = env;
+        let (id, name, env_type) = (id.as_str(), name.as_str(), env_type.as_str());
         let mut tx = self.begin().await?;
         let type_exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM env_types WHERE org_id = ? AND id = ?")
@@ -629,16 +633,16 @@ impl Store for SqliteStore {
 
     async fn delta(&self, org: &str, app: &str, id: &str) -> Result<Option<DeltaRecord>> {
         self.check_org(org)?;
-        let row: Option<(String, Option<String>, String, Option<i64>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+        type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
+        let row: Option<DeltaRow> = sqlx::query_as(
+            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
                  WHERE org_id = ? AND app_id = ? AND id = ?",
-            )
-            .bind(org)
-            .bind(app)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        )
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(|(id, env, content, frozen_at, created_by)| {
             Ok(DeltaRecord {
                 content: serde_json::from_str(&content)

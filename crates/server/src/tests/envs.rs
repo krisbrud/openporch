@@ -3,7 +3,7 @@
 
 use axum::http::StatusCode;
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
-use openporch_store::{AuditIntent, DeploymentRecord, DeploymentRequest, Store};
+use openporch_store::{AuditIntent, DeploymentRecord, DeploymentRequest, NewEnv, Store};
 use serde_json::json;
 
 use super::{Server, assert_error, server};
@@ -179,7 +179,17 @@ async fn environment_authority_is_rechecked_with_the_change() {
     let e = s
         .state
         .store
-        .create_env("acme", "shop", "staging", "staging", "staging", None, audit)
+        .create_env(
+            "acme",
+            "shop",
+            NewEnv {
+                id: "staging".into(),
+                name: "staging".into(),
+                env_type: "staging".into(),
+                draft: None,
+            },
+            audit,
+        )
         .await
         .unwrap_err();
     assert!(e.to_string().contains("`deployer`"), "{e}");
