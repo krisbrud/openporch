@@ -232,6 +232,15 @@ async fn bootstrap(config: &Config, store: &SqliteStore) -> Result<(), StartupEr
     let token = auth::new_token();
     let expires = openporch_store::now_ms() + i64::from(config.bootstrap_token_hours) * 3_600_000;
 
+    // Refuse before committing anything, so the token always reaches the configured
+    // path and a retry after removing the stale file bootstraps again.
+    let path = config.bootstrap_token_path();
+    if path.symlink_metadata().is_ok() {
+        return Err(StartupError::Io(format!(
+            "{} already exists in a new installation; remove the stale file and start again",
+            path.display()
+        )));
+    }
     let pending = pending_bootstrap_path(config);
     match std::fs::remove_file(&pending) {
         Ok(()) => {}
@@ -252,12 +261,5 @@ async fn bootstrap(config: &Config, store: &SqliteStore) -> Result<(), StartupEr
         return Err(e.into());
     }
     finish_bootstrap_file(config)?;
-    if pending.exists() {
-        tracing::warn!(
-            existing = %config.bootstrap_token_path().display(),
-            path = %pending.display(),
-            "a bootstrap token file already existed; the new token is in the pending file"
-        );
-    }
     Ok(())
 }

@@ -1526,3 +1526,20 @@ async fn other_organizations_are_hidden_before_routing() {
         .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn stale_bootstrap_file_stops_a_new_installation_without_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bootstrap-token"), "opt_stale\n").unwrap();
+    let e = start(Config::new("acme", dir.path()), None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("remove the stale file"), "{e}");
+    // After removing it, the next start bootstraps normally.
+    std::fs::remove_file(dir.path().join("bootstrap-token")).unwrap();
+    let s = server_in(dir).await;
+    assert_eq!(
+        s.get("/orgs/acme/current-user", &s.admin).await.0,
+        StatusCode::OK
+    );
+}
