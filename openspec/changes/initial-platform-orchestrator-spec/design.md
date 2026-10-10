@@ -98,6 +98,14 @@ Alternatives: a built-in Rust Lambda driver (rejected: the module is auditable a
 
 Kubernetes is the last phase of the milestone. Until it lands, the `openporch/none` and Lambda workload targets make the whole AWS path (cloud accounts, OpenTofu driver, RDS, DynamoDB, S3, SQS, rollback, deprovisioning) deployable and testable without any cluster.
 
+**Rendering is pure.** `crates/k8s` renders a resolved workload into a manifest list with no cluster access: no reads of live objects, no defaulting from the API server. Apply, readiness, removal and status are separate steps. This keeps the golden-file tests honest and leaves room for other ways to deliver manifests.
+
+**Deferred: GitOps delivery.** Humanitec's Operator exists for customer-owned secret stores, private cluster endpoints and GitOps. The first two are answered by the executor boundary (D10). GitOps is not in milestone 1 (an independent review on 2026-10-10 concluded that a render/apply "sink" split now would change the driver contract and the direct-apply path for no milestone benefit). If it is added later:
+(a) Select it per environment through the `k8s-cluster` resource, for example an `openporch/k8s-cluster-git` driver whose outputs name a repository, branch and path, matched by criteria like any cluster. No second workload driver.
+(b) A deployment succeeds once the commit is pushed; readiness waiting does not apply. Runtime status needs a separate read-only cluster credential. The namespace and its removal become file changes in Git, not API calls.
+(c) Secrets reach Git only as references, preferably as External Secrets Operator `ExternalSecret` objects pointing at the same AWS Secrets Manager or SSM store the orchestrator references. This requires an external primary store, because the built-in store would otherwise need an endpoint that returns values, which the secrets spec forbids. The executor and driver contracts gain a "references, not values" mode at that point, confined to the Kubernetes crate.
+(d) Humanitec's custom resource definitions and in-cluster reconciliation are not adopted.
+
 Alternatives: shelling out to `kubectl` (rejected: binary dependency and weaker typing); an in-cluster operator like Humanitec's (rejected: non-goal, adds a second component).
 
 ### D9. Placeholder engine
@@ -167,6 +175,7 @@ Greenfield: there is nothing to migrate. Deployment is one binary plus a data di
 
 ## Open Questions
 
+- GitOps delivery and how its secrets are handled (see D8).
 - Which Kubernetes minor versions to support officially (affects only the `k8s-openapi` feature flag and the test matrix).
 - Whether the first release ships a container image in addition to the binary.
 - When to promote Postgres from "CI-tested" to "documented for production".
