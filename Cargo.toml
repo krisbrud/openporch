@@ -24,6 +24,18 @@ openporch-store = { path = "crates/store" }
 openporch-drivers = { path = "crates/drivers" }
 openporch-engine = { path = "crates/engine" }
 openporch-client = { path = "crates/client" }
+base64 = "0.22"
+indexmap = { version = "2", features = ["serde"] }
+json-patch = "4"
+proptest = "1"
+regex = "1"
+schemars = { version = "1", features = ["indexmap2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+thiserror = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
