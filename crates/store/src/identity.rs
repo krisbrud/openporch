@@ -480,6 +480,36 @@ pub(crate) async fn check_app_authority(
     }
 }
 
+/// Creating or deleting an environment needs `developer` or `owner` on the application
+/// and `deployer` on the environment type (administrators hold both), checked inside
+/// the transaction.
+pub(crate) async fn check_env_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    app: &str,
+    env_type: &str,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let roles = roles_in(conn, org, actor).await?;
+    if roles.org == Some(OrgRole::Administrator) {
+        return Ok(());
+    }
+    if roles.apps.get(app).copied() < Some(AppRole::Developer) {
+        return Err(StoreError::Forbidden(format!(
+            "`{actor}` is not `developer` or `owner` on `{app}`"
+        )));
+    }
+    if !roles.deployer.contains(env_type) {
+        return Err(StoreError::Forbidden(format!(
+            "requires the `deployer` role on environment type `{env_type}`"
+        )));
+    }
+    Ok(())
+}
+
 /// Environment type role changes need administrator, checked inside the transaction.
 pub(crate) async fn check_admin_authority(
     conn: &mut SqliteConnection,

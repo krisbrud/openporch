@@ -272,6 +272,20 @@ pub async fn create_env_type(
     ))
 }
 
+/// Deletes an environment type no environment uses.
+pub async fn delete_env_type(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let org = state.org();
+    state
+        .store
+        .delete_env_type(org, &id, ctx.audit(org, "env_type.delete", &id))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn env_type_users(
     State(state): State<AppState>,
     Path((_, id)): Path<(String, String)>,

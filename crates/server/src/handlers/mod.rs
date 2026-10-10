@@ -2,6 +2,7 @@
 
 mod apps;
 mod audit;
+mod envs;
 mod health;
 mod login;
 mod members;
@@ -162,6 +163,31 @@ pub fn api(state: AppState) -> Api {
             App(AppPerm::Manage),
             apps::remove_user,
         )
+        // Environments.
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs",
+            App(AppPerm::Read),
+            envs::list,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs",
+            App(AppPerm::Configure),
+            envs::create,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}",
+            App(AppPerm::Read),
+            envs::get,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/apps/{app}/envs/{env}",
+            App(AppPerm::Deploy),
+            envs::delete,
+        )
         // Environment types.
         .route(
             get(),
@@ -180,6 +206,12 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/env-types/{type}",
             Org(OrgPerm::ReadMembers),
             apps::env_type,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/env-types/{type}",
+            Org(OrgPerm::Administer),
+            apps::delete_env_type,
         )
         .route(
             get(),

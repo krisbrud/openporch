@@ -33,6 +33,43 @@ pub struct EnvRecord {
     pub state: String,
 }
 
+/// A new environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEnv {
+    /// Environment ID.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Environment type.
+    pub env_type: String,
+    /// A draft delta created with it, for a clone.
+    pub draft: Option<DraftDelta>,
+}
+
+/// A draft delta created together with an environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftDelta {
+    /// Delta ID.
+    pub id: String,
+    /// The delta.
+    pub content: Value,
+}
+
+/// A stored delta.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeltaRecord {
+    /// Delta ID.
+    pub id: String,
+    /// The environment it was created for, if any.
+    pub env: Option<String>,
+    /// The delta.
+    pub content: Value,
+    /// Whether a deployment froze it.
+    pub frozen: bool,
+    /// The creating principal.
+    pub created_by: Option<String>,
+}
+
 /// A request to accept a deployment.
 #[derive(Debug, Clone)]
 pub struct DeploymentRequest {

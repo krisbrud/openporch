@@ -11,6 +11,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditEntry, AuditIntent, AuditOutcome};
 use crate::deploy::*;
+use crate::identity::{check_admin_authority, check_env_authority};
 use crate::secrets::{BUILTIN_STORE, Sealed};
 use crate::{Ownership, Result, Store, StoreError, now_ms};
 
@@ -213,6 +214,39 @@ impl DeploymentRow {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct EnvRow {
+    app_id: String,
+    id: String,
+    name: String,
+    #[sqlx(rename = "type")]
+    env_type: String,
+    generation: i64,
+    desired_set_id: Option<String>,
+    last_successful_set_id: Option<String>,
+    last_successful_deploy_id: Option<String>,
+    state: String,
+}
+
+impl EnvRow {
+    fn into_record(self) -> EnvRecord {
+        EnvRecord {
+            app: self.app_id,
+            id: self.id,
+            name: self.name,
+            env_type: self.env_type,
+            generation: self.generation,
+            desired_set_id: self.desired_set_id,
+            last_successful_set_id: self.last_successful_set_id,
+            last_successful_deploy_id: self.last_successful_deploy_id,
+            state: self.state,
+        }
+    }
+}
+
+const ENV_COLUMNS: &str = "app_id, id, name, type, generation, desired_set_id, \
+     last_successful_set_id, last_successful_deploy_id, state";
+
 const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, seq, actor_id, set_id, delta_id, comment, \
      generation, status, error, created_at, finished_at";
 
@@ -369,12 +403,17 @@ impl Store for SqliteStore {
         &self,
         org: &str,
         app: &str,
-        id: &str,
-        name: &str,
-        env_type: &str,
+        env: NewEnv,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
+        let NewEnv {
+            id,
+            name,
+            env_type,
+            draft,
+        } = env;
+        let (id, name, env_type) = (id.as_str(), name.as_str(), env_type.as_str());
         let mut tx = self.begin().await?;
         let type_exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM env_types WHERE org_id = ? AND id = ?")
@@ -396,6 +435,8 @@ impl Store for SqliteStore {
         if app_exists.is_none() {
             return Err(StoreError::NotFound(format!("application `{app}`")));
         }
+        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, env_type).await?;
+        let now = now_ms();
         let res = sqlx::query(
             "INSERT INTO envs (org_id, app_id, id, name, type, created_at, created_by) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -405,7 +446,7 @@ impl Store for SqliteStore {
         .bind(id)
         .bind(name)
         .bind(env_type)
-        .bind(now_ms())
+        .bind(now)
         .bind(&audit.actor)
         .execute(&mut *tx)
         .await;
@@ -417,44 +458,233 @@ impl Store for SqliteStore {
             )));
         }
         res?;
+        if let Some(draft) = draft {
+            let res = sqlx::query(
+                "INSERT INTO deltas (org_id, app_id, id, env_id, content, created_at, created_by, \
+                 updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(&draft.id)
+            .bind(id)
+            .bind(draft.content.to_string())
+            .bind(now)
+            .bind(&audit.actor)
+            .bind(now)
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = &res
+                && unique_violation(e)
+            {
+                return Err(StoreError::AlreadyExists(format!("delta `{}`", draft.id)));
+            }
+            res?;
+        }
         audit::insert(&mut tx, &audit, None, None).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    async fn env(&self, org: &str, app: &str, env: &str) -> Result<Option<EnvRecord>> {
+    async fn envs(&self, org: &str, app: &str) -> Result<Vec<EnvRecord>> {
         self.check_org(org)?;
-        #[allow(clippy::type_complexity)]
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-        )> = sqlx::query_as(
-            "SELECT app_id, id, name, type, generation, desired_set_id, last_successful_set_id, \
-             last_successful_deploy_id, state FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+        let rows: Vec<EnvRow> = sqlx::query_as(&format!(
+            "SELECT {ENV_COLUMNS} FROM envs WHERE org_id = ? AND app_id = ? ORDER BY id"
+        ))
+        .bind(org)
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(EnvRow::into_record).collect())
+    }
+
+    async fn delete_env(&self, org: &str, app: &str, env: &str, audit: AuditIntent) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let env_type: Option<String> =
+            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
+                .bind(org)
+                .bind(app)
+                .bind(env)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(env_type) = env_type else {
+            return Err(StoreError::NotFound(format!("environment `{app}/{env}`")));
+        };
+        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
+        if env == "development" {
+            return Err(StoreError::Conflict(
+                "the `development` environment exists as long as its application".into(),
+            ));
+        }
+        let (deployed,): (i64,) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM deployments WHERE org_id = ?1 AND app_id = ?2 AND env_id = ?3) \
+                  + (SELECT COUNT(*) FROM active_resources WHERE org_id = ?1 AND app_id = ?2 AND env_id = ?3)",
         )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_one(&mut *tx)
+        .await?;
+        if deployed > 0 {
+            return Err(StoreError::Conflict(format!(
+                "environment `{app}/{env}` has deployments; deleting deployed environments is \
+                 not supported yet"
+            )));
+        }
+        for table in [
+            "app_values",
+            "value_set_versions",
+            "deltas",
+            "secret_grants",
+            "envs",
+        ] {
+            let column = if table == "envs" { "id" } else { "env_id" };
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE org_id = ? AND app_id = ? AND {column} = ?"
+            ))
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *tx)
+            .await?;
+        }
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_env_type(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM env_types WHERE org_id = ? AND id = ?")
+                .bind(org)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(format!("environment type `{id}`")));
+        }
+        let users: Vec<String> = sqlx::query_scalar(
+            "SELECT app_id || '/' || id FROM envs WHERE org_id = ? AND type = ? ORDER BY app_id, id LIMIT 5",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !users.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "environment type `{id}` is used by {}",
+                users.join(", ")
+            )));
+        }
+        sqlx::query("DELETE FROM env_type_roles WHERE org_id = ? AND env_type_id = ?")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM env_types WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn latest_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+    ) -> Result<Option<DeploymentRecord>> {
+        self.check_org(org)?;
+        let row: Option<DeploymentRow> = sqlx::query_as(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS} FROM deployments \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? ORDER BY seq DESC LIMIT 1"
+        ))
         .bind(org)
         .bind(app)
         .bind(env)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| EnvRecord {
-            app: r.0,
-            id: r.1,
-            name: r.2,
-            env_type: r.3,
-            generation: r.4,
-            desired_set_id: r.5,
-            last_successful_set_id: r.6,
-            last_successful_deploy_id: r.7,
-            state: r.8,
-        }))
+        row.map(DeploymentRow::into_record).transpose()
+    }
+
+    async fn app_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+    ) -> Result<Option<DeploymentRecord>> {
+        self.check_org(org)?;
+        let row: Option<DeploymentRow> = sqlx::query_as(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE org_id = ? AND app_id = ? AND id = ?"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(DeploymentRow::into_record).transpose()
+    }
+
+    async fn delta(&self, org: &str, app: &str, id: &str) -> Result<Option<DeltaRecord>> {
+        self.check_org(org)?;
+        type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
+        let row: Option<DeltaRow> = sqlx::query_as(
+            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+                 WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(id, env, content, frozen_at, created_by)| {
+            Ok(DeltaRecord {
+                content: serde_json::from_str(&content)
+                    .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
+                id,
+                env,
+                frozen: frozen_at.is_some(),
+                created_by,
+            })
+        })
+        .transpose()
+    }
+
+    async fn set(&self, org: &str, app: &str, id: &str) -> Result<Option<DeploymentSet>> {
+        self.check_org(org)?;
+        let content: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM sets WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        content
+            .map(|c| {
+                serde_json::from_str(&c)
+                    .map_err(|e| StoreError::Corrupt(format!("set `{id}`: {e}")))
+            })
+            .transpose()
+    }
+
+    async fn env(&self, org: &str, app: &str, env: &str) -> Result<Option<EnvRecord>> {
+        self.check_org(org)?;
+        let row: Option<EnvRow> = sqlx::query_as(&format!(
+            "SELECT {ENV_COLUMNS} FROM envs WHERE org_id = ? AND app_id = ? AND id = ?"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(EnvRow::into_record))
     }
 
     async fn put_set(&self, org: &str, app: &str, set: &DeploymentSet) -> Result<String> {
