@@ -201,8 +201,21 @@ async fn custom_types_are_org_prefixed_and_built_ins_are_fixed() {
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 
-    // Once unused, the custom type can be deleted.
+    // Co-provisioning keeps the type too.
     s.delete("/orgs/acme/resources/defs/flags", &s.admin).await;
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "with-flags", "type": "redis", "driver_type": "openporch/echo",
+               "provision": {"acme/feature-flags": {}}}),
+    )
+    .await;
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(b["message"].as_str().unwrap().contains("with-flags"), "{b}");
+
+    // Once unused, the custom type can be deleted.
+    s.delete("/orgs/acme/resources/defs/with-flags", &s.admin)
+        .await;
     let (status, b) = s.delete(path, &s.admin).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
     assert_eq!(s.get(path, &s.admin).await.0, StatusCode::NOT_FOUND);

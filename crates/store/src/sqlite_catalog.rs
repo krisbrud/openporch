@@ -414,6 +414,52 @@ async fn check_criterion(
     Ok(())
 }
 
+/// Checks that every co-provisioning key names an existing type.
+async fn check_provision(
+    conn: &mut SqliteConnection,
+    org: &str,
+    provision: &BTreeMap<String, Provision>,
+) -> Result<()> {
+    for key in provision.keys() {
+        let target = ResourceRef::parse(key)
+            .map_err(|e| StoreError::Invalid(format!("`provision` key `{key}` is invalid: {e}")))?;
+        if !type_exists(conn, org, target.ty.as_str()).await? {
+            return Err(StoreError::Invalid(format!(
+                "`provision` key `{key}` names resource type `{}`, which does not exist",
+                target.ty
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Up to five definitions that co-provision type `ty`.
+async fn definitions_provisioning(
+    conn: &mut SqliteConnection,
+    org: &str,
+    ty: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, provision FROM definitions WHERE org_id = ? ORDER BY id")
+            .bind(org)
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut out = Vec::new();
+    for (id, provision) in rows {
+        let provision: BTreeMap<String, Provision> = serde_json::from_str(&provision)?;
+        let uses = provision
+            .keys()
+            .any(|k| ResourceRef::parse(k).is_ok_and(|r| r.ty.as_str() == ty));
+        if uses {
+            out.push(id);
+            if out.len() == 5 {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Checks everything a definition refers to: its type, driver, cloud account,
 /// secret stores and criterion classes, and that no two criteria are identical.
 async fn check_definition_refs(
@@ -429,16 +475,7 @@ async fn check_definition_refs(
     }
     check_driver_and_account(conn, org, &def.driver_type, def.driver_account.as_deref()).await?;
     check_secret_stores(conn, org, &def.driver_inputs).await?;
-    for key in def.provision.keys() {
-        let target = ResourceRef::parse(key)
-            .map_err(|e| StoreError::Invalid(format!("`provision` key `{key}` is invalid: {e}")))?;
-        if !type_exists(conn, org, target.ty.as_str()).await? {
-            return Err(StoreError::Invalid(format!(
-                "`provision` key `{key}` names resource type `{}`, which does not exist",
-                target.ty
-            )));
-        }
-    }
+    check_provision(conn, org, &def.provision).await?;
     for (i, criterion) in def.criteria.iter().enumerate() {
         check_criterion(conn, org, ty, criterion, &def.criteria[..i]).await?;
     }
@@ -669,6 +706,13 @@ impl CatalogStore for SqliteStore {
         if !users.is_empty() {
             return Err(StoreError::Conflict(format!(
                 "resource type `{id}` is used by definitions {}",
+                users.join(", ")
+            )));
+        }
+        let users = definitions_provisioning(&mut tx, org, id).await?;
+        if !users.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "resource type `{id}` is co-provisioned by definitions {}",
                 users.join(", ")
             )));
         }
@@ -1018,6 +1062,7 @@ impl CatalogStore for SqliteStore {
         )
         .await?;
         check_secret_stores(&mut tx, org, &update.driver_inputs).await?;
+        check_provision(&mut tx, org, &update.provision).await?;
         sqlx::query(
             "UPDATE definitions SET name = ?, driver_type = ?, driver_account = ?, \
              driver_inputs = ?, provision = ?, version = version + 1, updated_at = ? \
