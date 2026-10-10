@@ -127,27 +127,7 @@ pub fn evaluate(perm: Permission, roles: &Roles, scope: &Scope<'_>) -> Decision 
     }
 }
 
-/// Whether an organization role may be held by someone acting on behalf of `issuer`.
-fn org_role_covers(issuer: OrgRole, target: OrgRole) -> bool {
-    issuer == OrgRole::Administrator || target == OrgRole::Member || issuer == target
-}
-
-/// Whether `issuer` holds at least every permission `target` holds, so that acting for
-/// `target` (issuing it a token, for example) cannot increase `issuer`'s authority.
-pub fn covers(issuer: &Roles, target: &Roles) -> bool {
-    if is_admin(issuer) {
-        return true;
-    }
-    let (Some(i), Some(t)) = (issuer.org, target.org) else {
-        return target.org.is_none() && target.apps.is_empty() && target.deployer.is_empty();
-    };
-    org_role_covers(i, t)
-        && target
-            .apps
-            .iter()
-            .all(|(app, role)| issuer.apps.get(app).is_some_and(|r| r >= role))
-        && target.deployer.is_subset(&issuer.deployer)
-}
+pub use openporch_store::covers;
 
 #[cfg(test)]
 mod tests {

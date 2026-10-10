@@ -43,6 +43,16 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Principal>> + Send;
 
+    /// Creates the `bootstrap` administrator service user with its token in one
+    /// transaction. `audit` has no actor: the server itself does this on first start.
+    fn create_bootstrap_admin(
+        &self,
+        org: &str,
+        token_hash: &str,
+        expires_at: i64,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Principal>> + Send;
+
     /// Reads a principal.
     fn principal(
         &self,
@@ -344,9 +354,51 @@ impl IdentityStore for SqliteStore {
     ) -> Result<Principal> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        check_authority(
+            &mut tx,
+            org,
+            audit.actor.as_deref(),
+            None,
+            Some(principal.role),
+        )
+        .await?;
         insert_principal(&mut tx, org, &principal, audit.actor.as_deref()).await?;
         audit_in(&mut tx, &audit).await?;
         let p = require_principal(&mut tx, org, &principal.id).await?;
+        tx.commit().await?;
+        Ok(p)
+    }
+
+    async fn create_bootstrap_admin(
+        &self,
+        org: &str,
+        token_hash: &str,
+        expires_at: i64,
+        audit: AuditIntent,
+    ) -> Result<Principal> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let admin = NewPrincipal {
+            id: "bootstrap".into(),
+            kind: "service".into(),
+            name: "Bootstrap administrator".into(),
+            email: None,
+            role: OrgRole::Administrator,
+        };
+        insert_principal(&mut tx, org, &admin, None).await?;
+        sqlx::query(
+            "INSERT INTO api_tokens (org_id, principal_id, id, description, token_hash, expires_at, \
+             created_at, created_by) VALUES (?, 'bootstrap', 'bootstrap', 'Created on first start', \
+             ?, ?, ?, 'system')",
+        )
+        .bind(org)
+        .bind(token_hash)
+        .bind(expires_at)
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+        audit_in(&mut tx, &audit).await?;
+        let p = require_principal(&mut tx, org, "bootstrap").await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -378,6 +430,7 @@ impl IdentityStore for SqliteStore {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         let current = require_principal(&mut tx, org, id).await?;
+        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), Some(role)).await?;
         if current.role == OrgRole::Administrator && role != OrgRole::Administrator {
             guard_last_admin(&mut tx, org, id).await?;
         }
@@ -397,6 +450,7 @@ impl IdentityStore for SqliteStore {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         let current = require_principal(&mut tx, org, id).await?;
+        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), None).await?;
         if current.role == OrgRole::Administrator {
             guard_last_admin(&mut tx, org, id).await?;
         }
@@ -414,31 +468,7 @@ impl IdentityStore for SqliteStore {
     async fn roles(&self, org: &str, principal: &str) -> Result<Roles> {
         self.check_org(org)?;
         let mut conn = self.pool().acquire().await?;
-        let Some(p) = fetch_principal(&mut conn, org, principal).await? else {
-            return Ok(Roles::default());
-        };
-        let apps: Vec<(String, String)> = sqlx::query_as(
-            "SELECT app_id, role FROM app_roles WHERE org_id = ? AND principal_id = ?",
-        )
-        .bind(org)
-        .bind(principal)
-        .fetch_all(&mut *conn)
-        .await?;
-        let deployer: Vec<String> = sqlx::query_scalar(
-            "SELECT env_type_id FROM env_type_roles WHERE org_id = ? AND principal_id = ?",
-        )
-        .bind(org)
-        .bind(principal)
-        .fetch_all(&mut *conn)
-        .await?;
-        Ok(Roles {
-            org: Some(p.role),
-            apps: apps
-                .into_iter()
-                .filter_map(|(a, r)| AppRole::parse(&r).map(|r| (a, r)))
-                .collect(),
-            deployer: deployer.into_iter().collect(),
-        })
+        roles_in(&mut conn, org, principal).await
     }
 
     async fn create_token(
@@ -455,7 +485,18 @@ impl IdentityStore for SqliteStore {
         // Tokens issued by the server itself, such as the bootstrap token, have no actor.
         let created_by = audit.actor.clone().unwrap_or_else(|| "system".to_owned());
         let mut tx = self.begin().await?;
-        require_principal(&mut tx, org, principal).await?;
+        let target = require_principal(&mut tx, org, principal).await?;
+        // Everyone may issue tokens for themselves; tokens of another human user never;
+        // tokens of a service user within the delegation ceiling.
+        match audit.actor.as_deref() {
+            Some(actor) if actor == principal => {}
+            Some(_) if target.kind != "service" => {
+                return Err(StoreError::Forbidden(
+                    "tokens of a user can only be created by that user".into(),
+                ));
+            }
+            actor => check_authority(&mut tx, org, actor, Some(principal), None).await?,
+        }
         let res = sqlx::query(
             "INSERT INTO api_tokens (org_id, principal_id, id, description, token_hash, expires_at, \
              created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -675,6 +716,7 @@ impl IdentityStore for SqliteStore {
             .clone()
             .ok_or_else(|| StoreError::Conflict("invitations need an inviting principal".into()))?;
         let mut tx = self.begin().await?;
+        check_authority(&mut tx, org, Some(&created_by), None, Some(invitation.role)).await?;
         sqlx::query(
             "INSERT INTO invitations (org_id, id, org_role, email, provider, subject, login, \
              code_hash, expires_at, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

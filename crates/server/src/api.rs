@@ -292,32 +292,55 @@ async fn check(
         )));
     }
     let roles = state.store.roles(state.org(), &principal.id).await?;
-    let app = param("app");
-    let mut env_type = None;
-    if permission == Permission::App(AppPerm::Deploy)
-        && let (Some(a), Some(e)) = (&app, param("env"))
-    {
-        if !rbac::can_see_app(&roles, a) {
-            return Err(ApiError::not_found(format!("application `{a}` not found")));
-        }
-        env_type = Some(
-            state
-                .store
-                .env(state.org(), a, &e)
-                .await?
-                .ok_or_else(|| ApiError::not_found(format!("environment `{a}/{e}` not found")))?
-                .env_type,
-        );
-    }
-    let scope = Scope {
-        app: app.as_deref(),
-        env_type: env_type.as_deref(),
-    };
     let request_id = parts
         .extensions
         .get::<RequestId>()
         .map(|r| r.0.clone())
         .unwrap_or_default();
+    let deny = |status: u16, reason: String| {
+        let mut intent = AuditIntent::accepted(
+            state.org(),
+            &principal.id,
+            parts.method.as_str(),
+            parts.uri.path(),
+            "request.denied",
+        );
+        intent.request_id = Some(request_id.clone());
+        intent.outcome = AuditOutcome::Denied;
+        intent.status_code = Some(status);
+        intent.reason = Some(reason);
+        intent
+    };
+    let app = param("app");
+    let mut env_type = None;
+    if let (Permission::App(perm), Some(a)) = (permission, &app) {
+        // Applications the caller may not see, and missing ones, look the same.
+        if !rbac::can_see_app(&roles, a) || state.store.app(state.org(), a).await?.is_none() {
+            if mutating {
+                state
+                    .store
+                    .record_audit(deny(404, format!("application `{a}` not visible")))
+                    .await?;
+            }
+            return Err(ApiError::not_found(format!("application `{a}` not found")));
+        }
+        if perm == AppPerm::Deploy
+            && let Some(e) = param("env")
+        {
+            env_type = Some(
+                state
+                    .store
+                    .env(state.org(), a, &e)
+                    .await?
+                    .ok_or_else(|| ApiError::not_found(format!("environment `{a}/{e}` not found")))?
+                    .env_type,
+            );
+        }
+    }
+    let scope = Scope {
+        app: app.as_deref(),
+        env_type: env_type.as_deref(),
+    };
     match rbac::evaluate(permission, &roles, &scope) {
         Decision::Allow => {}
         Decision::Hidden => {
@@ -328,18 +351,7 @@ async fn check(
         }
         Decision::Deny(reason) => {
             if mutating {
-                let mut intent = AuditIntent::accepted(
-                    state.org(),
-                    &principal.id,
-                    parts.method.as_str(),
-                    parts.uri.path(),
-                    "request.denied",
-                );
-                intent.request_id = Some(request_id);
-                intent.outcome = AuditOutcome::Denied;
-                intent.status_code = Some(403);
-                intent.reason = Some(reason.clone());
-                state.store.record_audit(intent).await?;
+                state.store.record_audit(deny(403, reason.clone())).await?;
             }
             return Err(ApiError::forbidden(reason));
         }

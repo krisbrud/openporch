@@ -5,9 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use openporch_store::secrets::{Keyring, MasterKey, Sealed, SecretError};
-use openporch_store::{
-    AuditIntent, IdentityStore, NewPrincipal, OrgRole, Ownership, SqliteStore, Store, StoreError,
-};
+use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError};
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
@@ -29,7 +27,6 @@ pub struct Inner {
     pub signer: Option<SessionSigner>,
     /// Why the server is not ready; empty when it is.
     pub not_ready: Vec<String>,
-    _ownership: Ownership,
 }
 
 impl std::ops::Deref for AppState {
@@ -65,15 +62,11 @@ pub enum StartupError {
     Io(String),
 }
 
-/// Writes `contents` to a new or truncated owner-only file.
-fn write_private(path: &Path, contents: &str, create_new: bool) -> Result<(), StartupError> {
+/// Writes `contents` to a new owner-only file. Never follows or replaces an existing
+/// file or symlink.
+fn write_private(path: &Path, contents: &str) -> Result<(), StartupError> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
-    if create_new {
-        opts.create_new(true);
-    } else {
-        opts.create(true).truncate(true);
-    }
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -108,7 +101,7 @@ async fn load_keyring(
     }
     if store.is_new().await? && store.required_key_ids().await?.is_empty() {
         let key = MasterKey::generate();
-        write_private(&path, &format!("{}\n", key.to_base64().as_str()), true)?;
+        write_private(&path, &format!("{}\n", key.to_base64().as_str()))?;
         tracing::info!(path = %path.display(), key_id = key.id(), "generated a master key");
         return Ok(Some(Keyring::new(key, [])));
     }
@@ -121,7 +114,7 @@ async fn load_keyring(
 /// `env_key` is the value of `OPENPORCH_MASTER_KEY`, if set.
 pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, StartupError> {
     let ownership = Ownership::acquire(&config.data_dir)?;
-    let store = SqliteStore::open(&ownership, &config.org).await?;
+    let store = SqliteStore::open(ownership, &config.org).await?;
     let keyring = load_keyring(&config, &store, env_key).await?.map(Arc::new);
 
     let mut not_ready = Vec::new();
@@ -154,6 +147,8 @@ pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, 
 
     if store.is_new().await? {
         bootstrap(&config, &store).await?;
+    } else {
+        finish_bootstrap_file(&config)?;
     }
 
     Ok(AppState(Arc::new(Inner {
@@ -162,7 +157,6 @@ pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, 
         keyring,
         signer,
         not_ready,
-        _ownership: ownership,
     })))
 }
 
@@ -185,8 +179,30 @@ async fn session_signer(
     Ok(SessionSigner::from_seed(&seed))
 }
 
-/// Creates the `bootstrap` administrator and writes its token to the owner-only
-/// bootstrap file. The token never reaches the logs.
+fn pending_bootstrap_path(config: &Config) -> std::path::PathBuf {
+    let mut name = config.bootstrap_token_path().into_os_string();
+    name.push(".pending");
+    name.into()
+}
+
+/// Completes a bootstrap whose database commit succeeded but whose token file was not
+/// yet moved into place, for example after a crash.
+fn finish_bootstrap_file(config: &Config) -> Result<(), StartupError> {
+    let pending = pending_bootstrap_path(config);
+    let path = config.bootstrap_token_path();
+    if pending.exists() && !path.exists() {
+        std::fs::rename(&pending, &path)
+            .map_err(|e| StartupError::Io(format!("moving {}: {e}", pending.display())))?;
+        tracing::info!(path = %path.display(), "wrote the bootstrap administrator token");
+    }
+    Ok(())
+}
+
+/// Creates the `bootstrap` administrator and its token in one transaction. The token
+/// is written to an owner-only file before the commit and moved into place after it,
+/// so a failure leaves either nothing (and the next start bootstraps again) or a
+/// committed administrator whose token file is completed on the next start. The token
+/// never reaches the logs.
 async fn bootstrap(config: &Config, store: &SqliteStore) -> Result<(), StartupError> {
     let org = &config.org;
     let mut audit = AuditIntent::accepted(
@@ -197,38 +213,36 @@ async fn bootstrap(config: &Config, store: &SqliteStore) -> Result<(), StartupEr
         "bootstrap",
     );
     audit.actor = None;
-    store
-        .create_principal(
-            org,
-            NewPrincipal {
-                id: "bootstrap".into(),
-                kind: "service".into(),
-                name: "Bootstrap administrator".into(),
-                email: None,
-                role: OrgRole::Administrator,
-            },
-            audit.clone(),
-        )
-        .await?;
+    audit.target = Some("bootstrap".into());
     let token = auth::new_token();
     let expires = openporch_store::now_ms() + i64::from(config.bootstrap_token_hours) * 3_600_000;
-    store
-        .create_token(
-            org,
-            "bootstrap",
-            "bootstrap",
-            Some("Created on first start"),
-            Some(expires),
-            &auth::hash_token(&token),
-            AuditIntent {
-                action: "token.create".into(),
-                path: format!("/orgs/{org}/users/bootstrap/tokens"),
-                ..audit
-            },
-        )
-        .await?;
-    let path = config.bootstrap_token_path();
-    write_private(&path, &format!("{}\n", token.as_str()), false)?;
-    tracing::info!(path = %path.display(), "wrote the bootstrap administrator token");
+
+    let pending = pending_bootstrap_path(config);
+    match std::fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(StartupError::Io(format!(
+                "removing {}: {e}",
+                pending.display()
+            )));
+        }
+    }
+    write_private(&pending, &format!("{}\n", token.as_str()))?;
+    if let Err(e) = store
+        .create_bootstrap_admin(org, &auth::hash_token(&token), expires, audit)
+        .await
+    {
+        let _ = std::fs::remove_file(&pending);
+        return Err(e.into());
+    }
+    finish_bootstrap_file(config)?;
+    if pending.exists() {
+        tracing::warn!(
+            existing = %config.bootstrap_token_path().display(),
+            path = %pending.display(),
+            "a bootstrap token file already existed; the new token is in the pending file"
+        );
+    }
     Ok(())
 }

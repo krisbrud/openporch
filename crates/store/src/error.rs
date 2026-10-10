@@ -44,6 +44,10 @@ pub enum StoreError {
     /// A conflict with the object's current state.
     #[error("{0}")]
     Conflict(String),
+    /// The acting principal lacks the authority for the change, checked atomically
+    /// with it.
+    #[error("{0}")]
+    Forbidden(String),
     /// A stored record could not be decoded.
     #[error("corrupt record: {0}")]
     Corrupt(String),

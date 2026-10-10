@@ -338,3 +338,102 @@ pub struct AuditFilter {
     /// Page size.
     pub limit: u32,
 }
+
+/// A principal's roles at every level, read on `conn`; empty for non-members.
+pub(crate) async fn roles_in(
+    conn: &mut SqliteConnection,
+    org: &str,
+    principal: &str,
+) -> Result<Roles> {
+    let Some(p) = fetch_principal(conn, org, principal).await? else {
+        return Ok(Roles::default());
+    };
+    let apps: Vec<(String, String)> =
+        sqlx::query_as("SELECT app_id, role FROM app_roles WHERE org_id = ? AND principal_id = ?")
+            .bind(org)
+            .bind(principal)
+            .fetch_all(&mut *conn)
+            .await?;
+    let deployer: Vec<String> = sqlx::query_scalar(
+        "SELECT env_type_id FROM env_type_roles WHERE org_id = ? AND principal_id = ?",
+    )
+    .bind(org)
+    .bind(principal)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Roles {
+        org: Some(p.role),
+        apps: apps
+            .into_iter()
+            .filter_map(|(a, r)| AppRole::parse(&r).map(|r| (a, r)))
+            .collect(),
+        deployer: deployer.into_iter().collect(),
+    })
+}
+
+/// Whether an organization role may be held by someone acting on behalf of `issuer`.
+fn org_role_covers(issuer: OrgRole, target: OrgRole) -> bool {
+    issuer == OrgRole::Administrator || target == OrgRole::Member || issuer == target
+}
+
+/// Whether `issuer` holds at least every permission `target` holds, so that acting for
+/// `target` (issuing it a token, for example) cannot increase `issuer`'s authority.
+pub fn covers(issuer: &Roles, target: &Roles) -> bool {
+    if issuer.org == Some(OrgRole::Administrator) {
+        return true;
+    }
+    let (Some(i), Some(t)) = (issuer.org, target.org) else {
+        return target.org.is_none() && target.apps.is_empty() && target.deployer.is_empty();
+    };
+    org_role_covers(i, t)
+        && target
+            .apps
+            .iter()
+            .all(|(app, role)| issuer.apps.get(app).is_some_and(|r| r >= role))
+        && target.deployer.is_subset(&issuer.deployer)
+}
+
+/// The delegation ceiling, checked inside the transaction that makes the change:
+/// administrators may do anything; managers may act only on non-administrators whose
+/// current and resulting roles they cover; nobody else may. Changes without an actor
+/// (made by the server itself) are not limited.
+pub(crate) async fn check_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    target: Option<&str>,
+    resulting: Option<OrgRole>,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let issuer = roles_in(conn, org, actor).await?;
+    if issuer.org == Some(OrgRole::Administrator) {
+        return Ok(());
+    }
+    let denied = || {
+        StoreError::Forbidden(format!(
+            "`{actor}` does not hold every permission this change would grant or affect"
+        ))
+    };
+    if issuer.org != Some(OrgRole::Manager) {
+        return Err(denied());
+    }
+    let current = match target {
+        Some(t) => roles_in(conn, org, t).await?,
+        None => Roles::default(),
+    };
+    if current.org == Some(OrgRole::Administrator) || !covers(&issuer, &current) {
+        return Err(denied());
+    }
+    if let Some(role) = resulting {
+        let after = Roles {
+            org: Some(role),
+            ..current
+        };
+        if role == OrgRole::Administrator || !covers(&issuer, &after) {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}

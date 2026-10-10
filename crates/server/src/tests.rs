@@ -1206,3 +1206,95 @@ async fn audit_failure_rejects_the_mutation() {
         OrgRole::Member
     );
 }
+
+#[tokio::test]
+async fn hidden_and_missing_applications_are_404_and_mutations_are_audited() {
+    let s = server().await;
+    s.app("billing").await;
+    let member = s.member("dev", "member").await;
+    let viewer = s.member("auditor", "orgViewer").await;
+    let (status, body) = s.delete("/orgs/acme/apps/billing", &member).await;
+    assert_error(status, &body, StatusCode::NOT_FOUND, "API-001");
+    let (status, _) = s.delete("/orgs/acme/apps/nope", &viewer).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, page) = s.get("/orgs/acme/audit-logs?user_id=dev", &s.admin).await;
+    let entry = &page["entries"][0];
+    assert_eq!(entry["outcome"], "denied");
+    assert_eq!(entry["status_code"], 404);
+    assert_eq!(entry["path"], "/orgs/acme/apps/billing");
+}
+
+#[tokio::test]
+async fn delegation_is_rechecked_with_the_change() {
+    // The store re-checks the ceiling inside the transaction, so a check that passed
+    // in the handler cannot be raced: here the store is called directly.
+    let s = server().await;
+    s.member("carol", "manager").await;
+    s.member("admin-2", "administrator").await;
+    s.member("ci", "member").await;
+    let as_carol = |path: &str| AuditIntent::accepted("acme", "carol", "PATCH", path, "test");
+    let store = &s.state.store;
+    let e = store
+        .set_org_role("acme", "admin-2", OrgRole::Member, as_carol("/u/admin-2"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+    let e = store
+        .remove_principal("acme", "admin-2", as_carol("/u/admin-2"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+    // `ci` gained production deployer after the handler would have checked.
+    s.env_type("production").await;
+    s.grant_deployer("production", "ci").await;
+    let e = store
+        .create_token(
+            "acme",
+            "ci",
+            "t1",
+            None,
+            None,
+            "hash",
+            as_carol("/u/ci/tokens"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+    assert_eq!(
+        store
+            .principal("acme", "admin-2")
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        OrgRole::Administrator
+    );
+}
+
+#[tokio::test]
+async fn interrupted_bootstrap_completes_on_the_next_start() {
+    let s = server().await;
+    let token = s.admin.clone();
+    let Server {
+        dir, state, router, ..
+    } = s;
+    drop((state, router));
+    // Simulate a crash after the commit, before the file was moved into place.
+    let path = dir.path().join("bootstrap-token");
+    std::fs::rename(&path, dir.path().join("bootstrap-token.pending")).unwrap();
+    let s = server_in(dir).await;
+    assert_eq!(s.admin, token);
+    assert_eq!(
+        s.get("/orgs/acme/current-user", &token).await.0,
+        StatusCode::OK
+    );
+}

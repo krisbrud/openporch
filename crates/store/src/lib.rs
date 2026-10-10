@@ -25,7 +25,7 @@ pub use deploy::{
 pub use error::StoreError;
 pub use identity::{
     AppRole, AuditFilter, ExternalIdentity, Invitation, NewInvitation, NewPrincipal, OrgRole,
-    Principal, Roles, TokenInfo,
+    Principal, Roles, TokenInfo, covers,
 };
 pub use ownership::Ownership;
 pub use sqlite::SqliteStore;

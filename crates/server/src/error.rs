@@ -132,6 +132,7 @@ impl From<StoreError> for ApiError {
             | StoreError::Busy(_)
             | StoreError::RecoveryRequired(_)
             | StoreError::IdempotencyMismatch(_) => Self::conflict(e.to_string()),
+            StoreError::Forbidden(_) => Self::forbidden(e.to_string()),
             other => Self::internal(other),
         }
     }
