@@ -10,7 +10,6 @@ const ORG: &str = "acme";
 
 struct Fixture {
     dir: tempfile::TempDir,
-    ownership: Option<Ownership>,
     store: SqliteStore,
 }
 
@@ -18,7 +17,7 @@ impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let ownership = Ownership::acquire(dir.path()).unwrap();
-        let store = SqliteStore::open(&ownership, ORG).await.unwrap();
+        let store = SqliteStore::open(ownership, ORG).await.unwrap();
         for (id, role) in [("alice", "manager"), ("ci", "member")] {
             sqlx::query(
                 "INSERT INTO principals (org_id, id, type, name, org_role, created_at) \
@@ -42,21 +41,23 @@ impl Fixture {
             )
             .await
             .unwrap();
-        Self {
-            dir,
-            ownership: Some(ownership),
-            store,
-        }
+        Self { dir, store }
     }
 
     /// Simulates a crash and restart: the pool and the lock are dropped without any
     /// cleanup, then the installation is opened again.
-    async fn restart(&mut self) {
+    async fn restart(self) -> Self {
+        let Self { dir, store } = self.close().await;
+        drop(store);
+        let ownership = Ownership::acquire(dir.path()).unwrap();
+        let store = SqliteStore::open(ownership, ORG).await.unwrap();
+        Self { dir, store }
+    }
+
+    /// Closes the pool; dropping the returned store releases the ownership.
+    async fn close(self) -> Self {
         self.store.pool().close().await;
-        self.ownership = None;
-        let ownership = Ownership::acquire(self.dir.path()).unwrap();
-        self.store = SqliteStore::open(&ownership, ORG).await.unwrap();
-        self.ownership = Some(ownership);
+        self
     }
 
     async fn generation(&self) -> i64 {
@@ -162,29 +163,35 @@ async fn second_owner_is_refused() {
 
 #[tokio::test]
 async fn ownership_returns_after_the_owner_exits() {
-    let mut f = Fixture::new().await;
-    f.restart().await;
+    let f = Fixture::new().await;
+    // Any clone of the store keeps the installation owned.
+    let clone = f.store.clone();
+    let Fixture { dir, store } = f;
+    drop(store);
+    assert!(Ownership::acquire(dir.path()).is_err());
+    clone.pool().close().await;
+    drop(clone);
+    let ownership = Ownership::acquire(dir.path()).unwrap();
+    let store = SqliteStore::open(ownership, ORG).await.unwrap();
     let owner: Option<String> = sqlx::query_scalar("SELECT owner_id FROM installation")
-        .fetch_one(f.store.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
-    assert_eq!(owner.as_deref(), f.ownership.as_ref().map(Ownership::id));
+    assert_eq!(owner.as_deref(), Some(store.ownership().id()));
 }
 
 #[tokio::test]
 async fn installation_serves_one_organization() {
-    let f = Fixture::new().await;
-    f.store.pool().close().await;
-    let dir = f.dir.path().to_owned();
-    drop(f.ownership);
-    let ownership = Ownership::acquire(&dir).unwrap();
-    let e = SqliteStore::open(&ownership, "other").await.unwrap_err();
+    let Fixture { dir, store } = Fixture::new().await.close().await;
+    drop(store);
+    let ownership = Ownership::acquire(dir.path()).unwrap();
+    let e = SqliteStore::open(ownership, "other").await.unwrap_err();
     assert!(e.to_string().contains("serves organization `acme`"), "{e}");
 }
 
 #[tokio::test]
 async fn newer_schema_is_refused_without_changes() {
-    let mut f = Fixture::new().await;
+    let f = Fixture::new().await;
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, \
          execution_time) VALUES (99990101000000, 'future', CURRENT_TIMESTAMP, 1, x'00', 0)",
@@ -192,10 +199,10 @@ async fn newer_schema_is_refused_without_changes() {
     .execute(f.store.pool())
     .await
     .unwrap();
-    f.store.pool().close().await;
-    f.ownership = None;
-    let ownership = Ownership::acquire(f.dir.path()).unwrap();
-    let e = SqliteStore::open(&ownership, ORG).await.unwrap_err();
+    let Fixture { dir, store } = f.close().await;
+    drop(store);
+    let ownership = Ownership::acquire(dir.path()).unwrap();
+    let e = SqliteStore::open(ownership, ORG).await.unwrap_err();
     assert!(
         matches!(
             e,
@@ -237,7 +244,13 @@ async fn acceptance_records_job_desired_set_and_audit_together() {
     let f = Fixture::new().await;
     let set = f.set("nginx:1").await;
     f.store
-        .put_delta(ORG, "shop", "d1", &json!({"modules": {}}), "ci")
+        .put_delta(
+            ORG,
+            "shop",
+            "d1",
+            &json!({"modules": {}}),
+            audit("PUT", "/orgs/acme/apps/shop/deltas/d1"),
+        )
         .await
         .unwrap();
     let mut req = f.request(0, &set, Some("key-1"));
@@ -267,11 +280,18 @@ async fn acceptance_records_job_desired_set_and_audit_together() {
             "shop",
             "d1",
             &json!({"modules": {"remove": ["web"]}}),
-            "ci",
+            audit("PUT", "/orgs/acme/apps/shop/deltas/d1"),
         )
         .await
         .unwrap_err();
     assert!(e.to_string().contains("can no longer change"), "{e}");
+    let delta_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE method = 'PUT' AND path LIKE '%/deltas/d1'",
+    )
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(delta_audits, 1, "the rejected change must not be audited");
 
     let entries = f.store.audit_entries(ORG, 10).await.unwrap();
     let accepted = &entries[0];
@@ -519,11 +539,11 @@ async fn checkpoints_survive_partial_failure() {
 
 #[tokio::test]
 async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
-    let mut f = Fixture::new().await;
+    let f = Fixture::new().await;
     let d1 = f.deploy("nginx:1").await;
     let op = f.start(&d1.id, DB).await.unwrap();
     // Crash before the result is checkpointed.
-    f.restart().await;
+    let f = f.restart().await;
 
     let report = f.store.recover_interrupted().await.unwrap();
     assert_eq!(report.failed_deployments, vec![d1.id.clone()]);
@@ -555,6 +575,25 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
         matches!(&e, StoreError::RecoveryRequired(d) if d == DB),
         "{e}"
     );
+
+    // A guess or a result that does not fit the operation does not resolve it.
+    for result in [
+        CheckpointResult::Failed {
+            error: "gave up".into(),
+        },
+        CheckpointResult::Unknown {
+            error: "still unsure".into(),
+        },
+        CheckpointResult::Deleted,
+    ] {
+        let e = f
+            .store
+            .checkpoint_operation(&op.operation_id, result)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, StoreError::Conflict(_)), "{e}");
+    }
+    assert_eq!(f.resource(DB).await.unwrap().status, "unknown");
 
     // Resolving the operation (here: observed as provisioned) unblocks them, and the
     // same GUResID is kept.
@@ -648,11 +687,27 @@ async fn deletion_leaves_a_tombstone() {
         .await
         .unwrap();
     assert_eq!(del.attempt, 3);
+    // A delete is never checkpointed as provisioned.
+    let e = f
+        .store
+        .checkpoint_operation(&del.operation_id, provisioned("db1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, StoreError::Conflict(_)), "{e}");
     f.store
         .checkpoint_operation(&del.operation_id, CheckpointResult::Deleted)
         .await
         .unwrap();
     assert!(f.resource(DB).await.is_none());
+    let run_status: String = sqlx::query_scalar(
+        "SELECT status FROM deployment_resources WHERE deployment_id = ? AND descriptor = ?",
+    )
+    .bind(&d1.id)
+    .bind(DB)
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(run_status, "deleted");
     let (guresid, reason): (String, String) =
         sqlx::query_as("SELECT guresid, reason FROM tombstones")
             .fetch_one(f.store.pool())

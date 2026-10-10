@@ -218,11 +218,12 @@ impl MasterKey {
                 .decode(s.trim())
                 .map_err(|_| SecretError::InvalidKey("not valid base64".into()))?,
         );
-        let arr: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SecretError::InvalidKey("expected 32 bytes".into()))?;
-        Ok(Self::from_bytes(arr))
+        if bytes.len() != 32 {
+            return Err(SecretError::InvalidKey("expected 32 bytes".into()));
+        }
+        let mut arr = Zeroizing::new([0u8; 32]);
+        arr.copy_from_slice(&bytes);
+        Ok(Self::from_bytes(*arr))
     }
 
     /// A new random key.
@@ -306,11 +307,15 @@ impl Keyring {
     /// Reads keys from a file in the [`Keyring::from_text`] format. On Unix the file
     /// must not be readable by group or others.
     pub fn from_file(path: &std::path::Path) -> Result<Self, SecretError> {
+        use std::io::Read as _;
         let invalid = |what: String| SecretError::InvalidKey(format!("{}: {what}", path.display()));
+        // Check the permissions of the file actually read, not of the path.
+        let mut file = std::fs::File::open(path).map_err(|e| invalid(e.to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path)
+            let mode = file
+                .metadata()
                 .map_err(|e| invalid(e.to_string()))?
                 .permissions()
                 .mode();
@@ -321,8 +326,9 @@ impl Keyring {
                 )));
             }
         }
-        let text =
-            Zeroizing::new(std::fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?);
+        let mut text = Zeroizing::new(String::new());
+        file.read_to_string(&mut text)
+            .map_err(|e| invalid(e.to_string()))?;
         Self::from_text(&text)
     }
 

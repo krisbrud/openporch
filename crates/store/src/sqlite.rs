@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use openporch_core::ids::Guresid;
 use openporch_core::model::SecretRef;
@@ -21,6 +22,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub struct SqliteStore {
     pool: SqlitePool,
     org: String,
+    ownership: Arc<Ownership>,
 }
 
 impl SqliteStore {
@@ -30,7 +32,10 @@ impl SqliteStore {
     ///
     /// Fails if the database belongs to another organization or was written by a newer
     /// schema than this binary supports.
-    pub async fn open(ownership: &Ownership, org: &str) -> Result<Self> {
+    ///
+    /// The store keeps `ownership` for as long as it or any clone of it lives, so the
+    /// installation lock cannot be released while the database is still in use.
+    pub async fn open(ownership: Ownership, org: &str) -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(ownership.dir().join("openporch.db"))
             .create_if_missing(true)
@@ -47,8 +52,9 @@ impl SqliteStore {
         let store = Self {
             pool,
             org: org.to_owned(),
+            ownership: Arc::new(ownership),
         };
-        store.init_installation(ownership).await?;
+        store.init_installation().await?;
         Ok(store)
     }
 
@@ -62,7 +68,13 @@ impl SqliteStore {
         &self.org
     }
 
-    async fn init_installation(&self, ownership: &Ownership) -> Result<()> {
+    /// The installation ownership this store holds.
+    pub fn ownership(&self) -> &Ownership {
+        &self.ownership
+    }
+
+    async fn init_installation(&self) -> Result<()> {
+        let ownership = &*self.ownership;
         let now = now_ms();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing: Option<String> =
@@ -461,7 +473,7 @@ impl Store for SqliteStore {
         app: &str,
         id: &str,
         content: &serde_json::Value,
-        actor: &str,
+        audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let now = now_ms();
@@ -489,10 +501,11 @@ impl Store for SqliteStore {
         .bind(id)
         .bind(serde_json::to_string(content)?)
         .bind(now)
-        .bind(actor)
+        .bind(&audit.actor)
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -839,6 +852,25 @@ impl Store for SqliteStore {
                 "operation `{operation_id}` is already {state}"
             )));
         }
+        match (&result, kind.as_str()) {
+            (CheckpointResult::Provisioned(_), "put") | (CheckpointResult::Deleted, "delete") => {}
+            (CheckpointResult::Provisioned(_) | CheckpointResult::Deleted, _) => {
+                return Err(StoreError::Conflict(format!(
+                    "operation `{operation_id}` is a {kind}; the result does not match it"
+                )));
+            }
+            // An operation whose outcome is unknown is resolved only by observing the
+            // resource: a guess or another failure leaves it blocking.
+            (CheckpointResult::Failed { .. } | CheckpointResult::Unknown { .. }, _)
+                if state == "unknown" =>
+            {
+                return Err(StoreError::Conflict(format!(
+                    "operation `{operation_id}` has an unknown outcome; it is resolved only by \
+                     an observation of the resource"
+                )));
+            }
+            _ => {}
+        }
         let descriptor: String =
             sqlx::query_scalar("SELECT descriptor FROM active_resources WHERE guresid = ?")
                 .bind(&guresid)
@@ -894,7 +926,7 @@ impl Store for SqliteStore {
                     .bind(&guresid)
                     .execute(&mut *tx)
                     .await?;
-                ("succeeded", None, "provisioned", None, None)
+                ("succeeded", None, "deleted", None, None)
             }
             CheckpointResult::Failed { error } => (
                 "failed",

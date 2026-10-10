@@ -106,14 +106,15 @@ pub trait Store: Send + Sync {
         set: &openporch_core::sets::DeploymentSet,
     ) -> impl Future<Output = Result<String>> + Send;
 
-    /// Stores or replaces a draft delta. A frozen delta cannot be replaced.
+    /// Stores or replaces a draft delta with its audit intent. A frozen delta cannot
+    /// be replaced.
     fn put_delta(
         &self,
         org: &str,
         app: &str,
         id: &str,
         content: &serde_json::Value,
-        actor: &str,
+        audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Atomically accepts a deployment: checks idempotency, generation and running

@@ -5,19 +5,14 @@ use crate::{Ownership, SqliteStore, Store};
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    _ownership: Ownership,
     store: SqliteStore,
 }
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let ownership = Ownership::acquire(dir.path()).unwrap();
-    let store = SqliteStore::open(&ownership, "acme").await.unwrap();
-    Fixture {
-        _dir: dir,
-        _ownership: ownership,
-        store,
-    }
+    let store = SqliteStore::open(ownership, "acme").await.unwrap();
+    Fixture { _dir: dir, store }
 }
 
 fn key(byte: u8) -> MasterKey {

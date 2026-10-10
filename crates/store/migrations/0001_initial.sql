@@ -375,7 +375,7 @@ CREATE TABLE deployment_resources (
     deployment_id TEXT NOT NULL,
     descriptor TEXT NOT NULL,
     guresid TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'provisioning', 'provisioned', 'failed', 'skipped', 'unknown')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'provisioning', 'provisioned', 'deleted', 'failed', 'skipped', 'unknown')),
     attempts INTEGER NOT NULL DEFAULT 0,
     outputs TEXT,
     error TEXT,
