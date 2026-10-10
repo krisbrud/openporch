@@ -52,7 +52,11 @@ A secret reference MAY be given as `{value}` instead of `{store, ref}`. The orch
 
 ### Requirement: Resolution and access
 
-Only the orchestrator's provisioning engine SHALL read secret values, using the store's cloud account, immediately before invoking a driver. Values SHALL be held in memory for the duration of the call, redacted from logs, and never written to active resources except as encrypted secret outputs. No API endpoint SHALL return a secret value.
+Only the executor component that invokes drivers SHALL read secret values, using the store's cloud account, immediately before the call; the planning side of a deployment SHALL handle references only. Values SHALL be held in memory for the duration of the call and redacted from logs. No API endpoint SHALL return a secret value.
+
+#### Scenario: Secret output stored as a reference
+- **WHEN** a driver returns a secret output `password`
+- **THEN** the executor writes it to the primary store and the active resource records a reference and version, not the value
 
 #### Scenario: Store unreachable
 - **WHEN** a referenced store cannot be read during a deployment

@@ -16,7 +16,7 @@ Each active resource SHALL have a permanent, non-semantic GUResID generated at f
 
 ### Requirement: Record contents
 
-An active resource SHALL record its descriptor, GUResID, definition ID, driver type, resolved non-secret inputs, outputs (secrets stored encrypted and never returned), driver cookie, the ID of the deployment that last provisioned it successfully, status, and `scheduled_deletion`.
+An active resource SHALL record its descriptor, GUResID, definition ID, driver type, resolved non-secret inputs, non-secret outputs, secret outputs as secret references into the primary store (never returned as values), driver cookie, the ID of the deployment that last provisioned it successfully, status, and `scheduled_deletion`.
 
 #### Scenario: Read outputs
 - **WHEN** a client reads an active postgres resource

@@ -34,7 +34,7 @@ Cargo workspace:
 - `crates/store`: persistence behind a `Store` trait, implemented with `sqlx` on SQLite (default) with the schema written to also run on Postgres. Migrations embedded.
 - `crates/drivers`: the `Driver` trait and built-in drivers (`echo`, `none`, `template`, `opentofu`, `k8s-cluster-static`, `k8s-cluster-eks`, external HTTP adapter).
 - `crates/k8s`: the `openporch/kubernetes` workload driver: rendering to manifests and server-side apply via `kube`/`k8s-openapi`.
-- `crates/engine`: the deployment executor (graph walk, concurrency, retries, timeouts, logs, active-resource bookkeeping) on `tokio`.
+- `crates/engine`: the planner (graph walk, concurrency, retries, timeouts, logs, active-resource bookkeeping) on `tokio`, and the `Executor` trait with its in-process implementation (see D10).
 - `crates/server`: `axum` HTTP API, auth, config, the `openporch` binary.
 - `crates/client` and `crates/cli`: typed API client and the `porch` binary (`clap`).
 
@@ -48,7 +48,7 @@ Alternatives: Postgres only (rejected: operational burden for a solo user); an e
 
 ### D3. Secrets: one reference model, stores behind it
 
-Every secret the orchestrator knows about is a secret reference `{store, ref, version}`; there is no second code path for "inline" secrets. The built-in store `openporch` encrypts values with AES-256-GCM under a server master key (environment variable or file, key ID stored beside the ciphertext for rotation) and is the primary store until an administrator promotes an AWS Secrets Manager or SSM store. Inline `secrets` on definitions, cloud account keys and shared secret values are sugar: the API writes them to the primary store and keeps the reference. Because openporch has no in-cluster operator, the orchestrator's engine is the only reader: it resolves references immediately before a driver call using the store's cloud account, keeps values in memory for the call, and a redaction layer replaces every resolved value in logs and errors before persistence. Secret outputs of resources and driver cookies are stored encrypted in the database with the same primitives.
+Every secret the orchestrator knows about is a secret reference `{store, ref, version}`; there is no second code path for "inline" secrets. The built-in store `openporch` encrypts values with AES-256-GCM under a server master key (environment variable or file, key ID stored beside the ciphertext for rotation) and is the primary store until an administrator promotes an AWS Secrets Manager or SSM store. Inline `secrets` on definitions, cloud account keys and shared secret values are sugar: the API writes them to the primary store and keeps the reference. Because openporch has no in-cluster operator, the executor (D10) is the only reader: it resolves references immediately before a driver call using the store's cloud account, keeps values in memory for the call, and a redaction layer replaces every resolved value in logs and errors before persistence. Secret outputs of resources are written by the executor to the primary store and recorded as references; driver cookies are stored encrypted in the database with the same primitives.
 
 Alternatives: Humanitec's split where the SaaS never reads secrets and an operator does (rejected: openporch is self-hosted, so the orchestrator already sits inside the trust boundary, and an operator is a non-goal); environment variables only (rejected: no rotation, no audit, no sharing).
 
@@ -104,9 +104,18 @@ Alternatives: shelling out to `kubectl` (rejected: binary dependency and weaker 
 
 A hand-written parser turns strings into a list of literal and placeholder segments (`context.*`, `resources[...]...`, `externals.*`, `shared.*`, `values.*`, `pod.*`). The same AST feeds two passes: dependency discovery during graph construction (resource references add nodes and edges) and resolution during provisioning (typed substitution, secret tainting). Resolution errors carry the definition ID and JSON path of the offending input.
 
-### D10. Deployment engine
+### D10. Deployment engine: a planner and an executor, one process by default
 
-A deployment is a persisted job. The engine builds the graph, persists it as the deployment's resource list, then walks it with a `tokio` semaphore (default 4) starting any node whose dependencies are `provisioned`. Three attempts per node with a short backoff; a failed node leaves dependents `pending`. The `workload` node is provisioned last among its dependencies by the `k8s` crate. On completion the engine writes active resources, outputs and the environment's current set. A server restart marks `in_progress` deployments `failed` with reason `interrupted`.
+A deployment is a persisted job. The engine is split in two along the secret boundary:
+
+- The **planner** builds the graph, persists it as the deployment's resource list, matches definitions, resolves every non-secret placeholder, and walks the graph with a `tokio` semaphore (default 4), starting any node whose dependencies are `provisioned`. Three attempts per node with a short backoff; a failed node leaves dependents `pending`. On completion it writes active resources and the environment's current set. A server restart marks `in_progress` deployments `failed` with reason `interrupted`.
+- The **executor** takes one `ProvisionJob` at a time: the resolved non-secret inputs, the unresolved secret references, the cloud account to use and the driver to call. It resolves the references against the secret stores, obtains cloud credentials, runs the driver (in-process drivers, the OpenTofu subprocess, the Kubernetes client, or an external HTTP driver), writes any secret outputs to the primary secret store, and returns non-secret outputs, references for secret outputs, the driver cookie, logs and status.
+
+The contract between them is the `Executor` trait, and milestone 1 ships exactly one implementation: `LocalExecutor`, a `tokio` task inside the server process. There is nothing extra to deploy, configure or monitor; `openporch serve` is still one binary and one data directory. The split costs one trait and one job type, and buys three things: the planner never holds a secret value, the server database never holds one either when the primary store is external, and a remote executor (an agent running in your AWS account or cluster that connects outbound and pulls jobs) is a later additive change with no spec impact.
+
+Rules that keep the boundary honest: secret references cross the boundary unresolved; the executor's logs go through the redaction layer before leaving it; secret outputs never return as values; and the planner's tests use a fake executor, so the planner cannot accidentally depend on having the values.
+
+Alternatives: a single engine that resolves secrets wherever convenient (rejected: cheap now, impossible to split later); shipping the remote agent in this milestone (rejected: adds a job queue, agent identity and log streaming to a milestone that should first work end to end).
 
 ### D11. OpenTofu provider written in Go
 
@@ -149,7 +158,7 @@ Paths are `/orgs/{org}/apps/{app}/envs/{env}/...`, `/orgs/{org}/resources/{defs,
 - [Two toolchains (Rust and Go)] → the Go code is confined to `provider/`, built and tested in its own CI job.
 - [Content-addressed sets diverge if canonicalization changes] → JCS canonicalization is pinned and tested with fixtures; the set ID algorithm is versioned in the stored record.
 - [RBAC and secrets touch every endpoint, so retrofitting is impossible] → they are implemented in group 3 before any domain endpoint, every route declares its permission, and the HTTP tests for each capability include a forbidden-role case.
-- [The orchestrator reads secrets itself] → it runs inside the operator's trust boundary by design; the mitigation is minimal exposure (resolve late, hold briefly, redact always) and an audit log of every change.
+- [The orchestrator reads secrets itself] → only the executor does, behind the `Executor` trait, so a remote executor can move that work into your account later; meanwhile the mitigation is minimal exposure (resolve late, hold briefly, redact always), secret outputs stored as references, and an audit log of every change.
 - [SQLite's single-writer model under concurrent deployments] → one engine process with WAL mode and short transactions; Postgres is the escape hatch.
 
 ## Migration Plan
