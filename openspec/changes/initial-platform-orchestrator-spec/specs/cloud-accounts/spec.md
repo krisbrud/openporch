@@ -8,7 +8,7 @@ Cloud accounts hold the credentials the orchestrator uses to reach a cloud, so t
 
 ### Requirement: AWS cloud account types
 
-The orchestrator SHALL support cloud accounts of type `aws` (static access key ID and secret, stored as secret references), `aws-role` (an IAM role ARN assumed with `AssumeRole` from the orchestrator's own AWS identity, with a required `external_id` and optional `session_duration`) and `aws-identity` (role assumption with web identity through the openporch OIDC provider, see `oidc-provider`). Accounts are managed under `/orgs/{org}/resources/accounts` by administrators.
+Milestone 1 SHALL support administrator-managed accounts under `/orgs/{org}/resources/accounts`: `aws` (static keys as secret references) and `aws-role` (AssumeRole from host identity, role ARN, required external ID and optional session duration). `aws-identity` SHALL be reserved for the later cloud OIDC integration; unavailable account types return `400` naming the missing capability.
 
 #### Scenario: Create a static account
 - **WHEN** a client creates account `aws-dev` of type `aws` with `access_key_id` and `secret_access_key`
@@ -36,8 +36,16 @@ When a definition sets `driver_account`, the orchestrator SHALL obtain temporary
 
 ### Requirement: Deleting an account in use
 
-A cloud account SHALL NOT be deleted while a resource definition references it. The API SHALL return `409` naming the definitions.
+A cloud account SHALL NOT be deleted while a definition, secret store, active resource or retained recovery snapshot requires it. The API SHALL return `409` naming the definitions.
 
 #### Scenario: Delete in use
 - **WHEN** `aws-prod` is referenced by `prod-postgres`
 - **THEN** deleting `aws-prod` returns `409` naming `prod-postgres`
+
+### Requirement: Credential lifetime and scope
+
+The executor SHALL obtain credentials immediately before use with lifetime sufficient for the bounded operation, refresh through a supported provider mechanism, or fail safely before starting work that cannot complete before expiry. It SHALL never persist temporary credentials in execution snapshots. Reference modules SHALL scope IAM actions and resources to declared dependencies; wildcards SHALL require documented provider necessity or explicit administrator policy.
+
+#### Scenario: Expiring role session
+- **WHEN** available credentials expire before the operation's required window and cannot be refreshed
+- **THEN** the executor obtains a new session or fails before mutation without logging credentials

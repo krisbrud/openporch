@@ -8,15 +8,15 @@ Applications group workloads that are deployed together; environments are the pl
 
 ### Requirement: Application lifecycle
 
-The orchestrator SHALL let clients create, read, list and delete applications under `/orgs/{org}/apps`. Creating an application SHALL also create a default environment `development` of type `development`. Deleting an application SHALL delete all its environments, deprovisioning their resources first.
+Applications SHALL support create/read/list/delete under `/orgs/{org}/apps`. Creation also creates environment `development` of type `development` and requires that type's deployer gate. The creator becomes owner. Application deletion SHALL require permits for all environments and deprovision their owned resources first; failed environments and remaining management records SHALL be preserved.
 
 #### Scenario: Create an application
-- **WHEN** a client creates application `shop`
+- **WHEN** a principal permitted to create applications and deploy to `development` creates application `shop`
 - **THEN** `shop` exists, has one environment `development` with type `development`, and the creating principal is its `owner`
 
 #### Scenario: Delete an application with provisioned resources
-- **WHEN** a client deletes an application whose environments have active resources
-- **THEN** every active resource of every environment is deprovisioned before the application and its environments are removed
+- **WHEN** an authorized client deletes an application with matching permits for its active resources
+- **THEN** owned resources are deprovisioned before application removal, while external or retained adopted objects remain and are listed in the deletion result
 
 ### Requirement: Environment types
 
@@ -40,10 +40,10 @@ An environment SHALL be created with an `id`, a display `name`, a `type` naming 
 
 ### Requirement: Environment deletion deprovisions resources
 
-Deleting an environment SHALL deprovision every active resource in it in reverse dependency order, then remove the environment. The default `development` environment SHALL NOT be deletable while the application exists. If deprovisioning fails the environment SHALL remain, marked with the failure.
+Environment deletion SHALL use the deployment mutation guard, expected generation, idempotency key and `deployment-safety` rules. Owned resources, including retained dependencies, SHALL be deleted in reverse retained dependency order before the environment. Failure SHALL preserve the environment and remaining records for retry. The default `development` environment SHALL not be deleted while its application exists.
 
 #### Scenario: Successful deletion
-- **WHEN** a client deletes `shop/pr-42` which has a workload, a postgres and a namespace
+- **WHEN** an authorized client deletes `shop/pr-42` with a matching permit for its owned workload, postgres and namespace
 - **THEN** the workload, postgres and namespace are deprovisioned in that order and the environment no longer exists
 
 #### Scenario: Deprovision failure
@@ -52,8 +52,8 @@ Deleting an environment SHALL deprovision every active resource in it in reverse
 
 ### Requirement: Environment runtime summary
 
-`GET /orgs/{org}/apps/{app}/envs/{env}` SHALL include the ID of the last deployment, its status, and the set ID currently deployed.
+`GET /orgs/{org}/apps/{app}/envs/{env}` SHALL include `generation`, `desired_set_id`, `last_successful_set_id`, `last_successful_deploy_id`, the most recent attempt and its status, and convergence (`converged`, `partial`, `unknown` or `never_deployed`). It SHALL NOT describe a partially applied set as wholly deployed.
 
 #### Scenario: After a deployment
 - **WHEN** a deployment to `shop/development` succeeds
-- **THEN** reading the environment shows that deployment's ID, status `succeeded` and its set ID
+- **THEN** reading the environment shows that deployment's ID, status `succeeded`, equal desired and last-successful set IDs, and convergence `converged`

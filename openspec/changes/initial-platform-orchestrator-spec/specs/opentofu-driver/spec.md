@@ -20,7 +20,7 @@ The OpenTofu driver provisions any resource type by running OpenTofu code from a
 
 ### Requirement: Run procedure
 
-For each `put` the driver SHALL prepare an isolated working directory, clone `source` at `rev` (or write `script`), write `files`, configure state, run `tofu init` and `tofu apply -auto-approve -input=false` with `variables` passed as `-var` values (secrets through a variables file not logged), and return the module's outputs. The `tofu` binary and version SHALL be configurable.
+For `put`, prepare a restricted run directory, resolve source to an immutable commit or write the script, and generate protected input files. Run noninteractive init and a saved plan; inspect actions/permits before applying that exact plan. Stale state SHALL require re-planning. Checkpoint result/state before exposing outputs. Configurable OpenTofu versions SHALL stay within the support matrix and preserve dependency integrity/TLS verification.
 
 #### Scenario: Git module with variables
 - **WHEN** `source.url` is a repository containing an RDS module and `variables.instance_class` is `db.t4g.micro`
@@ -36,7 +36,7 @@ For each `put` the driver SHALL prepare an isolated working directory, clone `so
 
 ### Requirement: State handling
 
-If the code declares a backend, the driver SHALL use it. Otherwise the driver SHALL store state in the orchestrator's state store keyed by GUResID: an S3 bucket configured on the server, or the local filesystem for development. A `local` backend in the code SHALL be ignored in favour of the orchestrator store.
+Approved non-local module backends SHALL satisfy state separation, locking and protected-artifact policy. Override module-local backends with stable GUResID-keyed orchestrator state: configured S3 or persistent local state. Local state SHALL have owner-only permissions and documented encrypted-volume/state encryption. S3 is optional. Retain backend identity; definition edits SHALL not move it silently or make different GUResIDs share a state key.
 
 #### Scenario: Orchestrator-managed state
 - **WHEN** the server is configured with `state.s3_bucket` and a module without a backend is applied twice
@@ -52,10 +52,10 @@ Every OpenTofu output SHALL become a resource output; outputs marked `sensitive 
 
 ### Requirement: Deprovisioning
 
-`delete` SHALL run `tofu destroy -auto-approve` against the same source revision and state, then remove the orchestrator-managed state. Repeated deletes after success SHALL be no-ops.
+`delete` SHALL plan destruction against the retained source revision, dependency lock information and backend identity, validate its permit, and apply that exact destroy plan. The orchestrator-managed state SHALL be removed only after confirmed destruction. Missing source, expired credentials or failed destruction SHALL preserve state and recovery metadata. Repeated deletes after success SHALL be no-ops.
 
 #### Scenario: Environment deleted
-- **WHEN** an environment with an opentofu-provisioned bucket is deleted
+- **WHEN** an environment with an owned opentofu-provisioned bucket is deleted with a matching permit
 - **THEN** `tofu destroy` removes the bucket and the state object is deleted
 
 ### Requirement: Failure reporting
@@ -65,3 +65,31 @@ On a non-zero exit the driver SHALL fail the attempt with the last lines of Open
 #### Scenario: Apply fails
 - **WHEN** `tofu apply` exits non-zero because of a missing IAM permission
 - **THEN** the resource error contains the AWS error message and the deployment shows the full run log
+
+### Requirement: State and process recovery
+
+Mutations SHALL use backend locking and preserve partial-apply state outside ephemeral directories. Timeout SHALL terminate/reap the local process group before another invocation. Recovery SHALL inspect persisted state/provider observations; process termination does not undo cloud effects. Missing state or unresolved remote effects SHALL block mutation with actionable recovery instructions, never bypass locks or allocate fresh state.
+
+#### Scenario: Partial apply writes state
+- **WHEN** an apply creates one object and fails on a second
+- **THEN** retry uses the same state and GUResID and converges the existing object instead of allocating a fresh state path
+
+#### Scenario: Missing state
+- **WHEN** an active resource's previously written backend state is unexpectedly absent
+- **THEN** the driver reports `recovery_required` instead of treating the resource as a new installation
+
+### Requirement: Retained dependency inputs
+
+Resolve and retain module commit, provider/module selections and lockfile checksums. Sources needed for recovery/deletion SHALL remain retrievable; retrieval failure SHALL preserve state and fail explicitly. Secret variables SHALL use owner-only files, never command-line arguments or logged content.
+
+#### Scenario: Module revision removed upstream
+- **WHEN** recovery cannot obtain its retained source from cache or configured source
+- **THEN** it fails without deleting state or substituting the current branch tip
+
+### Requirement: Backend credential separation
+
+Orchestrator-managed S3 state SHALL use a separately configured backend identity, defaulting to the server's identity scoped to the state bucket. Resource provisioning SHALL use the definition's cloud account. Supported backend role/configuration mechanisms SHALL keep the identities distinct without logging credentials or granting every resource account access to all state.
+
+#### Scenario: State and resource accounts differ
+- **WHEN** a definition provisions in an account that cannot read the control-plane state bucket
+- **THEN** its resource provider uses that account while the backend uses its separately authorized state identity

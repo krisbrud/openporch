@@ -4,6 +4,10 @@
 
 openporch acts as an OpenID Connect identity provider so that a cloud account can trust short-lived tokens it issues instead of holding standing credentials, starting with AWS role assumption with web identity. This capability is sequenced after the orchestrator works end to end.
 
+## Delivery scope
+
+This is a later optional integration, not a milestone 1 or milestone 2 release gate. Host identity and `aws-role` are the initial credential path.
+
 ## ADDED Requirements
 
 ### Requirement: Issuer and discovery

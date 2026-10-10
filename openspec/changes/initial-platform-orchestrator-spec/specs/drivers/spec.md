@@ -8,7 +8,7 @@ A driver turns a resource definition's inputs into a provisioned resource and it
 
 ### Requirement: Driver contract
 
-Every driver SHALL implement three operations keyed by GUResID: `put` (create or update to the desired inputs, returning outputs `values`/`secrets` and optional `manifests`), `get` (current state), and `delete` (idempotent deprovision). Drivers MAY return `in_progress` and the orchestrator SHALL poll `get` until done or timed out. Drivers MAY persist an opaque cookie up to 10 KB that the orchestrator stores per active resource and returns on later calls.
+Drivers SHALL implement GUResID-keyed idempotent `put` (converge), `get` (observe) and `delete`, with value/secret outputs, optional manifests and a versioned opaque cookie up to 10 KB. Poll asynchronous operations within deadlines. Mutations carry durable operation ID/input fingerprint; identical retries recover the same effect, changed fingerprints fail. Engine SHALL serialize operations per GUResID and checkpoint cookies for later calls.
 
 #### Scenario: Asynchronous provisioning
 - **WHEN** `put` returns `in_progress` with an estimated completion time
@@ -20,7 +20,7 @@ Every driver SHALL implement three operations keyed by GUResID: `put` (create or
 
 ### Requirement: Driver registry
 
-Drivers SHALL be identified as `<namespace>/<name>`. Built-in drivers use namespace `openporch`. `GET /orgs/{org}/resources/drivers` SHALL list registered drivers with their input schemas. External drivers SHALL be registrable with an HTTPS URL and optional static bearer token under `/orgs/{org}/resources/drivers`.
+Drivers SHALL use `<namespace>/<name>` IDs (`openporch` reserved for built-ins). Registry records SHALL pin protocol/cookie versions, input/output schemas and resource/workload/trigger, observation, recovery, preview and cancellation capabilities. External registration requires an HTTPS URL and optional secret bearer token. Incompatible definitions SHALL fail preflight. Releases SHALL ship built-in schemas and protocol fixtures.
 
 #### Scenario: Register an external driver
 - **WHEN** a client registers `acme/vault-secret` with `target: https://driver.internal/vault`
@@ -52,7 +52,7 @@ Drivers SHALL be identified as `<namespace>/<name>`. Built-in drivers use namesp
 
 ### Requirement: External HTTP driver protocol
 
-External drivers SHALL be called with `PUT`, `GET` and `DELETE /{guresid}` and JSON bodies compatible with Humanitec's Driver API 0.9.3: request `{type, resource, driver: {values, secrets}}`, response `{id, type, resource: {values, secrets}, manifests}`, status codes 200/202/204/400/404/409, and `Set-Openporch-Driver-Cookie` / `Openporch-Driver-Cookie` headers.
+External drivers SHALL use PUT/GET/DELETE `/{guresid}` with the documented Humanitec 0.9.3-derived profile: request `{type, resource, driver: {values, secrets}}`, response `{id, type, resource: {values, secrets}, manifests}`. Cookies use `Set-Openporch-Driver-Cookie`/`Openporch-Driver-Cookie`; mutations use `Openporch-Operation-Id`/`Openporch-Input-Fingerprint`. Fixtures SHALL specify version differences; full wire compatibility is not promised.
 
 #### Scenario: Driver error
 - **WHEN** an external driver returns `400` with `{error: "RES-101", message: "..."}`
@@ -60,8 +60,36 @@ External drivers SHALL be called with `PUT`, `GET` and `DELETE /{guresid}` and J
 
 ### Requirement: Driver timeouts
 
-Each driver call SHALL have a timeout (default 15 minutes, overridable per definition under `driver_inputs.values.timeout`). A timed-out call counts as a failed attempt.
+Each driver call SHALL have a timeout (default 15 minutes, overridable per definition under `driver_inputs.values.timeout`). The deadline SHALL be bounded by the remaining deployment deadline. A timeout SHALL first cancel and reap a local subprocess group, or invoke supported remote cancellation and observe its result. A failed cancellation or uncertain remote outcome SHALL be recorded as `unknown` and recovered before retry. Timeout alone SHALL NOT authorize a second mutation.
 
 #### Scenario: Hung driver
 - **WHEN** a driver does not answer within the timeout
-- **THEN** the attempt is recorded as failed with a timeout error
+- **THEN** the timeout is recorded, cancellation/recovery is attempted, and no retry runs concurrently with an unresolved operation
+
+### Requirement: Preview and driver upgrades
+
+Drivers MAY offer read-only `plan` returning classified actions and input/state fingerprint; unsupported plans SHALL report unknown impact. Echo/none report no infrastructure effects; OpenTofu SHALL plan. Cookie upgrades require tested migration/compatible readers, otherwise activation fails for affected resources. Old driver/source metadata needed for recovery/deletion SHALL remain available.
+
+#### Scenario: Incompatible cookie upgrade
+- **WHEN** a driver upgrade cannot read an active resource's cookie version
+- **THEN** activation is rejected with the affected GUResIDs and existing management metadata remains intact
+
+#### Scenario: Duplicate put
+- **WHEN** the same operation ID and inputs reach a driver twice after a response is lost
+- **THEN** the driver returns or recovers the same object identity rather than creating another object
+
+### Requirement: Observation and recovery capability
+
+`get` SHALL distinguish absent, in-progress, ready, failed and unknown and return observation/recovery metadata. Drivers unable to recover ambiguous outcomes SHALL advertise that limitation; the engine SHALL block automatic mutation retries until an operator establishes a safe outcome.
+
+#### Scenario: Unobservable timed-out creation
+- **WHEN** an external creation times out and its driver cannot observe or deduplicate it
+- **THEN** the engine marks recovery required and makes no second mutation automatically
+
+### Requirement: HTTP status mapping
+
+The adapter SHALL handle 200/202/204 completion/polling, permanent 400 validation failure, delete 404 as already absent, and 409 as a conflict requiring observation. Retry 429/transient 5xx only within deadline and with safe operation identity. Legacy drivers without recovery/preview guarantees SHALL report unknown capabilities and require matching policy.
+
+#### Scenario: Conflict after a lost response
+- **WHEN** an external PUT retry returns 409
+- **THEN** the engine observes the prior operation instead of blindly repeating mutation

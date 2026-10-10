@@ -4,6 +4,10 @@
 
 Workloads whose `workload` definition uses the built-in Kubernetes driver are rendered into manifests and applied to the cluster and namespace that definitions select for the environment.
 
+## Delivery scope
+
+This capability is milestone 2. Its contracts are retained here for design review; Kubernetes is not a first-release prerequisite.
+
 ## ADDED Requirements
 
 ### Requirement: Kubernetes workload driver
@@ -24,15 +28,15 @@ Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, 
 
 #### Scenario: Namespace per environment
 - **WHEN** the `k8s-namespace` definition uses the template driver to output `namespace: ${context.app.id}-${context.env.id}`
-- **THEN** the namespace `shop-dev` is created on the cluster if missing and workloads are applied into it
+- **THEN** the namespace `shop-dev` is created and its UID recorded if missing; an existing namespace requires explicit recorded adoption before workloads are applied
 
 ### Requirement: Workload rendering
 
-The `openporch/kubernetes` driver SHALL render a container workload into a `Deployment` (containers, env from variables, files as ConfigMap or Secret mounts, probes, resource requests), a `Service` when `service.ports` is set, and a `Secret` for secret variables, labelled with app, env, workload and deployment ID. A `schedule` trigger renders a `CronJob` instead. Function workloads and `queue`, `topic` or `stream` triggers SHALL fail naming the unsupported kind.
+The Kubernetes driver SHALL render containers into Deployment, optional Service, ConfigMap/Secret files and secret env references, with app/env/workload/deployment labels. Exactly one schedule without service/HTTP renders a CronJob instead. Function, queue/topic/stream, multiple-schedule and mixed scheduled/HTTP workloads SHALL fail preflight. Probes and resource requests SHALL follow the supported container schema.
 
 #### Scenario: Function workload on Kubernetes
 - **WHEN** a function workload is matched to an `openporch/kubernetes` definition
-- **THEN** provisioning fails stating the Kubernetes driver supports container workloads only
+- **THEN** preflight fails stating the Kubernetes driver supports container workloads only
 
 #### Scenario: Scheduled container
 - **WHEN** a container workload declares `triggers.nightly.schedule.cron: "0 3 * * *"`
@@ -44,7 +48,7 @@ The `openporch/kubernetes` driver SHALL render a container workload into a `Depl
 
 ### Requirement: Manifests from resources
 
-`manifests` returned by any resource in the graph SHALL be applied with the workload: `location: namespace` into the environment namespace, `cluster` at cluster scope, and `container`/`volume` merged into the workload's pod template.
+`manifests` returned by any resource in the graph SHALL be applied with the workload: `location: namespace` into the environment namespace, `cluster` at cluster scope only with administrator policy permitting the resource kind and ownership, and `container`/`volume` merged into the workload's pod template.
 
 #### Scenario: Service account injection
 - **WHEN** the `k8s-service-account` resource returns a ServiceAccount manifest with `location: namespace` and a pod spec patch setting `serviceAccountName`
@@ -52,7 +56,7 @@ The `openporch/kubernetes` driver SHALL render a container workload into a `Depl
 
 ### Requirement: Apply and readiness
 
-Manifests SHALL be applied with server-side apply using a field manager `openporch`. A workload counts as `provisioned` when its Deployment reports all replicas available within the extension file's `deploy.timeout` (default 5 minutes); with `deploy.status: deploy` it counts as provisioned once applied.
+Apply SHALL use server-side apply with field manager `openporch` and no forced conflicts. Deployment readiness requires the applied observed generation and all desired replicas updated/available within `deploy.timeout` (default 5m); `deploy.status: deploy` needs only apply. CronJob readiness means its expected specification and enabled schedule are persisted, not that a future Job ran. Runtime status SHALL report last schedule/recent Job outcomes separately.
 
 #### Scenario: Crash-looping container
 - **WHEN** the Deployment never becomes available within the timeout
@@ -60,7 +64,7 @@ Manifests SHALL be applied with server-side apply using a field manager `openpor
 
 ### Requirement: Workload removal and environment deletion
 
-When a deployment's set no longer contains a workload, its Deployment, Service, ConfigMaps and Secrets SHALL be deleted from the namespace. Deleting an environment SHALL delete the namespace if the `k8s-namespace` resource was created by openporch.
+Permitted workload removal SHALL delete its owned Deployment/CronJob, child Jobs, Service, ConfigMaps and Secrets. Retain a UID inventory and prune obsolete owned objects after kind/name changes. Delete a namespace only when recorded owned UID matches; adopted namespaces default to retain. Objects outside the ownership inventory SHALL block namespace deletion until an explicit administrator decision.
 
 #### Scenario: Remove a workload
 - **WHEN** a delta removes workload `payments` and is deployed
@@ -73,3 +77,15 @@ When a deployment's set no longer contains a workload, its Deployment, Service, 
 #### Scenario: Read status
 - **WHEN** `web` has 2 of 3 replicas available
 - **THEN** the runtime response shows `replicas: 3, available: 2` for `web`
+
+### Requirement: Shared manifest ownership
+
+Manifests emitted by shared resources SHALL be tracked once by the owning resource and reference-counted by consumers. Removing one workload SHALL not delete a shared object still used by another. The driver SHALL preserve pure rendering as a separate step from live apply, readiness and status observation.
+
+#### Scenario: Shared service account
+- **WHEN** two workloads consume one recorded ServiceAccount and one workload is removed
+- **THEN** the ServiceAccount remains for the other workload
+
+#### Scenario: Field conflict
+- **WHEN** another controller owns a field openporch attempts to change
+- **THEN** apply reports the conflict without forcing ownership or deleting the other controller's object

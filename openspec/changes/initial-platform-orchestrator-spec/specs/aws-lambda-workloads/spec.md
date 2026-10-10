@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Lets hobby and low-cost platforms run openporch workloads as AWS Lambda functions with serverless dependencies such as DynamoDB and SQS, with no Kubernetes cluster involved and no fixed monthly cost.
+Lets hobby and low-cost platforms run openporch workloads as AWS Lambda functions with serverless dependencies such as DynamoDB and SQS, with no Kubernetes cluster requirement. Cloud usage, retained data, artifacts, state and hosting the control plane can still incur costs.
 
 ## ADDED Requirements
 
@@ -20,7 +20,7 @@ openporch SHALL ship a reference OpenTofu module `aws-lambda-workload` and a `wo
 
 #### Scenario: Container workload on Lambda
 - **WHEN** a container workload with exactly one container and an ECR image is deployed with class `aws-lambda`
-- **THEN** it is deployed as an image function with the container's `command`/`args` as image config overrides, its `service.ports.targetPort` exported as `AWS_LWA_PORT`, and `files` or a second container cause a clear error
+- **THEN** it is deployed as an image function with the container's `command`/`args` as image config overrides, its `service.ports.targetPort` exported as `AWS_LWA_PORT`, and `files` or a second container cause a preflight error. A normal HTTP container SHALL include a compatible Lambda Web Adapter or Lambda runtime interface integration; the reference example SHALL pin and document the adapter and validate an actual HTTP invocation. Setting `AWS_LWA_PORT` alone SHALL NOT be described as making arbitrary container images Lambda-compatible
 
 #### Scenario: Non-ECR image
 - **WHEN** the image is not an ECR image URI in the function's region
@@ -36,10 +36,10 @@ Secret variables SHALL NOT be written as plain Lambda environment variables. The
 
 ### Requirement: Triggers
 
-The module SHALL support `http` (a Lambda function URL with auth `NONE` or `AWS_IAM`, published as output `url`), `schedule` (an EventBridge Scheduler schedule translated from 5-field cron and timezone, with `input` as the event payload), and `queue` (an SQS event source mapping with `batchSize`). `topic` and `stream` triggers SHALL fail provisioning with an error naming the trigger kind as unsupported in this milestone.
+The module SHALL support `http` (a Lambda function URL with auth `NONE` or `AWS_IAM`, published as output `url`), `schedule` (an EventBridge Scheduler schedule translated from 5-field cron and timezone, with `input` as the event payload), and `queue` (an SQS event source mapping with `batchSize`). `topic` and `stream` triggers SHALL fail preflight with an error naming the trigger kind as unsupported in this milestone.
 
 #### Scenario: Function URL
-- **WHEN** the workload declares an `http` trigger
+- **WHEN** the workload explicitly declares an `http` trigger with `auth: none`
 - **THEN** the workload's outputs include `url` and an HTTP GET to it invokes the function
 
 #### Scenario: Queue trigger
@@ -60,7 +60,7 @@ The execution role SHALL be granted access to the workload's AWS dependencies by
 
 ### Requirement: Serverless dependency definitions
 
-The reference platform SHALL include OpenTofu-driver definitions for `dynamodb-table` (inputs `primaryKey`, `attributes`, indexes; outputs `arn`, `name`, `region`), `sqs`, `sns-topic` and `s3`, each co-provisioning an `aws-policy` granting least-privilege access to that resource, so a function workload's whole stack is pay-per-use.
+The milestone 1 reference platform SHALL include OpenTofu-driver definitions for `dynamodb-table` (inputs `primaryKey`, `attributes`, indexes; outputs `arn`, `name`, `region`), `sqs` and `s3`; milestone 2 adds `sns-topic`, each co-provisioning an `aws-policy` granting least-privilege access to that resource, so a function workload's whole stack is pay-per-use.
 
 #### Scenario: Table from a workload file
 - **WHEN** a workload declares `resources.orders` of type `dynamodb-table` with `params.primaryKey: {name: id, type: S}`
@@ -68,7 +68,7 @@ The reference platform SHALL include OpenTofu-driver definitions for `dynamodb-t
 
 ### Requirement: Artifact bucket
 
-The reference platform SHALL create a versioned artifact bucket with a lifecycle rule that retains old versions, and document how CI uploads a zip under a content-addressed key and deploys it with `--artifact`. The cloud account used by the workload definition SHALL be able to read it.
+The reference platform SHALL create a versioned artifact bucket with a documented retention policy that preserves artifact versions referenced by retained deployment snapshots, and document how CI uploads a zip under a content-addressed key and deploys it with `--artifact`. The cloud account used by the workload definition SHALL be able to read it.
 
 #### Scenario: Rollback to a previous artifact
 - **WHEN** a deployment is rolled back with `+1`
@@ -76,8 +76,20 @@ The reference platform SHALL create a versioned artifact bucket with a lifecycle
 
 ### Requirement: Teardown
 
-Deleting the environment SHALL remove the function, its URL, schedules, event source mappings, role, parameters and every serverless dependency through `tofu destroy`, leaving no billable resource behind.
+Deleting the environment SHALL remove the function, its URL, schedules, event source mappings, role, parameters and every serverless dependency through permitted OpenTofu destruction of owned resources. Shared artifact/state buckets and externally supplied or explicitly retained resources SHALL be excluded and listed with their ownership and possible continuing cost; teardown SHALL NOT claim zero billing without accounting for retained objects.
 
 #### Scenario: Delete environment
-- **WHEN** `shop/dev` is deleted
+- **WHEN** `shop/dev` is deleted with a matching permit
 - **THEN** the function, its triggers, role, parameters, table and queue no longer exist
+
+### Requirement: Runtime secret resolution and target limits
+
+Examples SHALL include tested runtime code/helper fetching `_SECRET_REF` values with the workload identity and document refresh behavior; plaintext variables are not automatically populated. Preflight SHALL validate AWS size/time/region/ECR limits, cron translation and trigger combinations. HTTP URLs SHALL require explicit `auth: none|iam`; an inferred trigger SHALL not silently create a public URL. Unsupported cron expressions SHALL fail, not be approximated.
+
+#### Scenario: Function uses a secret
+- **WHEN** the example function is deployed with a database secret reference
+- **THEN** an integration invocation fetches that secret with its own scoped role while neither logs nor Lambda environment settings contain its plaintext
+
+#### Scenario: Workload removed
+- **WHEN** a permitted deployment removes a Lambda workload while retaining its queue dependency
+- **THEN** the function and its owned schedules, URL and event mappings are removed, while the retained queue remains tracked

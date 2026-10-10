@@ -16,10 +16,10 @@ Every member SHALL hold exactly one organization role: `administrator`, `manager
 
 ### Requirement: Invitations
 
-Administrators and managers SHALL invite humans with `POST /orgs/{org}/invitations` giving `email` or an external identity (`github:<login>`) and a role. The invitation SHALL carry a one-time code valid for 7 days. The invitee accepts by logging in with a matching identity, which creates the user with the invited role. Only administrators MAY invite administrators.
+Administrators/managers SHALL invite by verified email or GitHub login resolved to immutable ID, with role and a one-time 7-day code. Acceptance SHALL require the matching verified identity and code and atomically consume the invitation. Only administrators may invite administrators; all other grants SHALL obey the delegation ceiling.
 
 #### Scenario: Accept by GitHub login
-- **WHEN** an invitation for `github:octocat` with role `member` exists and that GitHub user logs in
+- **WHEN** an invitation for the immutable ID resolved from `octocat` with role `member` exists and that GitHub user logs in with its valid one-time code
 - **THEN** a user is created with role `member` and the invitation is consumed
 
 #### Scenario: Expired invitation
@@ -40,7 +40,7 @@ Administrators and managers SHALL create service users with `POST /orgs/{org}/us
 
 ### Requirement: Changing roles and removing members
 
-`PATCH /orgs/{org}/users/{user}` SHALL change the organization role and `DELETE` SHALL remove the member, revoking all their tokens and sessions and removing their application and environment type roles. Managers SHALL only change or remove members whose role is not `administrator`.
+`PATCH /orgs/{org}/users/{user}` SHALL change the organization role and `DELETE` SHALL remove the member, revoking all their tokens and sessions and removing their application and environment type roles. Managers SHALL only change or remove members whose current and proposed roles are not `administrator`, and every delegated grant SHALL obey the permission ceiling below. Last-administrator checks and membership changes SHALL be atomic.
 
 #### Scenario: Removal revokes access
 - **WHEN** user `alice` is removed while holding an API token
@@ -49,3 +49,19 @@ Administrators and managers SHALL create service users with `POST /orgs/{org}/us
 #### Scenario: Manager removes an administrator
 - **WHEN** a manager deletes an administrator
 - **THEN** the server returns `403`
+
+### Requirement: Delegation cannot increase authority
+
+Invites, service-user creation, role changes and token issuance SHALL check current and resulting privileges. Only administrators may create/promote administrators or issue tokens for administrator service users, including bootstrap. Non-administrators SHALL not grant or impersonate permissions beyond their own org/app/type authority. Self-tokens inherit current roles; authoritative role/grant checks SHALL be atomic.
+
+#### Scenario: Manager targets bootstrap
+- **WHEN** a manager requests a token for `bootstrap`
+- **THEN** the request returns `403` and produces no token
+
+#### Scenario: Manager creates or promotes an administrator
+- **WHEN** a manager creates an administrator service user or changes a non-administrator's role to administrator
+- **THEN** each request returns `403` without changing membership
+
+#### Scenario: Service user exceeds issuer's authority
+- **WHEN** a manager without production deployment permission requests a token for a production CI service user
+- **THEN** the request returns `403` even though that service user's organization role is only `member`

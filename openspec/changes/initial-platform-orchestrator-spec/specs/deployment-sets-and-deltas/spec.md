@@ -36,7 +36,7 @@ Applying a delta to a set SHALL process `modules.remove`, then `modules.add`, th
 
 ### Requirement: Delta from a workload document
 
-`POST /orgs/{org}/apps/{app}/deltas` SHALL accept either a raw delta or a workload conversion request (an openporch workload document or a Score file plus overlay), and `porch workload deploy` SHALL build a delta whose `modules.add` or `modules.update` brings the named workload to the document's content relative to the environment's current set.
+`POST /orgs/{org}/apps/{app}/deltas` SHALL accept either a raw delta or a workload conversion request (an openporch workload document or a Score file plus overlay), and `porch workload deploy` SHALL build a delta whose `modules.add` or `modules.update` brings the named workload to the document's content relative to the environment's desired set and return the base generation. Applying it SHALL require that generation, so intervening changes return `409` instead of overwriting them.
 
 #### Scenario: Redeploy unchanged workload
 - **WHEN** the same workload document is deployed twice to the same environment
@@ -44,7 +44,7 @@ Applying a delta to a set SHALL process `modules.remove`, then `modules.add`, th
 
 ### Requirement: Set diff
 
-`GET /orgs/{org}/apps/{app}/sets/{a}/diff/{b}` SHALL return a delta that transforms set `a` into set `b`. The CLI SHALL accept deployment references `deploy/.` (current) and `deploy/+n` (n deployments ago) in place of set IDs.
+`GET /orgs/{org}/apps/{app}/sets/{a}/diff/{b}` SHALL return a delta that transforms set `a` into set `b`. The CLI SHALL accept deployment references `deploy/.` (most recent attempt), `deploy/+n` (n attempts before it, including failures) and `deploy/last-successful` in place of set IDs.
 
 #### Scenario: Diff last two deployments
 - **WHEN** `porch diff sets --app shop --env dev deploy/. deploy/+1` runs

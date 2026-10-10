@@ -44,7 +44,7 @@ A workload SHALL be a YAML document with `apiVersion: openporch.dev/v1`, `kind: 
 
 ### Requirement: Triggers
 
-`triggers` SHALL be a map of trigger name to exactly one of `http` (`port`, `path`, `auth: none|iam`), `schedule` (`cron` in 5-field form, `timezone`, `input`), `queue` (`resource`, `batchSize`), `topic` (`resource`), `stream` (`resource`, `batchSize`, `startingPosition`). `resource` SHALL name a key under `resources`. The matched workload definition decides which trigger kinds it supports and fails provisioning for the rest.
+`triggers` SHALL map names to one kind: `http` (port/path/auth), `schedule` (5-field cron/timezone/input), `queue` (resource/batchSize), `topic` (resource) or `stream` (resource/batchSize/startingPosition). Resource names SHALL exist under `resources`. Driver capabilities SHALL reject unsupported kinds/combinations before any mutation. HTTP auth values are `none|iam`; defaults/exposure follow target policy.
 
 #### Scenario: Queue trigger on a dependency
 - **WHEN** `triggers.inbox.queue.resource` is `inbox` and `resources.inbox` is an `sqs`
@@ -56,7 +56,7 @@ A workload SHALL be a YAML document with `apiVersion: openporch.dev/v1`, `kind: 
 
 #### Scenario: Unsupported trigger for the target
 - **WHEN** a `queue` trigger reaches a workload definition using `openporch/kubernetes`
-- **THEN** the workload fails provisioning with an error naming the trigger and the driver
+- **THEN** preflight fails with an error naming the trigger and driver, before provisioning any dependency
 
 ### Requirement: Resource dependencies
 
@@ -80,7 +80,7 @@ Placeholders `${resources.<key>.<output>}` in variables, files and trigger input
 
 ### Requirement: Deploy settings and target passthrough
 
-`deploy` MAY set `status` (`deploy|available`, default `available`) and `timeout` (default `5m`). `target` MAY carry target-specific fragments under a key per target (for example `kubernetes.pod.annotations` or `lambda.layers`); the orchestrator SHALL pass them through unvalidated to the matched driver. The document SHALL be environment-agnostic and SHALL NOT contain environment-specific placeholders.
+`deploy` MAY set status `deploy|available` (default available) and timeout (default 5m). `target` fragments SHALL satisfy the selected driver's schema and administrator policy; unknown/unsupported fields fail preflight. Workload input and stored specs SHALL reject `${context.*}` and use `${values.*}` for environment configuration; context placeholders remain allowed in platform definitions. `${pod.*}` requires supported target capability.
 
 #### Scenario: Pod annotation
 - **WHEN** `target.kubernetes.pod.annotations.billing-code` is `X` and the workload is deployed through the Kubernetes driver
@@ -120,7 +120,7 @@ A document with `apiVersion: score.dev/v1b1` SHALL be accepted and converted to 
 
 ### Requirement: Deploy-time overrides
 
-Deploying SHALL accept `--image <container-or-function>=<ref>`, `--artifact <function>=<uri>` and `--property <path>=<value>` overrides, applied after conversion and before the delta is created. Artifact URIs SHALL be immutable references (`s3://bucket/key` with a version ID or a content hash in the key).
+After conversion and before delta creation, apply `--image <container-or-function>=<ref>`, `--artifact <function>=<uri>` and `--property <path>=<value>`. Before acceptance, pin artifacts to S3 versions or verified immutable content-addressed objects and image tags to digests. Hash-shaped filenames alone SHALL not prove immutability. Store identities in snapshots and recheck at execution/replay; unresolvable artifacts SHALL fail before mutation.
 
 #### Scenario: Override image from CI
 - **WHEN** CI deploys with `--image web=ghcr.io/acme/web:abc123`
@@ -128,4 +128,4 @@ Deploying SHALL accept `--image <container-or-function>=<ref>`, `--artifact <fun
 
 #### Scenario: Mutable artifact
 - **WHEN** CI deploys with `--artifact main=s3://acme-artifacts/order-worker/latest.zip` without a version ID
-- **THEN** the command fails explaining that artifact references must be immutable
+- **THEN** the command resolves and pins a version if the bucket is versioned, or fails explaining that an immutable object identity is required

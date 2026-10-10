@@ -28,11 +28,11 @@ A principal MAY hold API tokens created under `POST /orgs/{org}/users/{user}/tok
 
 #### Scenario: Who may create tokens
 - **WHEN** a user with the Member role tries to create a token for another user
-- **THEN** the server returns `403`; users may create tokens for themselves, and administrators and managers for service users
+- **THEN** the server returns `403`; users may create tokens for themselves, and administrators for service users; managers may issue service-user tokens only within the delegation ceiling in `organization-membership`
 
 ### Requirement: Bearer authentication
 
-Every API request except health, version, login and OIDC discovery endpoints SHALL carry `Authorization: Bearer <token>` where the token is an API token or a session token. Missing or invalid credentials SHALL be rejected with `401` and a uniform error body.
+Every API request except liveness, readiness, health, version, login and OIDC discovery endpoints SHALL carry `Authorization: Bearer <token>` where the token is an API token or a session token. Missing or invalid credentials SHALL be rejected with `401` and a uniform error body.
 
 #### Scenario: Missing token
 - **WHEN** a request carries no `Authorization` header
@@ -40,7 +40,7 @@ Every API request except health, version, login and OIDC discovery endpoints SHA
 
 ### Requirement: Sessions and login
 
-`porch login` SHALL obtain a short-lived session token (24 hours) by authenticating the user through a configured external identity provider and SHALL store it in the CLI config. Session tokens SHALL be signed by the server, carry the principal ID and expiry, and SHALL be verifiable without a database lookup; the server MAY additionally check a revocation list.
+`porch login` SHALL store a signed 24-hour session with principal ID and expiry. Its signature may be verified offline, but every request SHALL check current membership, permissions and revocation. Removal, logout/revocation and role changes SHALL affect the next request, including with caches. A valid signature alone SHALL not authorize a removed principal.
 
 #### Scenario: Login and expiry
 - **WHEN** a user completes `porch login` and uses the CLI 25 hours later
@@ -48,11 +48,11 @@ Every API request except health, version, login and OIDC discovery endpoints SHA
 
 ### Requirement: External identity providers
 
-The server SHALL support configuring identity providers of type `github` (OAuth app client ID and secret, using the device authorization flow for the CLI and the authorization code flow for browsers) and `oidc` (issuer, client ID and secret, PKCE). A successful login SHALL map the external identity (`github:<login>` or `<issuer>:<sub>`) to a user; an unknown identity with no matching invitation SHALL be rejected.
+Milestone 1 SHALL support `github` (OAuth app credentials, CLI device flow, browser authorization-code flow); milestone 2 adds `oidc` (issuer, client credentials, PKCE). Login SHALL map `github:<immutable-numeric-user-id>` or `<issuer>:<sub>` to a user; login names are display metadata. Unknown identities without a matching invitation SHALL be rejected.
 
 #### Scenario: GitHub device login
 - **WHEN** `porch login` runs against a server with a `github` provider
-- **THEN** the CLI shows a device code and URL, polls until the user approves, and receives a session token for the user linked to that GitHub login
+- **THEN** the CLI shows a device code and URL, polls until the user approves, and receives a session token for the user linked to the immutable GitHub user ID returned by the provider
 
 #### Scenario: Unknown identity
 - **WHEN** a GitHub user with no openporch user and no pending invitation logs in
@@ -64,8 +64,40 @@ The server SHALL support configuring identity providers of type `github` (OAuth 
 
 ### Requirement: Bootstrap administrator
 
-On first start with an empty database, the server SHALL create the organization and an initial `administrator` service user named `bootstrap`, and SHALL print a one-time API token for it to its log or write it to a file named in configuration. The token SHALL be usable to create the first human user and SHALL be revocable like any other.
+First start SHALL create the organization and administrator service user `bootstrap`. Its token SHALL expire after 24 hours by default and be written once to a configured owner-only file (default `<data-dir>/bootstrap-token`, Unix `0600`), never normal logs. Explicit interactive display MAY be supported. Documentation SHALL explain creating a human administrator and revoking/removing the bootstrap token/file.
 
 #### Scenario: First start
 - **WHEN** `openporch serve` starts with an empty data directory
-- **THEN** the log contains a bootstrap token and `porch get users` with it lists the `bootstrap` service user as administrator
+- **THEN** the restricted bootstrap file contains the token, logs contain only its file location, and `porch get users` with that token lists the `bootstrap` service user as administrator
+
+### Requirement: Identity verification
+
+GitHub identities SHALL use immutable numeric IDs; invitation login names SHALL be resolved to IDs at issuance. Renaming/reusing a login SHALL not transfer membership. Email invitations SHALL require provider-verified email ownership. OIDC login is a milestone 2 integration governed by the validation requirement below.
+
+#### Scenario: Reused GitHub name
+- **WHEN** another GitHub account acquires a former member's login name
+- **THEN** it gains no membership or invitation associated with the original immutable ID
+
+#### Scenario: Unverified invitation email
+- **WHEN** a login presents an invited email address without verified ownership
+- **THEN** invitation acceptance is denied
+
+#### Scenario: Removed user with a valid signature
+- **WHEN** a removed user presents an otherwise unexpired signed session
+- **THEN** the next request returns `401`
+
+### Requirement: Transport and credential handling
+
+Remote API/CLI/provider connections SHALL use verified TLS, either directly or through a documented trusted reverse proxy. Plain HTTP SHALL be allowed only through explicit loopback development configuration. CLI credential files SHALL be owner-only, tokens SHALL not appear in diagnostics, and token entry SHALL support stdin or a hidden prompt without requiring shell-history exposure. Login and token endpoints SHALL have configurable rate limits and bounded request sizes.
+
+#### Scenario: Invalid server certificate
+- **WHEN** a remote server presents an invalid TLS certificate
+- **THEN** the CLI and provider reject the connection without sending a credential
+
+### Requirement: OIDC login validation
+
+When enabled, OIDC login SHALL validate signature, allowed algorithm, issuer, audience, expiry, state and nonce, use PKCE, and reject reused login transactions. Browser callbacks SHALL be restricted to configured URLs.
+
+#### Scenario: Wrong audience or replayed transaction
+- **WHEN** an OIDC response targets another client or repeats a consumed login transaction
+- **THEN** login fails without creating a session

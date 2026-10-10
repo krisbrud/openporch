@@ -8,7 +8,7 @@ Active resources are the concrete things the orchestrator has provisioned in an 
 
 ### Requirement: Identity
 
-Each active resource SHALL have a permanent, non-semantic GUResID generated at first provisioning and stable across deployments, plus its descriptor `<type>.<class>#<res_id>` which is unique within an environment. The GUResID SHALL be what drivers and the OpenTofu state store are keyed by.
+Each active resource SHALL have a permanent, non-semantic GUResID allocated and durably recorded before the first provisioning call and stable across deployments, plus its descriptor `<type>.<class>#<res_id>` which is unique within an environment. The GUResID SHALL be what drivers and the OpenTofu state store are keyed by.
 
 #### Scenario: Stable across deployments
 - **WHEN** `postgres.default#modules.web.externals.db` is provisioned in two consecutive deployments
@@ -16,7 +16,7 @@ Each active resource SHALL have a permanent, non-semantic GUResID generated at f
 
 ### Requirement: Record contents
 
-An active resource SHALL record its descriptor, GUResID, definition ID, driver type, resolved non-secret inputs, non-secret outputs, secret outputs as secret references into the primary store (never returned as values), driver cookie, the ID of the deployment that last provisioned it successfully, status, and `scheduled_deletion`.
+An active resource SHALL retain descriptor, GUResID, definition/driver version, non-secret inputs/outputs, secret references, encrypted cookie, operation/recovery metadata, execution snapshot, backend and external object identities, ownership, dependency edges, last successful deployment, observation time, status and `scheduled_deletion`. It SHALL be checkpointed per operation and survive partial failure.
 
 #### Scenario: Read outputs
 - **WHEN** a client reads an active postgres resource
@@ -24,7 +24,7 @@ An active resource SHALL record its descriptor, GUResID, definition ID, driver t
 
 ### Requirement: Unreferenced resources persist
 
-Removing a dependency from a set SHALL NOT deprovision its active resource. The resource remains, no longer referenced by the current graph, so a rollback can reuse it.
+Removed non-workload dependencies SHALL remain tracked as retained and potentially billable for later reuse. Removed workloads SHALL lose their owned runtimes/triggers on every target under `deployment-safety`; dependencies remain unless separately scheduled for deletion. Retained records and destroy dependencies SHALL NOT expire with deployment logs.
 
 #### Scenario: Dependency removed then restored
 - **WHEN** a workload drops its `db` dependency in one deployment and adds it back in the next
@@ -32,10 +32,10 @@ Removing a dependency from a set SHALL NOT deprovision its active resource. The 
 
 ### Requirement: Deprovisioning rules
 
-An active resource SHALL be deprovisioned when its environment is deleted, when it is `scheduled_deletion` and a later deployment does not include it, or when its definition's driver type changes. Deprovisioning calls the driver's `delete` and removes the record on success.
+Owned resources SHALL be deprovisioned on permitted environment deletion, permitted workload removal, or permitted deployment excluding a resource scheduled for deletion. Deletion SHALL use retained source/state and reverse retained dependency order, including unreferenced resources. Remove the live record only on confirmed deletion and keep an audit tombstone. Adopted resources default to retain; external resources SHALL never be destroyed.
 
 #### Scenario: Scheduled deletion
-- **WHEN** a client deletes `postgres/modules.web.externals.db` via `DELETE .../envs/{env}/resources/{type}/{res_id}` and then deploys a set without it
+- **WHEN** a client schedules `postgres/modules.web.externals.db` via `DELETE .../envs/{env}/resources/{type}/{res_id}` and then deploys a set without it with a matching destructive-action permit
 - **THEN** the driver's `delete` runs during that deployment and the record disappears
 
 ### Requirement: Listing
@@ -48,8 +48,24 @@ An active resource SHALL be deprovisioned when its environment is deleted, when 
 
 ### Requirement: Detach
 
-`DELETE ...?detach=true` SHALL remove the active resource record without calling the driver, as an emergency fallback, and SHALL log a warning naming the resource.
+Detach SHALL require administrator permission, a reason, a matching permit and no running/uncertain operation. It removes management without calling the driver and retains an exportable tombstone with object IDs, GUResID and state location. Audit SHALL record actor and reason. A detached descriptor SHALL not silently receive a fresh GUResID and recreate its object; later adoption is explicit.
 
 #### Scenario: Detach
-- **WHEN** a client detaches an active resource
+- **WHEN** an administrator detaches an inactive resource with a matching permit and reason
 - **THEN** the record is gone, the driver was not called, and the real-world object still exists
+
+### Requirement: Partial deletion recovery
+
+Deletion SHALL persist each completed and failed step. A failed step SHALL block deletion of resources it depends on, preserve remaining records and state, and allow an explicit retry using the same identities. Failure to remove state after confirmed cloud deletion SHALL be reported as cleanup pending and retried without recreating the cloud object.
+
+#### Scenario: Database deletion fails
+- **WHEN** workload deletion succeeds but database deletion fails
+- **THEN** the database and its prerequisites remain tracked, the environment remains in deletion-failed state, and retry continues safely without repeating an already completed cloud deletion
+
+### Requirement: Driver and backend changes
+
+A definition change SHALL NOT implicitly destroy, replace or migrate an active resource when its driver, backend or ownership target changes. Milestone 1 SHALL return `409` and retain management metadata for an explicit operator-led migration or separately permitted replacement.
+
+#### Scenario: Definition switches backend
+- **WHEN** an in-use definition is changed to another backend
+- **THEN** the next deployment fails with a migration-required conflict without deleting the old resource or state

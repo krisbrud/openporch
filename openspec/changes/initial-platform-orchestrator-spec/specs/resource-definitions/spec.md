@@ -56,11 +56,18 @@ Criteria SHALL be addable and removable individually (`POST`/`DELETE /orgs/{org}
 
 ### Requirement: Co-provisioning
 
-A definition MAY declare `provision`, a map from resource type to `{is_dependent, match_dependents, params}`. When the definition is used, the orchestrator SHALL add a resource of that type with the same class and resource ID, apply the dependency flags, and pass `params` (with placeholders resolved) as its resource inputs.
+A definition MAY declare `provision`, mapping type to `{is_dependent, match_dependents, params}`. It SHALL add that type with the source class/ID and resolved params. Flags default false; edges SHALL follow this table. For source A, co-resource B and existing consumer C, X -> Y means X waits for Y.
+
+| is_dependent | match_dependents | Edges |
+| --- | --- | --- |
+| false | false | B -> A |
+| false | true | B -> A, C -> B |
+| true | false | A -> B |
+| true | true | A -> B, C -> B |
 
 #### Scenario: Policy co-provisioned with a database
-- **WHEN** the `postgres` definition provisions `aws-policy` with `is_dependent: false` and the `aws-policy` definition references `${resources.postgres.outputs.name}`
-- **THEN** the graph contains an `aws-policy` with the database's resource ID that is provisioned after the database
+- **WHEN** the `postgres` definition provisions `aws-policy` with `is_dependent: false, match_dependents: true` and the `aws-policy` definition references `${resources.postgres.outputs.name}`
+- **THEN** the graph contains an `aws-policy` with the database's resource ID that is provisioned after the database, and workloads consuming the database wait for both and receive the policy output
 
 ### Requirement: Deleting a definition in use
 
@@ -69,3 +76,11 @@ A definition SHALL NOT be deleted while active resources were provisioned by it.
 #### Scenario: Delete in use
 - **WHEN** a client deletes `prod-postgres` while `shop/production` has a postgres provisioned by it
 - **THEN** the server returns `409` naming `shop/production`
+
+### Requirement: Co-provisioning expansion
+
+Consumers SHALL include workload/resource-reference dependencies but exclude the co-resource itself. Expansion SHALL reach a deterministic fixed point and deduplicate edges. Placeholder edges are additional; cycles fail preflight. `match_dependents: true` exposes the co-resource as a direct dependency/output of each consumer. Repeated descriptors SHALL have identical canonical inputs; conflicts fail preflight.
+
+#### Scenario: Policy edge required by workload
+- **WHEN** a table co-provisions a policy with `match_dependents: true`
+- **THEN** the workload waits for both table and policy and receives both outputs regardless of traversal order

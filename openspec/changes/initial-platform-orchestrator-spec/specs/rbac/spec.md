@@ -40,7 +40,7 @@ The orchestrator SHALL grant `administrator` every permission and SHALL reserve 
 
 ### Requirement: Deployer gate
 
-Creating, deploying to, pausing or deleting an environment SHALL require `developer` or `owner` on the application and `deployer` on the environment's type. Deleting an application SHALL require `owner` plus `deployer` on every environment type the application uses.
+Creating, deploying to or deleting an environment SHALL require `developer` or `owner` on the application and `deployer` on the environment's type. Deleting an application SHALL require `owner` plus `deployer` on every environment type the application uses.
 
 #### Scenario: Developer without deployer
 - **WHEN** a `developer` on `shop` without `deployer` on `production` deploys to `shop/production`
@@ -51,7 +51,7 @@ Creating, deploying to, pausing or deleting an environment SHALL require `develo
 The principal that creates an application SHALL become its `owner`. Administrators SHALL hold every role implicitly.
 
 #### Scenario: Create an application
-- **WHEN** manager `carol` creates application `shop`
+- **WHEN** manager `carol`, with `deployer` on `development`, creates application `shop`
 - **THEN** `carol` is listed as `owner` of `shop`
 
 ### Requirement: Enforcement on every route
@@ -73,3 +73,15 @@ Roles SHALL be manageable through the API, the CLI (`porch users`, `porch apps u
 #### Scenario: Grant through the provider
 - **WHEN** a configuration declares `openporch_application_user` with user `ci`, app `shop` and role `developer`
 - **THEN** `tofu apply` grants the role and a later plan shows no changes
+
+### Requirement: Reference and action authorization
+
+Handlers SHALL supplement route checks with referenced-object scope, secret grants, action permits and delegation ceilings. Foreign set/delta/deployment IDs SHALL not bypass visibility or deployer gates. Environment-value changes require that type's deployer role; application-wide values require deployer on every type in the app. Changed authorization SHALL invalidate affected unused permits and block newly unauthorized execution.
+
+#### Scenario: Cross-application deployment reference
+- **WHEN** a developer submits a deployment ID from an application they cannot access
+- **THEN** the operation is rejected without disclosing its contents or deploying it
+
+#### Scenario: Development user changes production configuration
+- **WHEN** a developer without production deployer permission changes a production override or an application-wide value used by a production environment
+- **THEN** the request returns `403`

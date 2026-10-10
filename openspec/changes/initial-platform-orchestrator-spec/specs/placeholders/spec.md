@@ -48,8 +48,16 @@ A string that is exactly one placeholder SHALL take the referenced value's JSON 
 
 ### Requirement: Set placeholders for workloads
 
-Inside workload specs, `${externals.<key>.<output>}`, `${shared.<id>.<output>}`, `${values.<key>}` (shared values, environment level overriding application level), `${context.*}` and `${pod.status.podIP}`-style runtime references SHALL be resolved when rendering the workload; the pod references SHALL render as Kubernetes field references.
+Inside workload specs, `${externals.<key>.<output>}`, `${shared.<id>.<output>}`, `${values.<key>}` (shared values, environment level overriding application level) and `${pod.status.podIP}`-style runtime references SHALL be resolved when rendering the workload; the pod references SHALL render as Kubernetes field references.
 
 #### Scenario: Shared DNS host in a variable
 - **WHEN** a workload variable is `https://${shared.api-dns.host}/api`
 - **THEN** the container env var carries the provisioned host
+
+### Requirement: Deferred secret expression evaluation
+
+Whole-value and composite placeholders SHALL preserve secret taint consistently for resource outputs and shared values. The planner SHALL retain an expression containing secret references without evaluating it; the executor SHALL evaluate it only after reference-use authorization and only into a secret sink. Non-secret output/log fields SHALL reject tainted values rather than stringify them.
+
+#### Scenario: Composite connection string
+- **WHEN** a connection string combines a non-secret host and a secret password reference
+- **THEN** the planner stores a tainted expression and only the executor renders it for a workload secret variable or file

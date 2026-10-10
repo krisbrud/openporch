@@ -40,7 +40,7 @@ A placeholder `${resources.<type>[.<class>][#<id>].outputs.<name>}` in a definit
 
 ### Requirement: Provisioning order and parallelism
 
-Resources SHALL be provisioned in topological order; a resource starts only when all resources it depends on are `provisioned`. Independent resources MAY be provisioned concurrently, bounded by a configurable concurrency limit (default 4).
+Resources SHALL be provisioned in topological order; a resource starts only when all resources it depends on are `provisioned`. Independent resources MAY be provisioned concurrently, bounded by a configurable global driver concurrency limit (default 4) and an optional lower per-environment limit. Across all environments, active OpenTofu subprocesses SHALL count against the same global limit.
 
 #### Scenario: Parallel branches
 - **WHEN** a workload depends on `postgres` and `s3` that do not depend on each other
@@ -61,3 +61,11 @@ A resource's resolved driver inputs SHALL include the outputs of the resources i
 #### Scenario: Inspect after deployment
 - **WHEN** a client reads the graph after a failed deployment
 - **THEN** every node shows its status and the failed node shows its error
+
+### Requirement: Deterministic shared-resource inputs
+
+Requests for the same resource descriptor SHALL merge only when their canonical resource inputs agree. The graph SHALL be independent of workload iteration order. Conflicting definitions, parameters or ownership SHALL produce a preflight error identifying both request paths, without provisioning either resource.
+
+#### Scenario: Conflicting shared table
+- **WHEN** two workloads name the same shared DynamoDB table with different primary keys
+- **THEN** graph construction rejects both request paths and no driver mutates infrastructure

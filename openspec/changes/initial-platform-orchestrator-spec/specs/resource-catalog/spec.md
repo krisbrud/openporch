@@ -49,3 +49,11 @@ When a driver returns outputs for a resource, the orchestrator SHALL verify that
 #### Scenario: Missing required output
 - **WHEN** the definition for `postgres` returns no `host`
 - **THEN** provisioning of that resource fails with an error naming the missing output
+
+### Requirement: Published schema contracts
+
+Every built-in type SHALL ship versioned, pinned-dialect JSON Schema fixtures for required/optional inputs/outputs, types and sensitivity. External compatibility SHALL name a fixed version and differences. Schema changes follow public compatibility policy and SHALL not reinterpret stored inputs silently. Derived cloud names SHALL respect target limits, using deterministic collision-resistant shortening where needed.
+
+#### Scenario: Catalog schema fixture
+- **WHEN** a release validates its built-in catalog
+- **THEN** every listed type has a schema fixture and missing required or incorrectly typed outputs fail its conformance tests

@@ -20,7 +20,7 @@ The orchestrator SHALL expose an HTTP/JSON API rooted at `/orgs/{org}` for exact
 
 ### Requirement: Authentication and authorization on every route
 
-Every API route except health, version, login and OIDC discovery SHALL require an authenticated principal (see the `authentication` capability) and an explicit permission check (see the `rbac` capability). `401` means no valid credential; `403` means the principal lacks the permission.
+Every API route except liveness, readiness, health, version, login and OIDC discovery SHALL require an authenticated principal (see the `authentication` capability) and an explicit permission check (see the `rbac` capability). `401` means no valid credential; `403` means the principal lacks the permission.
 
 #### Scenario: Unauthenticated request
 - **WHEN** a request carries no valid credential
@@ -48,8 +48,8 @@ IDs of applications, environments, environment types, resource definitions, clou
 
 ### Requirement: Health and version endpoints
 
-The server SHALL expose unauthenticated `GET /healthz` returning `200` when it can reach its database, and `GET /version` returning the build version.
+The server SHALL expose unauthenticated `/livez`, `/readyz` and `/healthz` under the `control-plane-operations` health contract, and `GET /version` returning the build and public contract versions. Enabled capabilities SHALL be discoverable so clients can reject unsupported integrations before submission.
 
 #### Scenario: Healthy server
-- **WHEN** a client calls `GET /healthz` on a running server with a reachable database
+- **WHEN** a client calls `GET /healthz` on a running server with database, required keys, exclusive ownership and executor ready
 - **THEN** the server returns `200`

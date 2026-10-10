@@ -4,11 +4,15 @@
 
 The openporch OpenTofu provider lets platform engineers manage the orchestrator's platform-side objects as infrastructure as code.
 
+## Delivery scope
+
+Milestone 1 includes the provider resources needed by the Lambda reference platform (see tasks 7.2–7.3). Broader custom-type, driver, secret-store and identity-provider resources follow in milestone 2. Unavailable server capabilities SHALL be rejected before mutation.
+
 ## ADDED Requirements
 
 ### Requirement: Provider configuration
 
-The provider `openporch/openporch` SHALL be configured with `url`, `org_id` and `token`, each overridable by `OPENPORCH_URL`, `OPENPORCH_ORG` and `OPENPORCH_TOKEN`. It SHALL target OpenTofu 1.6 or later through the plugin protocol version 6.
+The provider `openporch/openporch` SHALL be configured with `url`, `org_id` and `token`, each overridable by `OPENPORCH_URL`, `OPENPORCH_ORG` and `OPENPORCH_TOKEN`. It SHALL use plugin protocol version 6 and publish a finite tested OpenTofu compatibility range per release, rather than promising all future versions.
 
 #### Scenario: Configure from environment
 - **WHEN** a configuration declares the provider with no arguments and the three environment variables are set
@@ -36,7 +40,7 @@ The provider SHALL also offer `openporch_user` (service users), `openporch_servi
 
 ### Requirement: Driver inputs and secrets in HCL
 
-`openporch_resource_definition` SHALL take `driver_inputs` as an object with `values` (arbitrary JSON-encodable map) and `secrets` (sensitive map). Secrets SHALL be marked sensitive in state and plans, and since the API never returns them, the provider SHALL detect drift only through the set of secret keys.
+`driver_inputs` SHALL accept JSON-compatible values and sensitive secrets. Sensitivity redacts display, not stored state; require protected/encrypted provider state and prefer references. Reads SHALL compare reference versions and keys without retrieving values. Configured value changes SHALL plan updates; unchanged inputs SHALL give no-op plans.
 
 #### Scenario: Placeholder escaping
 - **WHEN** a value is written `"$${context.app.id}-$${context.env.id}"` in HCL
@@ -61,3 +65,11 @@ The provider SHALL NOT offer resources for deployments, deltas or active resourc
 #### Scenario: Reviewer looks for a deploy resource
 - **WHEN** a user searches the provider schema for a deployment resource
 - **THEN** none exists and the documentation points to `porch score deploy`
+
+### Requirement: Protected deletion and compatibility
+
+Provider deletion SHALL obey server preview/permit checks, with explicit plan-fingerprint acknowledgement for infrastructure destruction and administrator permission for protected environments. A provider destroy SHALL not imply unconditional server authorization. Publish tested server/provider versions and import identifiers; acceptance tests SHALL cover them. One-time tokens in state SHALL follow protected-state rules.
+
+#### Scenario: Accidental application removal from HCL
+- **WHEN** a provider plan would delete an application with active resources but no matching destruction acknowledgement is configured
+- **THEN** apply returns an actionable preview/permit error before deprovisioning infrastructure

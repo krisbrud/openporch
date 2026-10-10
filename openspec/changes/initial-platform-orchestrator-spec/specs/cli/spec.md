@@ -28,7 +28,7 @@ The `porch` command line is the day-to-day interface for developers and platform
 
 ### Requirement: Object commands
 
-`porch get|create|delete <kind>` SHALL exist for `apps`, `envs`, `env-types`, `deploys`, `deltas`, `sets`, `active-resources`, `resource-definitions`, `resource-types`, `resource-classes`, `cloud-accounts`, with `-o yaml|json|table`. `porch create resource-definition -f file.yaml` SHALL accept the YAML `kind: Definition` format.
+`porch get` SHALL exist for `apps`, `envs`, `env-types`, `deploys`, `deltas`, `sets`, `active-resources`, `resource-definitions`, `resource-types`, `resource-classes`, `cloud-accounts`, with `-o yaml|json|table`. Create/delete verbs SHALL be offered only where the corresponding API lifecycle permits them; immutable sets and deployment records SHALL not gain arbitrary deletion or mutation verbs. `porch create resource-definition -f file.yaml` SHALL accept the YAML `kind: Definition` format.
 
 #### Scenario: Apply a definition file
 - **WHEN** `porch create resource-definition -f stg-redis.yaml` runs with a valid `kind: Definition` document
@@ -36,7 +36,7 @@ The `porch` command line is the day-to-day interface for developers and platform
 
 ### Requirement: Deployment commands
 
-`porch deploy delta <id> <env>`, `porch deploy deploy <id|+n>`, `porch diff sets <a> <b>`, `porch get deploys`, `porch logs deploy <id>` and `porch resources graph --app --env` SHALL be provided.
+`porch deploy delta <id> <env>`, `porch deploy deploy <id|+n|last-successful> [--replay snapshot|current]`, `porch diff sets <a> <b>`, `porch get deploys`, `porch logs deploy <id>` and `porch resources graph --app --env` SHALL be provided.
 
 #### Scenario: Follow logs
 - **WHEN** `porch logs deploy <id>` runs for an in-progress deployment
@@ -57,3 +57,23 @@ The `porch` command line is the day-to-day interface for developers and platform
 #### Scenario: Raw get
 - **WHEN** `porch api get /orgs/acme/resources/types` runs
 - **THEN** the JSON list of resource types is printed
+
+### Requirement: Preview, explicit acknowledgement and recovery guidance
+
+`porch workload plan` SHALL show server actions, unknown effects, app/environment and required permissions. Deploy/delete commands SHALL acknowledge named actions using preview fingerprints; generic `--yes` SHALL not bypass permits. Failures SHALL distinguish retry, approval and recovery required with operation/resource IDs. CLI SHALL expose `last-successful` and `--replay snapshot|current`, with `+n` counting attempts as the API does.
+
+#### Scenario: Stale confirmation
+- **WHEN** a user confirms a preview after the environment or relevant driver state changes
+- **THEN** the server rejects its permit, the CLI requests a fresh preview and no destructive apply runs
+
+#### Scenario: Interrupted deployment
+- **WHEN** a waited deployment ends with an uncertain external operation
+- **THEN** the CLI exits non-zero and identifies the resource and recovery action rather than suggesting an unconditional retry
+
+### Requirement: Safe transport retries
+
+Mutating CLI commands SHALL send expected generations and idempotency keys, retaining the key and request content across transport retries. A changed request SHALL use a new key and refreshed generation.
+
+#### Scenario: Response lost after acceptance
+- **WHEN** the CLI loses a deployment acceptance response and retries
+- **THEN** the original deployment ID is returned rather than creating another job
