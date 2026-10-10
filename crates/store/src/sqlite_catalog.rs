@@ -11,6 +11,7 @@ use std::future::Future;
 use openporch_core::catalog::{BUILTIN_DRIVERS, ResourceClass, ResourceType, builtin_type};
 use openporch_core::ids::{ClassId, CriterionId, DefinitionId, ResourceTypeId};
 use openporch_core::model::{Criterion, DriverInputs, Provision, ResourceDefinition, SecretRef};
+use openporch_core::placeholder::{Dialect, Expr, Template};
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
@@ -275,8 +276,24 @@ async fn check_driver_and_account(
             )));
         }
     }
-    if let Some(account) = driver_account
-        && !account.contains("${")
+    let Some(account) = driver_account else {
+        return Ok(());
+    };
+    // A template is resolved at deployment time; it must be valid now.
+    let template = Template::parse(account).map_err(|e| {
+        StoreError::Invalid(format!("`driver_account` `{account}` is invalid: {e}"))
+    })?;
+    if !template.is_literal() {
+        for raw in template.placeholders() {
+            Expr::interpret(raw, Dialect::DriverAccount).map_err(|e| {
+                StoreError::Invalid(format!(
+                    "`driver_account` placeholder `{}` is invalid: {e}",
+                    raw.text
+                ))
+            })?;
+        }
+        return Ok(());
+    }
     {
         let row: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM cloud_accounts WHERE org_id = ? AND id = ?")
@@ -804,6 +821,22 @@ impl CatalogStore for SqliteStore {
             return Err(StoreError::Conflict(format!(
                 "driver `{id}` is used by definitions {}",
                 users.join(", ")
+            )));
+        }
+        // Active resources need their driver to be observed, recovered and
+        // deprovisioned, even after their definition moved to another driver.
+        let envs: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT app_id || '/' || env_id FROM active_resources \
+             WHERE org_id = ? AND driver_type = ? ORDER BY 1 LIMIT 5",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !envs.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "driver `{id}` provisioned active resources in {}",
+                envs.join(", ")
             )));
         }
         let deleted = sqlx::query("DELETE FROM drivers WHERE org_id = ? AND id = ?")

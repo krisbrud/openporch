@@ -305,6 +305,8 @@ async fn definition_over_the_api() {
         ("driver_type", "acme/nope", "acme/nope"),
         ("type", "acme/nope", "acme/nope"),
         ("driver_account", "aws-nope", "aws-nope"),
+        ("driver_account", "aws-${broken", "driver_account"),
+        ("driver_account", "${unknown.path}", "driver_account"),
     ] {
         let mut body = json!({
             "id": "bad", "type": "redis", "driver_type": "openporch/echo", "criteria": [{}],
@@ -667,7 +669,29 @@ async fn external_drivers_are_registered() {
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 
-    s.delete("/orgs/acme/resources/defs/vault", &s.admin).await;
+    // An active resource keeps its driver after the definition moves away.
+    s.active_resource("shop", "production", "config.default.shared.vault", "vault")
+        .await;
+    sqlx::query("UPDATE active_resources SET driver_type = 'acme/vault-secret'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    s.put(
+        "/orgs/acme/resources/defs/vault",
+        &s.admin,
+        json!({"driver_type": "openporch/echo"}),
+    )
+    .await;
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(
+        b["message"].as_str().unwrap().contains("shop/production"),
+        "{b}"
+    );
+    sqlx::query("DELETE FROM active_resources")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
     let (status, b) = s.delete(path, &s.admin).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
 }

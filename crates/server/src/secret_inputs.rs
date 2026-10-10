@@ -172,7 +172,23 @@ fn collect_inline(
     for (k, v) in map {
         path.push(k.clone());
         match v {
-            Value::String(s) if is_template(s) => templates.push((path.clone(), v.clone())),
+            Value::String(s) if is_template(s) => {
+                // A template mixing literal text with placeholders would keep that
+                // text readable; only whole placeholders stay inline.
+                if Template::parse(s)
+                    .ok()
+                    .and_then(|t| t.whole().cloned())
+                    .is_none()
+                {
+                    return Err(ApiError::invalid(format!(
+                        "driver_inputs.secrets.{} mixes literal text with placeholders; a \
+                         secret template must be a single placeholder, with literal parts in \
+                         their own secret input",
+                        display(path)
+                    )));
+                }
+                templates.push((path.clone(), v.clone()));
+            }
             Value::String(s) => out.push((
                 path.clone(),
                 PlannedSecret(Planned::Write(SecretValue::new(s.as_str()))),
@@ -363,6 +379,14 @@ mod tests {
         .unwrap();
         assert_eq!(planned.templates.len(), 1);
         assert_eq!(planned.secrets.len(), 2);
+    }
+
+    #[test]
+    fn mixed_secret_templates_are_rejected() {
+        let mixed = inputs(json!({"secrets": {"p": "hunter2-${context.env.id}"}}));
+        let err = PlannedInputs::new(mixed).err().unwrap();
+        assert!(err.message.contains("secrets.p"), "{}", err.message);
+        assert!(!err.message.contains("hunter2"), "{}", err.message);
     }
 
     #[test]
