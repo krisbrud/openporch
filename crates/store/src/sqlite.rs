@@ -126,6 +126,12 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Checks that the database answers.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Whether the installation was created by this start, i.e. it has no principals yet.
     pub async fn is_new(&self) -> Result<bool> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM principals WHERE org_id = ?")
@@ -135,13 +141,13 @@ impl SqliteStore {
         Ok(n == 0)
     }
 
-    async fn begin(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    pub(crate) async fn begin(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
         // IMMEDIATE takes the write lock up front, so read-then-write checks in the
         // transaction cannot be invalidated by a concurrent writer.
         Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
-    fn check_org(&self, org: &str) -> Result<()> {
+    pub(crate) fn check_org(&self, org: &str) -> Result<()> {
         if org == self.org {
             Ok(())
         } else {
@@ -263,7 +269,7 @@ impl Store for SqliteStore {
     async fn audit_entries(&self, org: &str, limit: u32) -> Result<Vec<AuditEntry>> {
         self.check_org(org)?;
         Ok(sqlx::query_as(
-            "SELECT id, at, actor_id, request_id, operation_id, method, path, action, target, \
+            "SELECT seq, id, at, actor_id, request_id, operation_id, method, path, action, target, \
              outcome, status_code, reason, correlates FROM audit_log WHERE org_id = ? \
              ORDER BY seq DESC LIMIT ?",
         )
@@ -282,6 +288,7 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        crate::identity::check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
             "INSERT INTO env_types (org_id, id, description, created_at, created_by) \
              VALUES (?, ?, ?, ?, ?)",
@@ -317,6 +324,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let now = now_ms();
         let mut tx = self.begin().await?;
+        crate::identity::check_create_app_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
             "INSERT INTO apps (org_id, id, name, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
         )

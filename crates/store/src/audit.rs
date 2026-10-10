@@ -75,11 +75,14 @@ impl AuditIntent {
 /// A stored audit entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
 pub struct AuditEntry {
+    /// Position in the log; pass it as `before` to read older entries.
+    pub seq: i64,
     /// Stable entry ID.
     pub id: String,
     /// Timestamp in Unix milliseconds.
     pub at: i64,
     /// The principal, when known.
+    #[serde(rename = "user_id")]
     pub actor_id: Option<String>,
     /// The request ID.
     pub request_id: Option<String>,

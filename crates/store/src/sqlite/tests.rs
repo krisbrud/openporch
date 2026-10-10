@@ -37,7 +37,7 @@ impl Fixture {
                 "shop",
                 "Shop",
                 "alice",
-                audit("POST", "/orgs/acme/apps"),
+                system("POST", "/orgs/acme/apps"),
             )
             .await
             .unwrap();
@@ -133,6 +133,14 @@ impl Fixture {
 
 fn audit(method: &str, path: &str) -> AuditIntent {
     AuditIntent::accepted(ORG, "ci", method, path, "test")
+}
+
+/// An intent for a change the server makes itself, outside any caller's authority.
+fn system(method: &str, path: &str) -> AuditIntent {
+    AuditIntent {
+        actor: None,
+        ..audit(method, path)
+    }
 }
 
 fn provisioned(host: &str) -> CheckpointResult {
@@ -401,7 +409,7 @@ async fn failed_audit_write_rejects_the_mutation() {
 
     let e = f
         .store
-        .create_env_type(ORG, "staging", "", audit("POST", "/orgs/acme/env-types"))
+        .create_env_type(ORG, "staging", "", system("POST", "/orgs/acme/env-types"))
         .await
         .unwrap_err();
     assert!(e.to_string().contains("audit storage unavailable"), "{e}");
