@@ -1,0 +1,41 @@
+{
+  "id": "sns-topic",
+  "name": "SNS topic",
+  "use": "direct",
+  "category": "messaging",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arn",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "dynamodb-table",
+  "name": "DynamoDB table",
+  "use": "direct",
+  "category": "datastore",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "arn": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "stream_arn": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "arn",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  }
+}

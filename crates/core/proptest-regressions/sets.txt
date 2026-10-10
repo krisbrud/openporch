@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e32cd527e1e4ea02a6eea38d714a5b80fb0147630b147a86ad6ca685d7382d36 # shrinks to a = DeploymentSet { modules: {}, shared: {} }, b = DeploymentSet { modules: {}, shared: {"dns": SharedResource { ty: ResourceTypeId("dns"), class: ClassId("default"), params: Some(Null) }} }

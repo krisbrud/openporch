@@ -1,0 +1,55 @@
+{
+  "id": "workload",
+  "name": "Workload",
+  "use": "implicit",
+  "category": "workload",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "class": {
+        "type": "string"
+      },
+      "spec": {
+        "type": "object",
+        "description": "The resolved workload document: containers or function, triggers, service, deploy, target"
+      },
+      "dependencies": {
+        "type": "object",
+        "description": "Outputs of the workload's direct dependencies by key"
+      }
+    },
+    "required": [
+      "id",
+      "class",
+      "spec",
+      "dependencies"
+    ],
+    "additionalProperties": false
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": true
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+      }
+    }
+  }
+}
