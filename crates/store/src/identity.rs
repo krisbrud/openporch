@@ -217,8 +217,8 @@ pub struct ExternalIdentity {
     pub subject: String,
     /// The current login name, for display.
     pub login: Option<String>,
-    /// A provider-verified email address.
-    pub verified_email: Option<String>,
+    /// Every email address the provider has verified, primary first.
+    pub verified_emails: Vec<String>,
     /// A display name.
     pub name: String,
 }

@@ -169,7 +169,7 @@ fn github(subject: &str, login: &str) -> ExternalIdentity {
         provider: "github".into(),
         subject: subject.into(),
         login: Some(login.into()),
-        verified_email: None,
+        verified_emails: Vec::new(),
         name: login.into(),
     }
 }
@@ -602,7 +602,7 @@ async fn identity_binding_is_locked_after_first_login() {
         .invite(json!({"email": "alice@example.com", "role": "member"}))
         .await;
     let alice = ExternalIdentity {
-        verified_email: Some("alice@example.com".into()),
+        verified_emails: vec!["alice@example.com".into()],
         ..github("7", "alice")
     };
     login::login(&s.state, &alice, Some(&code)).await.unwrap();
@@ -611,7 +611,7 @@ async fn identity_binding_is_locked_after_first_login() {
         provider: "https://id.example.com".into(),
         subject: "alice-sub".into(),
         login: None,
-        verified_email: Some("alice@example.com".into()),
+        verified_emails: vec!["alice@example.com".into()],
         name: "Alice".into(),
     };
     assert!(login::login(&s.state, &oidc, None).await.is_err());

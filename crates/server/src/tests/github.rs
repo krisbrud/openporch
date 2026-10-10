@@ -356,21 +356,23 @@ async fn email_invitations_need_a_verified_github_email() {
         .await;
     let (status, b) = s.github_login(&gh, 8, Some(&code)).await;
     assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
-    // A verified address that is not the primary one is not used either.
+    // Once GitHub has verified it, the same code works, also as a secondary address,
+    // and the member gets the invited address.
     gh.account(
         8,
         "bob",
         &[
             ("bob@personal.example", true, true),
             ("bob@example.com", false, true),
+            ("bob@unverified.example", false, false),
         ],
     );
     let (status, b) = s.github_login(&gh, 8, Some(&code)).await;
-    assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
-    // Once GitHub has verified it as the primary address, the same code works.
-    gh.account(8, "bob", &[("bob@example.com", true, true)]);
-    let (status, b) = s.github_login(&gh, 8, Some(&code)).await;
     assert_eq!(status, StatusCode::OK, "{b}");
+    let (_, me) = s
+        .get("/orgs/acme/current-user", b["token"].as_str().unwrap())
+        .await;
+    assert_eq!(me["email"], "bob@example.com");
 }
 
 #[tokio::test]

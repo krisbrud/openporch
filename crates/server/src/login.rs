@@ -17,8 +17,8 @@ fn derive_user_id(identity: &ExternalIdentity) -> String {
         .clone()
         .or_else(|| {
             identity
-                .verified_email
-                .as_ref()
+                .verified_emails
+                .first()
                 .and_then(|e| e.split('@').next().map(str::to_owned))
         })
         .unwrap_or_default()

@@ -228,17 +228,16 @@ impl Github {
             .api_get("user/emails", Some(token))
             .await?
             .unwrap_or_default();
-        // Only the primary address, and only when GitHub has verified it.
-        let verified_email = emails
-            .into_iter()
-            .find(|e| e.primary && e.verified)
-            .map(|e| e.email);
+        // Only addresses GitHub has verified, primary first.
+        let mut verified: Vec<GithubEmail> = emails.into_iter().filter(|e| e.verified).collect();
+        verified.sort_by_key(|e| !e.primary);
+        let verified_emails = verified.into_iter().map(|e| e.email).collect();
         Ok(ExternalIdentity {
             provider: "github".into(),
             subject: user.id.to_string(),
             name: user.name.unwrap_or_else(|| user.login.clone()),
             login: Some(user.login),
-            verified_email,
+            verified_emails,
         })
     }
 }
@@ -323,7 +322,7 @@ impl IdentityProvider for Github {
                 subject: u.id.to_string(),
                 name: u.name.unwrap_or_else(|| u.login.clone()),
                 login: Some(u.login),
-                verified_email: None,
+                verified_emails: Vec::new(),
             }))
         })
     }
