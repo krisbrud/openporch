@@ -10,9 +10,11 @@ use std::future::Future;
 mod audit;
 mod deploy;
 mod error;
+mod identity;
 mod ownership;
 pub mod secrets;
 mod sqlite;
+mod sqlite_identity;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
@@ -21,8 +23,13 @@ pub use deploy::{
     RecoveryReport, UncertainOperation,
 };
 pub use error::StoreError;
+pub use identity::{
+    AppRole, AuditFilter, ExternalIdentity, Invitation, NewInvitation, NewPrincipal, OrgRole,
+    Principal, Roles, TokenInfo,
+};
 pub use ownership::Ownership;
 pub use sqlite::SqliteStore;
+pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
 
 /// The result type of store operations.
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
