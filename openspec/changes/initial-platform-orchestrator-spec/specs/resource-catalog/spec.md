@@ -14,6 +14,10 @@ The orchestrator SHALL ship with built-in resource types compatible in ID, use (
 - **WHEN** a client calls `GET /orgs/{org}/resources/types`
 - **THEN** every built-in type is returned with its `use`, `category`, `inputs_schema` and `outputs_schema` (values and secrets)
 
+#### Scenario: Workload type
+- **WHEN** a client reads type `workload`
+- **THEN** its inputs are `id`, `class`, `spec` (resolved containers, variables, files, service ports and extension spec) and `dependencies` (outputs of its direct dependencies), and its outputs schema is open so targets can publish what they create, such as `url`
+
 #### Scenario: Postgres outputs
 - **WHEN** a client reads type `postgres`
 - **THEN** its output values are `host`, `name`, `port` and its output secrets are `username`, `password`

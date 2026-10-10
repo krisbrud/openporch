@@ -40,19 +40,35 @@ Placeholders of the form `${resources.<key>.<output>}` in container variables an
 
 ### Requirement: Extension file
 
-An optional extension file with `apiVersion: openporch.dev/v1` MAY set `profile` (`openporch/default` for Kubernetes, the default, or `openporch/none`), `deploy` (`status: deploy|available`, `timeout`), and `spec` fragments (pod annotations, labels, replicas, service account) merged into the workload. The file SHALL be environment-agnostic and SHALL NOT contain placeholders bound to a specific environment.
+An optional extension file with `apiVersion: openporch.dev/v1` MAY set `class` (the workload class, default `default`), `deploy` (`status: deploy|available`, `timeout`), and `spec` fragments that the workload target understands (for example `pod.annotations` for Kubernetes or `lambda.memory_mb` for Lambda). The file SHALL be environment-agnostic and SHALL NOT contain placeholders bound to a specific environment.
 
 #### Scenario: Pod annotation
-- **WHEN** the extension file sets `spec.pod.annotations.billing-code: X`
+- **WHEN** the extension file sets `spec.pod.annotations.billing-code: X` for a workload whose target is Kubernetes
 - **THEN** the rendered pod template carries that annotation
 
-### Requirement: Target-less workload profile
+#### Scenario: Lambda memory
+- **WHEN** the extension file sets `class: aws-lambda` and `spec.lambda.memory_mb: 512`
+- **THEN** the workload resource is matched with class `aws-lambda` and its resolved inputs carry `spec.lambda.memory_mb: 512`
 
-Profile `openporch/none` SHALL provision the workload without a runtime target: the orchestrator resolves every placeholder in the workload spec and stores the rendered containers (variables, files, ports) as the workload's outputs, with secret values tainted. It exists so an environment's AWS resources can be deployed and verified before a cluster exists.
+### Requirement: Workload class selects the target
 
-#### Scenario: Resolved outputs without a cluster
-- **WHEN** a workload with profile `openporch/none` and a `postgres` dependency is deployed
-- **THEN** the deployment succeeds, the postgres is provisioned, and reading the workload's active resource shows its variables with the database host filled in and the password marked secret
+Each workload SHALL be a `workload` resource `workload.<class>#modules.<id>` matched to a resource definition like any other resource, so the platform decides per class, application and environment whether a workload runs on Kubernetes, as an AWS Lambda function, or nowhere. The matched driver SHALL receive the fully resolved workload spec (containers, variables, files, service ports, extension `spec`) as its resource inputs.
+
+#### Scenario: Lambda class
+- **WHEN** workload `api` has class `aws-lambda` and a `workload` definition with criteria `{class: aws-lambda}` uses the OpenTofu driver
+- **THEN** that definition provisions the workload and its module receives the resolved containers and variables as inputs
+
+#### Scenario: No workload definition
+- **WHEN** no `workload` definition matches the workload's context
+- **THEN** the deployment fails naming the workload, its class and the environment
+
+### Requirement: Workload without a runtime target
+
+A `workload` definition using driver `openporch/none` SHALL provision the workload without creating anything: the resolved spec is stored as the workload's outputs with secret values tainted. It lets an environment's cloud resources be deployed and verified before any runtime exists.
+
+#### Scenario: Resolved outputs without a runtime
+- **WHEN** a workload matched to an `openporch/none` definition has a `postgres` dependency and is deployed
+- **THEN** the deployment succeeds, the postgres is provisioned, and the workload's active resource shows its variables with the database host filled in and the password marked secret
 
 ### Requirement: Deploy properties and overrides
 

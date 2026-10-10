@@ -18,7 +18,7 @@ This change specifies milestone 1 of openporch: a self-hostable orchestrator tha
 - **Deployments** with full history, per-resource status, retries, failure semantics, redeploy/rollback and set diffing.
 - A **resource graph** engine: dependency discovery from Score requests, resource references and co-provisioning; topological ordering; parallel provisioning.
 - A **driver model** with in-process drivers (`echo`, `template`) and an **OpenTofu driver** that runs `tofu` against a Git source or inline script with credentials from a cloud account, plus a Humanitec-compatible external HTTP driver protocol.
-- **Kubernetes workload deployment**: the implicit `workload` resource is rendered into Deployment/Service/ConfigMap/Secret manifests and applied to the cluster selected by the `k8s-cluster` and `k8s-namespace` resources (static kubeconfig or EKS via a cloud account).
+- **Pluggable workload targets**: every workload is a `workload` resource matched by class to a definition, so the platform decides where it runs. Milestone 1 ships three targets: `openporch/none` (resolve only, no runtime), **AWS Lambda** through a reference OpenTofu module (container-image functions, function URLs, secrets in Secrets Manager, least-privilege roles) so hobby platforms can run serverless without a cluster, and **Kubernetes** through a built-in driver that renders Deployment/Service/ConfigMap/Secret manifests and applies them to the cluster selected by the `k8s-cluster` and `k8s-namespace` resources (static kubeconfig or EKS via a cloud account).
 - **Active resources** with stable GUResIDs, scheduled deletion and deprovisioning rules.
 - A **CLI** (`porch`) mirroring `humctl` for the day-to-day developer loop.
 - An **OpenTofu provider** (`openporch/openporch`) exposing the platform-engineering objects (applications, environment types, resource types, classes, definitions, criteria, cloud accounts, shared values).
@@ -29,7 +29,7 @@ This change specifies milestone 1 of openporch: a self-hostable orchestrator tha
 - Resource definition versions, resource selectors (`<`, `>` graph queries), incremental deployment mode, drift detection.
 - Pipelines, webhooks, artefact automation, a web portal, GitOps mode, a separate in-cluster operator and agent (openporch talks to clusters directly).
 - Secret stores other than openporch's own encrypted store; secret references to external stores.
-- Workload profiles beyond one built-in profile; serverless/non-Kubernetes workload targets; container logs.
+- Workload targets beyond none, AWS Lambda and Kubernetes (ECS, Cloud Run, etc.); container logs.
 - Non-AWS clusters and drivers (GCP, Azure); database drivers that create databases over a direct connection.
 
 ## Capabilities
@@ -48,6 +48,7 @@ This change specifies milestone 1 of openporch: a self-hostable orchestrator tha
 - `placeholders`: placeholder syntax, context and resource placeholders, type and secret propagation rules.
 - `drivers`: driver contract, built-in echo and template drivers, external HTTP drivers.
 - `opentofu-driver`: provisioning resources by running OpenTofu with Git or inline sources, state handling, outputs, destroy.
+- `aws-lambda-workloads`: the reference Lambda workload target and serverless dependency definitions (DynamoDB, SQS, SNS, S3) for cluster-free platforms.
 - `kubernetes-workloads`: how a workload is rendered into Kubernetes manifests and applied to the matched cluster and namespace.
 - `active-resources`: identity, listing, scheduled deletion, deprovisioning and detaching.
 - `cli`: the `porch` command line surface for developers and platform engineers.
@@ -60,5 +61,6 @@ None. The repository has no existing specs.
 ## Impact
 
 - Creates the first `openspec/specs/*` capabilities; every later change will build on them.
+- Keeps the orchestrator core free of any runtime assumption: Kubernetes and Lambda are both just `workload` definitions.
 - Decides the public surfaces of the project: the REST API paths, the CLI, the provider schema, the driver HTTP protocol and the supported Score subset. These are intended to stay close to Humanitec's so that existing Score files, resource definition YAML and mental models carry over.
 - Introduces external dependencies at implementation time: the `tofu` binary at runtime, a Kubernetes cluster and AWS account for integration tests, and the OpenTofu plugin protocol for the provider.

@@ -2,13 +2,21 @@
 
 ## Purpose
 
-Workloads run on Kubernetes: the implicit workload resource is rendered into manifests and applied to the cluster and namespace that definitions select for the environment.
+Workloads whose `workload` definition uses the built-in Kubernetes driver are rendered into manifests and applied to the cluster and namespace that definitions select for the environment.
 
 ## ADDED Requirements
 
-### Requirement: Cluster and namespace selection
+### Requirement: Kubernetes workload driver
 
-The graph of every environment with a workload of profile `openporch/default` SHALL include `k8s-cluster#k8s-cluster` and `k8s-namespace#k8s-namespace`, each resolved through resource definitions like any other type. Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, `ca_data`, secrets `token` or `client_cert`/`client_key`) and `openporch/k8s-cluster-eks` (inputs `name`, `region`, `loadbalancer`, with a `driver_account`).
+The built-in driver `openporch/kubernetes` SHALL be usable only for the `workload` type. Its driver inputs SHALL name the cluster and namespace through placeholders on `k8s-cluster` and `k8s-namespace` outputs, which add those resources to the graph.
+
+#### Scenario: Cluster reference
+- **WHEN** the `workload` definition for class `kubernetes` sets `cluster: ${resources.k8s-cluster.outputs.name}` and `namespace: ${resources.k8s-namespace.outputs.namespace}`
+- **THEN** both resources are provisioned before the workload and the driver applies manifests to that cluster and namespace
+
+### Requirement: Cluster drivers
+
+Built-in drivers SHALL include `openporch/k8s-cluster-static` (inputs `server`, `ca_data`, secrets `token` or `client_cert`/`client_key`) and `openporch/k8s-cluster-eks` (inputs `name`, `region`, `loadbalancer`, with a `driver_account`).
 
 #### Scenario: EKS cluster
 - **WHEN** the `k8s-cluster` definition uses `openporch/k8s-cluster-eks` with `driver_account: aws-dev`
@@ -20,7 +28,7 @@ The graph of every environment with a workload of profile `openporch/default` SH
 
 ### Requirement: Workload rendering
 
-The `openporch/default` profile SHALL render a workload into a `Deployment` (one container per Score container, env vars from variables, files as a ConfigMap or Secret mounted at their paths, probes and resource requests), a `Service` when `service.ports` is set, and a `Secret` for secret variables. Labels SHALL identify app, env, workload and deployment ID.
+The `openporch/kubernetes` driver SHALL render a workload into a `Deployment` (one container per Score container, env vars from variables, files as a ConfigMap or Secret mounted at their paths, probes and resource requests), a `Service` when `service.ports` is set, and a `Secret` for secret variables. Labels SHALL identify app, env, workload and deployment ID.
 
 #### Scenario: Render a web workload
 - **WHEN** workload `web` has a container `main` with image `nginx`, a non-secret variable, a secret variable and port `80 -> 8080`

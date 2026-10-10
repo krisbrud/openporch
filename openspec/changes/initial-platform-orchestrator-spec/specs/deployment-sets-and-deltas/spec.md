@@ -8,7 +8,7 @@ A deployment set is the immutable, environment-agnostic description of what runs
 
 ### Requirement: Deployment set content and identity
 
-A set SHALL contain `modules` (workloads keyed by ID, each with `profile`, `spec` and `externals`) and `shared` (shared resources keyed by ID with `type`, `class`, `params`). Its ID SHALL be a hash of its canonicalized JSON content so identical sets have identical IDs. Sets SHALL be immutable and readable at `/orgs/{org}/apps/{app}/sets/{set}`.
+A set SHALL contain `modules` (workloads keyed by ID, each with `class`, `spec` and `externals`) and `shared` (shared resources keyed by ID with `type`, `class`, `params`). Its ID SHALL be a hash of its canonicalized JSON content so identical sets have identical IDs. Sets SHALL be immutable and readable at `/orgs/{org}/apps/{app}/sets/{set}`.
 
 #### Scenario: Identical content, identical ID
 - **WHEN** two deltas applied in different environments produce sets with identical content

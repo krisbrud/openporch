@@ -34,6 +34,14 @@ Drivers SHALL be identified as `<namespace>/<name>`. Built-in drivers use namesp
 - **WHEN** a `postgres-instance` definition uses echo with values `host`, `port`, `name` and secrets `username`, `password`
 - **THEN** the resource is provisioned instantly with exactly those outputs
 
+### Requirement: None driver
+
+`openporch/none` SHALL return the resource's resolved resource inputs as output values (secret-tainted inputs as output secrets) and create nothing. It is intended for `workload` definitions in environments that have no runtime yet, and for any resource that only needs to carry data through the graph.
+
+#### Scenario: Workload without a runtime
+- **WHEN** a `workload` definition uses `openporch/none`
+- **THEN** provisioning succeeds immediately and the workload's outputs equal its resolved spec
+
 ### Requirement: Template driver
 
 `openporch/template` SHALL render Jinja2-style templates from `driver_inputs.values.templates` with keys `init`, `outputs`, `secrets`, `manifests`, and optionally `cookie`, against `.driver`, `.resource`, `.init`, `.cookie` and `.guresid`. Rendered `outputs`/`secrets` YAML become the resource outputs; `manifests` become Kubernetes manifests with a `location`.
