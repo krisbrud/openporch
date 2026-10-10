@@ -8,7 +8,7 @@ A resource definition tells the orchestrator how to provision one resource type 
 
 ### Requirement: Definition structure
 
-A resource definition SHALL have an `id`, `name`, `type` (an existing resource type), `driver_type`, optional `driver_account` (a cloud account ID or `${resources...account}` placeholder), `driver_inputs` with `values` and `secrets` maps, optional `provision` map, and `criteria`. It SHALL be accepted as JSON on the API and as YAML with `kind: Definition` on the CLI.
+A resource definition SHALL have an `id`, `name`, `type` (an existing resource type), `driver_type`, optional `driver_account` (a cloud account ID or `${resources...account}` placeholder), `driver_inputs` with `values`, `secret_refs` and (on write) `secrets` maps, optional `provision` map, and `criteria`. It SHALL be accepted as JSON on the API and as YAML with `kind: Definition` on the CLI.
 
 #### Scenario: Create a definition over the API
 - **WHEN** a client `POST`s a definition `stg-redis` of type `redis` with `driver_type: openporch/opentofu` and criteria `[{env_type: staging}]`
@@ -18,13 +18,17 @@ A resource definition SHALL have an `id`, `name`, `type` (an existing resource t
 - **WHEN** a client creates a definition whose `driver_type` is not registered
 - **THEN** the server returns `400` naming the driver
 
-### Requirement: Driver input secrets are write-only
+### Requirement: Driver input secrets are references
 
-Values under `driver_inputs.secrets` SHALL be stored encrypted and SHALL never be returned by the API or CLI. Reads SHALL show which secret keys exist.
+Secret driver inputs SHALL be given under `driver_inputs.secret_refs` as secret references (`{store, ref, version?}` or `{value}` to write into the primary store), mirroring the structure of `values`. Inline `driver_inputs.secrets` SHALL be accepted and converted to references on write. Reads SHALL show the references and never a value.
 
 #### Scenario: Read a definition with secrets
-- **WHEN** a client reads a definition that has `driver_inputs.secrets.password`
-- **THEN** the response contains the key `password` with a redacted marker and not its value
+- **WHEN** a client reads a definition created with `driver_inputs.secrets.password`
+- **THEN** the response shows `secret_refs.password` as `{store: openporch, ref: ..., version: ...}` and no value
+
+#### Scenario: External reference
+- **WHEN** a definition sets `secret_refs.variables.db_password` to `{store: prod-sm, ref: shop/db-password}`
+- **THEN** provisioning reads that secret from `prod-sm` and passes it to the driver as a secret variable
 
 ### Requirement: Matching criteria and specificity
 

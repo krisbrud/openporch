@@ -14,6 +14,10 @@ A deployment applies a set to an environment: it builds the resource graph, prov
 - **WHEN** a client posts a delta ID that adds workload `web` with a postgres dependency
 - **THEN** a deployment is created with status `in_progress`, the delta is frozen, and the environment's current set becomes the delta's result
 
+#### Scenario: Missing deployer role
+- **WHEN** a `developer` on `shop` without `deployer` on type `production` posts a deployment to `shop/production`
+- **THEN** the server returns `403`
+
 #### Scenario: Concurrent deployment
 - **WHEN** a deployment to `shop/dev` is `in_progress` and another is requested
 - **THEN** the server returns `409`

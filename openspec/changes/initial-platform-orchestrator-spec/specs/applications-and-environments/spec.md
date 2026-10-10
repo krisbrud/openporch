@@ -12,7 +12,7 @@ The orchestrator SHALL let clients create, read, list and delete applications un
 
 #### Scenario: Create an application
 - **WHEN** a client creates application `shop`
-- **THEN** `shop` exists and has one environment `development` with type `development`
+- **THEN** `shop` exists, has one environment `development` with type `development`, and the creating principal is its `owner`
 
 #### Scenario: Delete an application with provisioned resources
 - **WHEN** a client deletes an application whose environments have active resources

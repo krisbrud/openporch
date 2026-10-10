@@ -16,7 +16,15 @@ The provider `openporch/openporch` SHALL be configured with `url`, `org_id` and 
 
 ### Requirement: Platform object resources
 
-The provider SHALL offer resources `openporch_application`, `openporch_environment_type`, `openporch_environment`, `openporch_resource_type`, `openporch_resource_class`, `openporch_resource_definition`, `openporch_resource_definition_criteria`, `openporch_cloud_account`, `openporch_driver` and `openporch_value`, each mapping one-to-one onto the corresponding API object with full create, read, update, delete and import support.
+The provider SHALL offer one resource per platform object, each mapping one-to-one onto the API object with full create, read, update, delete and import support: `openporch_application`, `openporch_environment_type`, `openporch_environment`, `openporch_resource_type`, `openporch_resource_class`, `openporch_resource_definition`, `openporch_resource_definition_criteria`, `openporch_cloud_account`, `openporch_driver`, `openporch_value` and `openporch_secret_store`.
+
+#### Scenario: Secret store
+- **WHEN** a configuration declares `openporch_secret_store` of type `aws-ssm`
+- **THEN** `tofu apply` registers it and a later plan shows no changes
+
+### Requirement: Identity and access resources
+
+The provider SHALL also offer `openporch_user` (service users), `openporch_service_user_token`, `openporch_application_user`, `openporch_environment_type_user` and `openporch_identity_provider`, with the same lifecycle support.
 
 #### Scenario: Definition with criteria
 - **WHEN** a configuration declares an `openporch_resource_definition` for `redis` with `driver_type = "openporch/opentofu"` and an `openporch_resource_definition_criteria` with `env_type = "staging"`
@@ -34,13 +42,17 @@ The provider SHALL offer resources `openporch_application`, `openporch_environme
 - **WHEN** a value is written `"$${context.app.id}-$${context.env.id}"` in HCL
 - **THEN** the definition stored on the server contains `${context.app.id}-${context.env.id}`
 
-### Requirement: Shared values
+### Requirement: Secrets in provider resources
 
-`openporch_value` SHALL manage an application-level or environment-level key with `value` or `secret_value`, exposed to workloads as `${values.<key>}` after resolution.
+`openporch_value`, `openporch_cloud_account`, `openporch_secret_store` and `openporch_resource_definition` SHALL accept secrets either as a sensitive `value` (written to the primary store) or as a `secret_ref` block (`store`, `ref`, `version`). Written values SHALL be tracked by the reference and version the server returns, so a changed value plans an update and an unchanged one plans nothing.
 
-#### Scenario: Environment override
-- **WHEN** `API_URL` is set at application level and overridden in `production`
-- **THEN** a deployment to `production` resolves `${values.API_URL}` to the override
+#### Scenario: Secret value changed
+- **WHEN** the sensitive `value` of an `openporch_value` changes in HCL
+- **THEN** `tofu plan` shows an update and `apply` writes a new version
+
+#### Scenario: Service user token
+- **WHEN** a configuration declares `openporch_service_user_token` for user `ci` with `expires_at`
+- **THEN** the token value is in state as sensitive and is never re-readable from the server
 
 ### Requirement: No ephemeral objects
 

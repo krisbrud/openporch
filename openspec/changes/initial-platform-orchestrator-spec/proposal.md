@@ -8,7 +8,10 @@ openporch exists so that a single engineer can run their own internal developer 
 
 This change specifies milestone 1 of openporch: a self-hostable orchestrator that can take a workload document and deploy it, together with its AWS resources, as Lambda functions or into a Kubernetes environment. It introduces:
 
-- A **control plane API** (HTTP/JSON, single organization) with bearer-token authentication, which every other surface (CLI, OpenTofu provider) talks to.
+- A **control plane API** (HTTP/JSON, single organization) which every other surface (CLI, OpenTofu provider) talks to.
+- **Security built in from the first route**: principals (users and service users), API tokens and 24-hour sessions, pluggable identity providers with GitHub login, invitations and organization membership, Humanitec-compatible RBAC at organization, application and environment type level enforced on every route, and an audit log.
+- **Secret stores and secret references**: a built-in encrypted store plus AWS Secrets Manager and SSM stores, references usable in definitions, cloud accounts and shared values, and secrets written through the orchestrator into one primary store; no API ever returns a secret value.
+- An **OIDC provider** so that cloud accounts of type `aws-identity` can assume roles with short-lived tokens instead of standing credentials, sequenced after the end-to-end milestone.
 - **Applications, environment types and environments**, including cloning an environment from an existing deployment and deprovisioning on environment deletion.
 - A **resource catalog**: a built-in set of resource types (initially `workload`, `k8s-cluster`, `k8s-namespace`, `base-env`, `config`, `dns`, `postgres`, `postgres-instance`, `mysql`, `redis`, `s3`, `sqs`, `sns-topic`, `dynamodb-table`, `aws-role`, `aws-policy`, `k8s-service-account`, `route`), resource classes, and custom resource types.
 - **Resource definitions** with driver inputs, matching criteria with Humanitec-compatible specificity ordering, placeholders, and co-provisioning.
@@ -25,10 +28,10 @@ This change specifies milestone 1 of openporch: a self-hostable orchestrator tha
 
 ### Out of scope for milestone 1
 
-- Multiple organizations, RBAC roles, users and OIDC login (one org, static API tokens only).
+- Multiple organizations, SAML SSO, identity provider groups, email delivery for invitations (invitation links are handed out by the inviter).
 - Resource definition versions, resource selectors (`<`, `>` graph queries), incremental deployment mode, drift detection.
 - Pipelines, webhooks, artefact automation, a web portal, GitOps mode, a separate in-cluster operator and agent (openporch talks to clusters directly).
-- Secret stores other than openporch's own encrypted store; secret references to external stores.
+- Secret stores beyond the built-in, AWS Secrets Manager and SSM stores (Vault, GCP, Azure come later); secret purge and revert history.
 - Workload targets beyond none, AWS Lambda and Kubernetes (ECS, Cloud Run, etc.); container logs.
 - Non-AWS clusters and drivers (GCP, Azure); database drivers that create databases over a direct connection.
 
@@ -36,11 +39,18 @@ This change specifies milestone 1 of openporch: a self-hostable orchestrator tha
 
 ### New Capabilities
 
-- `api-access`: HTTP/JSON control plane shape, single organization, bearer-token authentication, error format.
+- `api-access`: HTTP/JSON control plane shape, single organization, error format, identifiers, health.
+- `authentication`: principals, API tokens, sessions and `porch login`, external identity providers (GitHub, OIDC), bootstrap administrator.
+- `organization-membership`: organization roles, invitations, service users, role changes and removal.
+- `rbac`: role model, permission matrix, deployer gate, enforcement on every route, role management surfaces.
+- `audit-log`: recorded events, query, retention.
+- `secret-stores-and-references`: secret stores, primary store, reference format, writing through the orchestrator, resolution.
+- `shared-values`: application and environment values and secrets, versions, lifecycle.
+- `oidc-provider`: issuer, identity tokens for `aws-identity` cloud accounts, setup guidance (sequenced last).
 - `applications-and-environments`: applications, environment types, environments, cloning and deletion.
 - `resource-catalog`: built-in and custom resource types with input/output schemas, and resource classes.
 - `resource-definitions`: definition structure, driver inputs, matching criteria and specificity, co-provisioning.
-- `cloud-accounts`: AWS credential types and how credentials reach drivers.
+- `cloud-accounts`: AWS credential types (`aws`, `aws-role`, `aws-identity`) and how credentials reach drivers.
 - `workload-spec`: the openporch workload document (containers or function, triggers, resources, deploy, target), Score import, placeholder translation and deploy-time overrides.
 - `deployment-sets-and-deltas`: immutable sets, mutable deltas, applying deltas, diffing.
 - `deployments`: triggering, modes, lifecycle, status, retries, failure semantics, redeploy and rollback.

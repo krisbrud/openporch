@@ -8,7 +8,7 @@ The `porch` command line is the day-to-day interface for developers and platform
 
 ### Requirement: Configuration and authentication
 
-`porch` SHALL read the server URL, organization and token from flags, environment variables (`OPENPORCH_URL`, `OPENPORCH_ORG`, `OPENPORCH_TOKEN`) and a config file in that precedence, and SHALL support `porch login --token` to store the token in the config file. Default `--app` and `--env` MAY be set in the config file.
+`porch` SHALL read the server URL, organization and token from flags, environment variables (`OPENPORCH_URL`, `OPENPORCH_ORG`, `OPENPORCH_TOKEN`) and a config file in that precedence, and SHALL support `porch login` (device-flow login through the server's identity provider, storing a session token) and `porch login --token` to store an API token. Default `--app` and `--env` MAY be set in the config file.
 
 #### Scenario: Environment variables
 - **WHEN** `OPENPORCH_URL`, `OPENPORCH_ORG` and `OPENPORCH_TOKEN` are set and `porch get apps` runs
@@ -41,6 +41,14 @@ The `porch` command line is the day-to-day interface for developers and platform
 #### Scenario: Follow logs
 - **WHEN** `porch logs deploy <id>` runs for an in-progress deployment
 - **THEN** it streams provisioning log lines until the deployment finishes
+
+### Requirement: Membership and role commands
+
+`porch users` (`list`, `invite`, `create-service`, `set-role`, `remove`, `tokens create|revoke`), `porch apps users <app> grant|revoke`, `porch env-types users <type> grant|revoke`, `porch secretstores` and `porch audit-logs` SHALL be provided with the same permission rules as the API.
+
+#### Scenario: Create CI token
+- **WHEN** an administrator runs `porch users tokens create ci --id deploy --expires-in 90d`
+- **THEN** the token value is printed once with its expiry
 
 ### Requirement: Raw API access
 

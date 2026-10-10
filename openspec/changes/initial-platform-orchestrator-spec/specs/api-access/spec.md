@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the shape of the openporch control plane API that the CLI, the OpenTofu provider and CI systems call: a single organization, bearer-token authentication and a uniform error format.
+Defines the shape of the openporch control plane API that the CLI, the OpenTofu provider and CI systems call: a single organization, a uniform error format, identifier rules and health endpoints.
 
 ## ADDED Requirements
 
@@ -18,17 +18,17 @@ The orchestrator SHALL expose an HTTP/JSON API rooted at `/orgs/{org}` for exact
 - **WHEN** a client calls `GET /orgs/other/apps`
 - **THEN** the server returns `404` with an error body
 
-### Requirement: Bearer token authentication
+### Requirement: Authentication and authorization on every route
 
-Every API request SHALL carry `Authorization: Bearer <token>`. Tokens are static API tokens configured on the server (environment variable or config file), each with a name. Requests without a valid token SHALL be rejected with `401`.
+Every API route except health, version, login and OIDC discovery SHALL require an authenticated principal (see the `authentication` capability) and an explicit permission check (see the `rbac` capability). `401` means no valid credential; `403` means the principal lacks the permission.
 
-#### Scenario: Valid token
-- **WHEN** a request carries a token listed in the server configuration
-- **THEN** the request is processed and the token name is recorded as the actor on any object it creates
-
-#### Scenario: Missing or invalid token
-- **WHEN** a request carries no token or a token that is not configured
+#### Scenario: Unauthenticated request
+- **WHEN** a request carries no valid credential
 - **THEN** the server returns `401` and does not process the request
+
+#### Scenario: Forbidden request
+- **WHEN** an authenticated `viewer` deletes an application
+- **THEN** the server returns `403`
 
 ### Requirement: Uniform error format
 

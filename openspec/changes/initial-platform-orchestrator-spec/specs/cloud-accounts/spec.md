@@ -8,11 +8,11 @@ Cloud accounts hold the credentials the orchestrator uses to reach a cloud, so t
 
 ### Requirement: AWS cloud account types
 
-The orchestrator SHALL support cloud accounts of type `aws` (static access key ID and secret) and `aws-role` (an IAM role ARN assumed with `AssumeRole` from the orchestrator's own AWS identity, with a required `external_id` and optional `session_duration`). Accounts are managed under `/orgs/{org}/resources/accounts`.
+The orchestrator SHALL support cloud accounts of type `aws` (static access key ID and secret, stored as secret references), `aws-role` (an IAM role ARN assumed with `AssumeRole` from the orchestrator's own AWS identity, with a required `external_id` and optional `session_duration`) and `aws-identity` (role assumption with web identity through the openporch OIDC provider, see `oidc-provider`). Accounts are managed under `/orgs/{org}/resources/accounts` by administrators.
 
 #### Scenario: Create a static account
 - **WHEN** a client creates account `aws-dev` of type `aws` with `access_key_id` and `secret_access_key`
-- **THEN** the account exists and its secret is never returned by reads
+- **THEN** the account exists, the secret is written to the primary secret store, and reads show a reference and never the value
 
 #### Scenario: Create a role account
 - **WHEN** a client creates account `aws-prod` of type `aws-role` with `role_arn` and `external_id`

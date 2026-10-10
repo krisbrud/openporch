@@ -46,9 +46,11 @@ SQLite via `sqlx` keeps the single-binary story (one data directory, one file). 
 
 Alternatives: Postgres only (rejected: operational burden for a solo user); an embedded KV store (rejected: migrations and ad-hoc queries are harder).
 
-### D3. Secrets at rest and in flight
+### D3. Secrets: one reference model, stores behind it
 
-All secret material (driver input secrets, cloud account keys, secret outputs, driver cookies) is encrypted with AES-256-GCM under a server master key supplied by environment variable or file, with the key ID stored next to the ciphertext so rotation is possible later. The engine keeps a per-deployment set of known secret values and a redaction layer replaces them in logs and error messages before persistence. External secret stores and references are a later milestone.
+Every secret the orchestrator knows about is a secret reference `{store, ref, version}`; there is no second code path for "inline" secrets. The built-in store `openporch` encrypts values with AES-256-GCM under a server master key (environment variable or file, key ID stored beside the ciphertext for rotation) and is the primary store until an administrator promotes an AWS Secrets Manager or SSM store. Inline `secrets` on definitions, cloud account keys and shared secret values are sugar: the API writes them to the primary store and keeps the reference. Because openporch has no in-cluster operator, the orchestrator's engine is the only reader: it resolves references immediately before a driver call using the store's cloud account, keeps values in memory for the call, and a redaction layer replaces every resolved value in logs and errors before persistence. Secret outputs of resources and driver cookies are stored encrypted in the database with the same primitives.
+
+Alternatives: Humanitec's split where the SaaS never reads secrets and an operator does (rejected: openporch is self-hosted, so the orchestrator already sits inside the trust boundary, and an operator is a non-goal); environment variables only (rejected: no rotation, no audit, no sharing).
 
 ### D4. The driver trait and execution model
 
@@ -116,7 +118,23 @@ Alternatives: Rust implementation of tfplugin6 (rejected: no framework, large su
 
 The template driver uses `minijinja` (Jinja2 dialect) rather than Go templates: it is the mature Rust option and the spec only requires a documented template language. Humanitec template-driver examples therefore need a syntax translation; the driver docs carry a side-by-side table.
 
-### D13. API shape mirrors Humanitec paths
+### D13. Identity: principals, hashed tokens, signed sessions, pluggable providers
+
+Authentication resolves every request to a principal before any handler runs. API tokens are random 256-bit values shown once and stored as SHA-256 hashes with expiry and revocation. Sessions are compact signed tokens (EdDSA, 24-hour expiry, `sub` = principal ID, `jti` for revocation) issued after a login through an identity provider. Providers are an enum behind one trait: `github` (OAuth app, device authorization flow for the CLI, authorization code for browsers; the GitHub login is the external identity) and generic `oidc` (authorization code with PKCE; `issuer:sub` is the identity). GitHub is a configured provider, not special-cased, so adding Google or an enterprise IdP is one more variant. The first administrator is a `bootstrap` service user whose token the server prints once on first start, which avoids any password or email dependency.
+
+Alternatives: passwords (rejected: another credential class to protect and no one wants them); SAML (deferred: the pieces exist but hobby users do not have an IdP).
+
+### D14. Authorization: declared per route, enforced centrally
+
+Each axum route is registered with a required permission (an enum such as `App(Read)`, `Deploy(EnvType)`, `Org(ManageResources)`), and an extractor evaluates it against the principal's effective roles (organization role, application roles, environment type roles, administrator implying all) before the handler sees the request. A startup check fails the process if any route lacks a permission, and a test walks the router to assert the same, so authorization cannot be forgotten on a new endpoint. Role IDs and semantics follow Humanitec so documentation and mental models carry over; the permission matrix lives in the `rbac` spec and in one table in code. Visibility rules (`404` for applications the principal may not list) are part of the same extractor. The audit log is a middleware that records successful mutating requests with the principal after the handler returns.
+
+Alternatives: policy engines like Casbin or OPA (rejected for now: the role model is small and fixed, and an in-process table is simpler to test and ship; a policy engine can replace the evaluator later behind the same extractor).
+
+### D15. OIDC provider, sequenced last
+
+Issuing identity tokens so AWS can trust openporch without standing credentials is the right end state, but it needs a public HTTPS URL and key management, neither of which a first end-to-end run needs. The design reserves the pieces now: the cloud account type enum includes `aws-identity`, the credential resolver is a trait with one implementation per account type, and signing keys live in the same encrypted key table as the session key. The issuer uses RS256 (AWS requires it), publishes a JWKS with two keys during rotation, mints tokens with `sub = <org>/<account-id>`, `aud = sts.amazonaws.com` and a 15-minute lifetime, and exchanges them with `AssumeRoleWithWebIdentity`. Until it ships, `aws-role` with an external ID gives role assumption from whatever identity the orchestrator host already has (an instance profile, or a developer's own credentials).
+
+### D16. API shape mirrors Humanitec paths
 
 Paths are `/orgs/{org}/apps/{app}/envs/{env}/...`, `/orgs/{org}/resources/{defs,types,classes,accounts,drivers}`, `/orgs/{org}/env-types`. IDs follow Humanitec's rules. This keeps `humctl` users and the docs' examples recognizable and leaves room for multiple orgs later without a path change.
 
@@ -130,6 +148,8 @@ Paths are `/orgs/{org}/apps/{app}/envs/{env}/...`, `/orgs/{org}/resources/{defs,
 - [Secret leakage through logs and errors] → single redaction layer applied before persistence, tested with secrets embedded in OpenTofu output and error text.
 - [Two toolchains (Rust and Go)] → the Go code is confined to `provider/`, built and tested in its own CI job.
 - [Content-addressed sets diverge if canonicalization changes] → JCS canonicalization is pinned and tested with fixtures; the set ID algorithm is versioned in the stored record.
+- [RBAC and secrets touch every endpoint, so retrofitting is impossible] → they are implemented in group 3 before any domain endpoint, every route declares its permission, and the HTTP tests for each capability include a forbidden-role case.
+- [The orchestrator reads secrets itself] → it runs inside the operator's trust boundary by design; the mitigation is minimal exposure (resolve late, hold briefly, redact always) and an audit log of every change.
 - [SQLite's single-writer model under concurrent deployments] → one engine process with WAL mode and short transactions; Postgres is the escape hatch.
 
 ## Migration Plan
