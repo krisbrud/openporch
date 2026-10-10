@@ -404,6 +404,27 @@ pub(crate) async fn check_authority(
     target: Option<&str>,
     resulting: Option<OrgRole>,
 ) -> Result<()> {
+    check_authority_for(conn, org, actor, target, resulting, false).await
+}
+
+/// Removing a member grants nothing, so managers may remove any non-administrator.
+pub(crate) async fn check_removal_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    target: &str,
+) -> Result<()> {
+    check_authority_for(conn, org, actor, Some(target), None, true).await
+}
+
+async fn check_authority_for(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    target: Option<&str>,
+    resulting: Option<OrgRole>,
+    removal: bool,
+) -> Result<()> {
     let Some(actor) = actor else {
         return Ok(());
     };
@@ -423,7 +444,7 @@ pub(crate) async fn check_authority(
         Some(t) => roles_in(conn, org, t).await?,
         None => Roles::default(),
     };
-    if current.org == Some(OrgRole::Administrator) || !covers(&issuer, &current) {
+    if current.org == Some(OrgRole::Administrator) || (!removal && !covers(&issuer, &current)) {
         return Err(denied());
     }
     if let Some(role) = resulting {
@@ -436,4 +457,43 @@ pub(crate) async fn check_authority(
         }
     }
     Ok(())
+}
+
+/// Application role changes need `owner` on the application, or administrator,
+/// checked inside the transaction that makes the change.
+pub(crate) async fn check_app_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    app: &str,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let roles = roles_in(conn, org, actor).await?;
+    if roles.org == Some(OrgRole::Administrator) || roles.apps.get(app) == Some(&AppRole::Owner) {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden(format!(
+            "`{actor}` is not `owner` on `{app}`"
+        )))
+    }
+}
+
+/// Environment type role changes need administrator, checked inside the transaction.
+pub(crate) async fn check_admin_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+) -> Result<()> {
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    if roles_in(conn, org, actor).await?.org == Some(OrgRole::Administrator) {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden(format!(
+            "`{actor}` is not an administrator"
+        )))
+    }
 }

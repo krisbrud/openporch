@@ -249,10 +249,28 @@ async fn authenticate(
 }
 
 async fn authorize(state: AppState, permission: Permission, req: Request, next: Next) -> Response {
-    match check(&state, permission, req).await {
-        Ok(req) => next.run(req).await,
-        Err(e) => e.into_response(),
+    let req = match check(&state, permission, req).await {
+        Ok(req) => req,
+        Err(e) => return e.into_response(),
+    };
+    let ctx = req.extensions().get::<Ctx>().cloned();
+    let res = next.run(req).await;
+    // Handlers deny with 403 after their own object-level checks; those denials of
+    // privileged actions are recorded like the route-level ones.
+    if res.status() == StatusCode::FORBIDDEN
+        && let Some(ctx) = ctx
+        && !matches!(ctx.method, Method::GET | Method::HEAD)
+    {
+        let mut intent = ctx.audit(state.org(), "request.denied", ctx.path.clone());
+        intent.target = None;
+        intent.outcome = AuditOutcome::Denied;
+        intent.status_code = Some(403);
+        intent.reason = Some("forbidden by an object-level check".into());
+        if let Err(e) = state.store.record_audit(intent).await {
+            return ApiError::from(e).into_response();
+        }
     }
+    res
 }
 
 async fn check(

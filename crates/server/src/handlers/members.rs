@@ -140,8 +140,11 @@ pub async fn remove(
 ) -> ApiResult<StatusCode> {
     let org = state.org();
     principal_or_404(&state, &user).await?;
+    // Removal grants nothing: managers may remove any non-administrator.
     let current = state.store.roles(org, &user).await?;
-    if !may_manage(&ctx, &current) {
+    let allowed = ctx.is_admin()
+        || (ctx.roles.org == Some(OrgRole::Manager) && current.org != Some(OrgRole::Administrator));
+    if !allowed {
         return Err(ApiError::forbidden(
             "removing this member requires the `administrator` role",
         ));

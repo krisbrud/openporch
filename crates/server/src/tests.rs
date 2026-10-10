@@ -1298,3 +1298,117 @@ async fn interrupted_bootstrap_completes_on_the_next_start() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn managers_remove_any_non_administrator() {
+    let s = server().await;
+    s.app("shop").await;
+    let manager = s.member("carol", "manager").await;
+    s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "owner").await;
+    s.member("auditor", "orgViewer").await;
+    assert_eq!(
+        s.delete("/orgs/acme/users/dev", &manager).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.delete("/orgs/acme/users/auditor", &manager).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.delete("/orgs/acme/users/bootstrap", &manager).await.0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn handler_denials_are_audited() {
+    let s = server().await;
+    let manager = s.member("carol", "manager").await;
+    let (status, _) = s
+        .post(
+            "/orgs/acme/users/bootstrap/tokens",
+            &manager,
+            json!({"id": "steal"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, page) = s.get("/orgs/acme/audit-logs?user_id=carol", &s.admin).await;
+    let entry = &page["entries"][0];
+    assert_eq!(entry["outcome"], "denied");
+    assert_eq!(entry["status_code"], 403);
+    assert_eq!(entry["path"], "/orgs/acme/users/bootstrap/tokens");
+}
+
+#[tokio::test]
+async fn invitations_need_the_inviters_current_authority() {
+    let s = server().await;
+    let manager = s.member("carol", "manager").await;
+    let (status, inv) = s
+        .post(
+            "/orgs/acme/invitations",
+            &manager,
+            json!({"provider": "github", "subject": "42", "login": "x", "role": "manager"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let code = inv["code"].as_str().unwrap().to_owned();
+    let (status, _) = s
+        .call(
+            Method::PATCH,
+            "/orgs/acme/users/carol",
+            Some(&s.admin),
+            Some(json!({"role": "member"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let e = login::login(&s.state, &github("42", "x"), Some(&code))
+        .await
+        .unwrap_err();
+    assert_eq!(e.status, StatusCode::UNAUTHORIZED);
+    assert!(e.message.contains("no longer valid"), "{}", e.message);
+}
+
+#[tokio::test]
+async fn role_grants_are_rechecked_with_the_change() {
+    let s = server().await;
+    s.app("shop").await;
+    s.member("alice", "member").await;
+    s.member("bob", "member").await;
+    s.grant_app("shop", "alice", "owner").await;
+    // alice lost ownership after her request passed the route check.
+    s.delete("/orgs/acme/apps/shop/users/alice", &s.admin).await;
+    let as_alice = AuditIntent::accepted(
+        "acme",
+        "alice",
+        "POST",
+        "/orgs/acme/apps/shop/users",
+        "test",
+    );
+    let e = s
+        .state
+        .store
+        .set_app_role(
+            "acme",
+            "shop",
+            "bob",
+            openporch_store::AppRole::Owner,
+            as_alice.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+    let e = s
+        .state
+        .store
+        .set_env_type_role("acme", "development", "bob", as_alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+}

@@ -81,7 +81,21 @@ fn write_private(path: &Path, contents: &str) -> Result<(), StartupError> {
             .map_err(io)?;
     }
     f.write_all(contents.as_bytes()).map_err(io)?;
-    f.sync_all().map_err(io)
+    f.sync_all().map_err(io)?;
+    sync_parent(path)
+}
+
+/// Makes a created or renamed directory entry durable.
+fn sync_parent(path: &Path) -> Result<(), StartupError> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| StartupError::Io(format!("syncing {}: {e}", dir.display())))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Loads the master keys. A new installation without configured keys gets a generated
@@ -193,6 +207,7 @@ fn finish_bootstrap_file(config: &Config) -> Result<(), StartupError> {
     if pending.exists() && !path.exists() {
         std::fs::rename(&pending, &path)
             .map_err(|e| StartupError::Io(format!("moving {}: {e}", pending.display())))?;
+        sync_parent(&path)?;
         tracing::info!(path = %path.display(), "wrote the bootstrap administrator token");
     }
     Ok(())

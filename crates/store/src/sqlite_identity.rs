@@ -450,7 +450,7 @@ impl IdentityStore for SqliteStore {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         let current = require_principal(&mut tx, org, id).await?;
-        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), None).await?;
+        check_removal_authority(&mut tx, org, audit.actor.as_deref(), id).await?;
         if current.role == OrgRole::Administrator {
             guard_last_admin(&mut tx, org, id).await?;
         }
@@ -808,6 +808,15 @@ impl IdentityStore for SqliteStore {
         if inv.expires_at <= now {
             return Err(StoreError::Conflict("the invitation has expired".into()));
         }
+        // The inviter must still hold the authority to grant this role.
+        if check_authority(&mut tx, org, Some(&inv.created_by), None, Some(inv.role))
+            .await
+            .is_err()
+        {
+            return Err(StoreError::Conflict(
+                "the invitation is no longer valid; ask for a new one".into(),
+            ));
+        }
         let matches = match (&inv.provider, &inv.subject, &inv.email) {
             (Some(p), Some(s), _) => *p == identity.provider && *s == identity.subject,
             (_, _, Some(email)) => identity
@@ -999,6 +1008,7 @@ impl IdentityStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        check_app_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
         require_principal(&mut tx, org, principal).await?;
         sqlx::query(
             "INSERT INTO app_roles (org_id, app_id, principal_id, role) VALUES (?, ?, ?, ?) \
@@ -1024,6 +1034,7 @@ impl IdentityStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        check_app_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
         let n = sqlx::query(
             "DELETE FROM app_roles WHERE org_id = ? AND app_id = ? AND principal_id = ?",
         )
@@ -1065,6 +1076,7 @@ impl IdentityStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         require_principal(&mut tx, org, principal).await?;
         sqlx::query(
             "INSERT INTO env_type_roles (org_id, env_type_id, principal_id, role) \
@@ -1089,6 +1101,7 @@ impl IdentityStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let n = sqlx::query(
             "DELETE FROM env_type_roles WHERE org_id = ? AND env_type_id = ? AND principal_id = ?",
         )
