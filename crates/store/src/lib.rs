@@ -14,6 +14,7 @@ mod identity;
 mod ownership;
 pub mod secrets;
 mod sqlite;
+mod sqlite_catalog;
 mod sqlite_identity;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
@@ -29,6 +30,7 @@ pub use identity::{
 };
 pub use ownership::Ownership;
 pub use sqlite::SqliteStore;
+pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
 
 /// The result type of store operations.

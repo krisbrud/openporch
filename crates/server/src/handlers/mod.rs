@@ -2,6 +2,7 @@
 
 mod apps;
 mod audit;
+mod catalog;
 mod envs;
 mod health;
 mod login;
@@ -24,6 +25,7 @@ pub fn api(state: AppState) -> Api {
     let get = || Method::GET;
     let post = || Method::POST;
     let patch = || Method::PATCH;
+    let put = || Method::PUT;
     let delete = || Method::DELETE;
     Api::new(state)
         .route(get(), "/livez", Public, health::livez)
@@ -230,6 +232,127 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/env-types/{type}/users/{user}",
             Org(OrgPerm::Administer),
             apps::remove_env_type_user,
+        )
+        // Resource catalog: members read, administrators change.
+        .route(
+            get(),
+            "/orgs/{org}/resources/types",
+            Org(OrgPerm::ReadMembers),
+            catalog::types,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/types",
+            Org(OrgPerm::Administer),
+            catalog::create_type,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/types/{type}",
+            Org(OrgPerm::ReadMembers),
+            catalog::get_type,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/resources/types/{type}",
+            Org(OrgPerm::Administer),
+            catalog::update_type,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/types/{type}",
+            Org(OrgPerm::Administer),
+            catalog::delete_type,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/types/{type}/classes",
+            Org(OrgPerm::ReadMembers),
+            catalog::classes,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/types/{type}/classes",
+            Org(OrgPerm::Administer),
+            catalog::create_class,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/types/{type}/classes/{class}",
+            Org(OrgPerm::Administer),
+            catalog::delete_class,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/classes",
+            Org(OrgPerm::ReadMembers),
+            catalog::all_classes,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/drivers",
+            Org(OrgPerm::ReadMembers),
+            catalog::drivers,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/drivers",
+            Org(OrgPerm::Administer),
+            catalog::create_driver,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/drivers/{driver}",
+            Org(OrgPerm::ReadMembers),
+            catalog::get_driver,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/drivers/{driver}",
+            Org(OrgPerm::Administer),
+            catalog::delete_driver,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/defs",
+            Org(OrgPerm::ReadMembers),
+            catalog::definitions,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/defs",
+            Org(OrgPerm::Administer),
+            catalog::create_definition,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/defs/{def}",
+            Org(OrgPerm::ReadMembers),
+            catalog::get_definition,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/resources/defs/{def}",
+            Org(OrgPerm::Administer),
+            catalog::update_definition,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/defs/{def}",
+            Org(OrgPerm::Administer),
+            catalog::delete_definition,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/defs/{def}/criteria",
+            Org(OrgPerm::Administer),
+            catalog::add_criterion,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/defs/{def}/criteria/{criterion}",
+            Org(OrgPerm::Administer),
+            catalog::delete_criterion,
         )
         // Audit log.
         .route(
