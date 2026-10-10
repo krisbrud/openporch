@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 mod handlers;
+pub mod identity;
 pub mod login;
 pub mod rbac;
 pub mod state;

@@ -24,8 +24,15 @@ struct Server {
     admin: String,
 }
 
+mod github;
+
 async fn server_in(dir: TempDir) -> Server {
-    let state = start(Config::new("acme", dir.path()), None).await.unwrap();
+    let config = Config::new("acme", dir.path());
+    server_with(dir, config).await
+}
+
+async fn server_with(dir: TempDir, config: Config) -> Server {
+    let state = start(config, None).await.unwrap();
     let admin = std::fs::read_to_string(dir.path().join("bootstrap-token"))
         .map(|t| t.trim().to_owned())
         .unwrap_or_default();
@@ -162,7 +169,7 @@ fn github(subject: &str, login: &str) -> ExternalIdentity {
         provider: "github".into(),
         subject: subject.into(),
         login: Some(login.into()),
-        verified_email: None,
+        verified_emails: Vec::new(),
         name: login.into(),
     }
 }
@@ -216,7 +223,14 @@ async fn authentication_and_authorization_on_every_route() {
 #[tokio::test]
 async fn router_walk_every_route_declares_a_permission_and_requires_credentials() {
     let s = server().await;
-    let public = ["/livez", "/readyz", "/healthz", "/version"];
+    let public = [
+        "/livez",
+        "/readyz",
+        "/healthz",
+        "/version",
+        "/auth/github/device",
+        "/auth/github/token",
+    ];
     assert!(!s.specs.is_empty());
     for spec in &s.specs {
         let path = spec
@@ -588,7 +602,7 @@ async fn identity_binding_is_locked_after_first_login() {
         .invite(json!({"email": "alice@example.com", "role": "member"}))
         .await;
     let alice = ExternalIdentity {
-        verified_email: Some("alice@example.com".into()),
+        verified_emails: vec!["alice@example.com".into()],
         ..github("7", "alice")
     };
     login::login(&s.state, &alice, Some(&code)).await.unwrap();
@@ -597,7 +611,7 @@ async fn identity_binding_is_locked_after_first_login() {
         provider: "https://id.example.com".into(),
         subject: "alice-sub".into(),
         login: None,
-        verified_email: Some("alice@example.com".into()),
+        verified_emails: vec!["alice@example.com".into()],
         name: "Alice".into(),
     };
     assert!(login::login(&s.state, &oidc, None).await.is_err());

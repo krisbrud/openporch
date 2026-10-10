@@ -9,6 +9,7 @@ use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store,
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
+use crate::identity::{Github, IdentityProvider};
 
 /// State shared by every request.
 #[derive(Clone, Debug)]
@@ -27,6 +28,8 @@ pub struct Inner {
     pub signer: Option<SessionSigner>,
     /// Why the server is not ready; empty when it is.
     pub not_ready: Vec<String>,
+    /// The GitHub identity provider, when configured.
+    pub github: Option<Arc<dyn IdentityProvider>>,
 }
 
 impl std::ops::Deref for AppState {
@@ -127,6 +130,12 @@ async fn load_keyring(
 ///
 /// `env_key` is the value of `OPENPORCH_MASTER_KEY`, if set.
 pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, StartupError> {
+    let github = match &config.github {
+        Some(c) => {
+            Some(Arc::new(Github::new(c).map_err(StartupError::Io)?) as Arc<dyn IdentityProvider>)
+        }
+        None => None,
+    };
     let ownership = Ownership::acquire(&config.data_dir)?;
     let store = SqliteStore::open(ownership, &config.org).await?;
     let keyring = load_keyring(&config, &store, env_key).await?.map(Arc::new);
@@ -171,6 +180,7 @@ pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, 
         keyring,
         signer,
         not_ready,
+        github,
     })))
 }
 

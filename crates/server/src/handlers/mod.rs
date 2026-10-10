@@ -3,6 +3,7 @@
 mod apps;
 mod audit;
 mod health;
+mod login;
 mod members;
 
 #[cfg(test)]
@@ -28,6 +29,9 @@ pub fn api(state: AppState) -> Api {
         .route(get(), "/readyz", Public, health::readyz)
         .route(get(), "/healthz", Public, health::readyz)
         .route(get(), "/version", Public, health::version)
+        // Login.
+        .route(post(), "/auth/github/device", Public, login::start)
+        .route(post(), "/auth/github/token", Public, login::poll)
         // Members.
         .route(
             get(),

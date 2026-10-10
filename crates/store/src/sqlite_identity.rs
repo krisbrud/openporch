@@ -121,13 +121,14 @@ pub trait IdentityStore: Send + Sync {
         now: i64,
     ) -> impl Future<Output = Result<Option<Principal>>> + Send;
 
-    /// Records an issued session.
+    /// Records an issued session with its audit entry.
     fn record_session(
         &self,
         org: &str,
         jti: &str,
         principal: &str,
         expires_at: i64,
+        audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Resolves an unexpired, unrevoked session of a current member.
@@ -623,8 +624,10 @@ impl IdentityStore for SqliteStore {
         jti: &str,
         principal: &str,
         expires_at: i64,
+        audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
+        let mut tx = self.begin().await?;
         sqlx::query(
             "INSERT INTO sessions (jti, org_id, principal_id, issued_at, expires_at) \
              VALUES (?, ?, ?, ?, ?)",
@@ -634,8 +637,10 @@ impl IdentityStore for SqliteStore {
         .bind(principal)
         .bind(now_ms())
         .bind(expires_at)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+        audit_in(&mut tx, &audit).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -834,13 +839,23 @@ impl IdentityStore for SqliteStore {
                 "the invitation is no longer valid; ask for a new one".into(),
             ));
         }
-        let matches = match (&inv.provider, &inv.subject, &inv.email) {
-            (Some(p), Some(s), _) => *p == identity.provider && *s == identity.subject,
-            (_, _, Some(email)) => identity
-                .verified_email
-                .as_ref()
-                .is_some_and(|v| v.eq_ignore_ascii_case(email)),
-            _ => false,
+        // The member's email: the invited address when the invitation is by email
+        // (any verified address of the identity may match it), otherwise the primary
+        // verified address.
+        let (matches, email) = match (&inv.provider, &inv.subject, &inv.email) {
+            (Some(p), Some(s), _) => (
+                *p == identity.provider && *s == identity.subject,
+                identity.verified_emails.first().cloned(),
+            ),
+            (_, _, Some(invited)) => match identity
+                .verified_emails
+                .iter()
+                .find(|v| v.eq_ignore_ascii_case(invited))
+            {
+                Some(v) => (true, Some(v.clone())),
+                None => (false, None),
+            },
+            _ => (false, None),
         };
         if !matches {
             return Err(StoreError::Conflict(
@@ -862,7 +877,7 @@ impl IdentityStore for SqliteStore {
         }
         // An email already used by a member stays bound to that member's identity; a
         // second provider cannot claim it, only an administrator can rebind it.
-        if let Some(email) = &identity.verified_email {
+        for email in &identity.verified_emails {
             let taken: Option<String> = sqlx::query_scalar(
                 "SELECT id FROM principals WHERE org_id = ? AND lower(email) = lower(?)",
             )
@@ -885,7 +900,7 @@ impl IdentityStore for SqliteStore {
                 id: user_id.to_owned(),
                 kind: "user".into(),
                 name: identity.name.clone(),
-                email: identity.verified_email.clone(),
+                email: email.clone(),
                 role: inv.role,
             },
             Some(&inv.created_by),
@@ -900,7 +915,7 @@ impl IdentityStore for SqliteStore {
         .bind(&identity.subject)
         .bind(user_id)
         .bind(&identity.login)
-        .bind(&identity.verified_email)
+        .bind(&email)
         .bind(now)
         .execute(&mut *tx)
         .await?;
