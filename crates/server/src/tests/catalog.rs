@@ -638,6 +638,17 @@ async fn external_drivers_are_registered() {
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/other", "target": "https://d.internal",
+                   "token": {"store": "missing", "ref": "x"}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(b["message"].as_str().unwrap().contains("missing"), "{b}");
+
     for (id, target) in [
         ("openporch/mine", "https://driver.internal"),
         ("vault-secret", "https://driver.internal"),
@@ -772,4 +783,17 @@ async fn malformed_secret_bodies_are_not_echoed() {
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
     assert!(!b.to_string().contains("hunter2"), "{b}");
+}
+
+#[tokio::test]
+async fn secrets_of_rejected_changes_are_discarded() {
+    use openporch_store::secrets::{SecretStore as _, SecretValue};
+    let s = server().await;
+    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let r = primary
+        .write("defs/x/password", &SecretValue::new("hunter2"))
+        .await
+        .unwrap();
+    crate::secret_inputs::discard(&primary, vec![r.clone()]).await;
+    assert!(primary.read(&r).await.is_err());
 }

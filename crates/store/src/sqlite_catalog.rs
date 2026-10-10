@@ -146,6 +146,15 @@ pub trait CatalogStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Runs the checks of [`CatalogStore::create_driver`] without changing
+    /// anything, so a request that would be rejected writes no token first.
+    fn check_driver(
+        &self,
+        org: &str,
+        driver: &DriverRecord,
+        actor: Option<&str>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Removes an external driver no definition uses.
     fn delete_driver(
         &self,
@@ -346,6 +355,33 @@ async fn check_secret_stores(
                 "secret store `{store}` is not registered"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Checks that a new driver's ID is free and its token's store is registered.
+async fn check_driver_record(
+    conn: &mut SqliteConnection,
+    org: &str,
+    driver: &DriverRecord,
+) -> Result<()> {
+    let id = driver.id.as_str();
+    let taken: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM drivers WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if BUILTIN_DRIVERS.contains(&id) || taken.is_some() {
+        return Err(StoreError::AlreadyExists(format!("driver `{id}`")));
+    }
+    if let Some(token) = &driver.token {
+        let mut inputs = DriverInputs::default();
+        inputs.secret_refs.insert(
+            "token".to_owned(),
+            serde_json::to_value(token).map_err(|e| corrupt("driver token", e))?,
+        );
+        check_secret_stores(conn, org, &inputs).await?;
     }
     Ok(())
 }
@@ -781,11 +817,9 @@ impl CatalogStore for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         let id = driver.id.as_str();
-        if BUILTIN_DRIVERS.contains(&id) {
-            return Err(StoreError::AlreadyExists(format!("built-in driver `{id}`")));
-        }
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        check_driver_record(&mut tx, org, driver).await?;
         let res = sqlx::query(
             "INSERT INTO drivers (org_id, id, body, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
         )
@@ -805,6 +839,18 @@ impl CatalogStore for SqliteStore {
         audit::insert(&mut tx, &audit, None, None).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn check_driver(
+        &self,
+        org: &str,
+        driver: &DriverRecord,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut conn = self.pool().acquire().await?;
+        check_admin_authority(&mut conn, org, actor).await?;
+        check_driver_record(&mut conn, org, driver).await
     }
 
     async fn delete_driver(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {

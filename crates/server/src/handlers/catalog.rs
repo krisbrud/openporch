@@ -352,29 +352,36 @@ pub async fn create_driver(
         .as_ref()
         .map(|t| PlannedSecret::new("`token`", t))
         .transpose()?;
-    if state.store.driver(org, &id).await?.is_some() || BUILTIN_DRIVERS.contains(&id.as_str()) {
-        return Err(ApiError::conflict(format!("driver `{id}` already exists")));
-    }
-    let token = match token {
-        Some(t) => {
-            let primary = secret_inputs::primary(&state)?;
-            Some(
-                t.materialize(&primary, &format!("drivers/{id}/token"))
-                    .await?,
-            )
-        }
-        None => None,
-    };
-    let record = DriverRecord {
+    let mut record = DriverRecord {
         id: id.clone(),
         target: target.to_string(),
         inputs_schema: body.inputs_schema,
-        token,
+        token: token.as_ref().and_then(|t| t.reference().cloned()),
     };
+    // Check everything before a token is written; the store checks again with
+    // the change, and a token written for a rejected registration is discarded.
     state
         .store
-        .create_driver(org, &record, ctx.audit(org, "driver.create", &id))
+        .check_driver(org, &record, Some(&ctx.principal.id))
         .await?;
+    let primary = secret_inputs::primary(&state)?;
+    let mut written = Vec::new();
+    let result = async {
+        if let Some(t) = token {
+            let name = format!("drivers/{id}/token");
+            record.token = Some(t.materialize(&primary, &name, &mut written).await?);
+        }
+        state
+            .store
+            .create_driver(org, &record, ctx.audit(org, "driver.create", &id))
+            .await?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(e) = result {
+        secret_inputs::discard(&primary, written).await;
+        return Err(e);
+    }
     Ok((StatusCode::CREATED, Json(record.into())))
 }
 
@@ -399,16 +406,6 @@ async fn definition_or_404(state: &AppState, id: &str) -> ApiResult<DefinitionRe
         .definition(state.org(), id)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("resource definition `{id}` not found")))
-}
-
-/// Converts secret inputs to references, writing values under the definition.
-async fn write_inputs(
-    state: &AppState,
-    def: &str,
-    planned: PlannedInputs,
-) -> ApiResult<DriverInputs> {
-    let primary = secret_inputs::primary(state)?;
-    planned.write(&primary, &format!("defs/{def}")).await
 }
 
 pub async fn definitions(State(state): State<AppState>) -> ApiResult<Json<Vec<DefinitionRecord>>> {
@@ -451,11 +448,25 @@ pub async fn create_definition(
     for c in &mut def.criteria {
         c.id = None;
     }
-    def.driver_inputs = write_inputs(&state, &id, planned).await?;
-    state
-        .store
-        .create_definition(org, &def, ctx.audit(org, "definition.create", &id))
-        .await?;
+    // Values are written under the definition; versions written for a rejected
+    // change are discarded.
+    let primary = secret_inputs::primary(&state)?;
+    let mut written = Vec::new();
+    let result = async {
+        def.driver_inputs = planned
+            .write(&primary, &format!("defs/{id}"), &mut written)
+            .await?;
+        state
+            .store
+            .create_definition(org, &def, ctx.audit(org, "definition.create", &id))
+            .await?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(e) = result {
+        secret_inputs::discard(&primary, written).await;
+        return Err(e);
+    }
     Ok((
         StatusCode::CREATED,
         Json(definition_or_404(&state, &id).await?),
@@ -509,11 +520,23 @@ pub async fn update_definition(
         .store
         .check_definition(org, &check, Some(&ctx.principal.id))
         .await?;
-    update.driver_inputs = write_inputs(&state, &id, planned).await?;
-    state
-        .store
-        .update_definition(org, &id, &update, ctx.audit(org, "definition.update", &id))
-        .await?;
+    let primary = secret_inputs::primary(&state)?;
+    let mut written = Vec::new();
+    let result = async {
+        update.driver_inputs = planned
+            .write(&primary, &format!("defs/{id}"), &mut written)
+            .await?;
+        state
+            .store
+            .update_definition(org, &id, &update, ctx.audit(org, "definition.update", &id))
+            .await?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    if let Err(e) = result {
+        secret_inputs::discard(&primary, written).await;
+        return Err(e);
+    }
     Ok(Json(definition_or_404(&state, &id).await?))
 }
 

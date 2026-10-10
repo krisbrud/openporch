@@ -8,7 +8,7 @@
 //! messages name paths, never values.
 
 use openporch_core::model::{DriverInputs, SecretRef};
-use openporch_core::placeholder::Template;
+use openporch_core::placeholder::{Part, Template};
 use openporch_store::secrets::{
     BuiltinSecretStore, SecretError, SecretInput, SecretStore, SecretValue, validate_reference,
 };
@@ -68,6 +68,17 @@ pub fn parse_body<T: serde::de::DeserializeOwned>(body: Value) -> ApiResult<T> {
     })
 }
 
+/// Deletes versions written for a change that was then rejected, so no secret is
+/// left behind that no accepted object refers to.
+pub async fn discard(primary: &BuiltinSecretStore, written: Vec<SecretRef>) {
+    for r in written {
+        if let Err(e) = primary.discard(&r).await {
+            tracing::warn!(store = %r.store, reference = %r.reference, error = %e,
+                "could not discard a secret version written for a rejected change");
+        }
+    }
+}
+
 /// What to put at one path of `secret_refs`.
 enum Planned {
     Ref(SecretRef),
@@ -102,11 +113,29 @@ impl PlannedSecret {
         }))
     }
 
-    /// Writes a value under `name`, or passes a reference through.
-    pub async fn materialize(self, primary: &dyn SecretStore, name: &str) -> ApiResult<SecretRef> {
+    /// The reference, if this input is one; values have none until written.
+    pub fn reference(&self) -> Option<&SecretRef> {
+        match &self.0 {
+            Planned::Ref(r) => Some(r),
+            Planned::Write(_) => None,
+        }
+    }
+
+    /// Writes a value under `name`, recording the new version in `written`, or
+    /// passes a reference through.
+    pub async fn materialize(
+        self,
+        primary: &dyn SecretStore,
+        name: &str,
+        written: &mut Vec<SecretRef>,
+    ) -> ApiResult<SecretRef> {
         match self.0 {
             Planned::Ref(r) => Ok(r),
-            Planned::Write(v) => primary.write(name, &v).await.map_err(store_error),
+            Planned::Write(v) => {
+                let r = primary.write(name, &v).await.map_err(store_error)?;
+                written.push(r.clone());
+                Ok(r)
+            }
         }
     }
 }
@@ -125,6 +154,23 @@ fn is_secret_leaf(m: &Map<String, Value>) -> bool {
         && m.values().all(|v| !v.is_object() && !v.is_array());
     let is_value = m.len() == 1 && m.get("value").is_some_and(Value::is_string);
     is_ref || is_value
+}
+
+/// The text a literal inline secret stands for: escapes such as `$\{` are applied
+/// when it parses as a template without placeholders; anything that does not
+/// parse is taken as it is.
+fn literal_text(s: &str) -> String {
+    match Template::parse(s) {
+        Ok(t) if t.is_literal() => t
+            .parts
+            .into_iter()
+            .map(|p| match p {
+                Part::Literal(l) => l,
+                Part::Placeholder(raw) => raw.text,
+            })
+            .collect(),
+        _ => s.to_owned(),
+    }
 }
 
 /// Whether `s` is a placeholder template rather than a literal that merely
@@ -191,7 +237,7 @@ fn collect_inline(
             }
             Value::String(s) => out.push((
                 path.clone(),
-                PlannedSecret(Planned::Write(SecretValue::new(s.as_str()))),
+                PlannedSecret(Planned::Write(SecretValue::new(literal_text(s)))),
             )),
             Value::Object(m) => collect_inline(m, path, templates, out)?,
             _ => {
@@ -293,7 +339,12 @@ impl PlannedInputs {
 
     /// Writes the values to `primary` under `{prefix}/{path}` and returns inputs
     /// that hold only references and placeholder templates.
-    pub async fn write(self, primary: &dyn SecretStore, prefix: &str) -> ApiResult<DriverInputs> {
+    pub async fn write(
+        self,
+        primary: &dyn SecretStore,
+        prefix: &str,
+        written: &mut Vec<SecretRef>,
+    ) -> ApiResult<DriverInputs> {
         let mut out = DriverInputs {
             values: self.values,
             ..DriverInputs::default()
@@ -304,7 +355,7 @@ impl PlannedInputs {
         }
         for (path, planned) in self.secrets {
             let name = format!("{prefix}/{}", path.join("/"));
-            let reference = planned.materialize(primary, &name).await?;
+            let reference = planned.materialize(primary, &name, written).await?;
             let value = serde_json::to_value(reference).map_err(ApiError::internal)?;
             insert(&mut out.secret_refs, &path, value)
                 .map_err(|()| ApiError::internal("checked secret layout changed"))?;
@@ -379,6 +430,13 @@ mod tests {
         .unwrap();
         assert_eq!(planned.templates.len(), 1);
         assert_eq!(planned.secrets.len(), 2);
+    }
+
+    #[test]
+    fn escapes_are_applied_to_literal_secrets() {
+        assert_eq!(literal_text("a$\\{context.env.id}"), "a${context.env.id}");
+        assert_eq!(literal_text("abc${def"), "abc${def");
+        assert_eq!(literal_text("plain"), "plain");
     }
 
     #[test]

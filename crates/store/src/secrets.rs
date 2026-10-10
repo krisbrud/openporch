@@ -471,6 +471,22 @@ impl BuiltinSecretStore {
         })
     }
 
+    /// Deletes the version a reference pins. Only for compensating a write whose
+    /// owning change was then rejected, so no accepted object refers to it.
+    pub async fn discard(&self, reference: &SecretRef) -> Result<(), SecretError> {
+        let version: Option<i64> = reference.version.as_deref().and_then(|v| v.parse().ok());
+        let (BUILTIN_STORE, Some(version)) = (reference.store.as_str(), version) else {
+            return Ok(());
+        };
+        sqlx::query("DELETE FROM secret_versions WHERE org_id = ? AND ref = ? AND version = ?")
+            .bind(&self.org)
+            .bind(&reference.reference)
+            .bind(version)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn read_impl(&self, reference: &SecretRef) -> Result<SecretValue, SecretError> {
         validate_reference(reference)?;
         if reference.store != BUILTIN_STORE {
