@@ -34,6 +34,43 @@ pub struct Config {
     /// Maximum request body size in bytes.
     #[serde(default = "default_body_limit")]
     pub max_body_bytes: usize,
+    /// The GitHub identity provider, when GitHub login is enabled.
+    #[serde(default)]
+    pub github: Option<GithubConfig>,
+}
+
+/// The GitHub identity provider: an OAuth app (or GitHub App) with the device flow
+/// enabled. The device flow and login lookups need only the public client ID.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubConfig {
+    /// The OAuth client ID.
+    pub client_id: String,
+    /// The REST API base URL.
+    #[serde(default = "default_github_api")]
+    pub api_url: String,
+    /// The web base URL that serves the OAuth endpoints.
+    #[serde(default = "default_github_web")]
+    pub web_url: String,
+}
+
+impl GithubConfig {
+    /// GitHub.com with `client_id`.
+    pub fn new(client_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_owned(),
+            api_url: default_github_api(),
+            web_url: default_github_web(),
+        }
+    }
+}
+
+fn default_github_api() -> String {
+    "https://api.github.com/".into()
+}
+
+fn default_github_web() -> String {
+    "https://github.com/".into()
 }
 
 fn default_listen() -> SocketAddr {
@@ -65,6 +102,7 @@ impl Config {
             bootstrap_token_hours: default_bootstrap_hours(),
             tls_terminated_by_proxy: false,
             max_body_bytes: default_body_limit(),
+            github: None,
         }
     }
 
@@ -116,6 +154,15 @@ impl Config {
                  `tls_terminated_by_proxy = true`",
                 self.listen
             )));
+        }
+        if let Some(github) = &self.github {
+            if github.client_id.trim().is_empty() {
+                return Err(ConfigError("`github.client_id` is empty".into()));
+            }
+            crate::identity::check_base_url("github.api_url", &github.api_url)
+                .map_err(ConfigError)?;
+            crate::identity::check_base_url("github.web_url", &github.web_url)
+                .map_err(ConfigError)?;
         }
         Ok(())
     }
@@ -174,5 +221,26 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.to_string().contains("org `Acme Corp` is invalid"), "{e}");
+    }
+
+    #[test]
+    fn github_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openporch.toml");
+        std::fs::write(
+            &path,
+            "org = \"acme\"\ndata_dir = \"/d\"\n[github]\nclient_id = \"Iv1.abc\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&path), |_| None).unwrap();
+        assert_eq!(c.github, Some(GithubConfig::new("Iv1.abc")));
+        std::fs::write(
+            &path,
+            "org = \"acme\"\ndata_dir = \"/d\"\n[github]\nclient_id = \"x\"\n\
+             api_url = \"http://ghe.example.com/api\"\n",
+        )
+        .unwrap();
+        let e = Config::load(Some(&path), |_| None).unwrap_err();
+        assert!(e.to_string().contains("must use https"), "{e}");
     }
 }

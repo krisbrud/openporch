@@ -27,6 +27,8 @@ pub mod code {
     pub const INTERNAL: &str = "SRV-001";
     /// The server is not ready to accept changes.
     pub const NOT_READY: &str = "SRV-002";
+    /// An external identity provider could not be reached.
+    pub const PROVIDER_UNAVAILABLE: &str = "SRV-003";
 }
 
 /// An API error.

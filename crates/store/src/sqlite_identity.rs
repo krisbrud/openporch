@@ -121,13 +121,14 @@ pub trait IdentityStore: Send + Sync {
         now: i64,
     ) -> impl Future<Output = Result<Option<Principal>>> + Send;
 
-    /// Records an issued session.
+    /// Records an issued session with its audit entry.
     fn record_session(
         &self,
         org: &str,
         jti: &str,
         principal: &str,
         expires_at: i64,
+        audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Resolves an unexpired, unrevoked session of a current member.
@@ -623,8 +624,10 @@ impl IdentityStore for SqliteStore {
         jti: &str,
         principal: &str,
         expires_at: i64,
+        audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
+        let mut tx = self.begin().await?;
         sqlx::query(
             "INSERT INTO sessions (jti, org_id, principal_id, issued_at, expires_at) \
              VALUES (?, ?, ?, ?, ?)",
@@ -634,8 +637,10 @@ impl IdentityStore for SqliteStore {
         .bind(principal)
         .bind(now_ms())
         .bind(expires_at)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+        audit_in(&mut tx, &audit).await?;
+        tx.commit().await?;
         Ok(())
     }
 

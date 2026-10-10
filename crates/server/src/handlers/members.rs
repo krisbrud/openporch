@@ -361,21 +361,24 @@ pub async fn invitations(State(state): State<AppState>) -> ApiResult<Json<Vec<In
     ))
 }
 
-/// Invites by email or by external identity. The one-time code is returned once.
+/// Invites by email or by external identity. A GitHub invitation may name only the
+/// login; it is resolved to the account's immutable ID now, so whoever holds the login
+/// later gains nothing. The one-time code is returned once.
 pub async fn invite(
     State(state): State<AppState>,
     ctx: Ctx,
-    JsonBody(body): JsonBody<CreateInvitation>,
+    JsonBody(mut body): JsonBody<CreateInvitation>,
 ) -> ApiResult<(StatusCode, Json<InvitationView>)> {
     let by_identity = body.provider.is_some() || body.subject.is_some();
-    match (&body.email, by_identity) {
-        (Some(_), false) => {}
-        (None, true) if body.provider.is_some() && body.subject.is_some() => {}
-        _ => {
-            return Err(ApiError::invalid(
-                "an invitation names either `email` or both `provider` and `subject`",
-            ));
-        }
+    let valid = match (&body.email, by_identity) {
+        (Some(_), false) => body.login.is_none(),
+        (None, true) => body.provider.is_some() && (body.subject.is_some() || body.login.is_some()),
+        _ => false,
+    };
+    if !valid {
+        return Err(ApiError::invalid(
+            "an invitation names either `email`, or `provider` with `subject` or `login`",
+        ));
     }
     if body.email.as_deref().is_some_and(|e| !e.contains('@')) {
         return Err(ApiError::invalid("`email` is not an email address"));
@@ -385,6 +388,27 @@ pub async fn invite(
             "inviting a member with role `{}` requires more authority than the caller has",
             body.role.as_str()
         )));
+    }
+    if body.subject.is_none()
+        && let Some(login) = body.login.clone()
+    {
+        if body.provider.as_deref() != Some("github") {
+            return Err(ApiError::invalid(
+                "only `github` invitations can name a `login` without a `subject`",
+            ));
+        }
+        let provider = state.github.clone().ok_or_else(|| {
+            ApiError::invalid(
+                "GitHub login is not configured, so the login cannot be resolved; give the \
+                 numeric GitHub user ID as `subject`",
+            )
+        })?;
+        let identity = provider
+            .resolve_login(&login)
+            .await?
+            .ok_or_else(|| ApiError::invalid(format!("GitHub has no user `{login}`")))?;
+        body.subject = Some(identity.subject);
+        body.login = identity.login;
     }
     let org = state.org();
     let id = auth::random_id(8);

@@ -24,8 +24,15 @@ struct Server {
     admin: String,
 }
 
+mod github;
+
 async fn server_in(dir: TempDir) -> Server {
-    let state = start(Config::new("acme", dir.path()), None).await.unwrap();
+    let config = Config::new("acme", dir.path());
+    server_with(dir, config).await
+}
+
+async fn server_with(dir: TempDir, config: Config) -> Server {
+    let state = start(config, None).await.unwrap();
     let admin = std::fs::read_to_string(dir.path().join("bootstrap-token"))
         .map(|t| t.trim().to_owned())
         .unwrap_or_default();
@@ -216,7 +223,14 @@ async fn authentication_and_authorization_on_every_route() {
 #[tokio::test]
 async fn router_walk_every_route_declares_a_permission_and_requires_credentials() {
     let s = server().await;
-    let public = ["/livez", "/readyz", "/healthz", "/version"];
+    let public = [
+        "/livez",
+        "/readyz",
+        "/healthz",
+        "/version",
+        "/auth/github/device",
+        "/auth/github/token",
+    ];
     assert!(!s.specs.is_empty());
     for spec in &s.specs {
         let path = spec
