@@ -8,6 +8,7 @@
 //! messages name paths, never values.
 
 use openporch_core::model::{DriverInputs, SecretRef};
+use openporch_core::placeholder::Template;
 use openporch_store::secrets::{
     BuiltinSecretStore, SecretError, SecretInput, SecretStore, SecretValue, validate_reference,
 };
@@ -90,7 +91,7 @@ impl PlannedSecret {
                 Planned::Ref(r)
             }
             SecretInput::Value(v) => {
-                if v.value.expose().contains("${") {
+                if is_template(v.value.expose()) {
                     return Err(ApiError::invalid(format!(
                         "{what} is a `{{value}}` with a placeholder; put placeholder templates \
                          under `driver_inputs.secrets`"
@@ -110,11 +111,26 @@ impl PlannedSecret {
     }
 }
 
-/// A leaf of `secret_refs` is an object with any of these keys.
+/// Whether an object in `secret_refs` is a single secret input.
+///
+/// A leaf has exactly the shape of a reference (`store` and `ref`, optionally
+/// `version`) or of `{value}` with a string, so containers may have children
+/// named `store`, `ref`, `version` or `value` like `values` can.
 fn is_secret_leaf(m: &Map<String, Value>) -> bool {
-    ["store", "ref", "version", "value"]
-        .iter()
-        .any(|k| m.contains_key(*k))
+    let is_ref = m.len() <= 3
+        && m.contains_key("store")
+        && m.contains_key("ref")
+        && m.keys()
+            .all(|k| ["store", "ref", "version"].contains(&k.as_str()))
+        && m.values().all(|v| !v.is_object() && !v.is_array());
+    let is_value = m.len() == 1 && m.get("value").is_some_and(Value::is_string);
+    is_ref || is_value
+}
+
+/// Whether `s` is a placeholder template rather than a literal that merely
+/// contains `${`. Anything that does not parse as a template is a literal.
+fn is_template(s: &str) -> bool {
+    Template::parse(s).is_ok_and(|t| !t.is_literal())
 }
 
 fn display(path: &[String]) -> String {
@@ -156,7 +172,7 @@ fn collect_inline(
     for (k, v) in map {
         path.push(k.clone());
         match v {
-            Value::String(s) if s.contains("${") => templates.push((path.clone(), v.clone())),
+            Value::String(s) if is_template(s) => templates.push((path.clone(), v.clone())),
             Value::String(s) => out.push((
                 path.clone(),
                 PlannedSecret(Planned::Write(SecretValue::new(s.as_str()))),
@@ -219,7 +235,12 @@ impl PlannedInputs {
         )?;
         // Dry run of the final layout: every path must be its own leaf.
         let mut layout = Map::new();
-        let marker = || Value::Object(Map::from_iter([("ref".to_owned(), Value::Null)]));
+        let marker = || {
+            Value::Object(Map::from_iter([
+                ("store".to_owned(), Value::Null),
+                ("ref".to_owned(), Value::Null),
+            ]))
+        };
         for path in templates
             .iter()
             .map(|t| &t.0)
@@ -237,6 +258,21 @@ impl PlannedInputs {
             templates,
             secrets,
         })
+    }
+
+    /// The given references alone, without writing anything, so the stores they
+    /// name can be checked first.
+    pub fn references(&self) -> DriverInputs {
+        let mut out = DriverInputs::default();
+        for (path, planned) in &self.secrets {
+            if let Planned::Ref(r) = &planned.0
+                && let Ok(value) = serde_json::to_value(r)
+            {
+                // The layout was checked in `new`, so insertion cannot clash.
+                let _ = insert(&mut out.secret_refs, path, value);
+            }
+        }
+        out
     }
 
     /// Writes the values to `primary` under `{prefix}/{path}` and returns inputs
@@ -305,6 +341,28 @@ mod tests {
         let err = PlannedInputs::new(bad).err().unwrap();
         assert!(!err.message.contains("hunter2"));
         assert!(err.message.contains("secret_refs.password"));
+    }
+
+    #[test]
+    fn containers_may_use_reference_key_names() {
+        let planned = PlannedInputs::new(inputs(json!({
+            "secret_refs": {"variables": {
+                "value": {"store": "openporch", "ref": "x"},
+                "store": {"value": "s"},
+            }}
+        })))
+        .unwrap();
+        assert_eq!(planned.secrets.len(), 2);
+    }
+
+    #[test]
+    fn literals_containing_placeholder_syntax_are_secrets() {
+        let planned = PlannedInputs::new(inputs(json!({
+            "secrets": {"a": "abc${def", "b": "x${not a path!}y", "c": "${context.app.id}"}
+        })))
+        .unwrap();
+        assert_eq!(planned.templates.len(), 1);
+        assert_eq!(planned.secrets.len(), 2);
     }
 
     #[test]

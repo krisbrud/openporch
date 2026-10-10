@@ -163,6 +163,15 @@ pub trait CatalogStore: Send + Sync {
         id: &str,
     ) -> impl Future<Output = Result<Option<DefinitionRecord>>> + Send;
 
+    /// Runs the checks of [`CatalogStore::create_definition`] without changing
+    /// anything, so a request that would be rejected writes no secrets first.
+    fn check_definition(
+        &self,
+        org: &str,
+        def: &ResourceDefinition,
+        actor: Option<&str>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Creates a definition and its criteria, generating criterion IDs.
     fn create_definition(
         &self,
@@ -289,7 +298,9 @@ fn referenced_stores(refs: &serde_json::Map<String, serde_json::Value>, out: &mu
     for v in refs.values() {
         if let Some(m) = v.as_object() {
             match m.get("store").and_then(serde_json::Value::as_str) {
-                Some(store) if m.contains_key("ref") => out.push(store.to_owned()),
+                Some(store) if m.get("ref").is_some_and(serde_json::Value::is_string) => {
+                    out.push(store.to_owned())
+                }
                 _ => referenced_stores(m, out),
             }
         }
@@ -346,6 +357,27 @@ async fn check_criterion(
         return Err(StoreError::Conflict(
             "the definition already has an identical criterion".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Checks everything a definition refers to: its type, driver, cloud account,
+/// secret stores and criterion classes, and that no two criteria are identical.
+async fn check_definition_refs(
+    conn: &mut SqliteConnection,
+    org: &str,
+    def: &ResourceDefinition,
+) -> Result<()> {
+    let ty = def.ty.as_str();
+    if !type_exists(conn, org, ty).await? {
+        return Err(StoreError::Invalid(format!(
+            "resource type `{ty}` does not exist"
+        )));
+    }
+    check_driver_and_account(conn, org, &def.driver_type, def.driver_account.as_deref()).await?;
+    check_secret_stores(conn, org, &def.driver_inputs).await?;
+    for (i, criterion) in def.criteria.iter().enumerate() {
+        check_criterion(conn, org, ty, criterion, &def.criteria[..i]).await?;
     }
     Ok(())
 }
@@ -819,6 +851,18 @@ impl CatalogStore for SqliteStore {
         }
     }
 
+    async fn check_definition(
+        &self,
+        org: &str,
+        def: &ResourceDefinition,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut conn = self.pool().acquire().await?;
+        check_admin_authority(&mut conn, org, actor).await?;
+        check_definition_refs(&mut conn, org, def).await
+    }
+
     async fn create_definition(
         &self,
         org: &str,
@@ -831,19 +875,7 @@ impl CatalogStore for SqliteStore {
         let now = now_ms();
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        if !type_exists(&mut tx, org, ty).await? {
-            return Err(StoreError::Invalid(format!(
-                "resource type `{ty}` does not exist"
-            )));
-        }
-        check_driver_and_account(
-            &mut tx,
-            org,
-            &def.driver_type,
-            def.driver_account.as_deref(),
-        )
-        .await?;
-        check_secret_stores(&mut tx, org, &def.driver_inputs).await?;
+        check_definition_refs(&mut tx, org, def).await?;
         let res = sqlx::query(
             "INSERT INTO definitions (org_id, id, name, type, driver_type, driver_account, \
              driver_inputs, provision, version, created_at, created_by, updated_at) \
@@ -870,11 +902,8 @@ impl CatalogStore for SqliteStore {
             )));
         }
         res?;
-        let mut added: Vec<Criterion> = Vec::new();
         for criterion in &def.criteria {
-            check_criterion(&mut tx, org, ty, criterion, &added).await?;
             insert_criterion(&mut tx, org, id, criterion).await?;
-            added.push(criterion.clone());
         }
         audit::insert(&mut tx, &audit, None, None).await?;
         tx.commit().await?;

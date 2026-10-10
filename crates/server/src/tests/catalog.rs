@@ -445,6 +445,41 @@ async fn definition_secrets_are_stored_as_references() {
         assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
         assert!(!b.to_string().contains("hunter2"), "{b}");
     }
+    // A request rejected for any reason writes no secret.
+    for invalid in [
+        json!({"driver_account": "aws-nope"}),
+        json!({"criteria": [{"class": "nope"}]}),
+        json!({"driver_type": "acme/nope"}),
+    ] {
+        let mut body = json!({"id": "bad", "type": "postgres", "driver_type": "openporch/echo",
+                              "driver_inputs": {"secrets": {"password": "hunter2"}}});
+        for (k, v) in invalid.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, b) = s.post("/orgs/acme/resources/defs", &s.admin, body).await;
+        assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    }
+    let written: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM secret_versions WHERE ref LIKE 'defs/bad/%'")
+            .fetch_one(s.state.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(written, 0);
+
+    // A literal that merely contains `${` is a secret, not a template.
+    let b = s
+        .created(
+            "/orgs/acme/resources/defs",
+            json!({"id": "odd", "type": "postgres", "driver_type": "openporch/echo",
+                   "driver_inputs": {"secrets": {"password": "abc${def"}}}),
+        )
+        .await;
+    assert!(!b.to_string().contains("abc"), "{b}");
+    assert_eq!(
+        b["driver_inputs"]["secret_refs"]["password"]["ref"],
+        "defs/odd/password"
+    );
+
     let (status, b) = s
         .post(
             "/orgs/acme/resources/defs",

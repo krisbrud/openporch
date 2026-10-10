@@ -401,24 +401,6 @@ async fn definition_or_404(state: &AppState, id: &str) -> ApiResult<DefinitionRe
         .ok_or_else(|| ApiError::not_found(format!("resource definition `{id}` not found")))
 }
 
-/// Checks before secrets are written, so that a request that will be rejected
-/// leaves nothing behind. The store checks again atomically with the change.
-async fn precheck_driver(state: &AppState, driver_type: &str) -> ApiResult<()> {
-    if BUILTIN_DRIVERS.contains(&driver_type)
-        || state
-            .store
-            .driver(state.org(), driver_type)
-            .await?
-            .is_some()
-    {
-        Ok(())
-    } else {
-        Err(ApiError::invalid(format!(
-            "driver `{driver_type}` is not registered"
-        )))
-    }
-}
-
 /// Converts secret inputs to references, writing values under the definition.
 async fn write_inputs(
     state: &AppState,
@@ -451,14 +433,13 @@ pub async fn create_definition(
     let org = state.org();
     let id = def.id.to_string();
     let planned = PlannedInputs::new(std::mem::take(&mut def.driver_inputs))?;
-    type_or_404(&state, def.ty.as_str()).await.map_err(|e| {
-        if e.status == StatusCode::NOT_FOUND {
-            ApiError::invalid(format!("resource type `{}` does not exist", def.ty))
-        } else {
-            e
-        }
-    })?;
-    precheck_driver(&state, &def.driver_type).await?;
+    def.driver_inputs = planned.references();
+    // Check everything before secrets are written, so a request that will be
+    // rejected leaves nothing behind. The store checks again with the change.
+    state
+        .store
+        .check_definition(org, &def, Some(&ctx.principal.id))
+        .await?;
     if state.store.definition(org, &id).await?.is_some() {
         return Err(ApiError::conflict(format!(
             "resource definition `{id}` already exists"
@@ -506,15 +487,29 @@ pub async fn update_definition(
     let body: UpdateDefinition = secret_inputs::parse_body(body)?;
     let org = state.org();
     let planned = PlannedInputs::new(body.driver_inputs)?;
-    let current = definition_or_404(&state, &id).await?;
-    precheck_driver(&state, &body.driver_type).await?;
-    let update = DefinitionUpdate {
-        name: body.name.unwrap_or(current.definition.name),
+    let current = definition_or_404(&state, &id).await?.definition;
+    let mut update = DefinitionUpdate {
+        name: body.name.unwrap_or(current.name),
         driver_type: body.driver_type,
         driver_account: body.driver_account,
-        driver_inputs: write_inputs(&state, &id, planned).await?,
+        driver_inputs: planned.references(),
         provision: body.provision,
     };
+    let check = ResourceDefinition {
+        id: current.id,
+        name: update.name.clone(),
+        ty: current.ty,
+        driver_type: update.driver_type.clone(),
+        driver_account: update.driver_account.clone(),
+        driver_inputs: std::mem::take(&mut update.driver_inputs),
+        provision: BTreeMap::new(),
+        criteria: Vec::new(),
+    };
+    state
+        .store
+        .check_definition(org, &check, Some(&ctx.principal.id))
+        .await?;
+    update.driver_inputs = write_inputs(&state, &id, planned).await?;
     state
         .store
         .update_definition(org, &id, &update, ctx.audit(org, "definition.update", &id))
