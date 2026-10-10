@@ -8,7 +8,7 @@
 //! messages name paths, never values.
 
 use openporch_core::model::{DriverInputs, SecretRef};
-use openporch_core::placeholder::{Part, Template};
+use openporch_core::placeholder::{Dialect, Expr, Part, Template};
 use openporch_store::secrets::{
     BuiltinSecretStore, SecretError, SecretInput, SecretStore, SecretValue, validate_reference,
 };
@@ -174,9 +174,14 @@ fn literal_text(s: &str) -> String {
 }
 
 /// Whether `s` is a placeholder template rather than a literal that merely
-/// contains `${`. Anything that does not parse as a template is a literal.
+/// contains `${`. Anything that does not parse as a template whose placeholders
+/// are valid in definitions, such as a generated `${Hunter2!}`, is a literal.
 fn is_template(s: &str) -> bool {
-    Template::parse(s).is_ok_and(|t| !t.is_literal())
+    Template::parse(s).is_ok_and(|t| {
+        !t.is_literal()
+            && t.placeholders()
+                .all(|raw| Expr::interpret(raw, Dialect::Definition).is_ok())
+    })
 }
 
 fn display(path: &[String]) -> String {
@@ -254,6 +259,17 @@ fn collect_inline(
 
 /// Inserts `value` at `path`, refusing to overwrite or nest inside another leaf.
 fn insert(root: &mut Map<String, Value>, path: &[String], value: Value) -> Result<(), ()> {
+    insert_with(root, path, value, is_secret_leaf)
+}
+
+/// Like [`insert`], with `is_leaf` deciding which objects are leaves. Templates in
+/// `secrets` are strings, so no object there is a leaf.
+fn insert_with(
+    root: &mut Map<String, Value>,
+    path: &[String],
+    value: Value,
+    is_leaf: fn(&Map<String, Value>) -> bool,
+) -> Result<(), ()> {
     let Some((last, parents)) = path.split_last() else {
         return Err(());
     };
@@ -264,7 +280,7 @@ fn insert(root: &mut Map<String, Value>, path: &[String], value: Value) -> Resul
             .or_insert_with(|| Value::Object(Map::new()));
         match entry {
             // An existing leaf here means one secret would nest inside another.
-            Value::Object(m) if !is_secret_leaf(m) => node = m,
+            Value::Object(m) if !is_leaf(m) => node = m,
             _ => return Err(()),
         }
     }
@@ -350,7 +366,7 @@ impl PlannedInputs {
             ..DriverInputs::default()
         };
         for (path, template) in self.templates {
-            insert(&mut out.secrets, &path, template)
+            insert_with(&mut out.secrets, &path, template, |_| false)
                 .map_err(|()| ApiError::internal("checked secret layout changed"))?;
         }
         for (path, planned) in self.secrets {
@@ -437,6 +453,52 @@ mod tests {
         assert_eq!(literal_text("a$\\{context.env.id}"), "a${context.env.id}");
         assert_eq!(literal_text("abc${def"), "abc${def");
         assert_eq!(literal_text("plain"), "plain");
+    }
+
+    #[test]
+    fn placeholder_lookalikes_are_secrets() {
+        let planned = PlannedInputs::new(inputs(json!({
+            "secrets": {"password": "${Hunter2!}"}
+        })))
+        .unwrap();
+        assert!(planned.templates.is_empty());
+        assert_eq!(planned.secrets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn templates_may_use_reference_key_names() {
+        struct NoStore;
+        impl SecretStore for NoStore {
+            fn id(&self) -> &str {
+                "none"
+            }
+            fn write<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a SecretValue,
+            ) -> openporch_store::secrets::BoxFuture<'a, Result<SecretRef, SecretError>>
+            {
+                unreachable!("templates are not written")
+            }
+            fn read<'a>(
+                &'a self,
+                _: &'a SecretRef,
+            ) -> openporch_store::secrets::BoxFuture<'a, Result<SecretValue, SecretError>>
+            {
+                unreachable!()
+            }
+        }
+        let planned = PlannedInputs::new(inputs(json!({"secrets": {"db": {
+            "value": "${context.app.id}", "x": "${context.env.id}",
+            "store": "${context.org.id}", "ref": "${context.env.type}",
+        }}})))
+        .unwrap();
+        let out = planned
+            .write(&NoStore, "defs/d", &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(out.secrets["db"]["value"], "${context.app.id}");
+        assert_eq!(out.secrets["db"]["ref"], "${context.env.type}");
     }
 
     #[test]

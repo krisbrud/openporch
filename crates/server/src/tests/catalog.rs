@@ -316,6 +316,16 @@ async fn definition_over_the_api() {
         assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
         assert!(b["message"].as_str().unwrap().contains(named), "{b}");
     }
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "bad", "type": "redis", "driver_type": "openporch/echo",
+                   "provision": {"aws-nope": {}}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(b["message"].as_str().unwrap().contains("aws-nope"), "{b}");
     // A placeholder account is resolved at deployment time.
     s.created(
         "/orgs/acme/resources/defs",

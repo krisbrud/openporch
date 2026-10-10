@@ -513,7 +513,7 @@ pub async fn update_definition(
         driver_type: update.driver_type.clone(),
         driver_account: update.driver_account.clone(),
         driver_inputs: std::mem::take(&mut update.driver_inputs),
-        provision: BTreeMap::new(),
+        provision: update.provision.clone(),
         criteria: Vec::new(),
     };
     state

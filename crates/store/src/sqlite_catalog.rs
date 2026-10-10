@@ -11,7 +11,7 @@ use std::future::Future;
 use openporch_core::catalog::{BUILTIN_DRIVERS, ResourceClass, ResourceType, builtin_type};
 use openporch_core::ids::{ClassId, CriterionId, DefinitionId, ResourceTypeId};
 use openporch_core::model::{Criterion, DriverInputs, Provision, ResourceDefinition, SecretRef};
-use openporch_core::placeholder::{Dialect, Expr, Template};
+use openporch_core::placeholder::{Dialect, Expr, ResourceRef, Template};
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
@@ -429,6 +429,16 @@ async fn check_definition_refs(
     }
     check_driver_and_account(conn, org, &def.driver_type, def.driver_account.as_deref()).await?;
     check_secret_stores(conn, org, &def.driver_inputs).await?;
+    for key in def.provision.keys() {
+        let target = ResourceRef::parse(key)
+            .map_err(|e| StoreError::Invalid(format!("`provision` key `{key}` is invalid: {e}")))?;
+        if !type_exists(conn, org, target.ty.as_str()).await? {
+            return Err(StoreError::Invalid(format!(
+                "`provision` key `{key}` names resource type `{}`, which does not exist",
+                target.ty
+            )));
+        }
+    }
     for (i, criterion) in def.criteria.iter().enumerate() {
         check_criterion(conn, org, ty, criterion, &def.criteria[..i]).await?;
     }
