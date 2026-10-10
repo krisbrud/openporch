@@ -1497,3 +1497,20 @@ async fn creation_and_revocation_are_rechecked_with_the_change() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn other_organizations_are_hidden_before_routing() {
+    let s = server().await;
+    for (method, path) in [
+        (Method::DELETE, "/orgs/other/audit-logs"),
+        (Method::PUT, "/orgs/other/apps"),
+        (Method::GET, "/orgs/other/nowhere"),
+    ] {
+        let (status, body) = s.call(method, path, None, None).await;
+        assert_error(status, &body, StatusCode::NOT_FOUND, "API-001");
+    }
+    let (status, _) = s
+        .call(Method::DELETE, "/orgs/acme/audit-logs", None, None)
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}

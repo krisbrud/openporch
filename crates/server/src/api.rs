@@ -101,9 +101,26 @@ impl Api {
                 )
             })
             .layer(axum::extract::DefaultBodyLimit::max(limit))
+            .layer(middleware::from_fn_with_state(
+                self.state.clone(),
+                organization_guard,
+            ))
             .layer(middleware::from_fn(request_id))
             .with_state(self.state)
     }
+}
+
+/// Hides every path under another organization, before routing, so that neither
+/// method fallbacks nor unknown paths reveal which routes exist.
+async fn organization_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let mut segments = req.uri().path().split('/').skip(1);
+    if segments.next() == Some("orgs")
+        && let Some(org) = segments.next()
+        && org != state.org()
+    {
+        return ApiError::not_found(format!("organization `{org}` not found")).into_response();
+    }
+    next.run(req).await
 }
 
 /// The request ID, from `x-request-id` or generated.
