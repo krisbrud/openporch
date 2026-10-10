@@ -602,6 +602,18 @@ async fn identity_binding_is_locked_after_first_login() {
     };
     assert!(login::login(&s.state, &oidc, None).await.is_err());
     assert!(login::login(&s.state, &oidc, Some(&code)).await.is_err());
+    // Not even with a fresh invitation for the same email.
+    let (_, fresh) = s
+        .invite(json!({"email": "alice@example.com", "role": "member"}))
+        .await;
+    let e = login::login(&s.state, &oidc, Some(&fresh))
+        .await
+        .unwrap_err();
+    assert!(
+        e.message.contains("already belongs to a member"),
+        "{}",
+        e.message
+    );
 }
 
 #[tokio::test]

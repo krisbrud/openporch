@@ -860,6 +860,24 @@ impl IdentityStore for SqliteStore {
                 "this identity already belongs to a user".into(),
             ));
         }
+        // An email already used by a member stays bound to that member's identity; a
+        // second provider cannot claim it, only an administrator can rebind it.
+        if let Some(email) = &identity.verified_email {
+            let taken: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM principals WHERE org_id = ? AND lower(email) = lower(?)",
+            )
+            .bind(org)
+            .bind(email)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if taken.is_some() {
+                return Err(StoreError::Conflict(
+                    "this email already belongs to a member linked to another identity; an \
+                     administrator must change that binding"
+                        .into(),
+                ));
+            }
+        }
         insert_principal(
             &mut tx,
             org,
