@@ -1412,3 +1412,30 @@ async fn role_grants_are_rechecked_with_the_change() {
         "{e}"
     );
 }
+
+#[tokio::test]
+async fn application_deletion_is_rechecked_with_the_change() {
+    let s = server().await;
+    s.app("shop").await;
+    s.member("alice", "member").await;
+    s.grant_app("shop", "alice", "owner").await;
+    s.grant_deployer("development", "alice").await;
+    // alice lost `deployer` after her request passed the handler check.
+    s.delete("/orgs/acme/env-types/development/users/alice", &s.admin)
+        .await;
+    let as_alice = AuditIntent::accepted("acme", "alice", "DELETE", "/orgs/acme/apps/shop", "test");
+    let e = s
+        .state
+        .store
+        .delete_app("acme", "shop", as_alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::Forbidden(_)),
+        "{e}"
+    );
+    assert_eq!(
+        s.get("/orgs/acme/apps/shop", &s.admin).await.0,
+        StatusCode::OK
+    );
+}

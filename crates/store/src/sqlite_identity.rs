@@ -939,6 +939,26 @@ impl IdentityStore for SqliteStore {
         if exists.is_none() {
             return Err(not_found(format!("application `{app}`")));
         }
+        // Owner plus deployer on every environment type the application uses,
+        // checked with the deletion.
+        if let Some(actor) = audit.actor.as_deref() {
+            let roles = roles_in(&mut tx, org, actor).await?;
+            if roles.org != Some(OrgRole::Administrator) {
+                check_app_authority(&mut tx, org, Some(actor), app).await?;
+                let types: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT type FROM envs WHERE org_id = ? AND app_id = ?",
+                )
+                .bind(org)
+                .bind(app)
+                .fetch_all(&mut *tx)
+                .await?;
+                if let Some(t) = types.iter().find(|t| !roles.deployer.contains(*t)) {
+                    return Err(StoreError::Forbidden(format!(
+                        "requires the `deployer` role on environment type `{t}`"
+                    )));
+                }
+            }
+        }
         let (deployed,): (i64,) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM deployments WHERE org_id = ?1 AND app_id = ?2) \
                   + (SELECT COUNT(*) FROM active_resources WHERE org_id = ?1 AND app_id = ?2)",
