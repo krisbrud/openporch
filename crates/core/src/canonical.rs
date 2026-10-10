@@ -17,12 +17,13 @@ fn write_value(value: &Value, out: &mut String) {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                out.push_str(&i.to_string());
-            } else if let Some(u) = n.as_u64() {
-                out.push_str(&u.to_string());
-            } else {
-                out.push_str(&es_number(n.as_f64().expect("JSON numbers are finite")));
+            // Integers within ±2^53 print exactly; larger ones go through the double
+            // they denote, as JCS requires, so every implementation agrees on the ID.
+            const EXACT: u64 = 1 << 53;
+            match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) if i.unsigned_abs() <= EXACT => out.push_str(&i.to_string()),
+                (_, Some(u)) if u <= EXACT => out.push_str(&u.to_string()),
+                _ => out.push_str(&es_number(n.as_f64().expect("JSON numbers are finite"))),
             }
         }
         Value::String(s) => write_string(s, out),
@@ -156,8 +157,23 @@ mod tests {
             assert_eq!(es_number(f), want, "{f}");
         }
         assert_eq!(
-            to_canonical_string(&json!([1, -7, 18446744073709551615u64, 2.0])),
-            "[1,-7,18446744073709551615,2]"
+            to_canonical_string(&json!([
+                1,
+                -7,
+                9007199254740992u64,
+                -9007199254740992i64,
+                2.0
+            ])),
+            "[1,-7,9007199254740992,-9007199254740992,2]"
+        );
+        // Beyond 2^53, integers canonicalize as the double they denote.
+        assert_eq!(
+            to_canonical_string(&json!([
+                9007199254740993u64,
+                -9007199254740993i64,
+                18446744073709551615u64
+            ])),
+            "[9007199254740992,-9007199254740992,18446744073709552000]"
         );
     }
 }

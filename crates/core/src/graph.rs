@@ -164,7 +164,7 @@ struct Builder<'a> {
     input: GraphInput<'a>,
     nodes: BTreeMap<Descriptor, Node>,
     /// The request that fixed each node's params, for conflict messages.
-    params_from: BTreeMap<Descriptor, String>,
+    explicit: BTreeMap<Descriptor, (String, Value)>,
     queue: VecDeque<Descriptor>,
     co: BTreeSet<CoProvision>,
 }
@@ -174,7 +174,7 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
     let mut b = Builder {
         input,
         nodes: BTreeMap::new(),
-        params_from: BTreeMap::new(),
+        explicit: BTreeMap::new(),
         queue: VecDeque::new(),
         co: BTreeSet::new(),
     };
@@ -201,7 +201,7 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
             b.request(
                 &dep,
                 &format!("{wpath}.externals.{key}"),
-                ext.params.clone(),
+                Some(ext.params.clone().unwrap_or(Value::Null)),
             )?;
             b.edge(&w, &dep);
         }
@@ -212,7 +212,8 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
             source,
         })?;
         let d = Descriptor::new(shared.ty.clone(), shared.class.clone(), res_id);
-        b.request(&d, &format!("shared.{id}"), shared.params.clone())?;
+        let params = Some(shared.params.clone().unwrap_or(Value::Null));
+        b.request(&d, &format!("shared.{id}"), params)?;
     }
     while let Some(d) = b.queue.pop_front() {
         b.expand(&d)?;
@@ -239,16 +240,15 @@ impl Builder<'_> {
             .is_some_and(|t| t.use_ == ResourceUse::Implicit)
     }
 
-    /// Adds a request for `d`. `params` is `Some` for requests that supply inputs
-    /// (workloads, shared resources, co-provisioning). References and requests without
-    /// params pass `None` and never conflict.
+    /// Adds a request for `d`. Requests that supply inputs (workloads, shared
+    /// resources, co-provisioning) pass `Some`, with `null` when they set no params,
+    /// and must all agree. Placeholder references pass `None` and never conflict.
     fn request(
         &mut self,
         d: &Descriptor,
         path: &str,
         params: Option<Value>,
     ) -> Result<(), GraphError> {
-        let params = params.filter(|p| !p.is_null());
         if self.resource_type(&d.ty).is_none() {
             return Err(GraphError::UnknownType {
                 path: path.to_owned(),
@@ -265,8 +265,8 @@ impl Builder<'_> {
         let canonical = params.as_ref().map(crate::canonical::to_canonical_string);
         if let Some(node) = self.nodes.get_mut(d) {
             if let Some(p) = &params {
-                match self.params_from.get(d) {
-                    Some(first) if node.params.as_ref() != Some(p) => {
+                match self.explicit.get(d) {
+                    Some((first, existing)) if existing != p => {
                         let mut paths = [first.clone(), path.to_owned()];
                         paths.sort();
                         let [first, second] = paths;
@@ -278,8 +278,9 @@ impl Builder<'_> {
                     }
                     Some(_) => {}
                     None => {
-                        node.params = Some(p.clone());
-                        self.params_from.insert(d.clone(), path.to_owned());
+                        node.params = Some(p.clone()).filter(|p| !p.is_null());
+                        self.explicit
+                            .insert(d.clone(), (path.to_owned(), p.clone()));
                     }
                 }
             }
@@ -305,8 +306,9 @@ impl Builder<'_> {
                 source,
             }
         })?;
-        if params.is_some() {
-            self.params_from.insert(d.clone(), path.to_owned());
+        if let Some(p) = &params {
+            self.explicit
+                .insert(d.clone(), (path.to_owned(), p.clone()));
         }
         self.nodes.insert(
             d.clone(),
@@ -314,7 +316,7 @@ impl Builder<'_> {
                 descriptor: d.clone(),
                 definition: def.id.clone(),
                 driver_type: def.driver_type.clone(),
-                params,
+                params: params.filter(|p| !p.is_null()),
                 requests: vec![Request {
                     path: path.to_owned(),
                     params: canonical,

@@ -463,4 +463,11 @@ fn json_schema_rejects_unknown_fields_and_requires_core_fields() {
     assert_eq!(s["additionalProperties"], json!(false));
     assert_eq!(s["required"], json!(["apiVersion", "kind", "metadata"]));
     assert!(s["$defs"]["Trigger"].is_object());
+    assert_eq!(
+        s["oneOf"],
+        json!([
+            {"required": ["containers"], "not": {"required": ["function"]}},
+            {"required": ["function"], "not": {"required": ["containers"]}}
+        ])
+    );
 }

@@ -91,6 +91,28 @@
     "kind",
     "metadata"
   ],
+  "oneOf": [
+    {
+      "required": [
+        "containers"
+      ],
+      "not": {
+        "required": [
+          "function"
+        ]
+      }
+    },
+    {
+      "required": [
+        "function"
+      ],
+      "not": {
+        "required": [
+          "containers"
+        ]
+      }
+    }
+  ],
   "$defs": {
     "Metadata": {
       "description": "Workload metadata.",

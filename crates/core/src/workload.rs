@@ -26,7 +26,15 @@ pub const SCORE_API_VERSION: &str = "score.dev/v1b1";
 /// A workload document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-#[schemars(title = "openporch Workload", extend("$id" = "https://openporch.dev/schemas/workload-v1.json"))]
+#[schemars(
+    title = "openporch Workload",
+    extend("$id" = "https://openporch.dev/schemas/workload-v1.json"),
+    // A workload is either containers or a function.
+    extend("oneOf" = [
+        {"required": ["containers"], "not": {"required": ["function"]}},
+        {"required": ["function"], "not": {"required": ["containers"]}}
+    ])
+)]
 pub struct Workload {
     /// Always `openporch.dev/v1`.
     #[schemars(extend("const" = "openporch.dev/v1"))]

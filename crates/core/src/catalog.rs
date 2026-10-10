@@ -126,13 +126,13 @@ impl ResourceType {
             }
         }
         for (name, _, required) in self.declared(OutputKind::Secret) {
-            if !secrets.contains(name) {
-                if values.contains_key(name) {
-                    return Err(err(name, "must be a secret output, not a value".to_owned()));
-                }
-                if required {
-                    return Err(err(name, "is missing".to_owned()));
-                }
+            // A plaintext copy in `values` would be stored and shown as a non-secret
+            // output, so it is rejected even when the secret is also present.
+            if values.contains_key(name) {
+                return Err(err(name, "must be a secret output, not a value".to_owned()));
+            }
+            if required && !secrets.contains(name) {
+                return Err(err(name, "is missing".to_owned()));
             }
         }
         Ok(())
@@ -611,6 +611,11 @@ mod tests {
             .validate_outputs(&leaked, &secrets(&["username"]))
             .unwrap_err();
         assert!(e.problem.contains("must be a secret"));
+        // Present as a secret and also leaked as a value.
+        let e = pg
+            .validate_outputs(&leaked, &secrets(&["username", "password"]))
+            .unwrap_err();
+        assert_eq!(e.output, "password");
     }
 
     #[test]

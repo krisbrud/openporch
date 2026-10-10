@@ -493,19 +493,44 @@ fn graph_is_independent_of_definition_order() {
 
 #[test]
 fn shared_resources_from_the_set() {
+    let shared = |params: Value| crate::sets::SharedResource {
+        ty: "dns".parse().unwrap(),
+        class: ClassId::default(),
+        params: Some(params),
+    };
+    // The workload requests `api-dns` without params, so the set must not add any.
     let mut set = set_of(&[DNS_A]);
-    set.shared.insert(
-        "api-dns".into(),
-        crate::sets::SharedResource {
-            ty: "dns".parse().unwrap(),
-            class: ClassId::default(),
-            params: Some(json!({"sub": "api"})),
-        },
+    set.shared
+        .insert("api-dns".into(), shared(json!({"sub": "api"})));
+    let e = Fixture::new(base_defs()).build(&set).unwrap_err();
+    assert_eq!(
+        e,
+        GraphError::Conflict {
+            descriptor: d("dns.default#shared.api-dns"),
+            first: "modules.alpha.externals.dns".into(),
+            second: "shared.api-dns".into(),
+        }
     );
+
+    let with_params = DNS_A.replace("id: api-dns}", "id: api-dns, params: {sub: api}}");
+    let mut set = set_of(&[&with_params]);
+    set.shared
+        .insert("api-dns".into(), shared(json!({"sub": "api"})));
     let g = Fixture::new(base_defs()).build(&set).unwrap();
     let node = &g.nodes[&d("dns.default#shared.api-dns")];
     assert_eq!(node.params, Some(json!({"sub": "api"})));
     assert_eq!(node.requests.len(), 2);
+}
+
+#[test]
+fn omitted_params_conflict_with_supplied_params() {
+    let with_params = DNS_A
+        .replace("name: alpha", "name: beta")
+        .replace("id: api-dns}", "id: api-dns, params: {sub: api}}");
+    let e = Fixture::new(base_defs())
+        .build(&set_of(&[DNS_A, &with_params]))
+        .unwrap_err();
+    assert!(matches!(e, GraphError::Conflict { .. }), "{e}");
 }
 
 #[test]
