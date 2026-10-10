@@ -24,10 +24,12 @@ openporch-store = { path = "crates/store" }
 openporch-drivers = { path = "crates/drivers" }
 openporch-engine = { path = "crates/engine" }
 openporch-client = { path = "crates/client" }
+aes-gcm = "0.10"
 base64 = "0.22"
 indexmap = { version = "2", features = ["serde"] }
 json-patch = "4"
 proptest = "1"
+rand = "0.8"
 regex = "1"
 schemars = { version = "1", features = ["indexmap2"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,7 +37,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_path_to_error = "0.1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
