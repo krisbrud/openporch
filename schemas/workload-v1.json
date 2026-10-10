@@ -1,0 +1,889 @@
+{
+  "$id": "https://openporch.dev/schemas/workload-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "openporch Workload",
+  "description": "A workload document.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "description": "Always `openporch.dev/v1`.",
+      "type": "string",
+      "const": "openporch.dev/v1"
+    },
+    "kind": {
+      "description": "Always `Workload`.",
+      "type": "string",
+      "const": "Workload"
+    },
+    "metadata": {
+      "description": "Name, class and annotations.",
+      "$ref": "#/$defs/Metadata"
+    },
+    "containers": {
+      "description": "Containers by ID. Exactly one of `containers` and `function` is required.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/Container"
+      }
+    },
+    "function": {
+      "description": "A function. Exactly one of `containers` and `function` is required.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Function"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "service": {
+      "description": "Network ports exposed by containers.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Service"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "triggers": {
+      "description": "Triggers by name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Trigger"
+      }
+    },
+    "resources": {
+      "description": "Resource dependencies by key.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ResourceRequest"
+      }
+    },
+    "deploy": {
+      "description": "Deployment settings.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Deploy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target": {
+      "description": "Driver-specific settings, validated by the selected driver.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata"
+  ],
+  "$defs": {
+    "Metadata": {
+      "description": "Workload metadata.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Workload name.",
+          "$ref": "#/$defs/WorkloadId"
+        },
+        "class": {
+          "description": "Workload class, which selects the target. Defaults to `default`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClassId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "annotations": {
+          "description": "Annotations.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "WorkloadId": {
+      "type": "string"
+    },
+    "ClassId": {
+      "type": "string"
+    },
+    "Container": {
+      "description": "A container, in Score's shape.",
+      "type": "object",
+      "properties": {
+        "image": {
+          "description": "Image reference, or `.` to supply it at deploy time.",
+          "type": "string"
+        },
+        "command": {
+          "description": "Overrides the image entrypoint.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "args": {
+          "description": "Overrides the image arguments.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "variables": {
+          "description": "Environment variables.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "files": {
+          "description": "Files by target path.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/File"
+          }
+        },
+        "resources": {
+          "description": "Compute limits and requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContainerResources"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "livenessProbe": {
+          "description": "Liveness probe.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Probe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readinessProbe": {
+          "description": "Readiness probe.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Probe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "image"
+      ]
+    },
+    "File": {
+      "description": "A file mounted into a container.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "File mode, such as `0644`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Path of a local file to read, relative to the document.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "description": "Inline content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "noExpand": {
+          "description": "Disables placeholder expansion in the content.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ContainerResources": {
+      "description": "Container compute resources.",
+      "type": "object",
+      "properties": {
+        "limits": {
+          "description": "Upper bounds.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requests": {
+          "description": "Guaranteed amounts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Quantities": {
+      "description": "CPU and memory quantities.",
+      "type": "object",
+      "properties": {
+        "memory": {
+          "description": "Memory, such as `512Mi`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cpu": {
+          "description": "CPU, such as `250m`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Probe": {
+      "description": "A container probe.",
+      "type": "object",
+      "properties": {
+        "httpGet": {
+          "description": "An HTTP GET check.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exec": {
+          "description": "A command check.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExecProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpProbe": {
+      "description": "An HTTP GET probe.",
+      "type": "object",
+      "properties": {
+        "scheme": {
+          "description": "`HTTP` or `HTTPS`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "description": "Host header.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Request path.",
+          "type": "string"
+        },
+        "port": {
+          "description": "Container port.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "httpHeaders": {
+          "description": "Extra headers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HttpHeader"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "port"
+      ]
+    },
+    "HttpHeader": {
+      "description": "An HTTP header.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Header name.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Header value.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "ExecProbe": {
+      "description": "A command probe.",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Command and arguments.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ]
+    },
+    "Function": {
+      "description": "A function workload.",
+      "type": "object",
+      "properties": {
+        "package": {
+          "description": "How the code is packaged.",
+          "$ref": "#/$defs/Package"
+        },
+        "variables": {
+          "description": "Environment variables.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "memory": {
+          "description": "Memory, such as `256Mi`.",
+          "type": "string",
+          "default": "256Mi"
+        },
+        "timeout": {
+          "description": "Timeout, such as `30s`.",
+          "type": "string",
+          "default": "30s"
+        },
+        "concurrency": {
+          "description": "Concurrency settings.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Concurrency"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "package"
+      ]
+    },
+    "Package": {
+      "description": "Function packaging.",
+      "oneOf": [
+        {
+          "description": "A zip archive with a runtime and handler.",
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "description": "Artifact URI, or `.` to supply it at deploy time.",
+              "type": "string"
+            },
+            "runtime": {
+              "description": "Runtime, such as `python3.12`.",
+              "type": "string"
+            },
+            "handler": {
+              "description": "Handler, such as `app.handler`.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "zip"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "artifact",
+            "runtime",
+            "handler"
+          ]
+        },
+        {
+          "description": "A container image.",
+          "type": "object",
+          "properties": {
+            "image": {
+              "description": "Image reference, or `.` to supply it at deploy time.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "image"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "image"
+          ]
+        }
+      ]
+    },
+    "Concurrency": {
+      "description": "Function concurrency.",
+      "type": "object",
+      "properties": {
+        "reserved": {
+          "description": "Reserved concurrency.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "provisioned": {
+          "description": "Provisioned concurrency.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Service": {
+      "description": "Ports exposed by a container workload.",
+      "type": "object",
+      "properties": {
+        "ports": {
+          "description": "Ports by name.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ServicePort"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServicePort": {
+      "description": "A service port.",
+      "type": "object",
+      "properties": {
+        "port": {
+          "description": "Exposed port.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "targetPort": {
+          "description": "Container port; defaults to `port`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "protocol": {
+          "description": "`TCP` or `UDP`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "port"
+      ]
+    },
+    "Trigger": {
+      "description": "A trigger. Each trigger has exactly one kind.",
+      "oneOf": [
+        {
+          "description": "HTTP requests.",
+          "type": "object",
+          "properties": {
+            "http": {
+              "$ref": "#/$defs/HttpTrigger"
+            }
+          },
+          "required": [
+            "http"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "A cron schedule.",
+          "type": "object",
+          "properties": {
+            "schedule": {
+              "$ref": "#/$defs/ScheduleTrigger"
+            }
+          },
+          "required": [
+            "schedule"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Messages from a queue resource.",
+          "type": "object",
+          "properties": {
+            "queue": {
+              "$ref": "#/$defs/QueueTrigger"
+            }
+          },
+          "required": [
+            "queue"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Messages from a topic resource.",
+          "type": "object",
+          "properties": {
+            "topic": {
+              "$ref": "#/$defs/TopicTrigger"
+            }
+          },
+          "required": [
+            "topic"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Records from a stream resource.",
+          "type": "object",
+          "properties": {
+            "stream": {
+              "$ref": "#/$defs/StreamTrigger"
+            }
+          },
+          "required": [
+            "stream"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HttpTrigger": {
+      "description": "HTTP trigger.",
+      "type": "object",
+      "properties": {
+        "port": {
+          "description": "For containers, the name of a service port.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path prefix.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auth": {
+          "description": "Authentication; the default follows the target's policy.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpAuth": {
+      "description": "HTTP trigger authentication.",
+      "oneOf": [
+        {
+          "description": "Public.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Cloud IAM authentication.",
+          "type": "string",
+          "const": "iam"
+        }
+      ]
+    },
+    "ScheduleTrigger": {
+      "description": "Schedule trigger.",
+      "type": "object",
+      "properties": {
+        "cron": {
+          "description": "A 5-field cron expression.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "IANA time zone; UTC when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "description": "Input passed to each invocation."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cron"
+      ]
+    },
+    "QueueTrigger": {
+      "description": "Queue trigger.",
+      "type": "object",
+      "properties": {
+        "resource": {
+          "description": "Key of the queue under `resources`.",
+          "type": "string"
+        },
+        "batchSize": {
+          "description": "Messages per invocation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource"
+      ]
+    },
+    "TopicTrigger": {
+      "description": "Topic trigger.",
+      "type": "object",
+      "properties": {
+        "resource": {
+          "description": "Key of the topic under `resources`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource"
+      ]
+    },
+    "StreamTrigger": {
+      "description": "Stream trigger.",
+      "type": "object",
+      "properties": {
+        "resource": {
+          "description": "Key of the stream under `resources`.",
+          "type": "string"
+        },
+        "batchSize": {
+          "description": "Records per invocation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "startingPosition": {
+          "description": "`latest` or `trim_horizon`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource"
+      ]
+    },
+    "ResourceRequest": {
+      "description": "A resource dependency.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Resource type.",
+          "$ref": "#/$defs/ResourceTypeId"
+        },
+        "class": {
+          "description": "Resource class. Defaults to `default`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClassId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "description": "Shared resource ID. Without it the dependency is private to the workload.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "description": "Parameters for the resource."
+        },
+        "metadata": {
+          "description": "Annotations.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResourceMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "ResourceTypeId": {
+      "type": "string"
+    },
+    "ResourceMetadata": {
+      "description": "Resource dependency metadata.",
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "description": "Annotations.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "Deploy": {
+      "description": "Deployment settings.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "What a successful deployment waits for. Defaults to `available`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeployStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout": {
+          "description": "How long to wait. Defaults to `5m`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeployStatus": {
+      "description": "What a deployment waits for.",
+      "oneOf": [
+        {
+          "description": "The target accepted the workload.",
+          "type": "string",
+          "const": "deploy"
+        },
+        {
+          "description": "The workload is available.",
+          "type": "string",
+          "const": "available"
+        }
+      ]
+    }
+  }
+}

@@ -7,3 +7,4 @@ pub mod ids;
 pub mod model;
 pub mod placeholder;
 pub mod sets;
+pub mod workload;
