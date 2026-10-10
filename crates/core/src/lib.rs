@@ -3,6 +3,7 @@
 pub mod canonical;
 pub mod catalog;
 pub mod criteria;
+pub mod graph;
 pub mod ids;
 pub mod model;
 pub mod placeholder;
