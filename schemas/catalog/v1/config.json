@@ -1,0 +1,28 @@
+{
+  "id": "config",
+  "name": "Configuration",
+  "use": "direct",
+  "category": "config",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+      }
+    }
+  }
+}

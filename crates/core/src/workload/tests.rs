@@ -333,6 +333,28 @@ containers:
 }
 
 #[test]
+fn placeholders_in_resource_params_are_rejected() {
+    let e = parse(
+        r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web: {image: nginx}
+resources:
+  bucket: {type: s3}
+  db: {type: postgres, params: {extensions: ["${resources.bucket.name}"]}}
+"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.path, "resources.db.params.extensions.0");
+    assert!(
+        e.message.contains("not supported in resource params"),
+        "{e}"
+    );
+}
+
+#[test]
 fn context_placeholders_are_rejected() {
     let e = parse(
         r#"
@@ -518,6 +540,16 @@ fn json_schema_rejects_unknown_fields_and_requires_core_fields() {
     assert!(s["$defs"]["Trigger"].is_object());
     // Each branch requires its own kind and allows the other to be absent or null,
     // matching what the parser accepts.
+    // Identifiers carry their validation rules.
+    assert_eq!(
+        s["$defs"]["WorkloadId"]["pattern"],
+        crate::ids::OBJECT_ID_PATTERN
+    );
+    assert_eq!(s["$defs"]["ClassId"]["minLength"], 2);
+    assert_eq!(
+        s["$defs"]["ResourceTypeId"]["pattern"],
+        crate::ids::RESOURCE_TYPE_PATTERN
+    );
     assert_eq!(s["oneOf"][0]["required"], json!(["containers"]));
     assert_eq!(s["oneOf"][1]["required"], json!(["function"]));
     assert_eq!(

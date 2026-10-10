@@ -82,12 +82,12 @@ macro_rules! object_id {
             }
         }
 
-        string_newtype_impls!($name);
+        string_newtype_impls!($name, object_id_schema());
     };
 }
 
 macro_rules! string_newtype_impls {
-    ($name:ident) => {
+    ($name:ident, $schema:expr) => {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)
@@ -124,11 +124,35 @@ macro_rules! string_newtype_impls {
             fn schema_name() -> std::borrow::Cow<'static, str> {
                 stringify!($name).into()
             }
-            fn json_schema(g: &mut schemars::SchemaGenerator) -> schemars::Schema {
-                String::json_schema(g)
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                $schema
+                    .try_into()
+                    .expect("identifier schemas are objects")
             }
         }
     };
+    ($name:ident) => {
+        string_newtype_impls!($name, serde_json::json!({"type": "string"}));
+    };
+}
+
+/// JSON Schema pattern of an object ID. With a minimum length of 2 it is the same rule
+/// as [`is_valid_object_id`], written without nested quantifiers so it cannot backtrack
+/// exponentially.
+pub const OBJECT_ID_PATTERN: &str = "^[a-z0-9]+(?:-[a-z0-9]+)*$";
+
+/// JSON Schema pattern of a resource type ID. The lookahead bounds the organization
+/// prefix to the object ID length.
+pub const RESOURCE_TYPE_PATTERN: &str =
+    "^(?:(?=[a-z0-9-]{2,50}/)[a-z0-9]+(?:-[a-z0-9]+)*/)?[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?$";
+
+fn object_id_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "minLength": 2,
+        "maxLength": MAX_ID_LEN,
+        "pattern": OBJECT_ID_PATTERN,
+    })
 }
 
 object_id!(
@@ -206,7 +230,7 @@ impl Default for ClassId {
     }
 }
 
-string_newtype_impls!(ClassId);
+string_newtype_impls!(ClassId, object_id_schema());
 
 /// A resource type ID: a built-in name such as `postgres` or a custom `{org}/{name}`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -251,7 +275,14 @@ fn is_type_name(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
-string_newtype_impls!(ResourceTypeId);
+string_newtype_impls!(
+    ResourceTypeId,
+    serde_json::json!({
+        "type": "string",
+        "maxLength": 2 * MAX_ID_LEN + 1,
+        "pattern": RESOURCE_TYPE_PATTERN,
+    })
+);
 
 /// A resource ID within an environment, such as `modules.web.externals.db`,
 /// `shared.api-dns` or `k8s-cluster`.
@@ -448,13 +479,19 @@ mod tests {
         #[test]
         fn object_id_matches_spec_regex(s in "[a-z0-9_ A-Z-]{0,60}") {
             let re = regex::Regex::new(r"^[a-z0-9](?:-?[a-z0-9]+)+$").unwrap();
-            prop_assert_eq!(is_valid_object_id(&s), re.is_match(&s) && s.len() <= MAX_ID_LEN);
+            prop_assert_eq!(
+                is_valid_object_id(&s),
+                re.is_match(&s) && (2..=MAX_ID_LEN).contains(&s.len())
+            );
         }
 
         #[test]
         fn object_id_matches_spec_regex_on_valid_alphabet(s in "[a-z0-9-]{0,55}") {
-            let re = regex::Regex::new(r"^[a-z0-9](?:-?[a-z0-9]+)+$").unwrap();
-            prop_assert_eq!(is_valid_object_id(&s), re.is_match(&s) && s.len() <= MAX_ID_LEN);
+            let re = regex::Regex::new(OBJECT_ID_PATTERN).unwrap();
+            prop_assert_eq!(
+                is_valid_object_id(&s),
+                re.is_match(&s) && (2..=MAX_ID_LEN).contains(&s.len())
+            );
         }
     }
 

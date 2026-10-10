@@ -1,0 +1,37 @@
+{
+  "id": "aws-role",
+  "name": "AWS IAM role",
+  "use": "indirect",
+  "category": "aws",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arn"
+        ],
+        "additionalProperties": false
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  }
+}

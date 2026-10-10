@@ -1,0 +1,42 @@
+{
+  "id": "sqs",
+  "name": "SQS queue",
+  "use": "direct",
+  "category": "messaging",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arn",
+          "url",
+          "region"
+        ],
+        "additionalProperties": false
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  }
+}

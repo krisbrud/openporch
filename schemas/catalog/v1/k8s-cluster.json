@@ -1,0 +1,47 @@
+{
+  "id": "k8s-cluster",
+  "name": "Kubernetes cluster",
+  "use": "implicit",
+  "category": "kubernetes",
+  "inputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object"
+  },
+  "outputs_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "values": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "loadbalancer": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "secrets": {
+        "type": "object",
+        "properties": {
+          "credentials": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  }
+}

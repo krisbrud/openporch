@@ -415,6 +415,11 @@ pub struct ResourceRequest {
     pub class: Option<ClassId>,
     /// Shared resource ID. Without it the dependency is private to the workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend(
+        "minLength" = 2,
+        "maxLength" = crate::ids::MAX_ID_LEN,
+        "pattern" = crate::ids::OBJECT_ID_PATTERN
+    ))]
     pub id: Option<String>,
     /// Parameters for the resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -752,6 +757,11 @@ impl Workload {
                     crate::ids::OBJECT_ID_RULE,
                 ));
             }
+            // Params go to the resource's driver as they are: placeholders in them would
+            // be neither translated nor ordered in the graph, so they are rejected.
+            if let Some(params) = &r.params {
+                reject_placeholders(params, &format!("resources.{key}.params"))?;
+            }
         }
         for (name, t) in &self.triggers {
             let path = format!("triggers.{name}.{}", t.kind());
@@ -947,6 +957,29 @@ fn join(path: &str, key: &str) -> String {
         key.to_owned()
     } else {
         format!("{path}.{key}")
+    }
+}
+
+fn reject_placeholders(v: &Value, path: &str) -> Result<(), WorkloadError> {
+    match v {
+        Value::String(s) => {
+            let t = Template::parse(s).map_err(|e| WorkloadError::new(path, e.to_string()))?;
+            if t.placeholders().next().is_some() {
+                return Err(WorkloadError::new(
+                    path,
+                    "placeholders are not supported in resource params",
+                ));
+            }
+            Ok(())
+        }
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, item)| reject_placeholders(item, &join(path, &i.to_string()))),
+        Value::Object(map) => map
+            .iter()
+            .try_for_each(|(k, item)| reject_placeholders(item, &join(path, k))),
+        _ => Ok(()),
     }
 }
 

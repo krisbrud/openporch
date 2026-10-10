@@ -142,6 +142,24 @@ impl ResourceType {
         }
         Ok(())
     }
+
+    /// Checks the JSON type of one secret output against the schema. The executor
+    /// calls this with the secret value before storing it as a reference; the
+    /// error names the output and the expected type, never the value.
+    pub fn validate_secret_output(&self, name: &str, value: &Value) -> Result<(), OutputError> {
+        let declared = self.declared(OutputKind::Secret);
+        let Some((_, schema, _)) = declared.iter().find(|(n, _, _)| *n == name) else {
+            return Ok(());
+        };
+        match schema.get("type").and_then(Value::as_str) {
+            Some(want) if !json_type_matches(want, value) => Err(OutputError {
+                ty: self.id.clone(),
+                output: name.to_owned(),
+                problem: format!("must be of type {want}"),
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
 fn json_type_matches(want: &str, v: &Value) -> bool {
@@ -644,5 +662,113 @@ mod tests {
         assert!(reg.contains(&s3, &"large".parse().unwrap()));
         assert!(!reg.contains(&s3, &"sensitive".parse().unwrap()));
         assert!(!reg.contains(&"postgres".parse().unwrap(), &"large".parse().unwrap()));
+    }
+
+    /// Each built-in type has a versioned fixture under `schemas/catalog/v1`.
+    /// Run with `OPENPORCH_UPDATE_SCHEMAS=1` to regenerate them.
+    #[test]
+    fn published_catalog_fixtures_are_current() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../schemas/catalog/v1");
+        let update = std::env::var_os("OPENPORCH_UPDATE_SCHEMAS").is_some();
+        let types = builtin_types();
+        for t in &types {
+            let path = format!("{dir}/{}.json", t.id);
+            let generated = serde_json::to_string_pretty(t).unwrap() + "\n";
+            if update {
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(&path, &generated).unwrap();
+            }
+            let published = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                published == generated,
+                "{path} is stale; rerun with OPENPORCH_UPDATE_SCHEMAS=1"
+            );
+            let fixture: ResourceType = serde_json::from_str(&published).unwrap();
+            for schema in [&fixture.inputs_schema, &fixture.outputs_schema] {
+                assert_eq!(
+                    schema["$schema"],
+                    "https://json-schema.org/draft/2020-12/schema"
+                );
+            }
+        }
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        files.sort();
+        let mut want: Vec<String> = types.iter().map(|t| format!("{}.json", t.id)).collect();
+        want.sort();
+        assert_eq!(files, want, "every fixture belongs to a built-in type");
+    }
+
+    fn sample(schema: &Value) -> Value {
+        match schema.get("type").and_then(Value::as_str) {
+            Some("integer") => json!(1),
+            Some("number") => json!(1.5),
+            Some("boolean") => json!(true),
+            Some("object") => json!({}),
+            Some("array") => json!([]),
+            _ => json!("x"),
+        }
+    }
+
+    fn wrong(schema: &Value) -> Value {
+        match schema.get("type").and_then(Value::as_str) {
+            Some("string") => json!(1),
+            _ => json!("x"),
+        }
+    }
+
+    /// Conformance: for every built-in type, outputs built from the fixture pass,
+    /// and a missing required or wrongly typed output fails.
+    #[test]
+    fn catalog_output_conformance() {
+        for t in builtin_types() {
+            let mut values = Map::new();
+            for (name, schema, _) in t.declared(OutputKind::Value) {
+                values.insert(name.to_owned(), sample(schema));
+            }
+            let secret_names: BTreeSet<String> = t
+                .declared(OutputKind::Secret)
+                .iter()
+                .map(|(n, _, _)| (*n).to_owned())
+                .collect();
+            assert!(
+                t.validate_outputs(&values, &secret_names).is_ok(),
+                "{}",
+                t.id
+            );
+            for (name, schema, required) in t.declared(OutputKind::Value) {
+                let mut bad = values.clone();
+                bad.insert(name.to_owned(), wrong(schema));
+                assert!(
+                    t.validate_outputs(&bad, &secret_names).is_err(),
+                    "{}.{name}",
+                    t.id
+                );
+                if required {
+                    bad.remove(name);
+                    assert!(
+                        t.validate_outputs(&bad, &secret_names).is_err(),
+                        "{}.{name}",
+                        t.id
+                    );
+                }
+            }
+            for (name, schema, required) in t.declared(OutputKind::Secret) {
+                assert!(t.validate_secret_output(name, &sample(schema)).is_ok());
+                let e = t.validate_secret_output(name, &wrong(schema)).unwrap_err();
+                assert!(!e.to_string().contains("\"x\""), "{e}");
+                if required {
+                    let mut fewer = secret_names.clone();
+                    fewer.remove(name);
+                    assert!(
+                        t.validate_outputs(&values, &fewer).is_err(),
+                        "{}.{name}",
+                        t.id
+                    );
+                }
+            }
+        }
     }
 }
