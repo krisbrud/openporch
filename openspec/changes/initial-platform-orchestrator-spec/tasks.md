@@ -7,9 +7,9 @@ Milestone 1 requires groups 1–8, first-release authentication in group 10, and
 Before archiving the first release, move unimplemented later-stage requirements/tasks into separate OpenSpec changes rather than marking them complete or promoting them as implemented. The tasks below describe future implementation; this PR remains a specification change.
 
 ## 1. Repository scaffolding
-- [ ] 1.1 Create the Cargo workspace with crates `core`, `store`, `drivers`, `engine`, `server`, `client`, `cli` (`k8s` is added in milestone 2), an Apache-2.0 LICENSE and a README describing openporch; verify `cargo build` and `cargo test` pass on the empty workspace
-- [ ] 1.2 Add CI (GitHub Actions) running `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and SQLite store tests; verify the workflow is green on the branch
-- [ ] 1.3 Add `rust-toolchain.toml`, `rustfmt.toml`, `deny.toml` (license allow-list) and a `justfile` with `dev`, `test`, `e2e` recipes; verify `cargo deny check` passes
+- [x] 1.1 Create the Cargo workspace with crates `core`, `store`, `drivers`, `engine`, `server`, `client`, `cli` (`k8s` is added in milestone 2), an Apache-2.0 LICENSE and a README describing openporch; verify `cargo build` and `cargo test` pass on the empty workspace
+- [x] 1.2 Add CI (GitHub Actions) running `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and SQLite store tests; verify the workflow is green on the branch
+- [x] 1.3 Add `rust-toolchain.toml`, `rustfmt.toml`, `deny.toml` (license allow-list) and a `justfile` with `dev`, `test`, `e2e` recipes; verify `cargo deny check` passes
 
 ## 2. Core domain and pure logic
 - [ ] 2.1 Implement domain types and ID validation (org, app, env, env type, resource descriptor, GUResID, definition, criteria, cloud account) with serde; verify unit tests cover the ID regex and descriptor parsing from `api-access` and `active-resources`

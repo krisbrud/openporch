@@ -1,0 +1,22 @@
+[package]
+name = "openporch-server"
+description = "The openporch HTTP API server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "openporch"
+path = "src/main.rs"
+
+[dependencies]
+openporch-core.workspace = true
+openporch-store.workspace = true
+openporch-drivers.workspace = true
+openporch-engine.workspace = true
+
+[lints]
+workspace = true
