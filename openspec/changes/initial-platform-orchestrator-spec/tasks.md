@@ -2,7 +2,7 @@
 
 ## Release gates and scope
 
-Milestone 1 requires groups 1–8, first-release authentication in group 10, and operational/safety gates in group 12. Milestone 2 items in group 13 and Kubernetes group 9 are not first-release blockers. Group 11 and Postgres are later integrations. Requirements for deferred integrations apply when those features are enabled; clients must reject unavailable capabilities. Never defer core authorization, secret-use grants, durable recovery or safe destruction as later hardening.
+Milestone 1 requires groups 1–8, first-release authentication in group 10, and the operational basics in group 12. Group 14 is first-release hardening: it follows milestone 1 and precedes a tagged public release, but a working Lambda platform does not wait for it. Milestone 2 items in group 13 and Kubernetes group 9 are not first-release blockers. Group 11 and Postgres are later integrations. Requirements for deferred integrations apply when those features are enabled; clients must reject unavailable capabilities. Never defer core authorization, secret-use grants, durable recovery or safe destruction as later hardening.
 
 Before archiving the first release, move unimplemented later-stage requirements/tasks into separate OpenSpec changes rather than marking them complete or promoting them as implemented. The tasks below describe future implementation; this PR remains a specification change.
 
@@ -59,7 +59,7 @@ Before archiving the first release, move unimplemented later-stage requirements/
 
 - [ ] 5.8 Implement the `Executor` trait and `LocalExecutor`: authorized secret-reference/expression resolution, fresh cloud credential acquisition, driver planning/permit checks and invocation, secret outputs written to the primary store and returned as references, redacted logs; verify tests with fake drivers and the built-in store cover the secret-output-as-reference scenario in `secret-stores-and-references`
 - [ ] 5.9 Persist execution snapshots, immutable artifact/secret versions, module locks and retained destroy graphs; verify snapshot replay differs from explicit current-configuration redeploy and missing historical inputs fail before mutation
-- [ ] 5.10 Implement `deployment-safety` preview, resource/action permits and protected environment types; verify direct API calls cannot bypass permits, stale permits fail, unknown impact is explicit and automatic driver/backend migration returns `409`
+- [ ] 5.10 Implement `deployment-safety` preview and resource/action permits; verify direct API calls cannot bypass permits, stale permits fail, unknown impact is explicit and automatic driver/backend migration returns `409`
 - [ ] 5.11 Add crash injection before mutation, after cloud creation, before result commit and during partial deletion; verify stable GUResIDs/state, no duplicate objects, preserved successful branches and operator recovery for uncertain outcomes
 - [ ] 5.12 Verify co-provisioning truth-table combinations, iteration-order independence, conflicting shared parameters, policy-before-workload ordering and removal of workloads while dependencies remain tracked
 
@@ -100,20 +100,26 @@ Before archiving the first release, move unimplemented later-stage requirements/
 - [ ] 11.2 Implement the `aws-identity` cloud account type (token minting with `sub = <org>/<account>`, `AssumeRoleWithWebIdentity`) and `porch cloud-accounts setup aws-identity`; verify unit tests with a mocked STS client and an opt-in e2e against a real role trusting a public dev server
 - [ ] 11.3 Add an optional reference-platform variant using `aws-identity`, preserving the host-identity/`aws-role` quickstart and document the trust policy setup in `docs/security.md`; verify the AWS e2e job passes with no static credentials stored in openporch
 
-## 12. Operational and release readiness — milestone 1
+## 12. Operational basics — milestone 1
 - [ ] 12.1 Implement liveness/readiness, exclusive installation ownership and graceful shutdown; verify a second writer never starts and loss of a required key or executor blocks mutations
-- [ ] 12.2 Document and execute a protected backup/restore drill covering SQLite, state, keys, source/locks and external references; verify restore starts in recovery mode, preserves identities and avoids duplicate cloud objects
-- [ ] 12.3 Add schema version guards and upgrade/downgrade fixtures, plus uninstall/retention documentation; verify unsupported binaries do not mutate data and uninstall does not destroy infrastructure
-- [ ] 12.4 Implement bounded queue/graph/request/log storage and global subprocess concurrency; run the declared reference benchmark and record p95 planning/API latency and peak memory/disk results
-- [ ] 12.5 Implement structured correlated events/metrics and sanitized diagnostics, audit intent/outcomes and configurable retention/export; verify secret omission, denied-action events, async failure correlation and no silent audit loss on storage failure
-- [ ] 12.6 Publish the API/workload/driver/provider compatibility matrix and owned schemas, locked build instructions, release checksums/provenance, LICENSE, CONTRIBUTING and SECURITY policy; verify a clean tagged build, fixtures and quickstart doc tests
-- [ ] 12.7 Complete the first-release acceptance matrix: every enabled capability scenario passes, fault-injection recovery and authorization-negative suites pass, a real Lambda invocation/replay/teardown passes, and deferred integrations are explicitly reported unavailable
+- [ ] 12.2 Add the schema version guard and uninstall/retention documentation; verify an unsupported binary refuses mutations and leaves data unchanged, and uninstall does not destroy infrastructure
+- [ ] 12.3 Implement bounded queue/graph/request/log storage and global subprocess concurrency; verify `429` with `Retry-After` under throttling and that status requests stay available while four OpenTofu processes run
+- [ ] 12.4 Implement structured correlated events/metrics and sanitized diagnostics, audit intent/outcomes and configurable retention/export; verify secret omission, denied-action events, async failure correlation and no silent audit loss on storage failure
+- [ ] 12.5 Write the local none/echo and AWS Lambda quickstarts; verify a clean machine can start the server, authenticate, deploy and remove a workload by following them
 
 ## 13. Broader integrations — milestone 2
 - [ ] 13.1 Add generic OIDC login with PKCE, issuer/audience/nonce/state checks and verified invitation email; verify against a local test issuer including negative/replay cases
 - [ ] 13.2 Add AWS Secrets Manager and SSM secret-store adapters with grants, version pinning, acyclic credential resolution and retention policy; verify fake-client tests and one documented real-account check
 - [ ] 13.3 Expand provider coverage to custom types, external drivers, secret stores and identity providers; verify CRUD/import, schema compatibility, secret-state handling and no-op plans
 - [ ] 13.4 Add SNS/RDS examples and complete the Kubernetes/EKS slice in group 9; verify each enabled target's ownership, readiness, safe removal and integration checks
+
+## 14. First-release hardening — after milestone 1
+- [ ] 14.1 Document and execute a protected backup/restore drill covering SQLite, state, keys, source/locks and external references; verify restore starts in recovery mode, preserves identities and avoids duplicate cloud objects
+- [ ] 14.2 Add upgrade/downgrade fixtures for every supported schema pair; verify migration from the preceding release and refusal of untested downgrades
+- [ ] 14.3 Run the declared reference benchmark and record p95 planning/API latency and peak memory/disk results; verify the thresholds in `control-plane-operations`
+- [ ] 14.4 Implement protected environment types; verify destructive permits in a protected environment require an administrator and unknown-impact changes are denied until planned
+- [ ] 14.5 Publish the API/workload/driver/provider compatibility matrix and owned schemas, locked build instructions, release checksums/provenance, CONTRIBUTING and SECURITY policy; verify a clean tagged build, fixtures and quickstart doc tests
+- [ ] 14.6 Complete the first-release acceptance matrix: every enabled capability scenario passes, fault-injection recovery and authorization-negative suites pass, a real Lambda invocation/replay/teardown passes, and deferred integrations are explicitly reported unavailable
 
 ## Workflow follow-up
 - Move deferred integration requirements into separate changes before archiving the completed milestone; do not mark unimplemented contracts complete.

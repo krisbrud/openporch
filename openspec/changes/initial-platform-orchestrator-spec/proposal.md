@@ -30,7 +30,8 @@ This change specifies a staged roadmap for openporch, with milestone 1 focused o
 
 | Stage | Required outcome |
 | --- | --- |
-| Milestone 1: small, safe platform | SQLite server, API/CLI, built-in encrypted secrets with scoped use, tokens and GitHub login, RBAC, durable operation/recovery records, none/echo/template/OpenTofu drivers, the provider resources needed for the AWS reference platform, and a tested Lambda deploy/replay/teardown path. Preview/permits, ownership, protected state, backup/restore and release checks are required. |
+| Milestone 1: small, safe platform | SQLite server, API/CLI, built-in encrypted secrets with scoped use, tokens and GitHub login, RBAC, durable operation/recovery records, none/echo/template/OpenTofu drivers, the provider resources needed for the AWS reference platform, and a tested Lambda deploy/replay/teardown path. Permits for destructive actions, ownership records, protected secret artifacts, health and readiness checks, a single-writer guard and a schema version guard are required. |
+| First-release hardening (after milestone 1) | Backup/restore drill, upgrade/downgrade fixtures, the reference capacity benchmark, protected environment types, compatibility matrix, release checksums and provenance, and the full acceptance matrix. A tagged public release waits for these; a working Lambda platform does not. |
 | Milestone 2: broader team/platform integrations | Kubernetes, AWS Secrets Manager/SSM store adapters, generic OIDC login, broader provider/type examples and RDS/EKS end-to-end coverage. Existing core security and recovery contracts apply to each added integration. |
 | Later | Postgres with tested migration, optional cloud OIDC issuance, remote executors, periodic drift detection, HA, multi-organization tenancy and GitOps delivery. |
 

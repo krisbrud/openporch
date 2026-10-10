@@ -51,7 +51,7 @@ Creating, deploying to or deleting an environment SHALL require `developer` or `
 The principal that creates an application SHALL become its `owner`. Administrators SHALL hold every role implicitly.
 
 #### Scenario: Create an application
-- **WHEN** manager `carol`, with `deployer` on `development`, creates application `shop`
+- **WHEN** manager `carol` creates application `shop`
 - **THEN** `carol` is listed as `owner` of `shop`
 
 ### Requirement: Enforcement on every route

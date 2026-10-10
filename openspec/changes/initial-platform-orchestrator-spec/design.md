@@ -161,7 +161,7 @@ Paths are `/orgs/{org}/apps/{app}/envs/{env}/...`, `/orgs/{org}/resources/{defs,
 
 Milestone 1 is a safe SQLite/CLI/API/OpenTofu/Lambda vertical slice. Milestone 2 adds Kubernetes, AWS secret-store adapters, generic OIDC login, broader examples and provider integrations. Postgres, the cloud OIDC issuer, remote execution, drift automation and HA are later work. `proposal.md` and `tasks.md` define release gates; retained later-stage specs are design contracts, not first-release dependencies.
 
-`deployment-safety` owns ownership, previews, permits and the trusted-code boundary. `control-plane-operations` owns readiness, exclusive ownership, backup/restore, upgrade compatibility, uninstall, bounded work, diagnostics and release policy. Those contracts are first-release requirements. Single-organization authorization is supported; hostile-tenant or plugin isolation is not claimed. Kubernetes rendering remains pure, and GitOps stays deferred as recorded in D8.
+`deployment-safety` owns ownership, previews, permits and the trusted-code boundary. `control-plane-operations` owns readiness, exclusive ownership, backup/restore, upgrade compatibility, uninstall, bounded work, diagnostics and release policy. Readiness, exclusive ownership, bounded work, destructive-action permits and ownership records are milestone 1 requirements. Backup/restore drills, upgrade fixtures, the capacity benchmark, release provenance and protected environment types are first-release hardening that follows milestone 1 (tasks group 14). Single-organization authorization is supported; hostile-tenant or plugin isolation is not claimed. Kubernetes rendering remains pure, and GitOps stays deferred as recorded in D8.
 
 ## Risks / Trade-offs
 

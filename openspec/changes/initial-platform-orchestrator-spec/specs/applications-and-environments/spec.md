@@ -8,10 +8,10 @@ Applications group workloads that are deployed together; environments are the pl
 
 ### Requirement: Application lifecycle
 
-Applications SHALL support create/read/list/delete under `/orgs/{org}/apps`. Creation also creates environment `development` of type `development` and requires that type's deployer gate. The creator becomes owner. Application deletion SHALL require permits for all environments and deprovision their owned resources first; failed environments and remaining management records SHALL be preserved.
+Applications SHALL support create/read/list/delete under `/orgs/{org}/apps`. Creation also creates environment `development` of type `development`; that default environment is exempt from the deployer gate, so creating an application needs no environment type role. The creator becomes owner. Application deletion SHALL require permits for all environments and deprovision their owned resources first; failed environments and remaining management records SHALL be preserved.
 
 #### Scenario: Create an application
-- **WHEN** a principal permitted to create applications and deploy to `development` creates application `shop`
+- **WHEN** a principal permitted to create applications creates application `shop`
 - **THEN** `shop` exists, has one environment `development` with type `development`, and the creating principal is its `owner`
 
 #### Scenario: Delete an application with provisioned resources

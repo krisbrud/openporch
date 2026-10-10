@@ -4,6 +4,10 @@
 
 Provide a small, server-enforced safety contract for validation, destructive changes and ownership without requiring an enterprise approval service.
 
+## Delivery scope
+
+Milestone 1: preflight and preview, destructive-action permits, ownership and conflict checks, trusted execution, unknown preview effects, permit binding and driver transport scope. Protected environment types are first-release hardening after milestone 1 (tasks group 14); until they exist, permit issuance follows the operation's application and environment type permissions alone.
+
 ## ADDED Requirements
 
 ### Requirement: Preflight and preview

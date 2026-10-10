@@ -4,6 +4,10 @@
 
 Make a small single-server installation operable, recoverable and bounded without requiring high availability, a separate monitoring stack or a Kubernetes control plane.
 
+## Delivery scope
+
+Milestone 1: installation profile, exclusive ownership and shutdown, liveness and readiness, uninstall and retention, bounded work and storage, observability, and the schema version guard from the schema compatibility requirement. First-release hardening after milestone 1 (tasks group 14): the backup/restore drill, upgrade/downgrade fixtures, reference capacity validation, public compatibility and release hygiene, reproducible release inputs, and the contribution and security policy.
+
 ## ADDED Requirements
 
 ### Requirement: First-release installation profile
