@@ -22,8 +22,24 @@ Every request except health, version and login carries
 On first start the server creates the service user `bootstrap` with the
 `administrator` role. It writes a token for it to `<data_dir>/bootstrap-token`, a
 new file only the server's user can read. The log names the file, never the token.
-The token expires after `bootstrap_token_hours`, 24 by default. Use it to create
-the real administrators and service users, then revoke it.
+The token expires after `bootstrap_token_hours`, 24 by default.
+
+Human members cannot be created directly; they join through an
+[invitation](#invitations). To hand over to a human administrator:
+
+1. With the bootstrap token, invite them as an administrator:
+   `POST /orgs/{org}/invitations` with
+   `{"role": "administrator", "provider": "github", "login": "<their login>"}`
+   (or `"subject"` with their numeric GitHub ID). Keep the `code` from the
+   response; it is shown only once.
+2. They sign in through GitHub device login (see [api.md](api.md#login)),
+   passing the code as `invitation_code`. The first login binds their GitHub
+   account and makes them a member with the invited role.
+3. As the new administrator, remove the bootstrap user with
+   `DELETE /orgs/{org}/users/bootstrap`. This revokes its token. To keep the user
+   but end the token, use `DELETE /orgs/{org}/users/bootstrap/tokens/bootstrap`.
+4. Delete `<data_dir>/bootstrap-token` (or the file `bootstrap_token_file` names).
+   The server never reads it again.
 
 The server refuses to listen on a non-loopback address over plain HTTP unless
 `tls_terminated_by_proxy = true` says a reverse proxy terminates TLS in front of it.
