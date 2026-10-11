@@ -60,6 +60,7 @@ fn shell_quote(s: &str) -> String {
 pub(super) async fn fetch(
     config: &Config,
     log: &mut RunLog,
+    stop: &exec::Stop,
     source: &Source,
     rev: &str,
     dir: &Path,
@@ -128,7 +129,7 @@ pub(super) async fn fetch(
             "FETCH_HEAD",
         ],
     ] {
-        let out = exec::run(log, git, &args, dir, &env, exec::Stdout::Logged)
+        let out = exec::run(log, git, &args, dir, &env, exec::Stdout::Logged, stop)
             .await
             .map_err(Failure::io)?;
         if !out.success {
@@ -146,6 +147,7 @@ pub(super) async fn fetch(
         dir,
         &env,
         exec::Stdout::Logged,
+        stop,
     )
     .await
     .map_err(Failure::io)?;

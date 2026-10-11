@@ -302,6 +302,11 @@ async fn lost_state_needs_recovery() {
         Observation::Unknown { .. }
     ));
     assert!(!root.path().join("record.log").exists());
+    // The documented recovery, once nothing the resource created remains.
+    let record = root.path().join("state/0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(&record).unwrap();
+    std::fs::write(record.join("deleted"), "").unwrap();
+    d.put(&req).await.unwrap();
 }
 
 #[tokio::test]
@@ -839,4 +844,256 @@ async fn deleting_a_script_resource_never_fetches_a_newer_source() {
     );
     del.cookie = cookie;
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
+}
+
+// --- faults (4.8) -----------------------------------------------------------------
+
+/// Whether `pid` is a live process; zombies count as gone.
+fn alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .ok()
+        .and_then(|s| s.rsplit(')').next().map(|r| r.trim().to_owned()))
+        .is_some_and(|rest| !rest.starts_with('Z'))
+}
+
+/// A fake `tofu` whose `init` hangs while `<root>/hang` exists, with a child
+/// process, after running `trap` (a shell `trap` line for the parent) and
+/// `child_trap` (one for the child).
+fn hanging_driver(root: &Path, trap: &str, child_trap: &str) -> OpenTofu {
+    let r = root.display();
+    let hang = format!(
+        "init) if [ -e '{r}/hang' ]; then echo $$ > '{r}/tofu.pid'; {trap}\n    \
+         sh -c '{child_trap} echo $$ > \"{r}/child.pid\"; exec sleep 300' &\n    \
+         wait; echo finished >> '{r}/events'; fi ;;"
+    );
+    let mut d = fake_driver(root, |s| {
+        s.replacen(
+            "case \"$1\" in\n",
+            &format!("case \"$1\" in\n  {hang}\n"),
+            1,
+        )
+    });
+    d.config.stop_grace = std::time::Duration::from_secs(1);
+    d
+}
+
+async fn assert_timeout_reaps(root: &Path, d: &OpenTofu) {
+    std::fs::write(root.join("hang"), "").unwrap();
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    let err = crate::with_timeout(std::time::Duration::from_millis(800), d.put(&req))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+    let tofu = std::fs::read_to_string(root.join("tofu.pid")).unwrap();
+    let child = std::fs::read_to_string(root.join("child.pid")).unwrap();
+    std::fs::remove_file(root.join("hang")).unwrap();
+    // The next call for the resource waits until the abandoned run's whole
+    // process group is gone and its directory removed.
+    d.put(&req).await.unwrap();
+    assert!(!alive(&tofu), "tofu {tofu} still runs");
+    assert!(!alive(&child), "its child {child} still runs");
+    let runs = root.join("runs/0123456789abcdef0123456789abcdef");
+    assert_eq!(std::fs::read_dir(runs).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_timed_out_run_is_interrupted_and_reaped_before_the_next() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path().display().to_string();
+    let d = hanging_driver(
+        root.path(),
+        &format!("trap 'echo interrupted >> \"{r}/events\"; exit 130' INT;"),
+        "",
+    );
+    assert_timeout_reaps(root.path(), &d).await;
+    // OpenTofu got SIGINT, which lets it write state and release its lock.
+    let events = std::fs::read_to_string(root.path().join("events")).unwrap();
+    assert!(events.contains("interrupted"), "{events}");
+}
+
+#[tokio::test]
+async fn a_run_that_ignores_interrupts_is_killed_after_the_grace_period() {
+    let root = tempfile::tempdir().unwrap();
+    let d = hanging_driver(root.path(), "trap '' INT;", "trap \"\" INT;");
+    assert_timeout_reaps(root.path(), &d).await;
+}
+
+#[tokio::test]
+async fn a_held_state_lock_is_a_conflict_and_never_bypassed() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), |s| {
+        s.replace(
+            "case \"$1\" in\n",
+            "case \"$1\" in\n  plan) printf 'Error: Error acquiring the state lock\\n\\nLock Info:\\n  ID:        5c2d-77ab\\n' >&2; exit 1 ;;\n",
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    match d.put(&req).await.unwrap_err() {
+        DriverError::Conflict(m) => {
+            assert!(m.contains("tofu force-unlock 5c2d-77ab"), "{m}");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    let record = std::fs::read_to_string(root.path().join("record.log")).unwrap();
+    assert!(record.contains("-lock-timeout=30000ms"), "{record}");
+    assert!(!record.contains("force-unlock") && !record.contains("-lock=false"));
+}
+
+#[tokio::test]
+async fn a_lock_held_at_apply_time_leaves_no_record_of_an_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let locked = root.path().join("locked");
+    let d = fake_driver(root.path(), |s| {
+        s.replace(
+            "case \"$1\" in\n",
+            &format!(
+                "case \"$1\" in\n  apply) if [ -e '{}' ]; then printf 'Error: Error acquiring \
+                 the state lock\\n\\nLock Info:\\n  ID:        5c2d-77ab\\n' >&2; exit 1; fi ;;\n",
+                locked.display()
+            ),
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    std::fs::write(&locked, "").unwrap();
+    assert!(matches!(
+        d.put(&req).await.unwrap_err(),
+        DriverError::Conflict(_)
+    ));
+    let record = root.path().join("state/0123456789abcdef0123456789abcdef");
+    assert!(!record.join("retained.json").exists());
+    // Nothing ran, so missing state is not lost state.
+    std::fs::remove_file(&locked).unwrap();
+    d.put(&req).await.unwrap();
+}
+
+#[tokio::test]
+async fn state_lost_after_an_apply_started_is_never_replaced() {
+    // `no accidental fresh state after state loss`, without a cookie: the
+    // first apply was cut off before its outcome was recorded.
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), str::to_owned);
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    d.put(&req).await.unwrap();
+    // The fake writes no state, as if it were lost.
+    match d.put(&req).await.unwrap_err() {
+        DriverError::Uncertain(m) => assert!(m.contains("needs recovery"), "{m}"),
+        other => panic!("expected uncertain, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cookies_are_checked_for_compatibility() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), str::to_owned);
+    let mut req = request(json!({"script": "terraform {}"}), json!({}));
+    for (version, data) in [(2, "{}"), (1, "not json")] {
+        req.cookie = Some(Cookie::new(version, data).unwrap());
+        assert!(
+            matches!(d.put(&req).await, Err(DriverError::Uncertain(_))),
+            "{version} {data}"
+        );
+    }
+    // A cookie from before the backend was recorded still reads.
+    let state = root.path().join("state/0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("terraform.tfstate"), r#"{"resources":[]}"#).unwrap();
+    req.cookie = Some(Cookie::new(1, r#"{"source":null}"#).unwrap());
+    d.put(&req).await.unwrap();
+}
+
+#[tokio::test]
+async fn symlinks_cannot_lead_out_of_a_git_module() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(repo.join("module")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(repo.join("module/main.tf"), "").unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("module/escape")).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("escape-module")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "module"]);
+    let url = format!("file://{}", repo.display());
+    let d = fake_driver(root.path(), str::to_owned);
+    for (values, want) in [
+        (
+            json!({"source": {"url": url, "rev": "main", "path": "module"},
+                   "files": {"escape/x.tf": "resource \"x\" \"y\" {}"}}),
+            "leaves the module through a symlink",
+        ),
+        (
+            json!({"source": {"url": url, "rev": "main", "path": "escape-module"}}),
+            "leaves the module through a symlink",
+        ),
+    ] {
+        let (_, message) = invalid(d.put(&request(values, json!({}))).await.unwrap_err());
+        assert!(message.contains(want), "{message}");
+    }
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_a_timed_out_apply_leaves_usable_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = driver(root.path());
+    d.config.stop_grace = std::time::Duration::from_secs(30);
+    let script = r#"
+variable "seconds" { type = number }
+resource "terraform_data" "slow" {
+  input = var.seconds
+  provisioner "local-exec" { command = "sleep ${var.seconds}" }
+}
+"#;
+    let req = |seconds: u32| {
+        request(
+            json!({"script": script, "variables": {"seconds": seconds}}),
+            json!({}),
+        )
+    };
+    let err = crate::with_timeout(std::time::Duration::from_secs(8), d.put(&req(120)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+    // The interrupted apply wrote state and released its lock, so the next
+    // run plans against it: the tainted object is replaced, with a permit.
+    let mut next = req(0);
+    let Plan::Actions {
+        actions,
+        fingerprint,
+    } = d.plan(&next).await.unwrap()
+    else {
+        panic!("no actions");
+    };
+    assert_eq!(
+        actions,
+        [(Action::Replace, "terraform_data.slow".to_owned())]
+    );
+    next.permit = Some(fingerprint);
+    d.put(&next).await.unwrap();
+    let state = root.path().join("state/0123456789abcdef0123456789abcdef");
+    assert!(!state.join(".terraform.tfstate.lock.info").exists());
+}
+
+#[tokio::test]
+async fn a_process_left_holding_the_output_does_not_hold_up_the_run() {
+    let root = tempfile::tempdir().unwrap();
+    let pid = root.path().join("lingering.pid");
+    let d = fake_driver(root.path(), |s| {
+        s.replacen(
+            "case \"$1\" in\n",
+            &format!(
+                "case \"$1\" in\n  init) sleep 300 & echo $! > '{}' ;;\n",
+                pid.display()
+            ),
+            1,
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    crate::with_timeout(std::time::Duration::from_secs(10), d.put(&req))
+        .await
+        .unwrap();
+    let pid = std::fs::read_to_string(pid).unwrap();
+    assert!(!alive(&pid), "{pid} still runs");
 }

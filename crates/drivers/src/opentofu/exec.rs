@@ -2,10 +2,17 @@
 //! into one run log that is redacted before anyone sees it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 /// Environment variables passed through from the server: the program search
 /// path, and proxy and CA settings the network needs. Nothing else, so the
@@ -111,8 +118,104 @@ pub(super) enum Stdout {
     Withheld,
 }
 
-/// Runs `program` with exactly `env` (plus [`PASSTHROUGH`]) in `dir`, and
-/// appends what it printed to `log` under a header naming the command.
+/// How a command's process group is stopped when its call is abandoned, such
+/// as on timeout.
+#[derive(Clone)]
+pub(super) struct Stop {
+    /// How long the group has to finish after `SIGINT`, which lets OpenTofu
+    /// write state and release its lock, before `SIGKILL`.
+    pub grace: Duration,
+    /// Held until the group is gone, so that the next call for the same
+    /// resource waits for it.
+    pub hold: Arc<dyn Send + Sync>,
+    /// The run directory, removed once the group is gone.
+    pub dir: PathBuf,
+    /// Set when a dropped call leaves the group to be stopped in the
+    /// background, which then also removes `dir`.
+    pub abandoned: Arc<AtomicBool>,
+}
+
+/// A running process group, stopped and reaped if dropped before it exits.
+struct Running {
+    child: Option<Child>,
+    /// The command's output, drained until it exits even when abandoned:
+    /// closing the pipes would kill OpenTofu with `SIGPIPE` the moment it
+    /// reports the interrupt, before it writes state.
+    pipes: Option<(ChildStdout, ChildStderr)>,
+    stop: Stop,
+}
+
+/// Kills what is left of an abandoned group and removes its run directory when
+/// dropped, so that even a cancelled reaper cleans up.
+struct Reap {
+    group: Pid,
+    dir: PathBuf,
+}
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = killpg(self.group, Signal::SIGKILL);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // `None` once the command has been reaped.
+        let Some(group) = child.id().and_then(|id| i32::try_from(id).ok()) else {
+            return;
+        };
+        let group = Pid::from_raw(group);
+        let _ = killpg(group, Signal::SIGINT);
+        let stop = self.stop.clone();
+        let pipes = self.pipes.take();
+        stop.abandoned.store(true, Ordering::SeqCst);
+        let reap = Reap {
+            group,
+            dir: stop.dir.clone(),
+        };
+        // Every caller runs in a runtime; without one there is no grace
+        // period, and `reap` kills the group at once.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _hold = stop.hold;
+                let _reap = reap;
+                let exited = async { tokio::join!(drain(pipes), wait_and_kill(&mut child, group)) };
+                if tokio::time::timeout(stop.grace, exited).await.is_err() {
+                    let _ = killpg(group, Signal::SIGKILL);
+                    let _ = child.wait().await;
+                }
+            });
+        }
+    }
+}
+
+/// Reads and discards a command's output until every writer closes it.
+async fn drain(pipes: Option<(ChildStdout, ChildStderr)>) {
+    if let Some((mut out, mut err)) = pipes {
+        let (mut sink_out, mut sink_err) = (tokio::io::sink(), tokio::io::sink());
+        let _ = tokio::join!(
+            tokio::io::copy(&mut out, &mut sink_out),
+            tokio::io::copy(&mut err, &mut sink_err),
+        );
+    }
+}
+
+/// Waits for the command, then kills whatever it left running in its group,
+/// which also closes any output pipes those processes held.
+async fn wait_and_kill(child: &mut Child, group: Pid) -> std::io::Result<std::process::ExitStatus> {
+    let status = child.wait().await;
+    let _ = killpg(group, Signal::SIGKILL);
+    status
+}
+
+/// Runs `program` with exactly `env` (plus [`PASSTHROUGH`]) in `dir`, in a
+/// process group of its own, and appends what it printed to `log` under a
+/// header naming the command. If the call is dropped, the group is stopped as
+/// `stop` says.
 pub(super) async fn run(
     log: &mut RunLog,
     program: &Path,
@@ -120,6 +223,7 @@ pub(super) async fn run(
     dir: &Path,
     env: &BTreeMap<String, String>,
     stdout_mode: Stdout,
+    stop: &Stop,
 ) -> std::io::Result<Output> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -128,9 +232,7 @@ pub(super) async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A cancelled call kills the process; reaping its whole group on
-        // timeout is task 4.8.
-        .kill_on_drop(true);
+        .process_group(0);
     for key in PASSTHROUGH {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
@@ -143,16 +245,48 @@ pub(super) async fn run(
         .file_name()
         .map_or_else(|| "?".into(), |n| n.to_string_lossy().into_owned());
     log.push(&format!("$ {name} {}", args.join(" ")));
-    let out = cmd.output().await?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let mut child = cmd.spawn()?;
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(std::io::Error::other(
+            "the command's output is not captured",
+        ));
+    };
+    let group = child.id().and_then(|id| i32::try_from(id).ok());
+    let mut running = Running {
+        child: Some(child),
+        pipes: Some((out, err)),
+        stop: stop.clone(),
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let status = {
+        let (Some(child), Some((out, err))) = (running.child.as_mut(), running.pipes.as_mut())
+        else {
+            return Err(std::io::Error::other("the command is gone"));
+        };
+        let Some(group) = group else {
+            return Err(std::io::Error::other("the command has no process ID"));
+        };
+        // Nothing the command started outlives it, nor keeps its output open.
+        let (o, e, status) = tokio::join!(
+            out.read_to_end(&mut stdout),
+            err.read_to_end(&mut stderr),
+            wait_and_kill(child, Pid::from_raw(group))
+        );
+        o?;
+        e?;
+        status?
+    };
+    running.child = None;
+    running.pipes = None;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     match stdout_mode {
         Stdout::Logged => log.push(&stdout),
         Stdout::Withheld => log.push(&format!("({} bytes of output not logged)", stdout.len())),
     }
     log.push(&stderr);
     Ok(Output {
-        success: out.status.success(),
+        success: status.success(),
         stdout,
         stderr,
     })
