@@ -159,6 +159,10 @@ pub trait Sts: Send + Sync {
     ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>>;
 }
 
+/// When an account was read, relative to [`CredentialResolver::forget`] calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Generation(u64);
+
 /// A source of the current time, replaceable in tests.
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
@@ -208,12 +212,13 @@ impl CredentialResolver {
     pub async fn resolve(
         &self,
         account: &CloudAccount,
+        read_at: Generation,
         secrets: &dyn SecretStore,
         window: Duration,
     ) -> Result<AwsCredentials, CloudError> {
         match account.ty {
             CloudAccountType::Aws => static_keys(account, secrets).await,
-            CloudAccountType::AwsRole => self.role_session(account, window).await,
+            CloudAccountType::AwsRole => self.role_session(account, read_at, window).await,
             CloudAccountType::AwsIdentity => Err(CloudError::Invalid(format!(
                 "cloud account `{}` is of type `aws-identity`, which needs the openporch \
                  OIDC provider that this server does not offer yet",
@@ -226,9 +231,12 @@ impl CredentialResolver {
     pub async fn check(
         &self,
         account: &CloudAccount,
+        read_at: Generation,
         secrets: &dyn SecretStore,
     ) -> Result<CallerIdentity, CloudError> {
-        let credentials = self.resolve(account, secrets, CHECK_WINDOW).await?;
+        let credentials = self
+            .resolve(account, read_at, secrets, CHECK_WINDOW)
+            .await?;
         self.sts
             .caller_identity(&credentials)
             .await
@@ -238,6 +246,7 @@ impl CredentialResolver {
     async fn role_session(
         &self,
         account: &CloudAccount,
+        read_at: Generation,
         window: Duration,
     ) -> Result<AwsCredentials, CloudError> {
         let request = role_request(account)?;
@@ -265,7 +274,6 @@ impl CredentialResolver {
         {
             return Ok(s.credentials.clone());
         }
-        let generation = self.forgotten.load(Ordering::SeqCst);
         let mut credentials = self.sts.assume_role(request.clone()).await?;
         credentials.region = request.region;
         let Some(expires_at) = credentials.expires_at else {
@@ -287,9 +295,9 @@ impl CredentialResolver {
         }
         self.prune();
         let mut sessions = self.sessions();
-        // Checked under the lock `forget` takes, so a session obtained while its
-        // account was changed or deleted is returned once but never cached.
-        if self.forgotten.load(Ordering::SeqCst) == generation {
+        // Checked under the lock `forget` takes: if the account changed or was
+        // deleted since it was read, the session is returned once but never cached.
+        if self.generation() == read_at {
             sessions.insert(
                 key,
                 Session {
@@ -300,6 +308,13 @@ impl CredentialResolver {
         }
         drop(sessions);
         Ok(credentials)
+    }
+
+    /// The current generation. Callers take it before reading an account from the
+    /// store and pass it to [`CredentialResolver::resolve`], so a session for an
+    /// account read before a change or deletion is never cached.
+    pub fn generation(&self) -> Generation {
+        Generation(self.forgotten.load(Ordering::SeqCst))
     }
 
     /// Drops expired sessions, so temporary credentials are not kept past their

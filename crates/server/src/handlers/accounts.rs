@@ -274,11 +274,14 @@ pub async fn check_account(
     State(state): State<AppState>,
     Path((_, id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
+    // Taken before the read, so a change or deletion racing this check keeps its
+    // session out of the cache.
+    let read_at = state.cloud.generation();
     let account = account_or_404(&state, &id).await?.account;
     let primary = secret_inputs::primary(&state)?;
     let identity = state
         .cloud
-        .check(&account, &primary)
+        .check(&account, read_at, &primary)
         .await
         .map_err(|e| match e {
             CloudError::Invalid(m) | CloudError::Expiring(m) => ApiError::invalid(m),

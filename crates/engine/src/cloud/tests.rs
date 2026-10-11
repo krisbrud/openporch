@@ -206,7 +206,9 @@ impl Fixture {
         a: &CloudAccount,
         window: Duration,
     ) -> Result<AwsCredentials, CloudError> {
-        self.resolver.resolve(a, &secrets(), window).await
+        self.resolver
+            .resolve(a, self.resolver.generation(), &secrets(), window)
+            .await
     }
 }
 
@@ -307,7 +309,11 @@ async fn role_accounts_assume_the_role_with_the_external_id() {
         json!({"role_arn": "arn:aws:iam::111122223333:role/openporch",
                                     "external_id": "other"}),
     );
-    let err = f.resolver.check(&wrong, &secrets()).await.unwrap_err();
+    let err = f
+        .resolver
+        .check(&wrong, f.resolver.generation(), &secrets())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, CloudError::Rejected(m) if m.contains("AccessDenied")),
         "{err}"
@@ -375,9 +381,25 @@ async fn a_session_obtained_while_its_account_changes_is_not_cached() {
         }
     }));
     let a = role_account(role_config());
-    let first = resolver.resolve(&a, &secrets(), MINUTE).await.unwrap();
+    // Read before a concurrent change: the session is returned but not cached.
+    let read_at = resolver.generation();
+    let first = resolver
+        .resolve(&a, read_at, &secrets(), MINUTE)
+        .await
+        .unwrap();
     assert!(resolver.sessions().is_empty());
-    let second = resolver.resolve(&a, &secrets(), MINUTE).await.unwrap();
+    // An account read before the change, even if the call starts after it, is
+    // not cached either.
+    let third = resolver
+        .resolve(&a, read_at, &secrets(), MINUTE)
+        .await
+        .unwrap();
+    assert!(resolver.sessions().is_empty());
+    assert_ne!(first.access_key_id, third.access_key_id);
+    let second = resolver
+        .resolve(&a, resolver.generation(), &secrets(), MINUTE)
+        .await
+        .unwrap();
     assert_ne!(first.access_key_id, second.access_key_id);
     assert_eq!(resolver.sessions().len(), 1);
 }
@@ -408,14 +430,18 @@ async fn check_reports_the_caller_identity() {
     let f = fixture();
     let id = f
         .resolver
-        .check(&static_account(), &secrets())
+        .check(&static_account(), f.resolver.generation(), &secrets())
         .await
         .unwrap();
     assert_eq!(id.account, "111122223333");
     assert!(id.arn.ends_with("AKIAEXAMPLE"), "{id:?}");
     let id = f
         .resolver
-        .check(&role_account(role_config()), &secrets())
+        .check(
+            &role_account(role_config()),
+            f.resolver.generation(),
+            &secrets(),
+        )
         .await
         .unwrap();
     assert!(id.arn.ends_with("ASIASESSION1"), "{id:?}");
@@ -424,7 +450,7 @@ async fn check_reports_the_caller_identity() {
     let f = fixture_with(|s| s.echo_secret = true);
     let err = f
         .resolver
-        .check(&static_account(), &secrets())
+        .check(&static_account(), f.resolver.generation(), &secrets())
         .await
         .unwrap_err();
     assert!(!err.to_string().contains("wJalr-static-secret"), "{err}");
@@ -452,12 +478,18 @@ async fn real_account_check() {
     let resolver = CredentialResolver::new(Arc::new(AwsSts::new()));
     let a = role_account(json!({"role_arn": role_arn, "external_id": external_id,
                                 "session_duration": 900}));
-    let id = resolver.check(&a, &secrets()).await.unwrap();
+    let id = resolver
+        .check(&a, resolver.generation(), &secrets())
+        .await
+        .unwrap();
     assert!(id.arn.contains(":assumed-role/"), "{id:?}");
     assert!(id.arn.ends_with("/openporch-aws-prod"), "{id:?}");
 
     let wrong = role_account(json!({"role_arn": a.config["role_arn"], "external_id": "wrong"}));
-    let err = resolver.check(&wrong, &secrets()).await.unwrap_err();
+    let err = resolver
+        .check(&wrong, resolver.generation(), &secrets())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, CloudError::Rejected(m) if m.contains("AccessDenied")),
         "{err}"
