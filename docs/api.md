@@ -546,7 +546,9 @@ An environment shows its runtime summary: the desired and last successful sets,
 the latest deployment attempt, and `convergence`, which is `never_deployed`,
 `converged`, `partial` or `unknown`. With `from_deploy_id`, creation clones a
 deployment of the same application into a draft delta and returns its `delta_id`.
-Nothing is deployed. Environments that have been deployed cannot be deleted yet.
+Nothing is deployed. The default `development` environment cannot be deleted while
+its application exists (`409`), and environments that have been deployed cannot be
+deleted yet.
 
 ```http
 POST /orgs/acme/apps/shop/envs
