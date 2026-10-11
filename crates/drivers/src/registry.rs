@@ -6,7 +6,7 @@ use std::sync::Arc;
 use openporch_core::catalog::BUILTIN_DRIVER_NAMESPACE;
 use openporch_core::ids;
 
-use crate::{Driver, Echo, NoneDriver};
+use crate::{Driver, Echo, NoneDriver, Template};
 
 /// Why a driver could not be registered.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,6 +32,7 @@ impl DriverRegistry {
         for driver in [
             Arc::new(Echo::new()) as Arc<dyn Driver>,
             Arc::new(NoneDriver::new()),
+            Arc::new(Template::new()),
         ] {
             registry.drivers.insert(driver.info().id.clone(), driver);
         }
