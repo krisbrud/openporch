@@ -93,7 +93,7 @@ async fn override_without_base() {
 
     for body in [
         json!({"key": "API_URL"}),
-        json!({"key": "API_URL", "value": "x", "secret": {"value": "y"}}),
+        json!({"key": "API_URL", "value": "x", "secret_ref": {"value": "y"}}),
         json!({"key": "9LIVES", "value": "x"}),
         json!({"key": "versions", "value": "x"}),
     ] {
@@ -117,7 +117,10 @@ async fn secret_values_are_references() {
     s.shop().await;
     let token = "s3cr3t-token-value";
     let created = s
-        .value(APP, json!({"key": "API_TOKEN", "secret": {"value": token}}))
+        .value(
+            APP,
+            json!({"key": "API_TOKEN", "secret_ref": {"value": token}}),
+        )
         .await;
     assert_eq!(created["is_secret"], true);
     assert_eq!(created["secret_ref"]["store"], "openporch");
@@ -128,7 +131,7 @@ async fn secret_values_are_references() {
     // An environment override may reuse the application's secret.
     s.value(
         PROD,
-        json!({"key": "API_TOKEN", "secret": created["secret_ref"].clone()}),
+        json!({"key": "API_TOKEN", "secret_ref": created["secret_ref"].clone()}),
     )
     .await;
     // A rejected change leaves no secret behind: `DB_PASSWORD` has no base.
@@ -136,7 +139,7 @@ async fn secret_values_are_references() {
         .post(
             PROD,
             &s.admin,
-            json!({"key": "DB_PASSWORD", "secret": {"value": "only-in-prod"}}),
+            json!({"key": "DB_PASSWORD", "secret_ref": {"value": "only-in-prod"}}),
         )
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
@@ -174,7 +177,7 @@ async fn secret_references_need_a_grant() {
     s.app("billing").await;
     s.value(
         "/orgs/acme/apps/billing/values",
-        json!({"key": "STRIPE_KEY", "secret": {"value": "sk_live"}}),
+        json!({"key": "STRIPE_KEY", "secret_ref": {"value": "sk_live"}}),
     )
     .await;
     let foreign = json!({"store": "openporch", "ref": "apps/billing/values/STRIPE_KEY"});
@@ -184,7 +187,7 @@ async fn secret_references_need_a_grant() {
         .post(
             APP,
             &s.admin,
-            json!({"key": "STRIPE_KEY", "secret": foreign}),
+            json!({"key": "STRIPE_KEY", "secret_ref": foreign}),
         )
         .await;
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
@@ -194,7 +197,7 @@ async fn secret_references_need_a_grant() {
         .await;
     s.value(
         PROD,
-        json!({"key": "DB_PASSWORD", "secret": {"value": "prod-only"}}),
+        json!({"key": "DB_PASSWORD", "secret_ref": {"value": "prod-only"}}),
     )
     .await;
     let prod_ref =
@@ -203,7 +206,7 @@ async fn secret_references_need_a_grant() {
         .put(
             &format!("{APP}/DB_PASSWORD"),
             &s.admin,
-            json!({"secret": prod_ref}),
+            json!({"secret_ref": prod_ref}),
         )
         .await;
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
@@ -217,7 +220,7 @@ async fn secret_references_need_a_grant() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{b}");
-    s.value(APP, json!({"key": "STRIPE_KEY", "secret": foreign}))
+    s.value(APP, json!({"key": "STRIPE_KEY", "secret_ref": foreign}))
         .await;
 
     // Unregistered stores are rejected.
@@ -225,7 +228,7 @@ async fn secret_references_need_a_grant() {
         .post(
             APP,
             &s.admin,
-            json!({"key": "OTHER", "secret": {"store": "vault", "ref": "x"}}),
+            json!({"key": "OTHER", "secret_ref": {"store": "vault", "ref": "x"}}),
         )
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
@@ -280,7 +283,7 @@ async fn delete_environment() {
     let env = "/orgs/acme/apps/shop/envs/pr-42/values";
     s.value(
         env,
-        json!({"key": "DB_PASSWORD", "secret": {"value": "preview-secret"}}),
+        json!({"key": "DB_PASSWORD", "secret_ref": {"value": "preview-secret"}}),
     )
     .await;
 
@@ -345,7 +348,7 @@ async fn development_user_changes_production_configuration() {
         .post(
             PROD,
             &dev,
-            json!({"key": "API_URL", "secret": {"value": "refused"}}),
+            json!({"key": "API_URL", "secret_ref": {"value": "refused"}}),
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);

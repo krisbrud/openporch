@@ -1,6 +1,6 @@
 //! Shared values of applications and environments, with value set versions.
 //!
-//! A value is plain text (`value`) or a secret (`secret`: a reference
+//! A value is plain text (`value`) or a secret (`secret_ref`: a reference
 //! `{store, ref, version?}` or `{value}` to write to the primary store). Secrets are
 //! returned as references only. Changing an environment's values requires
 //! `deployer` on its type; changing application values requires `deployer` on the
@@ -35,7 +35,7 @@ pub struct ValueBody {
     #[serde(default)]
     description: String,
     value: Option<String>,
-    secret: Option<Value>,
+    secret_ref: Option<Value>,
 }
 
 fn check_key(key: &str) -> ApiResult<()> {
@@ -122,12 +122,12 @@ async fn write(
     create: bool,
 ) -> ApiResult<()> {
     check_key(key)?;
-    let content = match (body.value, &body.secret) {
+    let content = match (body.value, &body.secret_ref) {
         (Some(v), None) => Ok(ValueContent::Value(v)),
-        (None, Some(secret)) => Err(PlannedSecret::new("`secret`", secret)?),
+        (None, Some(secret)) => Err(PlannedSecret::new("`secret_ref`", secret)?),
         _ => {
             return Err(ApiError::invalid(
-                "a value needs exactly one of `value` and `secret`",
+                "a value needs exactly one of `value` and `secret_ref`",
             ));
         }
     };
