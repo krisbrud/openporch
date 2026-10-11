@@ -155,7 +155,7 @@ async fn inputs_are_checked_before_anything_runs() {
 const FAKE_TOFU: &str = r#"#!/bin/sh
 { echo "ARGS $*"; env | sort; for f in "$@"; do case "$f" in -var-file=*) echo "VARFILE ${f#-var-file=}"; cat "${f#-var-file=}"; echo; esac; done; } >> "$FAKE_TOFU_LOG"
 case "$1" in
-  init) cat openporch_backend_override.tf >> "$FAKE_TOFU_LOG" ;;
+  init) cat zzzz_openporch_backend_override.tf >> "$FAKE_TOFU_LOG" ;;
   show) echo '{"resource_changes":[{"address":"random_password.p","change":{"actions":["create"]}}]}' ;;
   output) echo '{"password":{"sensitive":true,"value":"generated-pw-123"},"length":{"sensitive":false,"value":12}}' ;;
   apply) echo "applied password generated-pw-123 with token hunter2-token" ;;
@@ -531,7 +531,9 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     let req = |cookie| {
         let mut r = request(
             json!({"source": {"url": url, "rev": "main", "path": "modules/pw"},
-                   "variables": {"length": 12}}),
+                   "variables": {"length": 12},
+                   // A backend in the script is overridden like one in the module.
+                   "script": "terraform {\n  backend \"local\" { path = \"script.tfstate\" }\n}\n"}),
             json!({"variables": {"label": "label-secret-value"}}),
         );
         r.cookie = cookie;
@@ -543,6 +545,11 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     assert_eq!(outputs.values["length"], 12);
     let retained: Retained = serde_json::from_str(&cookie.as_ref().unwrap().data).unwrap();
     assert_eq!(retained.source.as_ref().unwrap().commit.len(), 40);
+    assert!(
+        root.path()
+            .join("state/0123456789abcdef0123456789abcdef/terraform.tfstate")
+            .exists()
+    );
 
     // The branch moves on to a broken module; deletion still uses the commit
     // that was applied.
@@ -754,8 +761,63 @@ async fn opentofu_s3_state_applies_twice() {
     let root = tempfile::tempdir().unwrap();
     let mut d = driver(root.path());
     d.config.state = StateBackend::S3(Box::new(s3));
+    // A preview leaves an empty workspace, which is not the resource's state.
+    let mut preview = request(
+        json!({"script": LOCAL_BACKEND_MODULE, "variables": {"value": "v1"}}),
+        json!({}),
+    );
+    preview.guresid = Guresid::new("fedcba9876543210fedcba9876543210").unwrap();
+    assert!(matches!(
+        d.plan(&preview).await.unwrap(),
+        Plan::Actions { .. }
+    ));
+    assert_eq!(d.get(&preview).await.unwrap(), Observation::Absent);
+    assert_eq!(d.delete(&preview).await.unwrap(), DeleteOutcome::Deleted);
     apply_twice_then_delete(&d).await;
     // Only recovery metadata stays local.
     let local = root.path().join("state/0123456789abcdef0123456789abcdef");
     assert!(!local.join("terraform.tfstate").exists());
+}
+
+#[tokio::test]
+async fn an_empty_s3_workspace_from_a_preview_is_not_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = fake_driver(root.path(), |s| {
+        s.replace(
+            "case \"$1\" in\n",
+            "case \"$1\" in\n  workspace) if [ \"$2\" = list ]; then printf '* default\\n  0123456789abcdef0123456789abcdef\\n'; fi ;;\n  state) echo '{\"version\":4,\"serial\":1,\"lineage\":\"l\",\"outputs\":{},\"resources\":[]}' ;;\n",
+        )
+    });
+    let mut s3 = S3State::new("state-bucket", "eu-north-1");
+    s3.credentials = Some(S3Credentials {
+        access_key_id: "AKIASTATE".into(),
+        secret_access_key: "state-secret-1".into(),
+        session_token: None,
+    });
+    d.config.state = StateBackend::S3(Box::new(s3));
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    assert_eq!(d.get(&req).await.unwrap(), Observation::Absent);
+    assert_eq!(d.plan_delete(&req).await.unwrap(), Plan::NoEffects);
+    // Deleting removes the empty workspace without needing a retained script.
+    assert_eq!(d.delete(&req).await.unwrap(), DeleteOutcome::Deleted);
+    let record = std::fs::read_to_string(root.path().join("record.log")).unwrap();
+    assert!(
+        record.contains("ARGS workspace delete 0123456789abcdef0123456789abcdef"),
+        "{record}"
+    );
+}
+
+#[test]
+fn credentials_config_cannot_redirect_aws_endpoints() {
+    for name in [
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_CA_BUNDLE",
+        "AWS_PROFILE",
+        "TF_WORKSPACE",
+        "AWS_EC2_METADATA_DISABLED",
+    ] {
+        assert!(check_env_name(name).is_err(), "{name}");
+    }
+    assert!(check_env_name("AWS_ACCESS_KEY_ID").is_ok());
 }

@@ -33,7 +33,11 @@ pub struct S3State {
     pub role_arn: Option<String>,
     /// The backend's own identity, kept apart from the accounts resources are
     /// provisioned with. Without it the server's `AWS_ACCESS_KEY_ID`,
-    /// `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are used.
+    /// `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` are used; instance
+    /// profiles and other metadata-based identities are not, since runs
+    /// disable instance metadata. The identity can reach the whole bucket,
+    /// and module code can read it during a run, so modules are trusted code;
+    /// per-resource scoped credentials are future work.
     pub credentials: Option<S3Credentials>,
 }
 
@@ -125,7 +129,7 @@ impl StateBackend {
         }
     }
 
-    /// Checks the configuration once, when the driver is built.
+    /// Checks the configuration; every run does before touching state.
     pub(super) fn check(&self) -> Result<(), String> {
         let Self::S3(s) = self else {
             return Ok(());

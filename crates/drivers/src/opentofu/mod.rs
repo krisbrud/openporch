@@ -46,7 +46,9 @@ const CODE_PERMIT: &str = "TOFU-002";
 const CODE_INPUT: &str = "TOFU-003";
 const CODE_BACKEND: &str = "TOFU-004";
 /// The override file that points the module at orchestrator state.
-const BACKEND_OVERRIDE: &str = "openporch_backend_override.tf";
+/// Override files merge in lexical order, so this name sorts after a script's
+/// `override.tf`; module and `files` overrides are refused.
+const BACKEND_OVERRIDE: &str = "zzzz_openporch_backend_override.tf";
 const LOCK_FILE: &str = ".terraform.lock.hcl";
 const RETAINED_SCRIPT: &str = "script.tf";
 /// What the last apply ran, as [`Retained`] JSON.
@@ -155,10 +157,21 @@ impl OpenTofu {
                 ),
             });
         }
+        let unreadable = |_| DriverError::Uncertain("the resource's state cannot be read".into());
         if let Some(state) = self.read_state(req).await? {
+            // A preview or a failed plan leaves an empty S3 workspace behind;
+            // with no apply ever started it is not the resource's state.
+            let empty = state["resources"].as_array().is_none_or(Vec::is_empty);
+            let started = self
+                .state_dir(req)
+                .join(RETAINED_FILE)
+                .try_exists()
+                .map_err(unreadable)?;
+            if empty && !started {
+                return Ok(State::Unapplied);
+            }
             return Ok(State::Present(state));
         }
-        let unreadable = |_| DriverError::Uncertain("the resource's state cannot be read".into());
         let deleted = self
             .state_dir(req)
             .join(DELETED_MARKER)
@@ -182,6 +195,8 @@ enum State {
     Present(Value),
     /// Never applied, or deleted.
     Absent,
+    /// An empty S3 workspace from a preview or a failed plan.
+    Unapplied,
 }
 
 /// A failure inside a run, before redaction.
@@ -742,7 +757,8 @@ impl OpenTofu {
                 run,
                 "listing workspaces failed",
                 &["workspace", "list"],
-                exec::Stdout::Logged,
+                // Lists every resource under the prefix.
+                exec::Stdout::Withheld,
             )
             .await?;
         Ok(list
@@ -768,24 +784,15 @@ impl OpenTofu {
         // Remote state: a module holding only the backend, so no source or
         // provider is needed. Workspaces are listed first, because selecting
         // a missing one creates it.
-        let mut run = match self.start(req) {
-            Ok(run) => run,
-            Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
-        };
-        let result = async {
-            let home = run.dir.join("home");
-            files::private_dir(&home).map_err(Failure::io)?;
-            files::private_dir(&run.module).map_err(Failure::io)?;
-            self.prepare_backend(&mut run, req, &home)?;
-            self.init(&mut run).await?;
-            if !self.has_workspace(&mut run, req).await? {
+        self.with_bare_run(req, async |run| {
+            if !self.has_workspace(run, req).await? {
                 return Ok(None);
             }
             run.env
                 .insert("TF_WORKSPACE".into(), req.guresid.as_str().to_owned());
             let out = self
                 .tofu(
-                    &mut run,
+                    run,
                     "reading state failed",
                     &["state", "pull"],
                     exec::Stdout::Withheld,
@@ -797,9 +804,61 @@ impl OpenTofu {
             serde_json::from_str(&out.stdout)
                 .map(Some)
                 .map_err(|_| Failure::Io("`tofu state pull` printed no state".into()))
+        })
+        .await
+    }
+
+    /// Runs `body` in an initialized module that holds only the backend, so
+    /// no source or provider is needed.
+    async fn with_bare_run<T>(
+        &self,
+        req: &DriverRequest,
+        body: impl AsyncFnOnce(&mut Run) -> Result<T, Failure>,
+    ) -> Result<T, DriverError> {
+        let mut run = match self.start(req) {
+            Ok(run) => run,
+            Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
+        };
+        let result = async {
+            let home = run.dir.join("home");
+            files::private_dir(&home).map_err(Failure::io)?;
+            files::private_dir(&run.module).map_err(Failure::io)?;
+            self.prepare_backend(&mut run, req, &home)?;
+            self.init(&mut run).await?;
+            body(&mut run).await
         }
         .await;
         self.finish(req, &run.log, result, false)
+    }
+
+    /// Removes the resource's state and recovery metadata, leaving the deleted
+    /// marker. A remote workspace is removed only while its state is empty;
+    /// OpenTofu refuses otherwise.
+    async fn remove_state(&self, run: &mut Run, req: &DriverRequest) -> Result<(), Failure> {
+        if self.config.state.workspaces() {
+            run.env.remove("TF_WORKSPACE");
+            for args in [
+                ["workspace", "select", "default"].as_slice(),
+                &["workspace", "delete", req.guresid.as_str()],
+            ] {
+                self.tofu(
+                    run,
+                    "removing the resource's state failed",
+                    args,
+                    exec::Stdout::Logged,
+                )
+                .await?;
+            }
+        }
+        let state = self.state_dir(req);
+        let removed = match fs::remove_dir_all(&state) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+        removed
+            .and_then(|()| files::private_dir(&state))
+            .and_then(|()| files::write_private(&state.join(DELETED_MARKER), b""))
+            .map_err(Failure::io)
     }
 
     /// Starts a run and prepares it, then runs `body`; the log goes to the
@@ -818,7 +877,9 @@ impl OpenTofu {
             Ok(()) => body(&mut run).await,
             Err(f) => Err(f),
         };
-        let result = result.and_then(|t| self.protect_local_state(req).map(|()| t));
+        // Even after a failure: a partial apply writes state too.
+        let protected = self.protect_local_state(req);
+        let result = result.and_then(|t| protected.map(|()| t));
         self.finish(req, &run.log, result, Self::append_logs(req))
     }
 
@@ -1168,7 +1229,20 @@ fn check_env_name(name: &str) -> Result<(), Failure> {
     let ok = !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && !name.as_bytes()[0].is_ascii_digit()
-        && !matches!(name, "PATH" | "HOME" | "AWS_EC2_METADATA_DISABLED")
+        && !matches!(
+            name,
+            "PATH"
+                | "HOME"
+                | "AWS_EC2_METADATA_DISABLED"
+                // These would redirect or break the S3 state backend.
+                | "AWS_CA_BUNDLE"
+                | "AWS_S3_ENDPOINT"
+                | "AWS_STS_ENDPOINT"
+                | "AWS_PROFILE"
+                | "AWS_CONFIG_FILE"
+                | "AWS_SHARED_CREDENTIALS_FILE"
+        )
+        && !name.starts_with("AWS_ENDPOINT_URL")
         && !name.starts_with("TF_");
     if ok {
         Ok(())
@@ -1252,7 +1326,7 @@ impl Driver for OpenTofu {
 
     fn plan_delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async move {
-            if self.state(req).await? == State::Absent {
+            if matches!(self.state(req).await?, State::Absent | State::Unapplied) {
                 return Ok(Plan::NoEffects);
             }
             let retained = self.retained(req)?;
@@ -1281,7 +1355,7 @@ impl Driver for OpenTofu {
         Box::pin(async move {
             let state = match self.state(req).await {
                 Ok(State::Present(state)) => state,
-                Ok(State::Absent) => return Ok(Observation::Absent),
+                Ok(State::Absent | State::Unapplied) => return Ok(Observation::Absent),
                 Err(e) => {
                     return Ok(Observation::Unknown {
                         reason: e.to_string(),
@@ -1298,38 +1372,27 @@ impl Driver for OpenTofu {
 
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         Box::pin(async move {
-            // Nothing was applied, or an earlier delete finished.
-            if self.state(req).await? == State::Absent {
-                return Ok(DeleteOutcome::Deleted);
+            match self.state(req).await? {
+                // Nothing was applied, or an earlier delete finished.
+                State::Absent => return Ok(DeleteOutcome::Deleted),
+                State::Unapplied => {
+                    self.with_bare_run(req, async |run| self.remove_state(run, req).await)
+                        .await?;
+                    return Ok(DeleteOutcome::Deleted);
+                }
+                State::Present(_) => {}
             }
             let retained = self.retained(req)?;
             self.with_run(req, SourceAt::Retained(&retained), async |run| {
                 let (actions, fp) = self.plan_run(run, req, true).await?;
                 self.apply_run(run, req, &actions, &fp).await?;
-                // Only confirmed destruction removes the state, leaving a marker
-                // that it was deleted. A remote workspace is deleted only while
-                // its state is empty.
-                if self.config.state.workspaces() {
-                    run.env.remove("TF_WORKSPACE");
-                    for args in [
-                        ["workspace", "select", "default"].as_slice(),
-                        &["workspace", "delete", req.guresid.as_str()],
-                    ] {
-                        self.tofu(
-                            run,
-                            "removing the resource's state failed",
-                            args,
-                            exec::Stdout::Logged,
-                        )
-                        .await
-                        .map_err(Failure::after_apply)?;
-                    }
-                }
-                let state = self.state_dir(req);
-                let removed = fs::remove_dir_all(&state)
-                    .and_then(|()| files::private_dir(&state))
-                    .and_then(|()| files::write_private(&state.join(DELETED_MARKER), b""));
-                removed.map_err(|e| Failure::io(e).after_apply())
+                // Destruction is confirmed: mark it first, so that a repeated
+                // delete is a no-op even if removing the state fails halfway.
+                let marker = self.state_dir(req).join(DELETED_MARKER);
+                files::write_private(&marker, b"").map_err(|e| Failure::io(e).after_apply())?;
+                self.remove_state(run, req)
+                    .await
+                    .map_err(Failure::after_apply)
             })
             .await?;
             Ok(DeleteOutcome::Deleted)
