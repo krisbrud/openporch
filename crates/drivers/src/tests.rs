@@ -37,6 +37,8 @@ fn request() -> DriverRequest {
 struct Slow {
     info: DriverInfo,
     polls: usize,
+    /// The cookie `get` returns with the outputs.
+    ready_cookie: Option<&'static str>,
     seen: Mutex<Vec<(&'static str, Option<String>)>>,
 }
 
@@ -52,6 +54,7 @@ impl Slow {
                 capabilities: Capabilities::default(),
             },
             polls,
+            ready_cookie: None,
             seen: Mutex::new(Vec::new()),
         }
     }
@@ -88,6 +91,7 @@ impl Driver for Slow {
             if n <= self.polls {
                 return Ok(Observation::InProgress {
                     poll_after: Duration::from_secs(30),
+                    cookie: None,
                 });
             }
             Ok(Observation::Ready {
@@ -95,7 +99,7 @@ impl Driver for Slow {
                     values: object(json!({"host": "db.internal"})),
                     ..DriverOutputs::default()
                 },
-                cookie: None,
+                cookie: self.ready_cookie.map(|c| Cookie::new(1, c)).transpose()?,
             })
         })
     }
@@ -112,11 +116,11 @@ impl Driver for Slow {
 async fn asynchronous_provisioning_polls_get_until_ready() {
     let driver = Slow::new(2);
     let start = tokio::time::Instant::now();
-    let (outputs, cookie) = converge(&driver, &request(), DEFAULT_TIMEOUT)
-        .await
-        .unwrap();
+    let settled = converge(&driver, &request(), DEFAULT_TIMEOUT).await;
+    let outputs = settled.result.unwrap();
     assert_eq!(outputs.values, object(json!({"host": "db.internal"})));
-    assert_eq!(cookie, Some(Cookie::new(1, "abc").unwrap()));
+    // `get` returned no cookie, so the one from `put` stands.
+    assert_eq!(settled.cookie, Some(Cookie::new(1, "abc").unwrap()));
     // Three polls, each after the 30 seconds the driver asked for.
     assert_eq!(start.elapsed(), Duration::from_secs(90));
     let calls: Vec<_> = driver.seen().into_iter().map(|(c, _)| c).collect();
@@ -125,42 +129,57 @@ async fn asynchronous_provisioning_polls_get_until_ready() {
 
 #[tokio::test(start_paused = true)]
 async fn cookie_round_trip() {
-    let driver = Slow::new(0);
-    let (_, cookie) = converge(&driver, &request(), DEFAULT_TIMEOUT)
-        .await
-        .unwrap();
+    let mut driver = Slow::new(1);
+    driver.ready_cookie = Some("def");
+    let first = converge(&driver, &request(), DEFAULT_TIMEOUT).await;
+    first.result.unwrap();
+    // A newer cookie from `get` replaces the one from `put`.
+    assert_eq!(first.cookie, Some(Cookie::new(1, "def").unwrap()));
+
     // The checkpointed cookie goes with the next put and delete for the GUResID.
     let mut next = request();
-    next.cookie = cookie;
-    let _ = driver.put(&next).await.unwrap();
-    remove(&driver, &next, DEFAULT_TIMEOUT).await.unwrap();
-    let abc = Some("abc".to_owned());
+    next.cookie = first.cookie;
+    driver.ready_cookie = None;
+    let second = converge(&driver, &next, DEFAULT_TIMEOUT).await;
+    second.result.unwrap();
+    next.cookie = second.cookie;
+    remove(&driver, &next, DEFAULT_TIMEOUT)
+        .await
+        .result
+        .unwrap();
+    let c = |s: &str| Some(s.to_owned());
     assert_eq!(
         driver.seen(),
         [
             ("put", None),
-            ("get", abc.clone()),
-            ("put", abc.clone()),
-            ("delete", abc),
+            ("get", c("abc")),
+            ("get", c("abc")),
+            ("put", c("def")),
+            ("get", c("abc")),
+            ("delete", c("abc")),
         ]
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn polling_stops_at_the_deadline() {
+async fn polling_stops_at_the_deadline_and_keeps_the_cookie() {
     let driver = Slow::new(usize::MAX);
     let start = tokio::time::Instant::now();
-    let err = converge(&driver, &request(), Duration::from_secs(100))
-        .await
-        .unwrap_err();
+    let settled = converge(&driver, &request(), Duration::from_secs(100)).await;
+    let err = settled.result.unwrap_err();
     assert_eq!(err, DriverError::Timeout(Duration::from_secs(100)));
     assert!(!err.is_retryable());
-    assert_eq!(start.elapsed(), Duration::from_secs(100));
+    // Recovery needs the cookie of the operation that timed out.
+    assert_eq!(settled.cookie, Some(Cookie::new(1, "abc").unwrap()));
+    // Polls at 30, 60 and 90 seconds, and a last one 5 seconds before the deadline.
+    assert_eq!(start.elapsed(), Duration::from_secs(95));
+    assert_eq!(driver.seen().len(), 5);
 }
 
-/// A driver whose calls never return.
+/// A driver whose calls never return, and whose `cancel` reports the given
+/// observation.
 #[derive(Debug)]
-struct Hung(DriverInfo);
+struct Hung(DriverInfo, Option<Observation>);
 
 impl Driver for Hung {
     fn info(&self) -> &DriverInfo {
@@ -178,19 +197,71 @@ impl Driver for Hung {
     fn delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         Box::pin(std::future::pending())
     }
+
+    fn cancel<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        let o = self.1.clone();
+        Box::pin(async move {
+            match o {
+                Some(o) => Ok(o),
+                None => std::future::pending().await,
+            }
+        })
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_driver_that_does_not_answer_times_out() {
-    let driver = Hung(Echo::new().info().clone());
+    let driver = Hung(Echo::new().info().clone(), None);
     let timeout = Duration::from_secs(5);
-    let err = converge(&driver, &request(), timeout).await.unwrap_err();
+    let err = converge(&driver, &request(), timeout)
+        .await
+        .result
+        .unwrap_err();
     assert_eq!(err, DriverError::Timeout(timeout));
     assert_eq!(
-        remove(&driver, &request(), timeout).await.unwrap_err(),
+        remove(&driver, &request(), timeout)
+            .await
+            .result
+            .unwrap_err(),
         DriverError::Timeout(timeout)
     );
-    assert_eq!(err.to_string(), "the driver did not answer within 5s");
+    assert_eq!(err.to_string(), "the driver did not finish within 5s");
+    assert_eq!(
+        DriverError::Timeout(Duration::from_millis(500)).to_string(),
+        "the driver did not finish within 500ms"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timeout_cancels_drivers_that_can() {
+    let mut info = Echo::new().info().clone();
+    info.capabilities.cancel = true;
+    let timeout = Duration::from_secs(5);
+
+    // A confirmed cancellation leaves a plain timeout.
+    let stopped = Hung(info.clone(), Some(Observation::Absent));
+    let err = converge(&stopped, &request(), timeout)
+        .await
+        .result
+        .unwrap_err();
+    assert_eq!(err, DriverError::Timeout(timeout));
+
+    // Otherwise the outcome is uncertain and must be recovered.
+    for cancel in [
+        Some(Observation::InProgress {
+            poll_after: Duration::ZERO,
+            cookie: None,
+        }),
+        Some(Observation::Unknown { reason: "?".into() }),
+        None,
+    ] {
+        let driver = Hung(info.clone(), cancel);
+        let err = converge(&driver, &request(), timeout)
+            .await
+            .result
+            .unwrap_err();
+        assert!(matches!(err, DriverError::Uncertain(_)), "{err}");
+    }
 }
 
 /// A driver that reports `in_progress` and then the given observation.
@@ -218,9 +289,11 @@ impl Driver for Then {
     }
 
     fn delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
-        Box::pin(async {
+        let cookie = self.2.clone();
+        Box::pin(async move {
             Ok(DeleteOutcome::InProgress {
                 poll_after: Duration::ZERO,
+                cookie,
             })
         })
     }
@@ -238,38 +311,98 @@ async fn failed_absent_and_unknown_observations() {
         Observation::Failed {
             error: invalid.clone(),
         },
-        None,
+        Some(Cookie::new(0, "op-7").unwrap()),
     );
     let r = request();
-    assert_eq!(
-        converge(&failed, &r, DEFAULT_TIMEOUT).await.unwrap_err(),
-        invalid
-    );
+    let settled = converge(&failed, &r, DEFAULT_TIMEOUT).await;
+    assert_eq!(settled.result.unwrap_err(), invalid);
+    assert_eq!(settled.cookie, Some(Cookie::new(0, "op-7").unwrap()));
     assert_eq!(invalid.to_string(), "PG-1: bad version");
 
     let absent = Then(info.clone(), Observation::Absent, None);
     assert!(matches!(
-        converge(&absent, &r, DEFAULT_TIMEOUT).await,
+        converge(&absent, &r, DEFAULT_TIMEOUT).await.result,
         Err(DriverError::Uncertain(_))
     ));
     // For a deletion, absent is done.
-    remove(&absent, &r, DEFAULT_TIMEOUT).await.unwrap();
+    remove(&absent, &r, DEFAULT_TIMEOUT).await.result.unwrap();
 
     let unknown = Then(
         info,
         Observation::Unknown {
             reason: "lost the operation".into(),
         },
-        None,
+        Some(Cookie::new(0, "op-8").unwrap()),
     );
     assert_eq!(
-        converge(&unknown, &r, DEFAULT_TIMEOUT).await.unwrap_err(),
+        converge(&unknown, &r, DEFAULT_TIMEOUT)
+            .await
+            .result
+            .unwrap_err(),
         DriverError::Uncertain("lost the operation".into())
     );
+    let settled = remove(&unknown, &r, DEFAULT_TIMEOUT).await;
     assert_eq!(
-        remove(&unknown, &r, DEFAULT_TIMEOUT).await.unwrap_err(),
+        settled.result.unwrap_err(),
         DriverError::Uncertain("lost the operation".into())
     );
+    assert_eq!(settled.cookie, Some(Cookie::new(0, "op-8").unwrap()));
+}
+
+/// A driver that answers every call at once with `poll_after` and never finishes.
+#[derive(Debug)]
+struct Busy(DriverInfo, Duration);
+
+impl Driver for Busy {
+    fn info(&self) -> &DriverInfo {
+        &self.0
+    }
+
+    fn put<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
+        let poll_after = self.1;
+        Box::pin(async move {
+            Ok(PutOutcome::InProgress {
+                poll_after,
+                cookie: None,
+            })
+        })
+    }
+
+    fn get<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        let poll_after = self.1;
+        Box::pin(async move {
+            Ok(Observation::InProgress {
+                poll_after,
+                cookie: None,
+            })
+        })
+    }
+
+    fn delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
+        Box::pin(async { Ok(DeleteOutcome::Deleted) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn extreme_waits_and_timeouts_do_not_overflow() {
+    let info = Echo::new().info().clone();
+    let start = tokio::time::Instant::now();
+    let driver = Busy(info.clone(), Duration::MAX);
+    let err = converge(&driver, &request(), Duration::MAX)
+        .await
+        .result
+        .unwrap_err();
+    assert_eq!(err, DriverError::Timeout(MAX_TIMEOUT));
+    assert!(start.elapsed() <= MAX_TIMEOUT);
+
+    // A zero wait is raised to the minimum poll interval.
+    let start = tokio::time::Instant::now();
+    let driver = Busy(info, Duration::ZERO);
+    converge(&driver, &request(), Duration::from_secs(10))
+        .await
+        .result
+        .unwrap_err();
+    assert!(start.elapsed() >= Duration::from_secs(9));
 }
 
 #[tokio::test(start_paused = true)]
@@ -281,14 +414,15 @@ async fn returned_cookies_are_checked() {
         data: "x".repeat(MAX_COOKIE_BYTES + 1),
     };
     let driver = Then(info.clone(), Observation::Absent, Some(big));
-    assert!(matches!(
-        converge(&driver, &request(), DEFAULT_TIMEOUT).await,
-        Err(DriverError::Invalid { .. })
-    ));
+    let settled = converge(&driver, &request(), DEFAULT_TIMEOUT).await;
+    // An operation may be running, so the outcome is uncertain rather than invalid.
+    assert!(matches!(settled.result, Err(DriverError::Uncertain(_))));
+    assert_eq!(settled.cookie, None);
     let old = Cookie::new(1, "abc").unwrap();
     let driver = Then(info, Observation::Absent, Some(old));
     let err = converge(&driver, &request(), DEFAULT_TIMEOUT)
         .await
+        .result
         .unwrap_err();
     assert!(err.to_string().contains("version 1 cookie"), "{err}");
 }
@@ -311,21 +445,31 @@ fn call_timeouts() {
     assert_eq!(call_timeout(&Map::new(), None).unwrap(), DEFAULT_TIMEOUT);
     assert_eq!(t(Value::Null, None).unwrap(), DEFAULT_TIMEOUT);
     assert_eq!(t(json!(90), None).unwrap(), Duration::from_secs(90));
+    assert_eq!(t(json!(90.0), None).unwrap(), Duration::from_secs(90));
     assert_eq!(t(json!("90"), None).unwrap(), Duration::from_secs(90));
     assert_eq!(t(json!("90s"), None).unwrap(), Duration::from_secs(90));
     assert_eq!(t(json!("15m"), None).unwrap(), Duration::from_secs(900));
     assert_eq!(t(json!("1h"), None).unwrap(), Duration::from_secs(3600));
+    assert_eq!(t(json!("24h"), None).unwrap(), MAX_TIMEOUT);
     // Bounded by the deployment's remaining deadline.
     assert_eq!(t(json!("1h"), Some(60)).unwrap(), Duration::from_secs(60));
     assert_eq!(
         call_timeout(&Map::new(), Some(Duration::from_secs(10))).unwrap(),
         Duration::from_secs(10)
     );
+    // A spent deadline is not a timeout: nothing was called.
+    assert!(matches!(
+        call_timeout(&Map::new(), Some(Duration::ZERO)),
+        Err(DriverError::Invalid { .. })
+    ));
     for bad in [
         json!(0),
         json!(-5),
         json!(1.5),
+        json!(u64::MAX),
+        json!(1e300),
         json!("0s"),
+        json!("25h"),
         json!("5d"),
         json!("m"),
         json!(true),
@@ -333,6 +477,25 @@ fn call_timeouts() {
     ] {
         assert!(t(bad.clone(), None).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn cookies_and_manifests_are_not_printed() {
+    let mut req = request();
+    req.cookie = Some(Cookie::new(1, "generated-password").unwrap());
+    let debug = format!("{req:?}");
+    assert!(!debug.contains("generated-password"), "{debug}");
+    assert!(debug.contains("bytes: 18"), "{debug}");
+    let outputs = DriverOutputs {
+        manifests: vec![Manifest {
+            location: "namespace".into(),
+            data: json!({"kind": "Secret", "data": {"password": "aHVudGVyMg=="}}),
+        }],
+        ..DriverOutputs::default()
+    };
+    let debug = format!("{outputs:?}");
+    assert!(!debug.contains("aHVudGVyMg"), "{debug}");
+    assert!(debug.contains("Secret"), "{debug}");
 }
 
 #[test]
@@ -355,13 +518,14 @@ async fn echo_returns_driver_inputs() {
     req.values = object(json!({"host": "db.example.com", "port": 5432, "name": "shop"}));
     req.secrets = SecretMap::new(object(json!({"username": "shop", "password": "hunter2"})));
     let echo = Echo::new();
-    let (outputs, cookie) = converge(&echo, &req, DEFAULT_TIMEOUT).await.unwrap();
+    let settled = converge(&echo, &req, DEFAULT_TIMEOUT).await;
+    let outputs = settled.result.unwrap();
     assert_eq!(outputs.values, req.values);
     assert_eq!(outputs.secrets, req.secrets);
     assert!(outputs.manifests.is_empty());
-    assert_eq!(cookie, None);
+    assert_eq!(settled.cookie, None);
     assert_eq!(echo.plan(&req).await.unwrap(), Plan::NoEffects);
-    remove(&echo, &req, DEFAULT_TIMEOUT).await.unwrap();
+    remove(&echo, &req, DEFAULT_TIMEOUT).await.result.unwrap();
 }
 
 #[tokio::test]
@@ -375,7 +539,7 @@ async fn none_returns_resolved_resource_inputs() {
     req.resource_secrets = SecretMap::new(object(json!({"DB_PASS": "hunter2"})));
     req.values = object(json!({"ignored": true}));
     let none = NoneDriver::new();
-    let (outputs, _) = converge(&none, &req, DEFAULT_TIMEOUT).await.unwrap();
+    let outputs = converge(&none, &req, DEFAULT_TIMEOUT).await.result.unwrap();
     assert_eq!(outputs.values, req.resource);
     assert_eq!(outputs.secrets, req.resource_secrets);
     assert_eq!(none.plan(&req).await.unwrap(), Plan::NoEffects);

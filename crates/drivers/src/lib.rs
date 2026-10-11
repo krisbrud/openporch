@@ -23,7 +23,9 @@ mod run;
 pub use echo::Echo;
 pub use none::NoneDriver;
 pub use registry::{DriverRegistry, RegistryError};
-pub use run::{DEFAULT_TIMEOUT, call_timeout, converge, remove, with_timeout};
+pub use run::{
+    DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
+};
 
 /// The largest cookie a driver may return, in bytes.
 pub const MAX_COOKIE_BYTES: usize = 10 * 1024;
@@ -67,8 +69,9 @@ impl fmt::Debug for SecretMap {
 }
 
 /// An opaque, versioned driver state blob, returned by one call and passed to the
-/// next call for the same GUResID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// next call for the same GUResID. It may hold secrets, such as a generated
+/// password, so `Debug` shows only its version and size.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cookie {
     /// The cookie format version the driver wrote.
     pub version: u32,
@@ -99,6 +102,15 @@ impl Cookie {
             });
         }
         Ok(())
+    }
+}
+
+impl fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cookie")
+            .field("version", &self.version)
+            .field("bytes", &self.data.len())
+            .finish()
     }
 }
 
@@ -146,12 +158,22 @@ pub struct DriverRequest {
     pub cookie: Option<Cookie>,
 }
 
-/// A Kubernetes manifest with where it goes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A Kubernetes manifest with where it goes. It may be a `Secret`, so `Debug`
+/// shows only its location and kind.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     /// `namespace` or `cluster`.
     pub location: String,
     pub data: Value,
+}
+
+impl fmt::Debug for Manifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Manifest")
+            .field("location", &self.location)
+            .field("kind", &self.data.get("kind").and_then(Value::as_str))
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a provisioned resource produced.
@@ -183,7 +205,10 @@ pub enum Observation {
     /// Nothing exists for the GUResID.
     Absent,
     /// An operation is still running; poll again after `poll_after`.
-    InProgress { poll_after: Duration },
+    InProgress {
+        poll_after: Duration,
+        cookie: Option<Cookie>,
+    },
     /// The resource exists with these outputs.
     Ready {
         outputs: DriverOutputs,
@@ -196,12 +221,15 @@ pub enum Observation {
 }
 
 /// The result of `delete`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeleteOutcome {
     /// Gone, or never existed.
     Deleted,
     /// Still deleting; poll `get` until it reports `Absent`.
-    InProgress { poll_after: Duration },
+    InProgress {
+        poll_after: Duration,
+        cookie: Option<Cookie>,
+    },
 }
 
 /// A planned change to infrastructure.
@@ -221,8 +249,12 @@ pub enum Plan {
     Unknown,
     /// The call changes no infrastructure.
     NoEffects,
-    /// Classified actions on named objects.
-    Actions(Vec<(Action, String)>),
+    /// Classified actions on named objects, with a fingerprint of the inputs and
+    /// state they were planned against.
+    Actions {
+        actions: Vec<(Action, String)>,
+        fingerprint: String,
+    },
 }
 
 /// Driver failures. Messages never contain secret values.
@@ -244,7 +276,7 @@ pub enum DriverError {
         retry_after: Option<Duration>,
     },
     /// The call did not finish within its timeout; the outcome is uncertain.
-    #[error("the driver did not answer within {}s", .0.as_secs())]
+    #[error("the driver did not finish within {0:?}")]
     Timeout(Duration),
     /// The outcome of a mutation is unknown and must be recovered first.
     #[error("the outcome is unknown: {0}")]
@@ -313,6 +345,13 @@ pub trait Driver: Send + Sync + fmt::Debug {
 
     /// Removes the resource.
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome>;
+
+    /// Stops the operation `req` identifies after a timeout, and observes the
+    /// result. Drivers that declare the `cancel` capability implement it; an
+    /// in-process call is cancelled by dropping its future.
+    fn cancel<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        Box::pin(async { Err(DriverError::Unsupported("cancellation".into())) })
+    }
 }
 
 /// The input and output schemas of drivers that take any object.
