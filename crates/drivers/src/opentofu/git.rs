@@ -20,6 +20,8 @@ pub(super) struct Source {
     pub ssh_key: Option<String>,
 }
 
+const CREDENTIALS_IN_URL: &str = "`source.url` must not contain credentials; use `source.username` and the `source.password` or `source.ssh_key` secret";
+
 /// Checks a source URL: `https`, `ssh` or scp-like `user@host:path`, and `file`
 /// only when the server allows it. URLs carry no credentials.
 pub(super) fn check_url(url: &str, allow_file: bool) -> Result<(), String> {
@@ -31,15 +33,27 @@ pub(super) fn check_url(url: &str, allow_file: bool) -> Result<(), String> {
             ));
         }
         let authority = rest.split('/').next().unwrap_or_default();
-        if scheme == "https" && authority.contains('@') {
-            return Err("`source.url` must not contain credentials; use `source.username` and the `source.password` secret".into());
+        let userinfo = authority.rsplit_once('@').map(|(u, _)| u);
+        if (scheme == "https" && userinfo.is_some()) || userinfo.is_some_and(|u| u.contains(':')) {
+            return Err(CREDENTIALS_IN_URL.into());
         }
         Ok(())
-    } else if url.contains('@') && url.contains(':') && !url.starts_with('-') {
+    } else if let Some((user, host)) = url.split_once('@')
+        && host.contains(':')
+        && !url.starts_with('-')
+    {
+        if user.contains(':') {
+            return Err(CREDENTIALS_IN_URL.into());
+        }
         Ok(())
     } else {
         Err("`source.url` must be an https, ssh or `user@host:path` URL".into())
     }
+}
+
+/// `s` quoted for the shell that runs `GIT_SSH_COMMAND`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Fetches `source` at `rev` into `dir` and returns the commit it resolved to.
@@ -78,6 +92,16 @@ pub(super) async fn fetch(
         );
         log.redact_values([basic]);
     }
+    // SSH checks host keys against the configured known hosts only; without
+    // them, SSH sources fail rather than trust whatever host answers.
+    let known_hosts = config
+        .ssh_known_hosts
+        .as_deref()
+        .unwrap_or(Path::new("/dev/null"));
+    let mut ssh = format!(
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
+        shell_quote(&known_hosts.display().to_string())
+    );
     if let Some(key) = &source.ssh_key {
         let key_file = home.join("ssh_key");
         let mut text = key.clone();
@@ -85,15 +109,12 @@ pub(super) async fn fetch(
             text.push('\n');
         }
         files::write_private(&key_file, text.as_bytes()).map_err(Failure::io)?;
-        env.insert(
-            "GIT_SSH_COMMAND".into(),
-            format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}",
-                key_file.display(),
-                home.join("known_hosts").display()
-            ),
-        );
+        ssh.push_str(&format!(
+            " -o IdentitiesOnly=yes -i {}",
+            shell_quote(&key_file.display().to_string())
+        ));
     }
+    env.insert("GIT_SSH_COMMAND".into(), ssh);
     let git = &config.git;
     for args in [
         vec!["init", "-q"],
@@ -107,7 +128,7 @@ pub(super) async fn fetch(
             "FETCH_HEAD",
         ],
     ] {
-        let out = exec::run(log, git, &args, dir, &env)
+        let out = exec::run(log, git, &args, dir, &env, exec::Stdout::Logged)
             .await
             .map_err(Failure::io)?;
         if !out.success {
@@ -118,9 +139,16 @@ pub(super) async fn fetch(
             ));
         }
     }
-    let out = exec::run(log, git, &["rev-parse", "HEAD"], dir, &env)
-        .await
-        .map_err(Failure::io)?;
+    let out = exec::run(
+        log,
+        git,
+        &["rev-parse", "HEAD"],
+        dir,
+        &env,
+        exec::Stdout::Logged,
+    )
+    .await
+    .map_err(Failure::io)?;
     let commit = out.stdout.trim().to_owned();
     if !out.success || commit.len() < 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Failure::command(
@@ -130,4 +158,32 @@ pub(super) async fn fetch(
         ));
     }
     Ok(commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_url;
+
+    #[test]
+    fn urls() {
+        for ok in [
+            "https://github.com/o/r.git",
+            "ssh://git@github.com/o/r.git",
+            "git@github.com:o/r.git",
+        ] {
+            assert!(check_url(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            "https://user:pw@github.com/o/r.git",
+            "https://token@github.com/o/r.git",
+            "ssh://git:pw@github.com/o/r.git",
+            "git:pw@github.com:o/r.git",
+            "file:///etc",
+            "ext::sh -c id",
+            "-oProxyCommand=x@h:p",
+        ] {
+            assert!(check_url(bad, false).is_err(), "{bad}");
+        }
+        assert!(check_url("file:///tmp/repo", true).is_ok());
+    }
 }

@@ -4,9 +4,10 @@
 //! Each call gets a fresh owner-only run directory under
 //! `<root>/runs/<guresid>`. The module's backend is overridden with orchestrator
 //! state under `<root>/state/<guresid>`, which also keeps the dependency lock
-//! file and, for inline scripts, the script last applied. The cookie keeps the
-//! resolved source commit, so deletion plans against what was applied rather
-//! than the current branch tip. Secret variables go into an owner-only variables
+//! file, the script and the resolved source commit last applied. They are kept
+//! before an apply starts, so deletion plans against what was applied rather
+//! than the current branch tip even after a partial apply; the cookie carries
+//! the same record. Secret variables go into an owner-only variables
 //! file, never onto a command line, and every log line and error is redacted
 //! before it leaves the driver.
 
@@ -42,6 +43,11 @@ const CODE_INPUT: &str = "TOFU-003";
 const BACKEND_OVERRIDE: &str = "openporch_backend_override.tf";
 const LOCK_FILE: &str = ".terraform.lock.hcl";
 const RETAINED_SCRIPT: &str = "script.tf";
+/// What the last apply ran, as [`Retained`] JSON.
+const RETAINED_FILE: &str = "retained.json";
+/// Marks state removed by a confirmed delete, so a repeated delete is a no-op
+/// while state lost otherwise is not mistaken for "never existed".
+const DELETED_MARKER: &str = "deleted";
 
 /// Where and how the driver runs OpenTofu.
 #[derive(Debug, Clone)]
@@ -55,6 +61,8 @@ pub struct Config {
     /// Allows `file://` sources. Only for tests: it lets a definition read the
     /// server's files.
     pub allow_file_sources: bool,
+    /// Host keys SSH sources are checked against. Without it SSH sources fail.
+    pub ssh_known_hosts: Option<PathBuf>,
 }
 
 impl Config {
@@ -65,6 +73,7 @@ impl Config {
             git: "git".into(),
             root: root.into(),
             allow_file_sources: false,
+            ssh_known_hosts: None,
         }
     }
 }
@@ -83,7 +92,18 @@ impl OpenTofu {
                 id: "openporch/opentofu".into(),
                 protocol_version: "builtin".into(),
                 cookie_version: COOKIE_VERSION,
-                input_schema: any_object(),
+                input_schema: json!({
+                    "type": "object",
+                    "anyOf": [{"required": ["source"]}, {"required": ["script"]}],
+                    "properties": {
+                        "source": {"type": "object", "required": ["url"]},
+                        "script": {"type": "string"},
+                        "variables": {"type": "object"},
+                        "files": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "credentials_config": {"type": "object"},
+                        "append_logs_to_error": {"type": "boolean"},
+                    }
+                }),
                 output_schema: any_object(),
                 capabilities: Capabilities {
                     targets: Targets {
@@ -109,6 +129,35 @@ impl OpenTofu {
     fn state_file(&self, req: &DriverRequest) -> PathBuf {
         self.state_dir(req).join("terraform.tfstate")
     }
+
+    /// Whether the resource has state, and if not, whether that is expected.
+    fn state(&self, req: &DriverRequest) -> Result<State, DriverError> {
+        let unreadable = |_| DriverError::Uncertain("the resource's state cannot be read".into());
+        if self.state_file(req).try_exists().map_err(unreadable)? {
+            return Ok(State::Present);
+        }
+        let deleted = self
+            .state_dir(req)
+            .join(DELETED_MARKER)
+            .try_exists()
+            .map_err(unreadable)?;
+        // A cookie means an apply succeeded, so its state must exist.
+        if req.cookie.is_some() && !deleted {
+            return Err(DriverError::Uncertain(
+                "the resource was applied but its OpenTofu state is missing; it needs recovery"
+                    .into(),
+            ));
+        }
+        Ok(State::Absent)
+    }
+}
+
+/// See [`OpenTofu::state`].
+#[derive(PartialEq)]
+enum State {
+    Present,
+    /// Never applied, or deleted.
+    Absent,
 }
 
 /// A failure inside a run, before redaction.
@@ -118,6 +167,8 @@ pub(crate) enum Failure {
     Input(String),
     /// A command failed: its name, what it was doing and its stderr.
     Command { what: String, stderr: String },
+    /// A failure once an apply started: infrastructure may have changed.
+    Uncertain { what: String, stderr: String },
     /// The plan needs a permit the request does not carry.
     Permit(String),
     /// The local machine failed.
@@ -133,6 +184,19 @@ impl Failure {
         Self::Command {
             what: format!("{program}: {what}"),
             stderr: stderr.to_owned(),
+        }
+    }
+
+    /// This failure, happening after an apply started.
+    fn after_apply(self) -> Self {
+        match self {
+            Self::Command { what, stderr } | Self::Uncertain { what, stderr } => {
+                Self::Uncertain { what, stderr }
+            }
+            Self::Input(what) | Self::Permit(what) | Self::Io(what) => Self::Uncertain {
+                what,
+                stderr: String::new(),
+            },
         }
     }
 }
@@ -273,9 +337,23 @@ fn parse(config: &Config, req: &DriverRequest) -> Result<Inputs, Failure> {
             let Value::String(content) = content else {
                 return Err(input(format!("file `{path}` must be a string")));
             };
-            if files::relative(&path).is_none() {
+            let Some(rel) = files::relative(&path) else {
                 return Err(input(format!(
                     "file `{path}` must be a relative path inside the module"
+                )));
+            };
+            let name = rel
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let tofu_owned = rel
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with(".terraform"));
+            if rel.components().count() == 1 && (name == "main.tf" || is_override(&name))
+                || tofu_owned
+            {
+                return Err(input(format!(
+                    "file `{path}` would replace the script, the backend or OpenTofu's own files"
                 )));
             }
             files.push((path, content, secret));
@@ -310,6 +388,15 @@ fn parse(config: &Config, req: &DriverRequest) -> Result<Inputs, Failure> {
         credentials_config,
         tokens,
     })
+}
+
+/// Whether OpenTofu loads `name` as an override file, which can replace the
+/// orchestrator's backend.
+fn is_override(name: &str) -> bool {
+    let stem = name
+        .strip_suffix(".tf")
+        .or_else(|| name.strip_suffix(".tf.json"));
+    stem.is_some_and(|s| s == "override" || s.ends_with("_override"))
 }
 
 /// The string values in `v`, at any depth.
@@ -349,6 +436,7 @@ impl Drop for Run {
 }
 
 /// How the run's source is chosen.
+#[derive(Clone, Copy)]
 enum SourceAt<'a> {
     /// The definition's current source and revision.
     Current,
@@ -366,18 +454,13 @@ impl OpenTofu {
         }
         log.redact_values(redact);
 
-        let op: String = Sha256::digest(req.operation.id.as_bytes())
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // Unique per call, so concurrent calls never share a directory.
         let dir = self
             .config
             .root
             .join("runs")
             .join(req.guresid.as_str())
-            .join(op);
-        let _ = fs::remove_dir_all(&dir);
+            .join(format!("{:016x}", rand::random::<u64>()));
         files::private_dir(&dir).map_err(Failure::io)?;
         Ok(Run {
             module: dir.join("module"),
@@ -405,12 +488,15 @@ impl OpenTofu {
         // Source: fetched at the requested or retained revision, or the script.
         let script = match at {
             SourceAt::Current => inputs.script.clone(),
-            SourceAt::Retained(r) if r.source.is_some() => inputs.script.clone(),
-            SourceAt::Retained(_) => {
-                Some(fs::read_to_string(state.join(RETAINED_SCRIPT)).map_err(|_| {
-                    input("the script this resource was applied with is not retained; its state is kept")
-                })?)
-            }
+            SourceAt::Retained(r) => match fs::read_to_string(state.join(RETAINED_SCRIPT)) {
+                Ok(script) => Some(script),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && r.source.is_some() => None,
+                Err(_) => {
+                    return Err(input(
+                        "the script this resource was applied with is not retained; its state is kept",
+                    ));
+                }
+            },
         };
         let source = match (&inputs.source, at) {
             (_, SourceAt::Retained(Retained { source: Some(s) })) => {
@@ -452,6 +538,15 @@ impl OpenTofu {
                 if !run.module.is_dir() {
                     return Err(input("`source.path` is not a directory in the repository"));
                 }
+                for entry in fs::read_dir(&run.module).map_err(Failure::io)? {
+                    let name = entry.map_err(Failure::io)?.file_name();
+                    let name = name.to_string_lossy();
+                    if is_override(&name) {
+                        return Err(input(format!(
+                            "the module has an override file `{name}`; it could replace the orchestrator's backend"
+                        )));
+                    }
+                }
                 run.retained.source = Some(RetainedSource {
                     url: s.url.clone(),
                     path: path.clone(),
@@ -480,9 +575,15 @@ impl OpenTofu {
         );
         files::write_private(&run.module.join(BACKEND_OVERRIDE), backend.as_bytes())
             .map_err(Failure::io)?;
+        // The lock file applied last, unless the module brings its own.
         let lock = state.join(LOCK_FILE);
-        if lock.exists() {
-            fs::copy(&lock, run.module.join(LOCK_FILE)).map_err(Failure::io)?;
+        let module_lock = run.module.join(LOCK_FILE);
+        let use_retained = match at {
+            SourceAt::Retained(_) => true,
+            SourceAt::Current => !module_lock.exists(),
+        };
+        if use_retained && lock.exists() {
+            fs::copy(&lock, &module_lock).map_err(Failure::io)?;
         }
 
         // Credentials: as configured, or the default AWS environment.
@@ -593,12 +694,20 @@ impl OpenTofu {
         run: &mut Run,
         what: &str,
         args: &[&str],
+        stdout: exec::Stdout,
     ) -> Result<exec::Output, Failure> {
         let mut all: Vec<&str> = args.to_vec();
         all.push("-no-color");
-        let out = exec::run(&mut run.log, &self.config.tofu, &all, &run.module, &run.env)
-            .await
-            .map_err(|e| Failure::Io(format!("running `tofu`: {e}")))?;
+        let out = exec::run(
+            &mut run.log,
+            &self.config.tofu,
+            &all,
+            &run.module,
+            &run.env,
+            stdout,
+        )
+        .await
+        .map_err(|e| Failure::Io(format!("running `tofu`: {e}")))?;
         if !out.success {
             return Err(Failure::command("tofu", what, &out.stderr));
         }
@@ -609,50 +718,91 @@ impl OpenTofu {
     async fn plan_run(
         &self,
         run: &mut Run,
+        req: &DriverRequest,
         destroy: bool,
     ) -> Result<(Vec<(Action, String)>, String), Failure> {
-        self.tofu(run, "init failed", &["init", "-input=false"])
-            .await?;
+        self.tofu(
+            run,
+            "init failed",
+            &["init", "-input=false"],
+            exec::Stdout::Logged,
+        )
+        .await?;
         let mut args = vec!["plan", "-input=false", "-out=openporch.tfplan"];
         if destroy {
             args.push("-destroy");
         }
         let var_files = run.var_files.clone();
         args.extend(var_files.iter().map(String::as_str));
-        self.tofu(run, "plan failed", &args).await?;
+        self.tofu(run, "plan failed", &args, exec::Stdout::Logged)
+            .await?;
         let shown = self
             .tofu(
                 run,
                 "reading the plan failed",
                 &["show", "-json", "openporch.tfplan"],
+                exec::Stdout::Withheld,
             )
             .await?;
         let plan: Value = serde_json::from_str(&shown.stdout)
             .map_err(|_| Failure::Io("`tofu show -json` printed no plan".into()))?;
         let mut actions = Vec::new();
+        // What the permit covers: the resource, the call, the state it plans
+        // against, the inputs and each change with its reasons. Values are left
+        // out, so the fingerprint reveals nothing about secrets.
+        let mut covered = vec![
+            req.guresid.as_str().to_owned(),
+            if destroy { "destroy" } else { "apply" }.to_owned(),
+            req.operation.fingerprint.clone(),
+            self.state_version(req),
+        ];
         for change in plan["resource_changes"].as_array().into_iter().flatten() {
             let address = change["address"].as_str().unwrap_or_default().to_owned();
-            let kinds: Vec<&str> = change["change"]["actions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            let action = match kinds.as_slice() {
+            let action = match kinds(&change["change"]).as_slice() {
+                [] | ["no-op"] | ["read"] => continue,
                 ["create"] => Action::Create,
                 ["update"] => Action::Update,
-                ["delete"] => Action::Delete,
-                ["delete", "create"] | ["create", "delete"] => Action::Replace,
-                _ => continue,
+                // `forget` drops an object from state, leaving it unmanaged.
+                ["delete"] | ["forget"] => Action::Delete,
+                // Replacements and any action this driver does not know.
+                _ => Action::Replace,
             };
+            covered.push(
+                json!([
+                    address,
+                    change["change"]["actions"],
+                    change["change"]["replace_paths"],
+                    change["action_reason"],
+                ])
+                .to_string(),
+            );
             actions.push((action, address));
         }
+        // Outputs are effects too: a plan that only changes them still applies.
+        for (name, change) in plan["output_changes"].as_object().into_iter().flatten() {
+            if !matches!(kinds(change).as_slice(), [] | ["no-op"]) {
+                actions.push((Action::Update, format!("output.{name}")));
+            }
+        }
         actions.sort_by(|a, b| a.1.cmp(&b.1));
-        Ok((actions.clone(), fingerprint(&actions)))
+        covered[4..].sort();
+        Ok((actions, fingerprint(&covered)))
+    }
+
+    /// The lineage and serial of the resource's state, or `none`.
+    fn state_version(&self, req: &DriverRequest) -> String {
+        fs::read_to_string(self.state_file(req))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .map_or_else(
+                || "none".into(),
+                |s| format!("{} {}", s["lineage"], s["serial"]),
+            )
     }
 
     /// Applies the saved plan, refusing destructive changes without a matching
-    /// permit.
+    /// permit. What the apply runs is retained first; any failure once the
+    /// apply starts is uncertain.
     async fn apply_run(
         &self,
         run: &mut Run,
@@ -671,12 +821,15 @@ impl OpenTofu {
                 destructive.join(", ")
             )));
         }
+        self.retain(req, run)?;
         self.tofu(
             run,
             "apply failed",
             &["apply", "-input=false", "openporch.tfplan"],
+            exec::Stdout::Logged,
         )
-        .await?;
+        .await
+        .map_err(Failure::after_apply)?;
         Ok(())
     }
 
@@ -684,24 +837,56 @@ impl OpenTofu {
     /// redacted from the log.
     async fn outputs(&self, run: &mut Run) -> Result<DriverOutputs, Failure> {
         let out = self
-            .tofu(run, "reading outputs failed", &["output", "-json"])
+            .tofu(
+                run,
+                "reading outputs failed",
+                &["output", "-json"],
+                exec::Stdout::Withheld,
+            )
             .await?;
         let outputs: Map<String, Value> = serde_json::from_str(&out.stdout)
             .map_err(|_| Failure::Io("`tofu output -json` printed no outputs".into()))?;
         Ok(split_outputs(outputs, &mut run.log))
     }
 
-    /// Keeps what later calls need, once the apply succeeded.
-    fn retain(&self, req: &DriverRequest, run: &Run) -> Result<Option<Cookie>, Failure> {
+    /// Keeps what later calls need: the lock file, the script and the source
+    /// commit about to be applied.
+    fn retain(&self, req: &DriverRequest, run: &Run) -> Result<(), Failure> {
         let state = self.state_dir(req);
         let lock = run.module.join(LOCK_FILE);
         if lock.exists() {
-            fs::copy(&lock, state.join(LOCK_FILE)).map_err(Failure::io)?;
+            let content = fs::read(&lock).map_err(Failure::io)?;
+            files::write_private(&state.join(LOCK_FILE), &content).map_err(Failure::io)?;
         }
-        if run.retained.source.is_none() {
-            let script = fs::read(run.module.join("main.tf")).map_err(Failure::io)?;
-            files::write_private(&state.join(RETAINED_SCRIPT), &script).map_err(Failure::io)?;
+        let script_name = if run.retained.source.is_some() {
+            "override.tf"
+        } else {
+            "main.tf"
+        };
+        match fs::read(run.module.join(script_name)) {
+            Ok(script) => {
+                files::write_private(&state.join(RETAINED_SCRIPT), &script).map_err(Failure::io)?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match fs::remove_file(state.join(RETAINED_SCRIPT)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Failure::io(e));
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => return Err(Failure::io(e)),
         }
+        let data = serde_json::to_string(&run.retained).map_err(|e| Failure::Io(e.to_string()))?;
+        files::write_private(&state.join(RETAINED_FILE), data.as_bytes()).map_err(Failure::io)?;
+        match fs::remove_file(state.join(DELETED_MARKER)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Failure::io(e)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The cookie recording what `run` applied.
+    fn cookie(run: &Run) -> Result<Option<Cookie>, Failure> {
         let data = serde_json::to_string(&run.retained).map_err(|e| Failure::Io(e.to_string()))?;
         Cookie::new(COOKIE_VERSION, data)
             .map(Some)
@@ -720,43 +905,70 @@ impl OpenTofu {
         for line in log.redacted().lines() {
             req.log.line(line);
         }
-        result.map_err(|f| match f {
-            Failure::Input(m) => DriverError::Invalid {
-                code: Some(CODE_INPUT.into()),
-                message: log.redact(&m),
-            },
-            Failure::Permit(m) => DriverError::Invalid {
-                code: Some(CODE_PERMIT.into()),
-                message: m,
-            },
-            Failure::Io(m) => DriverError::Invalid {
-                code: Some(CODE_FAILED.into()),
-                message: log.redact(&m),
-            },
-            Failure::Command { what, stderr } => {
-                let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-                let tail = lines[lines.len().saturating_sub(ERROR_LINES)..].join("\n");
-                let mut message = format!("{what}:\n{}", log.redact(&tail));
-                if append_logs {
-                    let full = log.redacted();
-                    let start = full.len().saturating_sub(MAX_ERROR_LOG_BYTES);
-                    let start = (start..full.len())
-                        .find(|i| full.is_char_boundary(*i))
-                        .unwrap_or(full.len());
-                    message.push_str("\n\nFull log:\n");
-                    message.push_str(&full[start..]);
-                }
-                DriverError::Invalid {
+        result.map_err(|f| {
+            let uncertain = matches!(f, Failure::Uncertain { .. });
+            match f {
+                Failure::Input(m) => DriverError::Invalid {
+                    code: Some(CODE_INPUT.into()),
+                    message: log.redact(&m),
+                },
+                Failure::Permit(m) => DriverError::Invalid {
+                    code: Some(CODE_PERMIT.into()),
+                    message: m,
+                },
+                Failure::Io(m) => DriverError::Invalid {
                     code: Some(CODE_FAILED.into()),
-                    message,
+                    message: log.redact(&m),
+                },
+                Failure::Command { what, stderr } | Failure::Uncertain { what, stderr } => {
+                    // Redacted before cutting, so no secret is split.
+                    let stderr = log.redact(&stderr);
+                    let lines: Vec<&str> =
+                        stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+                    let tail = lines[lines.len().saturating_sub(ERROR_LINES)..].join("\n");
+                    let mut message = format!("{}:\n{tail}", log.redact(&what));
+                    if uncertain {
+                        message.insert_str(0, "infrastructure may have changed: ");
+                    }
+                    if append_logs {
+                        let full = log.redacted();
+                        let start = full.len().saturating_sub(MAX_ERROR_LOG_BYTES);
+                        let start = (start..full.len())
+                            .find(|i| full.is_char_boundary(*i))
+                            .unwrap_or(full.len());
+                        message.push_str("\n\nFull log:\n");
+                        message.push_str(&full[start..]);
+                    }
+                    if uncertain {
+                        DriverError::Uncertain(message)
+                    } else {
+                        DriverError::Invalid {
+                            code: Some(CODE_FAILED.into()),
+                            message,
+                        }
+                    }
                 }
             }
         })
     }
 
-    fn retained(req: &DriverRequest) -> Result<Option<Retained>, DriverError> {
+    /// What the last apply ran: kept with the state, or from the cookie.
+    fn retained(&self, req: &DriverRequest) -> Result<Retained, DriverError> {
+        match fs::read_to_string(self.state_dir(req).join(RETAINED_FILE)) {
+            Ok(text) => {
+                return serde_json::from_str(&text).map_err(|_| {
+                    DriverError::Uncertain("the resource's retained source is not readable".into())
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(DriverError::Uncertain(
+                    "the resource's retained source cannot be read".into(),
+                ));
+            }
+        }
         let Some(c) = &req.cookie else {
-            return Ok(None);
+            return Ok(Retained::default());
         };
         if c.version != COOKIE_VERSION {
             return Err(DriverError::Uncertain(format!(
@@ -765,7 +977,6 @@ impl OpenTofu {
             )));
         }
         serde_json::from_str(&c.data)
-            .map(Some)
             .map_err(|_| DriverError::Uncertain("the resource's cookie is not readable".into()))
     }
 
@@ -781,10 +992,10 @@ impl OpenTofu {
         req: &DriverRequest,
         run: &mut Run,
     ) -> Result<(DriverOutputs, Option<Cookie>), Failure> {
-        let (actions, fp) = self.plan_run(run, false).await?;
+        let (actions, fp) = self.plan_run(run, req, false).await?;
         self.apply_run(run, req, &actions, &fp).await?;
-        let outputs = self.outputs(run).await?;
-        let cookie = self.retain(req, run)?;
+        let outputs = self.outputs(run).await.map_err(Failure::after_apply)?;
+        let cookie = Self::cookie(run).map_err(Failure::after_apply)?;
         Ok((outputs, cookie))
     }
 }
@@ -793,7 +1004,7 @@ fn check_env_name(name: &str) -> Result<(), Failure> {
     let ok = !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && !name.as_bytes()[0].is_ascii_digit()
-        && !matches!(name, "PATH" | "HOME")
+        && !matches!(name, "PATH" | "HOME" | "AWS_EC2_METADATA_DISABLED")
         && !name.starts_with("TF_");
     if ok {
         Ok(())
@@ -804,13 +1015,35 @@ fn check_env_name(name: &str) -> Result<(), Failure> {
     }
 }
 
-/// A fingerprint of planned actions.
-fn fingerprint(actions: &[(Action, String)]) -> String {
+/// A plan's fingerprint: a hash of what a permit for it covers.
+fn fingerprint(covered: &[String]) -> String {
     let mut h = Sha256::new();
-    for (a, addr) in actions {
-        h.update(format!("{a:?} {addr}\n").as_bytes());
+    for line in covered {
+        h.update(line.as_bytes());
+        h.update(b"\n");
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The action kinds of a plan change, such as `["delete", "create"]`.
+fn kinds(change: &Value) -> Vec<&str> {
+    change["actions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// Every scalar in `v` as text, at any depth.
+fn scalars(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Number(n) => out.push(n.to_string()),
+        Value::Bool(_) | Value::Null => {}
+        Value::Array(a) => a.iter().for_each(|v| scalars(v, out)),
+        Value::Object(m) => m.values().for_each(|v| scalars(v, out)),
+    }
 }
 
 /// Splits `tofu output -json` (or state outputs) into values and secrets, and
@@ -822,7 +1055,7 @@ fn split_outputs(outputs: Map<String, Value>, log: &mut RunLog) -> DriverOutputs
     for (name, o) in outputs {
         let value = o.get("value").cloned().unwrap_or(Value::Null);
         if o.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
-            strings(&value, &mut redact);
+            scalars(&value, &mut redact);
             secrets.insert(name, value);
         } else {
             values.insert(name, value);
@@ -843,9 +1076,10 @@ impl Driver for OpenTofu {
 
     fn plan<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async move {
+            self.state(req)?;
             let planned = self
                 .with_run(req, SourceAt::Current, async |run| {
-                    self.plan_run(run, false).await
+                    self.plan_run(run, req, false).await
                 })
                 .await?;
             Ok(to_plan(planned))
@@ -854,13 +1088,13 @@ impl Driver for OpenTofu {
 
     fn plan_delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async move {
-            if !self.state_file(req).exists() {
+            if self.state(req)? == State::Absent {
                 return Ok(Plan::NoEffects);
             }
-            let retained = Self::retained(req)?.unwrap_or_default();
+            let retained = self.retained(req)?;
             let planned = self
                 .with_run(req, SourceAt::Retained(&retained), async |run| {
-                    self.plan_run(run, true).await
+                    self.plan_run(run, req, true).await
                 })
                 .await?;
             Ok(to_plan(planned))
@@ -869,6 +1103,7 @@ impl Driver for OpenTofu {
 
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
         Box::pin(async move {
+            self.state(req)?;
             let (outputs, cookie) = self
                 .with_run(req, SourceAt::Current, async |run| {
                     self.put_inner(req, run).await
@@ -880,12 +1115,17 @@ impl Driver for OpenTofu {
 
     fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
         Box::pin(async move {
-            let path = self.state_file(req);
-            let text = match fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Observation::Absent);
+            match self.state(req) {
+                Ok(State::Present) => {}
+                Ok(State::Absent) => return Ok(Observation::Absent),
+                Err(e) => {
+                    return Ok(Observation::Unknown {
+                        reason: e.to_string(),
+                    });
                 }
+            }
+            let text = match fs::read_to_string(self.state_file(req)) {
+                Ok(t) => t,
                 Err(_) => {
                     return Ok(Observation::Unknown {
                         reason: "the resource's state cannot be read".into(),
@@ -908,15 +1148,20 @@ impl Driver for OpenTofu {
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         Box::pin(async move {
             // Nothing was applied, or an earlier delete finished.
-            if !self.state_file(req).exists() {
+            if self.state(req)? == State::Absent {
                 return Ok(DeleteOutcome::Deleted);
             }
-            let retained = Self::retained(req)?.unwrap_or_default();
+            let retained = self.retained(req)?;
             self.with_run(req, SourceAt::Retained(&retained), async |run| {
-                let (actions, fp) = self.plan_run(run, true).await?;
+                let (actions, fp) = self.plan_run(run, req, true).await?;
                 self.apply_run(run, req, &actions, &fp).await?;
-                // Only confirmed destruction removes the state.
-                fs::remove_dir_all(self.state_dir(req)).map_err(Failure::io)
+                // Only confirmed destruction removes the state, leaving a marker
+                // that it was deleted.
+                let state = self.state_dir(req);
+                let removed = fs::remove_dir_all(&state)
+                    .and_then(|()| files::private_dir(&state))
+                    .and_then(|()| files::write_private(&state.join(DELETED_MARKER), b""));
+                removed.map_err(|e| Failure::io(e).after_apply())
             })
             .await?;
             Ok(DeleteOutcome::Deleted)

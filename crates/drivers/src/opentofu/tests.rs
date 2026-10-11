@@ -122,6 +122,26 @@ async fn inputs_are_checked_before_anything_runs() {
             json!({"tokens": {"bad host": "t"}}),
             "is not a host name",
         ),
+        (
+            json!({"script": "", "files": {"z_override.tf": "terraform {}"}}),
+            json!({}),
+            "would replace the script, the backend",
+        ),
+        (
+            json!({"script": "", "files": {"main.tf": ""}}),
+            json!({}),
+            "would replace the script",
+        ),
+        (
+            json!({"script": "", "files": {".terraform/x": ""}}),
+            json!({}),
+            "OpenTofu's own files",
+        ),
+        (
+            json!({"source": {"url": "ssh://git:pw@git.example/m"}}),
+            json!({}),
+            "must not contain credentials",
+        ),
     ] {
         let err = d.put(&request(values, secrets)).await.unwrap_err();
         let (code, message) = invalid(err);
@@ -184,6 +204,7 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
     assert!(record.contains("AWS_ACCESS_KEY_ID=AKIAFAKE"));
     assert!(record.contains("TF_TOKEN_app_terraform_io=tfc-token-1"));
     assert!(record.contains("TF_IN_AUTOMATION=1"));
+    assert!(record.contains("AWS_EC2_METADATA_DISABLED=true"));
     assert!(record.contains(r#""api_token":"hunter2-token""#));
     assert!(record.contains(r#""secret_key":"aws-secret-1""#));
     assert!(record.contains(r#"{"length":12}"#));
@@ -207,14 +228,108 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
         !log.contains("generated-pw-123") && !log.contains("hunter2-token"),
         "{log}"
     );
+    // Machine-readable output, which holds every value, is not logged.
+    assert!(!log.contains("resource_changes"), "{log}");
+    assert!(log.contains("bytes of output not logged"), "{log}");
 
     // The run directory, with its secret files, is gone.
     let runs = root.path().join("runs/0123456789abcdef0123456789abcdef");
     assert_eq!(std::fs::read_dir(runs).unwrap().count(), 0);
-    // State lives outside it, owner-only.
+    // State lives outside it, owner-only, with what the apply ran.
     let state = root.path().join("state/0123456789abcdef0123456789abcdef");
-    let mode = std::fs::metadata(state).unwrap().permissions().mode();
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
+    assert!(state.join("script.tf").exists());
+    assert!(state.join("retained.json").exists());
+}
+
+/// A driver whose `tofu` is [`FAKE_TOFU`] with `edit` applied, recording to
+/// `<root>/record.log`.
+fn fake_driver(root: &Path, edit: impl Fn(&str) -> String) -> OpenTofu {
+    let fake = root.join("fake-tofu");
+    let record = root.join("record.log");
+    let script = FAKE_TOFU.replace("\"$FAKE_TOFU_LOG\"", &format!("'{}'", record.display()));
+    std::fs::write(&fake, edit(&script)).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut d = driver(root);
+    d.config.tofu = fake;
+    d
+}
+
+#[tokio::test]
+async fn a_failed_apply_is_uncertain_and_keeps_what_it_ran() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), |s| {
+        s.replace(
+            r#"apply) echo "applied"#,
+            r##"apply) echo "partial apply failed" >&2; exit 1; echo ""##,
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    match d.put(&req).await.unwrap_err() {
+        DriverError::Uncertain(m) => assert!(m.contains("partial apply failed"), "{m}"),
+        other => panic!("expected uncertain, got {other:?}"),
+    }
+    // A later delete plans with the script the failed apply ran.
+    let state = root.path().join("state/0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        std::fs::read_to_string(state.join("script.tf")).unwrap(),
+        "terraform {}"
+    );
+    assert!(state.join("retained.json").exists());
+}
+
+#[tokio::test]
+async fn lost_state_needs_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), str::to_owned);
+    let mut req = request(json!({"script": "terraform {}"}), json!({}));
+    req.cookie = Some(Cookie::new(COOKIE_VERSION, "{}").unwrap());
+    // Applied before (there is a cookie) but no state: never start afresh.
+    assert!(matches!(d.put(&req).await, Err(DriverError::Uncertain(_))));
+    assert!(matches!(d.plan(&req).await, Err(DriverError::Uncertain(_))));
+    assert!(matches!(
+        d.delete(&req).await,
+        Err(DriverError::Uncertain(_))
+    ));
+    assert!(matches!(
+        d.plan_delete(&req).await,
+        Err(DriverError::Uncertain(_))
+    ));
+    assert!(matches!(
+        d.get(&req).await.unwrap(),
+        Observation::Unknown { .. }
+    ));
+    assert!(!root.path().join("record.log").exists());
+}
+
+#[tokio::test]
+async fn permits_cover_one_resource_and_one_kind_of_call() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), |s| {
+        s.replace(
+            r#""actions":["create"]"#,
+            r#""actions":["delete","create"]"#,
+        )
+    });
+    let plan = async |guresid: &str, fingerprint: &str| {
+        let mut req = request(json!({"script": "terraform {}"}), json!({}));
+        req.guresid = Guresid::new(guresid).unwrap();
+        req.operation.fingerprint = fingerprint.into();
+        let Plan::Actions {
+            actions,
+            fingerprint,
+        } = d.plan(&req).await.unwrap()
+        else {
+            panic!("no actions");
+        };
+        assert_eq!(actions, [(Action::Replace, "random_password.p".to_owned())]);
+        fingerprint
+    };
+    let a = plan("0123456789abcdef0123456789abcdef", "f1").await;
+    assert_eq!(a, plan("0123456789abcdef0123456789abcdef", "f1").await);
+    assert_ne!(a, plan("fedcba9876543210fedcba9876543210", "f1").await);
+    assert_ne!(a, plan("0123456789abcdef0123456789abcdef", "f2").await);
 }
 
 const PASSWORD_MODULE: &str = r#"
@@ -236,6 +351,15 @@ output "password" {
 output "length" { value = var.length }
 output "label_length" { value = length(nonsensitive(var.label)) }
 "#;
+
+/// Planned actions on resources, leaving out outputs.
+fn resources(actions: &[(Action, String)]) -> Vec<(Action, String)> {
+    actions
+        .iter()
+        .filter(|(_, address)| !address.starts_with("output."))
+        .cloned()
+        .collect()
+}
 
 fn password_request(length: u32) -> DriverRequest {
     request(
@@ -267,6 +391,9 @@ async fn opentofu_runs_a_local_module_end_to_end() {
     let log = lines.lock().unwrap().join("\n");
     assert!(log.contains("$ tofu apply"), "{log}");
     assert!(!log.contains(&password), "{log}");
+    let escaped = serde_json::to_string(&password).unwrap();
+    let escaped = &escaped[1..escaped.len() - 1];
+    assert!(!log.contains(escaped), "{log}");
     assert!(!log.contains("label-secret-value"), "{log}");
 
     // Observing reads the state.
@@ -294,7 +421,10 @@ async fn opentofu_runs_a_local_module_end_to_end() {
     else {
         panic!("no actions");
     };
-    assert_eq!(actions, [(Action::Replace, "random_password.p".to_owned())]);
+    assert_eq!(
+        resources(&actions),
+        [(Action::Replace, "random_password.p".to_owned())]
+    );
     let (code, message) = invalid(d.put(&longer).await.unwrap_err());
     assert_eq!(code, "TOFU-002");
     assert!(message.contains("random_password.p"), "{message}");
@@ -321,13 +451,16 @@ async fn opentofu_runs_a_local_module_end_to_end() {
     else {
         panic!("no destroy actions");
     };
-    assert_eq!(actions, [(Action::Delete, "random_password.p".to_owned())]);
+    assert_eq!(
+        resources(&actions),
+        [(Action::Delete, "random_password.p".to_owned())]
+    );
     del.permit = Some(fingerprint);
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
     assert!(
         !root
             .path()
-            .join("state/0123456789abcdef0123456789abcdef")
+            .join("state/0123456789abcdef0123456789abcdef/terraform.tfstate")
             .exists()
     );
     assert_eq!(d.get(&del).await.unwrap(), Observation::Absent);
