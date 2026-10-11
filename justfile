@@ -14,6 +14,10 @@ test:
 e2e:
     cargo test --workspace -- --ignored
 
+# Run every example in docs/api.md and docs/security.md against a dev server.
+docs:
+    cargo test -p openporch-server --test docs
+
 # Check dependency licenses, advisories and sources.
 deny:
     cargo deny check
