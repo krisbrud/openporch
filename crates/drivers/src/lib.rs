@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 mod echo;
 mod http;
 mod none;
+mod opentofu;
 mod registry;
 mod run;
 mod template;
@@ -28,6 +29,7 @@ pub use http::{
     PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER, check_target,
 };
 pub use none::NoneDriver;
+pub use opentofu::{Config as OpenTofuConfig, OpenTofu};
 pub use registry::{DriverRegistry, RegistryError};
 pub use run::{
     DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
@@ -163,6 +165,49 @@ pub struct DriverRequest {
     pub context: DriverContext,
     /// The cookie from the previous call for this GUResID.
     pub cookie: Option<Cookie>,
+    /// The plan fingerprint a permit authorizes, when the call may destroy or
+    /// replace infrastructure. A driver that previews refuses destructive
+    /// changes whose fingerprint does not match.
+    pub permit: Option<String>,
+    /// Where the driver writes its run log, already redacted.
+    pub log: LogSink,
+}
+
+/// Receives a driver's log lines. Lines are redacted before they are sent.
+#[derive(Clone, Default)]
+pub struct LogSink(Option<std::sync::Arc<LineFn>>);
+
+type LineFn = dyn Fn(&str) + Send + Sync;
+
+impl LogSink {
+    /// A sink that passes each line to `f`.
+    pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(f)))
+    }
+
+    /// Writes one line.
+    pub fn line(&self, line: &str) {
+        if let Some(f) = &self.0 {
+            f(line);
+        }
+    }
+}
+
+impl fmt::Debug for LogSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "LogSink"
+        } else {
+            "LogSink(none)"
+        })
+    }
+}
+
+/// Sinks are not part of a request's identity.
+impl PartialEq for LogSink {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// A Kubernetes manifest with where it goes. It may be a `Secret`, so `Debug`
@@ -342,6 +387,11 @@ pub trait Driver: Send + Sync + fmt::Debug {
 
     /// Previews a `put` without changing anything.
     fn plan<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
+        Box::pin(async { Ok(Plan::Unknown) })
+    }
+
+    /// Previews a `delete` without changing anything.
+    fn plan_delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async { Ok(Plan::Unknown) })
     }
 

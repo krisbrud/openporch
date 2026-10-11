@@ -71,3 +71,18 @@ jobs:
           }"
       - name: Account check
         run: cargo test -p openporch-engine real_account_check -- --ignored
+
+  opentofu:
+    name: OpenTofu driver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.11.5
+          tofu_wrapper: false
+      - name: End-to-end OpenTofu runs
+        run: cargo test -p openporch-drivers opentofu -- --ignored

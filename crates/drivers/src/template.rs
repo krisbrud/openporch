@@ -207,6 +207,10 @@ impl Driver for Template {
         })
     }
 
+    fn plan_delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
+        Box::pin(async { Ok(Plan::NoEffects) })
+    }
+
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
         Box::pin(async move {
             let (outputs, cookie) = self.render(req)?;

@@ -39,6 +39,15 @@ impl DriverRegistry {
         registry
     }
 
+    /// Adds the built-in OpenTofu driver, which needs a place for its runs and
+    /// state.
+    pub fn with_opentofu(mut self, config: crate::OpenTofuConfig) -> Self {
+        let driver = crate::OpenTofu::new(config);
+        self.drivers
+            .insert(driver.info().id.clone(), Arc::new(driver));
+        self
+    }
+
     /// Registers a non-built-in driver.
     pub fn register(&mut self, driver: Arc<dyn Driver>) -> Result<(), RegistryError> {
         let id = driver.info().id.clone();

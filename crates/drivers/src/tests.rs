@@ -28,6 +28,8 @@ fn request() -> DriverRequest {
         credentials: None,
         context: DriverContext::default(),
         cookie: None,
+        permit: None,
+        log: LogSink::default(),
     }
 }
 
@@ -553,6 +555,8 @@ fn registry_holds_builtins_and_reserves_their_namespace() {
         ["openporch/echo", "openporch/none", "openporch/template"]
     );
     assert!(registry.get("openporch/echo").is_some());
+    let with_tofu = DriverRegistry::with_builtins().with_opentofu(OpenTofuConfig::new("/tmp/x"));
+    assert!(with_tofu.get("openporch/opentofu").is_some());
     assert!(registry.get("acme/slow").is_none());
 
     let with_id = |id: &str| {
