@@ -9,6 +9,7 @@ mod health;
 mod login;
 mod members;
 mod sets;
+mod values;
 
 #[cfg(test)]
 pub(crate) use members::INVITATION_TTL_MS;
@@ -234,6 +235,79 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/deltas/{delta}",
             App(AppPerm::Configure),
             sets::replace_delta,
+        )
+        // Shared values; handlers add the deployer gate.
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/values",
+            App(AppPerm::Read),
+            values::app_list,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/values",
+            App(AppPerm::Configure),
+            values::app_create,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/values/versions",
+            App(AppPerm::Read),
+            values::app_versions,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/values/{key}",
+            App(AppPerm::Read),
+            values::app_get,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/apps/{app}/values/{key}",
+            App(AppPerm::Configure),
+            values::app_replace,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/apps/{app}/values/{key}",
+            App(AppPerm::Configure),
+            values::app_delete,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values",
+            App(AppPerm::Read),
+            values::env_list,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values",
+            App(AppPerm::Configure),
+            values::env_create,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values/versions",
+            App(AppPerm::Read),
+            values::env_versions,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values/{key}",
+            App(AppPerm::Read),
+            values::env_get,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values/{key}",
+            App(AppPerm::Configure),
+            values::env_replace,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/apps/{app}/envs/{env}/values/{key}",
+            App(AppPerm::Configure),
+            values::env_delete,
         )
         // Environment types.
         .route(

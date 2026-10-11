@@ -512,6 +512,41 @@ pub(crate) async fn check_configure_authority(
     }
 }
 
+/// Changing values needs configure authority and `deployer` on the environment's
+/// type, or, for application values, on the type of every environment of the
+/// application; checked inside the transaction that makes the change.
+pub(crate) async fn check_values_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    app: &str,
+    env: Option<&str>,
+) -> Result<()> {
+    check_configure_authority(conn, org, actor, app).await?;
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let roles = roles_in(conn, org, actor).await?;
+    if roles.org == Some(OrgRole::Administrator) {
+        return Ok(());
+    }
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT type FROM envs WHERE org_id = ? AND app_id = ? \
+         AND (?3 IS NULL OR id = ?3) ORDER BY type",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .fetch_all(&mut *conn)
+    .await?;
+    match types.iter().find(|t| !roles.deployer.contains(*t)) {
+        None => Ok(()),
+        Some(t) => Err(StoreError::Forbidden(format!(
+            "requires the `deployer` role on environment type `{t}`"
+        ))),
+    }
+}
+
 /// Creating or deleting an environment needs `developer` or `owner` on the application
 /// and `deployer` on the environment type (administrators hold both), checked inside
 /// the transaction.
