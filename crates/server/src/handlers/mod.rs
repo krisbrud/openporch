@@ -8,6 +8,7 @@ mod envs;
 mod health;
 mod login;
 mod members;
+mod sets;
 
 #[cfg(test)]
 pub(crate) use members::INVITATION_TTL_MS;
@@ -190,6 +191,49 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/envs/{env}",
             App(AppPerm::Deploy),
             envs::delete,
+        )
+        // Sets and deltas.
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/sets/{set}",
+            App(AppPerm::Read),
+            sets::get,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/sets/{set}",
+            App(AppPerm::Configure),
+            sets::apply,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/sets/{set}/diff/{other}",
+            App(AppPerm::Read),
+            sets::diff,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/deltas",
+            App(AppPerm::Read),
+            sets::list_deltas,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/deltas",
+            App(AppPerm::Configure),
+            sets::create_delta,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/deltas/{delta}",
+            App(AppPerm::Read),
+            sets::get_delta,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/apps/{app}/deltas/{delta}",
+            App(AppPerm::Configure),
+            sets::replace_delta,
         )
         // Environment types.
         .route(

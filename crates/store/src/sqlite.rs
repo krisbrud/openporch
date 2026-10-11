@@ -293,6 +293,19 @@ fn new_guresid() -> Guresid {
     Guresid::from_bytes(bytes)
 }
 
+type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
+
+fn delta_record((id, env, content, frozen_at, created_by): DeltaRow) -> Result<DeltaRecord> {
+    Ok(DeltaRecord {
+        content: serde_json::from_str(&content)
+            .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
+        id,
+        env,
+        frozen: frozen_at.is_some(),
+        created_by,
+    })
+}
+
 impl Store for SqliteStore {
     async fn record_audit(&self, intent: AuditIntent) -> Result<String> {
         self.check_org(&intent.org)?;
@@ -633,7 +646,6 @@ impl Store for SqliteStore {
 
     async fn delta(&self, org: &str, app: &str, id: &str) -> Result<Option<DeltaRecord>> {
         self.check_org(org)?;
-        type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
         let row: Option<DeltaRow> = sqlx::query_as(
             "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
                  WHERE org_id = ? AND app_id = ? AND id = ?",
@@ -643,17 +655,20 @@ impl Store for SqliteStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(id, env, content, frozen_at, created_by)| {
-            Ok(DeltaRecord {
-                content: serde_json::from_str(&content)
-                    .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
-                id,
-                env,
-                frozen: frozen_at.is_some(),
-                created_by,
-            })
-        })
-        .transpose()
+        row.map(delta_record).transpose()
+    }
+
+    async fn deltas(&self, org: &str, app: &str) -> Result<Vec<DeltaRecord>> {
+        self.check_org(org)?;
+        let rows: Vec<DeltaRow> = sqlx::query_as(
+            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+                 WHERE org_id = ? AND app_id = ? ORDER BY created_at DESC, id",
+        )
+        .bind(org)
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(delta_record).collect()
     }
 
     async fn set(&self, org: &str, app: &str, id: &str) -> Result<Option<DeploymentSet>> {

@@ -146,6 +146,10 @@ pub trait Store: Send + Sync {
         id: &str,
     ) -> impl Future<Output = Result<Option<DeltaRecord>>> + Send;
 
+    /// Lists an application's deltas, most recently created first.
+    fn deltas(&self, org: &str, app: &str)
+    -> impl Future<Output = Result<Vec<DeltaRecord>>> + Send;
+
     /// Reads a stored deployment set.
     fn set(
         &self,
