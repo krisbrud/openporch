@@ -32,12 +32,12 @@ fn examples(text: &str) -> Vec<Example> {
     let mut blocks: Vec<(usize, String, String)> = Vec::new();
     let mut lines = text.lines().enumerate();
     while let Some((n, line)) = lines.next() {
-        let Some(lang) = line.strip_prefix("```") else {
+        let Some(lang) = line.trim_start().strip_prefix("```") else {
             continue;
         };
         let mut body = Vec::new();
         for (_, l) in lines.by_ref() {
-            if l.starts_with("```") {
+            if l.trim_start().starts_with("```") {
                 break;
             }
             body.push(l);
@@ -62,7 +62,10 @@ fn examples(text: &str) -> Vec<Example> {
                 );
                 last.response = Some(body);
             }
-            _ => {}
+            other => assert!(
+                !other.starts_with("http"),
+                "line {line}: unknown example block `{other}`"
+            ),
         }
     }
     out
@@ -229,7 +232,9 @@ async fn run(file: &Path) {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| panic!("{at}: bad status line `{status_line}`"));
         assert_eq!(status, want, "{at}: {first} returned {actual}");
-        if !expected.is_empty() {
+        if expected.is_empty() {
+            assert_eq!(actual, Value::Null, "{at}: {first} returned a body");
+        } else {
             let pattern: Value = serde_json::from_str(expected)
                 .unwrap_or_else(|e| panic!("{at}: response body is not JSON: {e}"));
             if let Err(e) = matches(&pattern, &actual, &mut vars, "body") {
