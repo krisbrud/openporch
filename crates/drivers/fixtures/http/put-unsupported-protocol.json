@@ -1,0 +1,24 @@
+{
+  "description": "A response in another protocol version cannot be interpreted; after a mutation the outcome is uncertain.",
+  "call": "put",
+  "request": {
+    "method": "PUT",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "openporch-protocol": "openporch-http/2"
+    },
+    "body": {
+      "id": "0123456789abcdef0123456789abcdef"
+    }
+  },
+  "expect": {
+    "error": {
+      "kind": "uncertain",
+      "message": "the driver answered with protocol `openporch-http/2`; expected `openporch-http/1`",
+      "retryable": false
+    }
+  }
+}

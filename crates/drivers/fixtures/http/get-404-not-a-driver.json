@@ -1,0 +1,14 @@
+{
+  "description": "A 404 without Openporch-Protocol is not an absent resource.",
+  "call": "get",
+  "request": {
+    "method": "GET",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 404
+  },
+  "expect": {
+    "unknown": "the target answered 404 without `Openporch-Protocol`, so it may not be the driver; check the driver's target"
+  }
+}

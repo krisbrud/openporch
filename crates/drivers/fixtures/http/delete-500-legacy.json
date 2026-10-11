@@ -1,0 +1,7 @@
+{
+  "description": "A 5xx to DELETE from a driver that cannot deduplicate operations is uncertain.",
+  "call": "delete",
+  "request": {"method": "DELETE", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 500, "body": {"message": "boom"}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver answered 500 to a mutation: boom", "retryable": false}}
+}

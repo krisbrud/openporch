@@ -1,0 +1,20 @@
+{
+  "description": "POST /{guresid}/cancel stops the operation and reports what remains, for drivers with the cancel capability.",
+  "call": "cancel",
+  "capabilities": {
+    "cancel": true
+  },
+  "request": {
+    "method": "POST",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef/cancel"
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "openporch-protocol": "openporch-http/1"
+    }
+  },
+  "expect": {
+    "absent": null
+  }
+}

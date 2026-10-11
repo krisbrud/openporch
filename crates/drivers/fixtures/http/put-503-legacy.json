@@ -1,0 +1,7 @@
+{
+  "description": "A 5xx to a mutation from a driver that cannot deduplicate operations leaves the outcome uncertain.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 503},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver answered 503 to a mutation: the driver answered 503", "retryable": false}}
+}

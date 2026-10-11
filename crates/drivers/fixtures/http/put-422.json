@@ -1,0 +1,23 @@
+{
+  "description": "A 422 is a permanent validation failure like 400.",
+  "call": "put",
+  "request": {
+    "method": "PUT",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 422,
+    "body": {
+      "error": "RES-103",
+      "message": "name is too long"
+    }
+  },
+  "expect": {
+    "error": {
+      "kind": "invalid",
+      "code": "RES-103",
+      "message": "name is too long",
+      "retryable": false
+    }
+  }
+}

@@ -1865,10 +1865,13 @@ dependencies = [
 name = "openporch-drivers"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "minijinja",
  "openporch-core",
  "rand 0.8.8",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -1,0 +1,7 @@
+{
+  "description": "A cookie that is not <version>.<base64url> cannot be checkpointed.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 200, "headers": {"set-openporch-driver-cookie": "abc"}, "body": {"id": "0123456789abcdef0123456789abcdef"}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver returned a malformed cookie", "retryable": false}}
+}

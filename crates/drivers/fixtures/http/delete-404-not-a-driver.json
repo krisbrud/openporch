@@ -1,0 +1,18 @@
+{
+  "description": "A 404 without Openporch-Protocol may come from a proxy or a wrong path, so the resource is not assumed deleted.",
+  "call": "delete",
+  "request": {
+    "method": "DELETE",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 404
+  },
+  "expect": {
+    "error": {
+      "kind": "uncertain",
+      "message": "the target answered 404 without `Openporch-Protocol`, so it may not be the driver; check the driver's target",
+      "retryable": false
+    }
+  }
+}

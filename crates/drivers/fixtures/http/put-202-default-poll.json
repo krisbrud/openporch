@@ -1,0 +1,7 @@
+{
+  "description": "A 202 without Retry-After polls after 10 seconds.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 202},
+  "expect": {"in_progress": {"poll_after_secs": 10, "cookie": null}}
+}

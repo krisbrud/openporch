@@ -1,0 +1,7 @@
+{
+  "description": "A 429 was not acted on, so it may be retried after Retry-After.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 429, "headers": {"retry-after": "5"}},
+  "expect": {"error": {"kind": "transient", "message": "the driver answered 429", "retry_after_secs": 5, "retryable": true}}
+}

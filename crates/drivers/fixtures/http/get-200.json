@@ -1,0 +1,7 @@
+{
+  "description": "GET observes a ready resource.",
+  "call": "get",
+  "request": {"method": "GET", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 200, "body": {"id": "0123456789abcdef0123456789abcdef", "type": "postgres", "resource": {"values": {"host": "pg.internal"}}}},
+  "expect": {"ready": {"values": {"host": "pg.internal"}, "secrets": {}, "manifests": [], "cookie": null}}
+}

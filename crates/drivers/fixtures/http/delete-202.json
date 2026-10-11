@@ -1,0 +1,7 @@
+{
+  "description": "DELETE accepted; poll GET until 404.",
+  "call": "delete",
+  "request": {"method": "DELETE", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 202, "headers": {"retry-after": "20"}},
+  "expect": {"in_progress": {"poll_after_secs": 20, "cookie": null}}
+}
