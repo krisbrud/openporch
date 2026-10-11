@@ -145,11 +145,26 @@ struct Running {
     stop: Stop,
 }
 
+/// Kills what is left of an abandoned group and removes its run directory when
+/// dropped, so that even a cancelled reaper cleans up.
+struct Reap {
+    group: Pid,
+    dir: PathBuf,
+}
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = killpg(self.group, Signal::SIGKILL);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // `None` once the command has been reaped.
         let Some(group) = child.id().and_then(|id| i32::try_from(id).ok()) else {
             return;
         };
@@ -158,36 +173,43 @@ impl Drop for Running {
         let stop = self.stop.clone();
         let pipes = self.pipes.take();
         stop.abandoned.store(true, Ordering::SeqCst);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    let _hold = stop.hold;
-                    let exited = async {
-                        if let Some((mut out, mut err)) = pipes {
-                            let (mut sink_out, mut sink_err) =
-                                (tokio::io::sink(), tokio::io::sink());
-                            let _ = tokio::join!(
-                                tokio::io::copy(&mut out, &mut sink_out),
-                                tokio::io::copy(&mut err, &mut sink_err),
-                            );
-                        }
-                        child.wait().await
-                    };
-                    if tokio::time::timeout(stop.grace, exited).await.is_err() {
-                        let _ = killpg(group, Signal::SIGKILL);
-                        let _ = child.wait().await;
-                    }
-                    // Whatever the group started outlives nothing.
+        let reap = Reap {
+            group,
+            dir: stop.dir.clone(),
+        };
+        // Every caller runs in a runtime; without one there is no grace
+        // period, and `reap` kills the group at once.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _hold = stop.hold;
+                let _reap = reap;
+                let exited = async { tokio::join!(drain(pipes), wait_and_kill(&mut child, group)) };
+                if tokio::time::timeout(stop.grace, exited).await.is_err() {
                     let _ = killpg(group, Signal::SIGKILL);
-                    let _ = std::fs::remove_dir_all(&stop.dir);
-                });
-            }
-            Err(_) => {
-                let _ = killpg(group, Signal::SIGKILL);
-                let _ = std::fs::remove_dir_all(&stop.dir);
-            }
+                    let _ = child.wait().await;
+                }
+            });
         }
     }
+}
+
+/// Reads and discards a command's output until every writer closes it.
+async fn drain(pipes: Option<(ChildStdout, ChildStderr)>) {
+    if let Some((mut out, mut err)) = pipes {
+        let (mut sink_out, mut sink_err) = (tokio::io::sink(), tokio::io::sink());
+        let _ = tokio::join!(
+            tokio::io::copy(&mut out, &mut sink_out),
+            tokio::io::copy(&mut err, &mut sink_err),
+        );
+    }
+}
+
+/// Waits for the command, then kills whatever it left running in its group,
+/// which also closes any output pipes those processes held.
+async fn wait_and_kill(child: &mut Child, group: Pid) -> std::io::Result<std::process::ExitStatus> {
+    let status = child.wait().await;
+    let _ = killpg(group, Signal::SIGKILL);
+    status
 }
 
 /// Runs `program` with exactly `env` (plus [`PASSTHROUGH`]) in `dir`, in a
@@ -241,10 +263,14 @@ pub(super) async fn run(
         else {
             return Err(std::io::Error::other("the command is gone"));
         };
+        let Some(group) = group else {
+            return Err(std::io::Error::other("the command has no process ID"));
+        };
+        // Nothing the command started outlives it, nor keeps its output open.
         let (o, e, status) = tokio::join!(
             out.read_to_end(&mut stdout),
             err.read_to_end(&mut stderr),
-            child.wait()
+            wait_and_kill(child, Pid::from_raw(group))
         );
         o?;
         e?;
@@ -252,10 +278,6 @@ pub(super) async fn run(
     };
     running.child = None;
     running.pipes = None;
-    // Nothing the command started outlives it.
-    if let Some(group) = group {
-        let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
-    }
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
     match stdout_mode {

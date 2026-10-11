@@ -200,9 +200,9 @@ impl OpenTofu {
         if (req.cookie.is_some() || started) && !deleted {
             return Err(DriverError::Uncertain(format!(
                 "the resource was applied but its OpenTofu state is missing from {}; it needs \
-                 recovery: an operator restores the state, or confirms that nothing was created \
-                 and removes the resource's recovery record (`{}` under the driver's state \
-                 directory)",
+                 recovery: an operator restores the state, or removes whatever the resource \
+                 created and then creates an empty file named `deleted` in its record (`{}` \
+                 under the driver's state directory), so the next deploy starts afresh",
                 self.config.state.id(),
                 req.guresid.as_str()
             )));
@@ -221,6 +221,9 @@ enum State {
     /// An empty S3 workspace from a preview or a failed plan.
     Unapplied,
 }
+
+/// Files as they were, by path; `None` for a missing one.
+type SavedFiles = Vec<(PathBuf, Option<Vec<u8>>)>;
 
 /// A failure inside a run, before redaction.
 #[derive(Debug)]
@@ -593,6 +596,8 @@ impl OpenTofu {
                 .resources
                 .lock()
                 .map_err(|_| Failure::Io("the driver's resource locks are poisoned".into()))?;
+            // Forget resources nothing holds or waits for.
+            resources.retain(|_, m| Arc::strong_count(m) > 1);
             resources
                 .entry(req.guresid.as_str().to_owned())
                 .or_default()
@@ -1059,7 +1064,10 @@ impl OpenTofu {
         .await
         .map_err(|e| Failure::Io(format!("running `tofu`: {e}")))?;
         if !out.success {
-            if out.stderr.contains("Error acquiring the state lock") {
+            // Only when locking is the first error: output after a partial
+            // apply can quote the phrase.
+            let first_error = out.stderr.find("Error: ").map(|i| &out.stderr[i..]);
+            if first_error.is_some_and(|e| e.starts_with("Error: Error acquiring the state lock")) {
                 return Err(Failure::Locked(out.stderr));
             }
             return Err(Failure::command("tofu", what, &out.stderr));
@@ -1103,7 +1111,7 @@ impl OpenTofu {
             |_| "none".into(),
             |s| format!("{} {}", s["lineage"], s["serial"]),
         );
-        let lock_timeout = format!("-lock-timeout={}s", self.config.lock_timeout.as_secs());
+        let lock_timeout = self.lock_timeout();
         let mut args = vec![
             "plan",
             "-input=false",
@@ -1191,16 +1199,62 @@ impl OpenTofu {
                 destructive.join(", ")
             )));
         }
+        let before = self.retained_files(req)?;
         self.retain(req, run)?;
-        let lock_timeout = format!("-lock-timeout={}s", self.config.lock_timeout.as_secs());
-        self.tofu(
-            run,
-            "apply failed",
-            &["apply", "-input=false", &lock_timeout, "openporch.tfplan"],
-            exec::Stdout::Logged,
-        )
-        .await
-        .map_err(Failure::after_apply)?;
+        let lock_timeout = self.lock_timeout();
+        let result = self
+            .tofu(
+                run,
+                "apply failed",
+                &["apply", "-input=false", &lock_timeout, "openporch.tfplan"],
+                exec::Stdout::Logged,
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            // Nothing ran, so the record of a started apply is undone; it
+            // would otherwise make missing state look lost.
+            Err(Failure::Locked(stderr)) => {
+                Self::restore_retained_files(before)?;
+                Err(Failure::Locked(stderr))
+            }
+            Err(f) => Err(f.after_apply()),
+        }
+    }
+
+    fn lock_timeout(&self) -> String {
+        format!("-lock-timeout={}ms", self.config.lock_timeout.as_millis())
+    }
+
+    /// The retained record's files as they are, to restore if an apply never
+    /// starts.
+    fn retained_files(&self, req: &DriverRequest) -> Result<SavedFiles, Failure> {
+        let state = self.state_dir(req);
+        [LOCK_FILE, RETAINED_SCRIPT, RETAINED_FILE, DELETED_MARKER]
+            .into_iter()
+            .map(|name| {
+                let path = state.join(name);
+                match fs::read(&path) {
+                    Ok(data) => Ok((path, Some(data))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
+                    Err(e) => Err(Failure::io(e)),
+                }
+            })
+            .collect()
+    }
+
+    fn restore_retained_files(saved: SavedFiles) -> Result<(), Failure> {
+        for (path, data) in saved {
+            match data {
+                Some(data) => files::write_private(&path, &data).map_err(Failure::io)?,
+                None => match fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Failure::io(e));
+                    }
+                    _ => {}
+                },
+            }
+        }
         Ok(())
     }
 

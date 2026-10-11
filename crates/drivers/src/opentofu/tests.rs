@@ -302,6 +302,11 @@ async fn lost_state_needs_recovery() {
         Observation::Unknown { .. }
     ));
     assert!(!root.path().join("record.log").exists());
+    // The documented recovery, once nothing the resource created remains.
+    let record = root.path().join("state/0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(&record).unwrap();
+    std::fs::write(record.join("deleted"), "").unwrap();
+    d.put(&req).await.unwrap();
 }
 
 #[tokio::test]
@@ -930,8 +935,35 @@ async fn a_held_state_lock_is_a_conflict_and_never_bypassed() {
         other => panic!("expected a conflict, got {other:?}"),
     }
     let record = std::fs::read_to_string(root.path().join("record.log")).unwrap();
-    assert!(record.contains("-lock-timeout=30s"), "{record}");
+    assert!(record.contains("-lock-timeout=30000ms"), "{record}");
     assert!(!record.contains("force-unlock") && !record.contains("-lock=false"));
+}
+
+#[tokio::test]
+async fn a_lock_held_at_apply_time_leaves_no_record_of_an_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let locked = root.path().join("locked");
+    let d = fake_driver(root.path(), |s| {
+        s.replace(
+            "case \"$1\" in\n",
+            &format!(
+                "case \"$1\" in\n  apply) if [ -e '{}' ]; then printf 'Error: Error acquiring \
+                 the state lock\\n\\nLock Info:\\n  ID:        5c2d-77ab\\n' >&2; exit 1; fi ;;\n",
+                locked.display()
+            ),
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    std::fs::write(&locked, "").unwrap();
+    assert!(matches!(
+        d.put(&req).await.unwrap_err(),
+        DriverError::Conflict(_)
+    ));
+    let record = root.path().join("state/0123456789abcdef0123456789abcdef");
+    assert!(!record.join("retained.json").exists());
+    // Nothing ran, so missing state is not lost state.
+    std::fs::remove_file(&locked).unwrap();
+    d.put(&req).await.unwrap();
 }
 
 #[tokio::test]
@@ -1042,4 +1074,26 @@ resource "terraform_data" "slow" {
     d.put(&next).await.unwrap();
     let state = root.path().join("state/0123456789abcdef0123456789abcdef");
     assert!(!state.join(".terraform.tfstate.lock.info").exists());
+}
+
+#[tokio::test]
+async fn a_process_left_holding_the_output_does_not_hold_up_the_run() {
+    let root = tempfile::tempdir().unwrap();
+    let pid = root.path().join("lingering.pid");
+    let d = fake_driver(root.path(), |s| {
+        s.replacen(
+            "case \"$1\" in\n",
+            &format!(
+                "case \"$1\" in\n  init) sleep 300 & echo $! > '{}' ;;\n",
+                pid.display()
+            ),
+            1,
+        )
+    });
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    crate::with_timeout(std::time::Duration::from_secs(10), d.put(&req))
+        .await
+        .unwrap();
+    let pid = std::fs::read_to_string(pid).unwrap();
+    assert!(!alive(&pid), "{pid} still runs");
 }

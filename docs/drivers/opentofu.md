@@ -272,8 +272,12 @@ The same applies when state disappears. A resource whose cookie shows it was
 applied, but whose state is missing, is reported as needing recovery instead of
 being treated as new, which would create every object a second time. So is a
 resource whose first apply started, even one that failed partway before it had
-a cookie. To recover, restore the state, or delete what the resource created and
-remove its record under the driver's `state` directory.
+a cookie. To recover, restore the state. Or delete what the resource created,
+then create an empty file named `deleted` in the resource's record,
+`<root>/state/<GUResID>`, and the next deploy starts afresh. The record of a
+started apply lives in that same directory, so back it up along with local
+state: if the whole directory is lost before a first apply has a cookie, the
+driver cannot tell.
 
 The `backend` input, for state in a backend that the module chooses, is not
 supported yet.
@@ -302,16 +306,19 @@ Deleting again after a successful delete does nothing.
 
 ## Timeouts and locks
 
-Calls for one resource run one at a time. When a call times out, its commands
+Within one server process, calls for one resource run one at a time. When a call times out, its commands
 are interrupted with `SIGINT`, so that OpenTofu writes state and releases its
 lock. Whatever is still running after a grace period, one minute by default, is
 killed, including provider processes. The next call for the resource waits
 until all of them are gone.
 
-If another process holds the resource's state lock, the call waits for it
-(30 seconds by default), then fails as a conflict naming the lock ID. The driver
-never breaks a lock. When you are sure no run is using the state, release it
-with `tofu force-unlock <id>`.
+If another process holds the resource's state lock, plans and applies wait for
+it (30 seconds by default), then fail as a conflict naming the lock ID. A
+conflict means nothing was applied. The driver never breaks a lock. When you are
+sure no run is using the state, release it with `tofu force-unlock <id>` from a
+directory configured with the same backend: for local state, a `backend
+"local"` block whose `path` is `<root>/state/<GUResID>/terraform.tfstate`; for
+S3, the same bucket and prefix, with `TF_WORKSPACE` set to the GUResID.
 
 ## Errors and logs
 
