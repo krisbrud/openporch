@@ -257,7 +257,14 @@ async fn acceptance_records_job_desired_set_and_audit_together() {
             "shop",
             "d1",
             &json!({"modules": {}}),
-            audit("PUT", "/orgs/acme/apps/shop/deltas/d1"),
+            // The application's owner; deltas need `developer` or `owner`.
+            AuditIntent::accepted(
+                ORG,
+                "alice",
+                "PUT",
+                "/orgs/acme/apps/shop/deltas/d1",
+                "test",
+            ),
         )
         .await
         .unwrap();
@@ -288,7 +295,13 @@ async fn acceptance_records_job_desired_set_and_audit_together() {
             "shop",
             "d1",
             &json!({"modules": {"remove": ["web"]}}),
-            audit("PUT", "/orgs/acme/apps/shop/deltas/d1"),
+            AuditIntent::accepted(
+                ORG,
+                "alice",
+                "PUT",
+                "/orgs/acme/apps/shop/deltas/d1",
+                "test",
+            ),
         )
         .await
         .unwrap_err();

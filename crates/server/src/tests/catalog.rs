@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::{Server, assert_error, server};
 
 impl Server {
-    async fn put(&self, path: &str, token: &str, body: Value) -> (StatusCode, Value) {
+    pub(super) async fn put(&self, path: &str, token: &str, body: Value) -> (StatusCode, Value) {
         self.call(Method::PUT, path, Some(token), Some(body)).await
     }
 

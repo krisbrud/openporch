@@ -480,6 +480,38 @@ pub(crate) async fn check_app_authority(
     }
 }
 
+/// Changing an application's sets, deltas and values needs `developer` or `owner`
+/// on it, or administrator, and the application must still exist; checked inside
+/// the transaction that makes the change.
+pub(crate) async fn check_configure_authority(
+    conn: &mut SqliteConnection,
+    org: &str,
+    actor: Option<&str>,
+    app: &str,
+) -> Result<()> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM apps WHERE org_id = ? AND id = ?")
+        .bind(org)
+        .bind(app)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if exists.is_none() {
+        return Err(StoreError::NotFound(format!("application `{app}`")));
+    }
+    let Some(actor) = actor else {
+        return Ok(());
+    };
+    let roles = roles_in(conn, org, actor).await?;
+    if roles.org == Some(OrgRole::Administrator)
+        || roles.apps.get(app).copied() >= Some(AppRole::Developer)
+    {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden(format!(
+            "`{actor}` is not `developer` or `owner` on `{app}`"
+        )))
+    }
+}
+
 /// Creating or deleting an environment needs `developer` or `owner` on the application
 /// and `deployer` on the environment type (administrators hold both), checked inside
 /// the transaction.

@@ -11,7 +11,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditEntry, AuditIntent, AuditOutcome};
 use crate::deploy::*;
-use crate::identity::{check_admin_authority, check_env_authority};
+use crate::identity::{check_admin_authority, check_configure_authority, check_env_authority};
 use crate::secrets::{BUILTIN_STORE, Sealed};
 use crate::{Ownership, Result, Store, StoreError, now_ms};
 
@@ -291,6 +291,19 @@ fn new_guresid() -> Guresid {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     Guresid::from_bytes(bytes)
+}
+
+type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
+
+fn delta_record((id, env, content, frozen_at, created_by): DeltaRow) -> Result<DeltaRecord> {
+    Ok(DeltaRecord {
+        content: serde_json::from_str(&content)
+            .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
+        id,
+        env,
+        frozen: frozen_at.is_some(),
+        created_by,
+    })
 }
 
 impl Store for SqliteStore {
@@ -633,7 +646,6 @@ impl Store for SqliteStore {
 
     async fn delta(&self, org: &str, app: &str, id: &str) -> Result<Option<DeltaRecord>> {
         self.check_org(org)?;
-        type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
         let row: Option<DeltaRow> = sqlx::query_as(
             "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
                  WHERE org_id = ? AND app_id = ? AND id = ?",
@@ -643,17 +655,20 @@ impl Store for SqliteStore {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(id, env, content, frozen_at, created_by)| {
-            Ok(DeltaRecord {
-                content: serde_json::from_str(&content)
-                    .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
-                id,
-                env,
-                frozen: frozen_at.is_some(),
-                created_by,
-            })
-        })
-        .transpose()
+        row.map(delta_record).transpose()
+    }
+
+    async fn deltas(&self, org: &str, app: &str) -> Result<Vec<DeltaRecord>> {
+        self.check_org(org)?;
+        let rows: Vec<DeltaRow> = sqlx::query_as(
+            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+                 WHERE org_id = ? AND app_id = ? ORDER BY created_at DESC, id",
+        )
+        .bind(org)
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(delta_record).collect()
     }
 
     async fn set(&self, org: &str, app: &str, id: &str) -> Result<Option<DeploymentSet>> {
@@ -705,6 +720,34 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
+    async fn put_set_audited(
+        &self,
+        org: &str,
+        app: &str,
+        set: &DeploymentSet,
+        audit: AuditIntent,
+    ) -> Result<String> {
+        self.check_org(org)?;
+        let id = set.id();
+        let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
+        sqlx::query(
+            "INSERT INTO sets (org_id, app_id, id, algorithm, content, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, app_id, id) DO NOTHING",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(&id)
+        .bind(SET_ID_ALGORITHM)
+        .bind(set.canonical_json())
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     async fn put_delta(
         &self,
         org: &str,
@@ -716,6 +759,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let now = now_ms();
         let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
         let frozen: Option<Option<i64>> = sqlx::query_scalar(
             "SELECT frozen_at FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
         )
