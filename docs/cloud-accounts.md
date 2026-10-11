@@ -106,3 +106,31 @@ default. To run it:
 
 It assumes the role, checks that STS reports the `openporch-aws-prod` assumed-role
 session, and checks that a wrong external ID fails with `AccessDenied`.
+
+### Against Floci
+
+CI runs the same test against [Floci](https://floci.io), a local AWS emulator,
+in the `account check against Floci` job. Floci is started with
+`FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, so it evaluates the role's trust
+policy and refuses a wrong external ID. To run it locally with Docker and the AWS
+CLI:
+
+```sh
+docker run -d --name floci -p 4566:4566 \
+  -e FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true floci/floci:2.2.0
+export AWS_ENDPOINT_URL=http://localhost:4566 AWS_ACCESS_KEY_ID=test \
+  AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+caller=$(aws sts get-caller-identity --query Arn --output text)
+aws iam create-role --role-name openporch-test --assume-role-policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"$caller\"},
+    \"Action\": \"sts:AssumeRole\",
+    \"Condition\": {\"StringEquals\": {\"sts:ExternalId\": \"ext-123\"}}}]}"
+OPENPORCH_TEST_AWS_ROLE_ARN=arn:aws:iam::000000000000:role/openporch-test \
+OPENPORCH_TEST_AWS_EXTERNAL_ID=ext-123 \
+  cargo test -p openporch-engine real_account_check -- --ignored
+```
+
+This exercises the AWS SDK path end to end: the host credential chain, AssumeRole
+with the external ID, and GetCallerIdentity with the assumed session. It does not
+replace a check against a real account, because Floci only emulates IAM.

@@ -36,3 +36,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  floci:
+    name: account check against Floci
+    runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:2.2.0
+        ports:
+          - 4566:4566
+        env:
+          FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED: "true"
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      OPENPORCH_TEST_AWS_ROLE_ARN: arn:aws:iam::000000000000:role/openporch-test
+      OPENPORCH_TEST_AWS_EXTERNAL_ID: ext-123
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Create a role that requires an external ID
+        run: |
+          for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:4566/ && break; sleep 1; done
+          caller=$(aws sts get-caller-identity --query Arn --output text)
+          aws iam create-role --role-name openporch-test --assume-role-policy-document "{
+            \"Version\": \"2012-10-17\",
+            \"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"$caller\"},
+              \"Action\": \"sts:AssumeRole\",
+              \"Condition\": {\"StringEquals\": {\"sts:ExternalId\": \"$OPENPORCH_TEST_AWS_EXTERNAL_ID\"}}}]
+          }"
+      - name: Account check
+        run: cargo test -p openporch-engine real_account_check -- --ignored
