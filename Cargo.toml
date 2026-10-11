@@ -25,7 +25,7 @@ openporch-drivers = { path = "crates/drivers" }
 openporch-engine = { path = "crates/engine" }
 openporch-client = { path = "crates/client" }
 aes-gcm = "0.10"
-aws-config = { version = "1.12", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1.12", default-features = false, features = ["rt-tokio", "behavior-version-latest", "sso"] }
 aws-credential-types = "1"
 aws-sdk-sts = { version = "1.119", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }

@@ -328,11 +328,21 @@ async fn role_sessions_are_reused_and_refreshed_before_expiry() {
     assert_eq!(f.sts.calls().len(), 2);
     assert!(third.valid_for(*f.now.lock().unwrap(), window));
 
+    // Expired sessions of other accounts are dropped when a session is stored.
+    let mut other = a.clone();
+    other.id = AccountId::new("aws-other").unwrap();
+    f.resolve(&other, window).await.unwrap();
+    assert_eq!(f.resolver.sessions().len(), 2);
+    f.advance(Duration::from_secs(1000));
+    f.resolve(&other, window).await.unwrap();
+    assert_eq!(f.resolver.sessions().len(), 1);
+    assert_eq!(f.sts.calls().len(), 4);
+
     // A changed account configuration never reuses the old session.
     let mut changed = a.clone();
     changed.config.insert("region".into(), json!("eu-west-1"));
     f.resolve(&changed, window).await.unwrap();
-    assert_eq!(f.sts.calls().len(), 3);
+    assert_eq!(f.sts.calls().len(), 5);
 }
 
 #[tokio::test]
