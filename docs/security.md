@@ -353,10 +353,14 @@ values can also use that environment's secrets. Anything else needs an
 administrator's grant for that exact reference, scoped to an application and
 optionally one environment. An org-wide grant is meant for platform definitions.
 
-Today these grants are enforced when shared values are written. Enforcement for
-definitions, drivers and cloud accounts, and the recheck when a deployment runs,
-come with the delegation work in task 3.13; until then those objects accept any
-reference to a registered store from an administrator.
+Grants are checked twice. When an object is assigned a reference, shared values
+need a grant covering their application or environment, and definitions, cloud
+accounts and drivers need some grant for any secret they did not write
+themselves. When a deployment runs, the executor checks every reference again for
+the deploying application and environment immediately before reading it, so a
+production-only grant never serves development, and removing a grant blocks
+every later resolution, including replays of earlier deployments. Deployments
+are not implemented yet; the resolution check is in place for them.
 
 A reference copied from another application is refused:
 

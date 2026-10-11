@@ -1134,8 +1134,9 @@ Authorization: Bearer $ADMIN_TOKEN
 A definition says how one resource type is provisioned: a driver, its inputs and
 the criteria under which the definition matches. `driver_inputs.values` holds plain
 inputs, `driver_inputs.secret_refs` holds secret references or `{value}` to write,
-and `driver_inputs.secrets` holds placeholder templates for secrets. A definition
-without criteria never matches. A criterion matches on `app_id`, `env_type`,
+and `driver_inputs.secrets` holds placeholder templates for secrets. A reference
+to a secret the definition did not write needs a
+[grant](security.md#secret-use-grants). A definition without criteria never matches. A criterion matches on `app_id`, `env_type`,
 `env_id`, `res_id` and `class`. Without `class`, only the `default` class matches.
 
 ```http

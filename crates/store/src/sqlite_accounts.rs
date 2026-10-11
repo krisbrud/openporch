@@ -17,6 +17,7 @@ use sqlx::SqliteConnection;
 
 use crate::audit::{self, AuditIntent};
 use crate::identity::check_admin_authority;
+use crate::secret_use::{SecretOwner, check_assigned};
 use crate::secrets::BUILTIN_STORE;
 use crate::sqlite::{SqliteStore, unique_violation};
 use crate::sqlite_catalog::{check_ref_stores, corrupt, definitions_using, referenced_stores};
@@ -362,7 +363,8 @@ async fn check_account_in(
             account_edges(&account.secret_refs),
         ),
     )
-    .await
+    .await?;
+    check_assigned(conn, org, SecretOwner::Account(id), &refs).await
 }
 
 async fn store_row(

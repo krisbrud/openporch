@@ -17,6 +17,7 @@ use sqlx::SqliteConnection;
 
 use crate::audit::{self, AuditIntent};
 use crate::identity::check_admin_authority;
+use crate::secret_use::{SecretOwner, check_assigned};
 use crate::sqlite::{SqliteStore, unique_violation};
 use crate::{Result, StoreError, now_ms, random_hex};
 
@@ -336,13 +337,16 @@ pub(crate) fn referenced_stores(
     }
 }
 
-/// Checks that every store the references name is registered.
+/// Checks that every store the references name is registered and that `owner` may
+/// use each reference.
 async fn check_secret_stores(
     conn: &mut SqliteConnection,
     org: &str,
+    owner: SecretOwner<'_>,
     inputs: &DriverInputs,
 ) -> Result<()> {
-    check_ref_stores(conn, org, &inputs.secret_refs).await
+    check_ref_stores(conn, org, &inputs.secret_refs).await?;
+    check_assigned(conn, org, owner, &inputs.secret_refs).await
 }
 
 /// Checks that every store the references in `refs` name is registered.
@@ -393,7 +397,7 @@ async fn check_driver_record(
             "token".to_owned(),
             serde_json::to_value(token).map_err(|e| corrupt("driver token", e))?,
         );
-        check_secret_stores(conn, org, &inputs).await?;
+        check_secret_stores(conn, org, SecretOwner::Driver(id), &inputs).await?;
     }
     Ok(())
 }
@@ -486,7 +490,13 @@ async fn check_definition_refs(
         )));
     }
     check_driver_and_account(conn, org, &def.driver_type, def.driver_account.as_deref()).await?;
-    check_secret_stores(conn, org, &def.driver_inputs).await?;
+    check_secret_stores(
+        conn,
+        org,
+        SecretOwner::Definition(def.id.as_str()),
+        &def.driver_inputs,
+    )
+    .await?;
     check_provision(conn, org, &def.provision).await?;
     for (i, criterion) in def.criteria.iter().enumerate() {
         check_criterion(conn, org, ty, criterion, &def.criteria[..i]).await?;
@@ -1073,7 +1083,13 @@ impl CatalogStore for SqliteStore {
             update.driver_account.as_deref(),
         )
         .await?;
-        check_secret_stores(&mut tx, org, &update.driver_inputs).await?;
+        check_secret_stores(
+            &mut tx,
+            org,
+            SecretOwner::Definition(id),
+            &update.driver_inputs,
+        )
+        .await?;
         check_provision(&mut tx, org, &update.provision).await?;
         sqlx::query(
             "UPDATE definitions SET name = ?, driver_type = ?, driver_account = ?, \

@@ -12,6 +12,7 @@ mod deploy;
 mod error;
 mod identity;
 mod ownership;
+mod secret_use;
 pub mod secrets;
 mod sqlite;
 mod sqlite_accounts;
@@ -31,6 +32,7 @@ pub use identity::{
     Principal, Roles, TokenInfo, covers,
 };
 pub use ownership::Ownership;
+pub use secret_use::{SecretOwner, SecretUseStore};
 pub use sqlite::SqliteStore;
 pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
