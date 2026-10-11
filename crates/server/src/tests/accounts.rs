@@ -1,7 +1,11 @@
 //! HTTP tests for `cloud-accounts` (create, delete-in-use) and the store, grant and
 //! credential-graph scenarios of `secret-stores-and-references`.
 
+use std::time::SystemTime;
+
 use axum::http::{Method, StatusCode};
+use openporch_engine::cloud::{AssumeRole, AwsCredentials, CallerIdentity, CloudError, Sts};
+use openporch_store::secrets::{BoxFuture, SecretValue};
 use serde_json::{Value, json};
 
 use super::{Server, assert_error, server};
@@ -625,4 +629,147 @@ async fn account_changes_are_audited() {
     assert!(text.contains("cloud_account.create"), "{text}");
     assert!(text.contains("cloud_account.delete"), "{text}");
     assert!(!text.contains("wJalr-secret"), "{text}");
+}
+
+/// STS for the account check: role sessions need external ID `ext-123`, and role
+/// `arn:aws:iam::1:role/offline` cannot be reached.
+struct FakeSts;
+
+impl Sts for FakeSts {
+    fn assume_role(&self, r: AssumeRole) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
+        Box::pin(async move {
+            if r.role_arn.ends_with("/offline") {
+                return Err(CloudError::Unavailable(
+                    "STS AssumeRole failed: dispatch failure".into(),
+                ));
+            }
+            if r.external_id != "ext-123" {
+                return Err(CloudError::Rejected(
+                    "STS AssumeRole failed: AccessDenied: not authorized to perform \
+                     sts:AssumeRole"
+                        .into(),
+                ));
+            }
+            Ok(AwsCredentials {
+                access_key_id: "ASIASESSION".into(),
+                secret_access_key: SecretValue::new("session-secret"),
+                session_token: Some(SecretValue::new("session-token")),
+                region: None,
+                expires_at: Some(SystemTime::now() + r.duration),
+            })
+        })
+    }
+
+    fn caller_identity<'a>(
+        &'a self,
+        c: &'a AwsCredentials,
+    ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>> {
+        Box::pin(async move {
+            let arn = if c.session_token.is_some() {
+                "arn:aws:sts::111122223333:assumed-role/openporch/openporch-aws-prod".to_owned()
+            } else {
+                format!("arn:aws:iam::111122223333:user/{}", c.access_key_id)
+            };
+            Ok(CallerIdentity {
+                arn,
+                account: "111122223333".into(),
+                user_id: "AIDAEXAMPLE".into(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn account_check_returns_the_caller_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::Config::new("acme", dir.path());
+    let state = crate::start_with(config, None, std::sync::Arc::new(FakeSts))
+        .await
+        .unwrap();
+    let s = super::server_from(dir, state);
+    s.static_account("aws-dev").await;
+    let b = s
+        .ok(
+            Method::POST,
+            &format!("{ACCOUNTS}/aws-dev/check"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(b["arn"], "arn:aws:iam::111122223333:user/AKIAEXAMPLE");
+    assert_eq!(b["account"], "111122223333");
+
+    let role = |id: &str, arn: &str, external_id: &str| {
+        json!({"id": id, "type": "aws-role",
+               "config": {"role_arn": arn, "external_id": external_id}})
+    };
+    s.ok(
+        Method::POST,
+        ACCOUNTS,
+        role("aws-prod", "arn:aws:iam::1:role/openporch", "ext-123"),
+    )
+    .await;
+    let b = s
+        .ok(
+            Method::POST,
+            &format!("{ACCOUNTS}/aws-prod/check"),
+            json!({}),
+        )
+        .await;
+    assert!(b["arn"].as_str().unwrap().contains(":assumed-role/"), "{b}");
+    let text = b.to_string();
+    for secret in [
+        "wJalr-secret",
+        "session-secret",
+        "session-token",
+        "ASIASESSION",
+    ] {
+        assert!(!text.contains(secret), "{text}");
+    }
+
+    // Wrong external ID: the STS failure message is returned.
+    s.ok(
+        Method::POST,
+        ACCOUNTS,
+        role("aws-wrong", "arn:aws:iam::1:role/openporch", "nope"),
+    )
+    .await;
+    let (status, b) = s
+        .send(
+            Method::POST,
+            &format!("{ACCOUNTS}/aws-wrong/check"),
+            json!({}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::UNPROCESSABLE_ENTITY, "CLD-001");
+    assert!(message(&b).contains("AccessDenied"), "{b}");
+
+    s.ok(
+        Method::POST,
+        ACCOUNTS,
+        role("aws-offline", "arn:aws:iam::1:role/offline", "ext-123"),
+    )
+    .await;
+    let (status, b) = s
+        .send(
+            Method::POST,
+            &format!("{ACCOUNTS}/aws-offline/check"),
+            json!({}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_GATEWAY, "CLD-002");
+
+    let (status, b) = s
+        .send(Method::POST, &format!("{ACCOUNTS}/nope/check"), json!({}))
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let member = s.member("mia", "member").await;
+    let (status, b) = s
+        .call(
+            Method::POST,
+            &format!("{ACCOUNTS}/aws-dev/check"),
+            Some(&member),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
 }

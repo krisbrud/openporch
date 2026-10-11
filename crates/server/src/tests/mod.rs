@@ -35,7 +35,10 @@ async fn server_in(dir: TempDir) -> Server {
 }
 
 async fn server_with(dir: TempDir, config: Config) -> Server {
-    let state = start(config, None).await.unwrap();
+    server_from(dir, start(config, None).await.unwrap())
+}
+
+fn server_from(dir: TempDir, state: AppState) -> Server {
     let admin = std::fs::read_to_string(dir.path().join("bootstrap-token"))
         .map(|t| t.trim().to_owned())
         .unwrap_or_default();

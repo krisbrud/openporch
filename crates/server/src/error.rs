@@ -29,6 +29,10 @@ pub mod code {
     pub const NOT_READY: &str = "SRV-002";
     /// An external identity provider could not be reached.
     pub const PROVIDER_UNAVAILABLE: &str = "SRV-003";
+    /// The cloud provider refused a request made with an account's credentials.
+    pub const CLOUD_REJECTED: &str = "CLD-001";
+    /// The cloud provider or the host identity could not be reached.
+    pub const CLOUD_UNAVAILABLE: &str = "CLD-002";
 }
 
 /// An API error.
