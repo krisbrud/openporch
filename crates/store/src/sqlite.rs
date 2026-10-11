@@ -11,7 +11,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditEntry, AuditIntent, AuditOutcome};
 use crate::deploy::*;
-use crate::identity::{check_admin_authority, check_env_authority};
+use crate::identity::{check_admin_authority, check_configure_authority, check_env_authority};
 use crate::secrets::{BUILTIN_STORE, Sealed};
 use crate::{Ownership, Result, Store, StoreError, now_ms};
 
@@ -730,6 +730,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let id = set.id();
         let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
         sqlx::query(
             "INSERT INTO sets (org_id, app_id, id, algorithm, content, created_at) \
              VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, app_id, id) DO NOTHING",
@@ -758,6 +759,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let now = now_ms();
         let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
         let frozen: Option<Option<i64>> = sqlx::query_scalar(
             "SELECT frozen_at FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
         )

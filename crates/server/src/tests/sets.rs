@@ -2,7 +2,8 @@
 //! verified with the CLI in task 6.3.
 
 use axum::http::StatusCode;
-use openporch_store::{AuditIntent, DeploymentRequest, Store};
+use openporch_core::sets::DeploymentSet;
+use openporch_store::{AuditIntent, DeploymentRequest, Store, StoreError};
 use serde_json::{Value, json};
 
 use super::{Server, assert_error, server};
@@ -333,4 +334,36 @@ async fn viewers_read_and_developers_write() {
         )
         .await;
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+}
+
+#[tokio::test]
+async fn writes_recheck_authority_in_their_transaction() {
+    let s = server().await;
+    s.app("shop").await;
+    s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "viewer").await;
+    let store = &s.state.store;
+    let audit = || AuditIntent::accepted("acme", "dev", "POST", "/deltas", "delta.create");
+    let set = DeploymentSet::default();
+
+    // Access checked by the route but revoked before the write commits nothing.
+    let err = store
+        .put_delta("acme", "shop", "d1", &json!({}), audit())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Forbidden(_)), "{err}");
+    let err = store
+        .put_set_audited("acme", "shop", &set, audit())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Forbidden(_)), "{err}");
+    assert!(store.delta("acme", "shop", "d1").await.unwrap().is_none());
+
+    // A deleted application takes no writes, whoever asks.
+    let admin = || AuditIntent::accepted("acme", "bootstrap", "POST", "/deltas", "delta.create");
+    let err = store
+        .put_delta("acme", "gone", "d1", &json!({}), admin())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)), "{err}");
 }
