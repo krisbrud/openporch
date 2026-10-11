@@ -164,7 +164,8 @@ pub struct DriverRequest {
 /// shows only its location and kind.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// `namespace` or `cluster`.
+    /// `namespace`, `cluster`, or `container` or `volume` to merge into the
+    /// workload's pod template.
     pub location: String,
     pub data: Value,
 }

@@ -591,7 +591,7 @@ fn template_request(templates: Value) -> DriverRequest {
 async fn template_keeps_a_generated_password_in_its_cookie() {
     // The `Deterministic password` scenario.
     let templates = json!({
-        "init": "password: {{ cookie.password | default(random_alphanumeric(24)) }}\n",
+        "init": "password: {{ cookie.password | default(random_alphanumeric(24)) | tojson }}\n",
         "outputs": "host: {{ resource.name }}.db.internal\nport: {{ driver.values.port }}\nid: {{ guresid }}\n",
         "secrets": "password: {{ init.password | tojson }}\nadmin: {{ driver.secrets.admin | tojson }}\n",
         "cookie": "password: {{ init.password | tojson }}\n",
@@ -647,7 +647,7 @@ deployment.yaml:
     spec:
       replicas: {{ driver.values.port // 1000 }}
 secret.yaml:
-  location: namespace
+  location: cluster
   data:
     apiVersion: v1
     kind: Secret
@@ -668,6 +668,7 @@ secret.yaml:
     assert_eq!(deployment.data["metadata"]["name"], "shop");
     assert_eq!(deployment.data["spec"]["replicas"], 5);
     assert_eq!(outputs.manifests[1].data["data"]["admin"], "czNjcmV0");
+    assert_eq!(outputs.manifests[1].location, "cluster");
     assert!(outputs.values.is_empty());
     assert!(!format!("{outputs:?}").contains("czNjcmV0"));
 }
@@ -706,12 +707,22 @@ async fn template_errors_name_the_template_but_not_secrets() {
     );
     let e = err(json!({"output": "a: 1"})).await;
     assert!(e.contains("unknown template `output`"), "{e}");
-    let e = err(json!({"manifests": "x:\n  location: everywhere\n  data: {}"})).await;
-    assert!(e.contains("`location: namespace`"), "{e}");
+    // Manifest names are rendered text too, so errors give positions.
+    let e = err(json!({"manifests": "ok:\n  location: volume\n  data: {}\n{{ driver.secrets.admin }}:\n  location: everywhere\n  data: {}"})).await;
+    assert!(e.contains("manifest 2 needs a `location`"), "{e}");
+    assert!(!e.contains("s3cret"), "{e}");
+    // Output is bounded, so a template cannot grow the response without limit.
+    let e = err(json!({"outputs": "{% for i in range(5000) %}{{ 'x' * 1000 }}{% endfor %}"})).await;
+    assert!(e.contains("rendered more than 1048576 bytes"), "{e}");
+    let e = err(json!({"outputs": "a: {{ 'not base64!' | b64decode }}"})).await;
+    assert!(e.contains("b64decode: not base64"), "{e}");
     let mut req = template_request(json!({"outputs": "a: 1"}));
     req.cookie = Some(Cookie::new(1, "not json").unwrap());
     let e = driver.put(&req).await.unwrap_err().to_string();
     assert!(e.contains("cannot read the version 1 cookie"), "{e}");
+    req.cookie = Some(Cookie::new(2, "{}").unwrap());
+    let e = driver.put(&req).await.unwrap_err().to_string();
+    assert!(e.contains("cannot read the version 2 cookie"), "{e}");
     let mut req = request();
     req.values = Map::new();
     assert!(driver.put(&req).await.is_err());

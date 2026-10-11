@@ -43,9 +43,11 @@ like in any other driver input.
 ### Manifests
 
 Each entry in the `manifests` map is a manifest. `location` is `namespace` for an
-object in the workload's namespace, or `cluster` for a cluster-scoped object.
-`data` is the object itself. The entry's name only identifies the manifest within
-the map.
+object in the workload's namespace, `cluster` for a cluster-scoped object, or
+`container` or `volume` for a container or volume merged into the workload's pod
+template. `data` is the object itself. The entry's name only identifies the
+manifest within the map. Kubernetes deployment arrives in a later milestone; until
+then manifests are returned as outputs but not applied.
 
 ```yaml
 deployment.yaml:
@@ -74,7 +76,8 @@ otherwise change the YAML, such as a password that starts with `*` or contains `
 ## Keeping generated values
 
 A template that generates a value, such as a password, would generate a new one
-every deployment. To keep it, store it in `cookie` and read it back in `init`:
+every time it renders: on every deployment, and when openporch observes the
+resource. To keep it, store it in `cookie` and read it back in `init`:
 
 ```yaml
 id: shop-db-password
@@ -102,9 +105,22 @@ Cookies are limited to 10 KB.
 
 A template that fails, or renders something that is not a YAML map, fails the
 resource with error code `TPL-001`. The message names the template and the line, but
-never quotes rendered text, since it may contain secrets. Referring to an undefined
-variable is an error; use `default` or `is defined` for optional values. A template
-that runs too long, such as nested loops over large ranges, is stopped.
+never quotes rendered text, since it may contain secrets. Manifests are named by
+their position for the same reason.
+
+Referring to an undefined variable is an error. Use `default` or `is defined` for
+optional values. `default` only covers the last lookup: `cookie.password |
+default("x")` works when the cookie has no `password`, but `cookie.db.password |
+default("x")` fails when it has no `db`. Booleans render as `True` and `False`,
+which YAML reads as booleans; use `| tojson` to get `true` and `false`.
+
+## Limits
+
+Templates are code that administrators write, since only administrators can create
+definitions. A template that runs too long, such as nested loops over large ranges,
+is stopped, and each template may render at most 1 MB. Neither limit bounds the
+memory a template uses while it runs, so treat a definition's templates with the
+same care as any other code that runs on the server.
 
 ## Translating Go templates
 
@@ -115,13 +131,14 @@ that runs too long, such as nested loops over large ranges, is stopped.
 | `{{ .x \| default "y" }}` | `{{ x \| default("y") }}` |
 | `{{ randAlphaNum 16 }}` | `{{ random_alphanumeric(16) }}` |
 | `{{ .x \| b64enc }}`, `{{ .x \| b64dec }}` | `{{ x \| b64encode }}`, `{{ x \| b64decode }}` |
-| `{{ .x \| toRawJson }}`, `{{ .x \| quote }}` | `{{ x \| tojson }}` |
+| `{{ .x \| toRawJson }}` | `{{ x \| tojson }}` |
+| `{{ .x \| quote }}` | `{{ x \| string \| tojson }}` |
 | `{{ .x \| lower }}`, `{{ .x \| upper }}` | `{{ x \| lower }}`, `{{ x \| upper }}` |
 | `{{ printf "%s-%s" .a .b }}` | `{{ a ~ "-" ~ b }}` |
 | `{{ .x \| trunc 10 }}` | `{{ x[:10] }}` |
 | `{{ hasKey .m "k" }}` | `{{ "k" in m }}` |
 | `{{ $x := .a }}` | `{% set x = a %}` |
-| `{{ if .x }}…{{ else }}…{{ end }}` | `{% if x %}…{% else %}…{% endif %}` |
+| `{{ if .x }}…{{ else }}…{{ end }}` | `{% if x %}…{% else %}…{% endif %}`; when `x` may be missing, `{% if x is defined and x %}` |
 | `{{ if and .a (not .b) }}` | `{% if a and not b %}` |
 | `{{ if eq .a "b" }}` | `{% if a == "b" %}` |
 | `{{ range .list }}{{ . }}{{ end }}` | `{% for item in list %}{{ item }}{% endfor %}` |

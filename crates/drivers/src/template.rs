@@ -31,6 +31,13 @@ const COOKIE_VERSION: u32 = 1;
 /// Template instructions allowed per render, so a template cannot loop forever.
 const FUEL: u64 = 1_000_000;
 
+/// The most a template may render, in bytes.
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Manifest locations: the environment namespace, cluster scope, or merged into
+/// the workload's pod template.
+const LOCATIONS: [&str; 4] = ["namespace", "cluster", "container", "volume"];
+
 /// The longest string `random_alphanumeric` returns.
 const MAX_RANDOM_LENGTH: usize = 1024;
 
@@ -124,8 +131,9 @@ impl Template {
         let values = take("outputs");
         let secrets = take("secrets");
         let manifests = take("manifests")
-            .into_iter()
-            .map(|(name, m)| manifest(&name, m))
+            .into_values()
+            .enumerate()
+            .map(|(i, m)| manifest(i + 1, m))
             .collect::<Result<_, _>>()?;
         let cookie = match templates.contains_key("cookie") {
             true => Some(Cookie::new(
@@ -152,10 +160,13 @@ impl Template {
         source: &str,
         ctx: &Value,
     ) -> Result<Map<String, Value>, DriverError> {
-        let text = self
-            .env
-            .render_named_str(key, source, minijinja::value::Serde(ctx))
+        let mut out = Limited(Vec::new());
+        self.env
+            .template_from_named_str(key, source)
+            .and_then(|t| t.render_captured_to(minijinja::value::Serde(ctx), &mut out))
             .map_err(|e| invalid(describe(key, &e)))?;
+        let text = String::from_utf8(out.0)
+            .map_err(|_| invalid(format!("the `{key}` template rendered invalid UTF-8")))?;
         if text.trim().is_empty() {
             return Ok(Map::new());
         }
@@ -238,23 +249,42 @@ fn templates(req: &DriverRequest) -> Result<BTreeMap<String, String>, DriverErro
     Ok(out)
 }
 
-fn manifest(name: &str, m: Value) -> Result<Manifest, DriverError> {
+/// The `n`th manifest. Errors give its position: its name is rendered text.
+fn manifest(n: usize, m: Value) -> Result<Manifest, DriverError> {
     let Value::Object(mut m) = m else {
         return Err(invalid(format!(
-            "manifest `{name}` must be a map with `location` and `data`"
+            "manifest {n} must be a map with `location` and `data`"
         )));
     };
     let location = match m.remove("location") {
-        Some(Value::String(l)) if l == "namespace" || l == "cluster" => l,
+        Some(Value::String(l)) if LOCATIONS.contains(&l.as_str()) => l,
         _ => {
             return Err(invalid(format!(
-                "manifest `{name}` needs `location: namespace` or `location: cluster`"
+                "manifest {n} needs a `location` of {}",
+                LOCATIONS.map(|l| format!("`{l}`")).join(", ")
             )));
         }
     };
     match m.remove("data") {
         Some(data @ Value::Object(_)) => Ok(Manifest { location, data }),
-        _ => Err(invalid(format!("manifest `{name}` needs a `data` map"))),
+        _ => Err(invalid(format!("manifest {n} needs a `data` map"))),
+    }
+}
+
+/// A buffer that refuses to grow past [`MAX_OUTPUT_BYTES`].
+struct Limited(Vec<u8>);
+
+impl std::io::Write for Limited {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + buf.len() > MAX_OUTPUT_BYTES {
+            return Err(std::io::Error::other("template output too large"));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -266,6 +296,7 @@ fn describe(key: &str, e: &Error) -> String {
     let what = match e.kind() {
         ErrorKind::UndefinedError => "uses an undefined value".to_owned(),
         ErrorKind::OutOfFuel => "ran too long".to_owned(),
+        ErrorKind::WriteFailure => format!("rendered more than {MAX_OUTPUT_BYTES} bytes"),
         ErrorKind::SyntaxError => "has a syntax error".to_owned(),
         // Only the template functions' own messages are shown: others may quote
         // values.
