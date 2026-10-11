@@ -8,7 +8,11 @@ secret outputs.
 The driver is implemented and tested, including against real OpenTofu, but
 deployments do not call drivers until the deployment executor lands, so
 definitions using it cannot be deployed yet. The server already checks a
-definition's inputs when the definition is written.
+definition's inputs when the definition is written: the input names, the shapes
+of `source`, `files`, `variables` and `credentials_config`, the repository URL
+and revision, `timeout` and `append_logs_to_error`. Inputs that are placeholders,
+and whether `credentials_config` has a `driver_account`, are checked at
+deployment.
 
 ## Inputs
 
@@ -73,7 +77,9 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 The definition names the table after the application, the environment and the
-resource's ID, so tables never collide across environments. The `dynamodb-table` type requires the outputs `name`, `arn` and
+resource's ID, so each environment gets its own table. Use
+`${context.res.guresid}` instead if application and environment IDs could run
+together into the same name. The `dynamodb-table` type requires the outputs `name`, `arn` and
 `region`:
 
 ```hcl
@@ -162,7 +168,8 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 The same module from a Git repository, pinned to a tag, reads its variables the
-same way:
+same way. The token here is a secret the definition did not write, so using it
+needs a [secret-use grant](../security.md#secret-use-grants):
 
 ```json
 {
@@ -196,9 +203,11 @@ command line. Nothing from the server's own environment reaches OpenTofu except
 `PATH` and the proxy and CA certificate settings.
 
 Before an apply starts, the driver keeps the script, the dependency lock file and
-the resolved commit next to the resource's state. Deleting the resource later
-plans against exactly what was applied, even if the branch has moved on or the
-definition has changed. The resource's cookie carries the same record.
+the resolved commit on the server's disk, under `<root>/state/<guresid>`, whichever
+backend holds the state. Deleting the resource later plans against that code,
+even if the branch has moved on or the definition has changed. Variables, files
+and credentials come from the current definition. The resource's cookie carries
+the source commit and the backend.
 
 ## Credentials
 
@@ -231,8 +240,8 @@ picks them up with no provider configuration.
 Runs never fall back to the server's own cloud identity, because instance metadata
 is disabled (`AWS_EC2_METADATA_DISABLED=true`). Module code is trusted, though: it
 runs with the account's credentials and can reach the network. If the server runs
-on EC2 or ECS, also block the metadata address `169.254.169.254` for the user
-openporch runs as.
+on EC2 or ECS, also block the metadata addresses `169.254.169.254` and, on ECS,
+`169.254.170.2` for the user openporch runs as.
 
 ## State
 
@@ -259,9 +268,11 @@ Each resource remembers the backend its state is in. If the server is later
 configured with a different backend, the driver refuses that resource with
 `TOFU-004` instead of starting from empty state. Move the state first.
 
-The same applies when state disappears. A resource that was applied but whose
-state is missing is reported as needing recovery. The driver never treats it as
-new, which would create every object a second time.
+The same applies when state disappears. A resource whose cookie shows it was
+applied, but whose state is missing, is reported as needing recovery instead of
+being treated as new, which would create every object a second time. Detecting
+lost state for a resource whose first apply failed partway, before it had a
+cookie, arrives later in this milestone.
 
 The `backend` input, for state in a backend that the module chooses, is not
 supported yet.
@@ -270,7 +281,8 @@ supported yet.
 
 `plan` returns the actions an apply would take: creates, updates, replacements and
 deletions of resources, and changes to outputs. A plan that changes nothing
-returns no effects, and openporch skips the apply.
+returns no effects, so the deployment executor can skip the apply once it
+lands; `put` itself always plans and applies.
 
 A call whose plan deletes or replaces anything fails with `TOFU-002` unless it
 carries a permit for that plan's fingerprint. The fingerprint covers the resource,
@@ -301,8 +313,8 @@ than an error, since infrastructure may have changed. Retrying converges on the
 same state.
 
 The run log goes to the deployment's logs. Every secret input, credential, token
-and sensitive output is replaced with `[REDACTED]` before a line leaves the
-driver, in its raw form and in the escaped forms OpenTofu prints. The JSON that
+and sensitive output of four or more characters is replaced with `[REDACTED]`
+before a line leaves the driver, in its raw form and in the escaped forms OpenTofu prints. The JSON that
 `tofu show -json`, `tofu output -json` and `tofu state pull` print is never
 logged, since it holds every value.
 
@@ -321,7 +333,8 @@ registries and module sources such as `app.terraform.io` work as usual.
 
 - The deployment executor, which calls the driver, passes it permits and
   configures its state backend from the server's settings.
-- Ending a timed-out run gracefully. Today it is killed, which can leave a state
-  lock behind. Gracefully stopping and reaping the process arrives later in this
-  milestone.
+- Ending a timed-out run gracefully. Today only the `tofu` process is killed:
+  provider processes can keep running and changing infrastructure, and a state
+  lock can be left behind. Stopping and reaping the whole process group arrives
+  later in this milestone.
 - The `backend` input.

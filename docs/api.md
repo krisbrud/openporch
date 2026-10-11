@@ -1142,7 +1142,8 @@ to a secret the definition did not write needs a
 `env_id`, `res_id` and `class`. Without `class`, only the `default` class matches.
 
 The built-in drivers are documented in [drivers/template.md](drivers/template.md)
-and [drivers/opentofu.md](drivers/opentofu.md). The server checks
+and [drivers/opentofu.md](drivers/opentofu.md), and external drivers in
+[drivers/http.md](drivers/http.md). The server checks
 `openporch/opentofu` inputs when a definition is written; other drivers' inputs
 are checked when they run.
 

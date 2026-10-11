@@ -425,10 +425,11 @@ pub async fn get_definition(
 /// Checks a built-in driver's inputs, so mistakes fail with `400` when the
 /// definition is written rather than at deployment.
 fn check_driver_inputs(driver_type: &str, inputs: &DriverInputs) -> ApiResult<()> {
-    let mut secrets = inputs.secret_refs.clone();
-    secrets.extend(inputs.secrets.clone());
-    openporch_drivers::check_definition_inputs(driver_type, &inputs.values, &secrets)
-        .map_err(|m| ApiError::invalid(format!("`driver_inputs`: {m}")))
+    for secrets in [&inputs.secret_refs, &inputs.secrets] {
+        openporch_drivers::check_definition_inputs(driver_type, &inputs.values, secrets)
+            .map_err(|m| ApiError::invalid(format!("`driver_inputs`: {m}")))?;
+    }
+    Ok(())
 }
 
 /// Creates a definition. Inline secrets and `{value}` references are written to the

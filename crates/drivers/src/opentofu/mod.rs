@@ -312,22 +312,23 @@ pub fn check_definition(
     values: &Map<String, Value>,
     secrets: &Map<String, Value>,
 ) -> Result<(), String> {
+    let placeholder = |v: &Value| v.as_str().is_some_and(|s| s.contains("${"));
     for key in secrets.keys() {
         if !matches!(key.as_str(), "source" | "variables" | "files" | "tokens") {
             return Err(format!("unknown OpenTofu driver secret input `{key}`"));
         }
     }
+    // A placeholder can stand for a whole input of any type, so inputs that
+    // are placeholders are checked at deployment.
     let mut values = values.clone();
+    values.retain(|_, v| !placeholder(v));
     if let Some(Value::Object(source)) = values.get_mut("source") {
         for (key, stand_in) in [("url", "https://placeholder.invalid/m"), ("rev", "HEAD")] {
-            if source
-                .get(key)
-                .and_then(Value::as_str)
-                .is_some_and(|v| v.contains("${"))
-            {
+            if source.get(key).is_some_and(placeholder) {
                 source.insert(key.into(), stand_in.into());
             }
         }
+        source.retain(|_, v| !placeholder(v));
     }
     // Secret leaves are references here; only their names are checked.
     let mut stand_ins = Map::new();
@@ -337,12 +338,27 @@ pub fn check_definition(
             stand_ins.insert(key.into(), Value::Object(names));
         }
     }
-    parse(&Config::new(""), &values, &stand_ins)
+    let inputs = parse(&Config::new(""), &values, &stand_ins).map_err(|f| match f {
+        Failure::Input(m) => m,
+        other => format!("{other:?}"),
+    })?;
+    if let Some(cc) = &inputs.credentials_config {
+        for name in cc.environment.keys() {
+            check_env_name(name).map_err(|f| match f {
+                Failure::Input(m) => m,
+                other => format!("{other:?}"),
+            })?;
+        }
+    }
+    if values
+        .get("append_logs_to_error")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
+        return Err("`append_logs_to_error` must be true or false".into());
+    }
+    crate::call_timeout(&values, None)
         .map(|_| ())
-        .map_err(|f| match f {
-            Failure::Input(m) => m,
-            other => format!("{other:?}"),
-        })
+        .map_err(|e| e.to_string())
 }
 
 fn parse(
@@ -611,7 +627,9 @@ impl OpenTofu {
                     s.path.clone(),
                 ))
             }
-            (Some((s, path)), _) => Some((
+            // Applied from a script alone: never the definition's newer source.
+            (_, SourceAt::Retained(_)) => None,
+            (Some((s, path)), SourceAt::Current) => Some((
                 git::Source {
                     url: s.url.clone(),
                     rev: s.rev.clone(),

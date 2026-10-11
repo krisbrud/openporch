@@ -847,6 +847,19 @@ async fn opentofu_definition_inputs_are_checked_when_written() {
             json!({"values": {"script": ""}, "secrets": {"password": "${resources.x.outputs.y}"}}),
             "unknown OpenTofu driver secret input `password`",
         ),
+        (
+            json!({"values": {"script": "", "timeout": "15 minutes"}}),
+            "`timeout` must be",
+        ),
+        (
+            json!({"values": {"script": "", "credentials_config": {"environment": {"AWS_ENDPOINT_URL": "Region"}}}}),
+            "cannot be set by `credentials_config`",
+        ),
+        (
+            json!({"values": {"script": ""}, "secret_refs": {"files": {"main.tf": {"value": "x"}}},
+                   "secrets": {"files": {"ok.txt": "${resources.x.outputs.y}"}}}),
+            "would replace the script",
+        ),
     ] {
         let (status, b) = s
             .post("/orgs/acme/resources/defs", &s.admin, def(inputs))
@@ -854,6 +867,14 @@ async fn opentofu_definition_inputs_are_checked_when_written() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
         assert!(b["message"].as_str().unwrap().contains(want), "{b}");
     }
+    // A placeholder can stand for a whole input.
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "tofu-vars", "type": "sqs", "driver_type": "openporch/opentofu",
+               "driver_inputs": {"values": {"script": "", "variables": "${resources.cfg.outputs.vars}"}},
+               "criteria": [{}]}),
+    )
+    .await;
     // Placeholders in `source` are left to deployment.
     s.created(
         "/orgs/acme/resources/defs",
