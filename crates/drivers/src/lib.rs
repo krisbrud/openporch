@@ -19,6 +19,7 @@ mod echo;
 mod none;
 mod registry;
 mod run;
+mod template;
 
 pub use echo::Echo;
 pub use none::NoneDriver;
@@ -26,6 +27,7 @@ pub use registry::{DriverRegistry, RegistryError};
 pub use run::{
     DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
 };
+pub use template::Template;
 
 /// The largest cookie a driver may return, in bytes.
 pub const MAX_COOKIE_BYTES: usize = 10 * 1024;
@@ -162,7 +164,8 @@ pub struct DriverRequest {
 /// shows only its location and kind.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// `namespace` or `cluster`.
+    /// `namespace`, `cluster`, or `container` or `volume` to merge into the
+    /// workload's pod template.
     pub location: String,
     pub data: Value,
 }

@@ -550,7 +550,7 @@ fn registry_holds_builtins_and_reserves_their_namespace() {
     let mut registry = DriverRegistry::with_builtins();
     assert_eq!(
         registry.ids().collect::<Vec<_>>(),
-        ["openporch/echo", "openporch/none"]
+        ["openporch/echo", "openporch/none", "openporch/template"]
     );
     assert!(registry.get("openporch/echo").is_some());
     assert!(registry.get("acme/slow").is_none());
@@ -577,4 +577,179 @@ fn registry_holds_builtins_and_reserves_their_namespace() {
             "{bad}"
         );
     }
+}
+
+fn template_request(templates: Value) -> DriverRequest {
+    let mut req = request();
+    req.values = object(json!({"templates": templates, "port": 5432}));
+    req.secrets = SecretMap::new(object(json!({"admin": "s3cret"})));
+    req.resource = object(json!({"name": "shop"}));
+    req
+}
+
+#[tokio::test]
+async fn template_keeps_a_generated_password_in_its_cookie() {
+    // The `Deterministic password` scenario.
+    let templates = json!({
+        "init": "password: {{ cookie.password | default(random_alphanumeric(24)) | tojson }}\n",
+        "outputs": "host: {{ resource.name }}.db.internal\nport: {{ driver.values.port }}\nid: {{ guresid }}\n",
+        "secrets": "password: {{ init.password | tojson }}\nadmin: {{ driver.secrets.admin | tojson }}\n",
+        "cookie": "password: {{ init.password | tojson }}\n",
+    });
+    let driver = Template::new();
+    let req = template_request(templates);
+    let first = converge(&driver, &req, DEFAULT_TIMEOUT).await;
+    let outputs = first.result.unwrap();
+    assert_eq!(
+        outputs.values,
+        object(json!({
+            "host": "shop.db.internal",
+            "port": 5432,
+            "id": "0123456789abcdef0123456789abcdef",
+        }))
+    );
+    let password = outputs.secrets.expose()["password"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(password.len(), 24);
+    assert_eq!(outputs.secrets.expose()["admin"], "s3cret");
+
+    // Without the cookie, a new password is generated.
+    let fresh = converge(&driver, &req, DEFAULT_TIMEOUT)
+        .await
+        .result
+        .unwrap();
+    assert_ne!(fresh.secrets.expose()["password"], password.as_str());
+
+    // With it, the second deployment returns the same password.
+    let mut second = req.clone();
+    second.cookie = first.cookie;
+    let again = converge(&driver, &second, DEFAULT_TIMEOUT).await;
+    assert_eq!(
+        again.result.unwrap().secrets.expose()["password"],
+        password.as_str()
+    );
+    assert_eq!(again.cookie, second.cookie);
+}
+
+#[tokio::test]
+async fn template_emits_manifests() {
+    let templates = json!({
+        "manifests": r#"
+deployment.yaml:
+  location: namespace
+  data:
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ resource.name }}
+    spec:
+      replicas: {{ driver.values.port // 1000 }}
+secret.yaml:
+  location: cluster
+  data:
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: {{ resource.name }}-admin
+    data:
+      admin: {{ driver.secrets.admin | b64encode }}
+"#,
+    });
+    let driver = Template::new();
+    let outputs = converge(&driver, &template_request(templates), DEFAULT_TIMEOUT)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(outputs.manifests.len(), 2);
+    let deployment = &outputs.manifests[0];
+    assert_eq!(deployment.location, "namespace");
+    assert_eq!(deployment.data["metadata"]["name"], "shop");
+    assert_eq!(deployment.data["spec"]["replicas"], 5);
+    assert_eq!(outputs.manifests[1].data["data"]["admin"], "czNjcmV0");
+    assert_eq!(outputs.manifests[1].location, "cluster");
+    assert!(outputs.values.is_empty());
+    assert!(!format!("{outputs:?}").contains("czNjcmV0"));
+}
+
+#[tokio::test]
+async fn template_errors_name_the_template_but_not_secrets() {
+    let driver = Template::new();
+    let err = |templates: Value| {
+        let req = template_request(templates);
+        let driver = &driver;
+        async move { driver.put(&req).await.unwrap_err().to_string() }
+    };
+
+    let e = err(json!({"outputs": "a: {{ driver.values.missing }}"})).await;
+    assert_eq!(
+        e,
+        "TPL-001: the `outputs` template uses an undefined value at line 1"
+    );
+    // YAML errors give a position, not the rendered text.
+    let e = err(json!({"secrets": "admin: [{{ driver.secrets.admin }}"})).await;
+    assert!(
+        e.starts_with("TPL-001: the `secrets` template rendered invalid YAML"),
+        "{e}"
+    );
+    assert!(!e.contains("s3cret"), "{e}");
+    let e = err(json!({"secrets": "{{ driver.secrets.admin }}"})).await;
+    assert_eq!(e, "TPL-001: the `secrets` template must render a YAML map");
+    let e = err(json!({"outputs": "a: {{ 1 + driver.secrets.admin }}"})).await;
+    assert!(!e.contains("s3cret"), "{e}");
+    let e = err(json!({"outputs": "{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}"})).await;
+    assert!(e.contains("ran too long"), "{e}");
+    let e = err(json!({"outputs": "a: {{ random_alphanumeric(0) }}"})).await;
+    assert!(
+        e.contains("random_alphanumeric takes a length from 1 to 1024"),
+        "{e}"
+    );
+    let e = err(json!({"output": "a: 1"})).await;
+    assert!(e.contains("unknown template `output`"), "{e}");
+    // Manifest names are rendered text too, so errors give positions.
+    let e = err(json!({"manifests": "ok:\n  location: volume\n  data: {}\n{{ driver.secrets.admin }}:\n  location: everywhere\n  data: {}"})).await;
+    assert!(e.contains("manifest 2 needs a `location`"), "{e}");
+    assert!(!e.contains("s3cret"), "{e}");
+    // Output is bounded, so a template cannot grow the response without limit.
+    let e = err(json!({"outputs": "{% for i in range(5000) %}{{ 'x' * 1000 }}{% endfor %}"})).await;
+    assert!(e.contains("rendered more than 1048576 bytes"), "{e}");
+    let e = err(json!({"outputs": "a: {{ 'not base64!' | b64decode }}"})).await;
+    assert!(e.contains("b64decode: not base64"), "{e}");
+    let mut req = template_request(json!({"outputs": "a: 1"}));
+    req.cookie = Some(Cookie::new(1, "not json").unwrap());
+    let e = driver.put(&req).await.unwrap_err().to_string();
+    assert!(e.contains("cannot read the version 1 cookie"), "{e}");
+    req.cookie = Some(Cookie::new(2, "{}").unwrap());
+    let e = driver.put(&req).await.unwrap_err().to_string();
+    assert!(e.contains("cannot read the version 2 cookie"), "{e}");
+    let mut req = request();
+    req.values = Map::new();
+    assert!(driver.put(&req).await.is_err());
+}
+
+#[tokio::test]
+async fn template_docs_example_keeps_its_password() {
+    let doc = include_str!("../../../docs/drivers/template.md");
+    let example = doc
+        .split("```yaml\n")
+        .filter_map(|b| b.split_once("```").map(|(b, _)| b))
+        .find(|b| b.contains("driver_type: openporch/template"))
+        .unwrap();
+    let def: Value = serde_yaml_ng::from_str(example).unwrap();
+    let mut req = template_request(def["driver_inputs"]["values"]["templates"].clone());
+    req.resource_type = "postgres".into();
+    let driver = Template::new();
+    let first = converge(&driver, &req, DEFAULT_TIMEOUT).await;
+    let password = first.result.unwrap().secrets.expose()["password"].clone();
+    req.cookie = first.cookie;
+    let second = converge(&driver, &req, DEFAULT_TIMEOUT)
+        .await
+        .result
+        .unwrap();
+    assert_eq!(second.secrets.expose()["password"], password);
+    assert_eq!(
+        second.values,
+        object(json!({"host": "shop.db.internal", "port": 5432}))
+    );
 }

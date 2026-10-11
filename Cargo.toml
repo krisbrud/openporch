@@ -36,6 +36,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 http-body-util = "0.1"
 indexmap = { version = "2", features = ["serde"] }
 json-patch = "4"
+minijinja = { version = "3", default-features = false, features = ["builtins", "serde", "json", "fuel", "preserve_order", "std_collections"] }
 proptest = "1"
 rand = "0.8"
 regex = "1"
