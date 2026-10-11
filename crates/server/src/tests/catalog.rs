@@ -379,6 +379,7 @@ async fn definition_over_the_api() {
 #[tokio::test]
 async fn definition_secrets_are_stored_as_references() {
     let s = server().await;
+    s.grant_secret("openporch", "shared/key").await;
     let created = s
         .created(
             "/orgs/acme/resources/defs",

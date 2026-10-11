@@ -12,7 +12,7 @@ const PROD: &str = "/orgs/acme/apps/shop/envs/production/values";
 
 impl Server {
     /// `shop` with environments `development` and `production`.
-    async fn shop(&self) {
+    pub(super) async fn shop(&self) {
         self.app("shop").await;
         self.env_type("production").await;
         let (s, b) = self
@@ -25,7 +25,7 @@ impl Server {
         assert_eq!(s, StatusCode::CREATED, "{b}");
     }
 
-    async fn value(&self, path: &str, body: Value) -> Value {
+    pub(super) async fn value(&self, path: &str, body: Value) -> Value {
         let (s, b) = self.post(path, &self.admin, body).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         b

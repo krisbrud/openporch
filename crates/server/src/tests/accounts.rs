@@ -314,7 +314,8 @@ async fn register_an_aws_store() {
     assert_eq!(b["primary"], false);
     assert_eq!(b["config"]["cloud_account"], "aws-prod");
 
-    // References may now name the store.
+    // References may now name the store, once granted.
+    s.grant_secret("prod-sm", "shop/db-user").await;
     s.ok(
         Method::POST,
         "/orgs/acme/resources/defs",
@@ -408,6 +409,7 @@ async fn delete_a_store_in_use() {
     let s = server().await;
     s.static_account("aws-prod").await;
     s.aws_store("prod-sm", "aws-prod").await;
+    let db_grant = s.grant_secret("prod-sm", "db").await;
     s.ok(
         Method::POST,
         "/orgs/acme/resources/defs",
@@ -434,8 +436,10 @@ async fn delete_a_store_in_use() {
         Value::Null,
     )
     .await;
+    s.ok(Method::DELETE, &db_grant, Value::Null).await;
 
     // Accounts and grants keep it too.
+    let key_grant = s.grant_secret("prod-sm", "keys/other").await;
     s.ok(
         Method::POST,
         ACCOUNTS,
@@ -452,6 +456,7 @@ async fn delete_a_store_in_use() {
         Value::Null,
     )
     .await;
+    s.ok(Method::DELETE, &key_grant, Value::Null).await;
     let grant = s
         .ok(
             Method::POST,
@@ -492,6 +497,7 @@ async fn store_depends_on_itself() {
     assert!(message(&b).contains("credential cycle"), "{b}");
 
     // A longer cycle through a second store, closed by a store update.
+    s.grant_secret("sm-a", "keys/b").await;
     s.ok(
         Method::POST,
         ACCOUNTS,

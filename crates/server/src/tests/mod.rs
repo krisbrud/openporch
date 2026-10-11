@@ -28,6 +28,7 @@ mod accounts;
 mod catalog;
 mod envs;
 mod github;
+mod secret_use;
 mod sets;
 mod values;
 
@@ -135,6 +136,22 @@ impl Server {
             )
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    /// Grants `store`/`reference` organization-wide and returns the grant's path.
+    async fn grant_secret(&self, store: &str, reference: &str) -> String {
+        let (s, b) = self
+            .post(
+                &format!("/orgs/acme/secretstores/{store}/grants"),
+                &self.admin,
+                json!({"ref": reference, "org_wide": true}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        format!(
+            "/orgs/acme/secretstores/{store}/grants/{}",
+            b["id"].as_str().unwrap()
+        )
     }
 
     async fn grant_deployer(&self, env_type: &str, user: &str) {
