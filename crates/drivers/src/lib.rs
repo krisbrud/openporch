@@ -29,7 +29,10 @@ pub use http::{
     PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER, check_target,
 };
 pub use none::NoneDriver;
-pub use opentofu::{Config as OpenTofuConfig, OpenTofu};
+pub use opentofu::{
+    Config as OpenTofuConfig, OpenTofu, S3Credentials as OpenTofuS3Credentials,
+    S3State as OpenTofuS3State, StateBackend as OpenTofuStateBackend,
+};
 pub use registry::{DriverRegistry, RegistryError};
 pub use run::{
     DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,

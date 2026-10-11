@@ -75,6 +75,17 @@ jobs:
   opentofu:
     name: OpenTofu driver
     runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:2.2.0
+        ports:
+          - 4566:4566
+    env:
+      # The opt-in S3 state test runs against Floci's S3.
+      OPENPORCH_TEST_S3_BUCKET: openporch-state
+      OPENPORCH_TEST_S3_ENDPOINT: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain from rust-toolchain.toml
@@ -84,5 +95,9 @@ jobs:
         with:
           tofu_version: 1.11.5
           tofu_wrapper: false
+      - name: Create the state bucket
+        run: |
+          for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:4566/ && break; sleep 1; done
+          curl -sf -X PUT http://localhost:4566/openporch-state
       - name: End-to-end OpenTofu runs
         run: cargo test -p openporch-drivers opentofu -- --ignored
