@@ -8,6 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::ids::AccountId;
 use openporch_core::model::{CloudAccount, CloudAccountType, SecretRef};
+use openporch_engine::cloud::CloudError;
 use openporch_store::secrets::{BUILTIN_STORE, validate_reference};
 use openporch_store::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 use serde::Deserialize;
@@ -15,7 +16,7 @@ use serde_json::{Map, Value, json};
 
 use super::check_id;
 use crate::api::{Ctx, JsonBody};
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, code};
 use crate::secret_inputs::{self, PlannedSecret};
 use crate::state::AppState;
 
@@ -212,6 +213,7 @@ async fn write_account(
         } else {
             let audit = ctx.audit(org, "cloud_account.update", &id);
             state.store.update_account(org, &account, audit).await?;
+            state.cloud.forget(&id);
         }
         Ok(())
     }
@@ -266,6 +268,37 @@ pub async fn update_account(
     Ok(Json(account_or_404(&state, &id).await?))
 }
 
+/// Obtains credentials for the account and asks AWS STS who they belong to. Errors
+/// carry the STS failure message, never credentials.
+pub async fn check_account(
+    State(state): State<AppState>,
+    Path((_, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    // Taken before the read, so a change or deletion racing this check keeps its
+    // session out of the cache.
+    let read_at = state.cloud.generation();
+    let account = account_or_404(&state, &id).await?.account;
+    let primary = secret_inputs::primary(&state)?;
+    let identity = state
+        .cloud
+        .check(&account, read_at, &primary)
+        .await
+        .map_err(|e| match e {
+            CloudError::Invalid(m) | CloudError::Expiring(m) => ApiError::invalid(m),
+            CloudError::Rejected(m) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, code::CLOUD_REJECTED, m)
+            }
+            CloudError::Unavailable(m) => {
+                ApiError::new(StatusCode::BAD_GATEWAY, code::CLOUD_UNAVAILABLE, m)
+            }
+        })?;
+    Ok(Json(json!({
+        "arn": identity.arn,
+        "account": identity.account,
+        "user_id": identity.user_id,
+    })))
+}
+
 pub async fn delete_account(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -276,6 +309,7 @@ pub async fn delete_account(
         .store
         .delete_account(org, &id, ctx.audit(org, "cloud_account.delete", &id))
         .await?;
+    state.cloud.forget(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 

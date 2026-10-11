@@ -9,6 +9,8 @@ use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store,
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
+use openporch_engine::cloud::{AwsSts, CredentialResolver, Sts};
+
 use crate::identity::{Github, IdentityProvider};
 
 /// State shared by every request.
@@ -30,6 +32,8 @@ pub struct Inner {
     pub not_ready: Vec<String>,
     /// The GitHub identity provider, when configured.
     pub github: Option<Arc<dyn IdentityProvider>>,
+    /// Resolves cloud accounts into credentials.
+    pub cloud: CredentialResolver,
 }
 
 impl std::ops::Deref for AppState {
@@ -130,6 +134,15 @@ async fn load_keyring(
 ///
 /// `env_key` is the value of `OPENPORCH_MASTER_KEY`, if set.
 pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, StartupError> {
+    start_with(config, env_key, Arc::new(AwsSts::new())).await
+}
+
+/// [`start`] with the given STS client.
+pub async fn start_with(
+    config: Config,
+    env_key: Option<String>,
+    sts: Arc<dyn Sts>,
+) -> Result<AppState, StartupError> {
     let github = match &config.github {
         Some(c) => {
             Some(Arc::new(Github::new(c).map_err(StartupError::Io)?) as Arc<dyn IdentityProvider>)
@@ -174,14 +187,32 @@ pub async fn start(config: Config, env_key: Option<String>) -> Result<AppState, 
         finish_bootstrap_file(&config)?;
     }
 
-    Ok(AppState(Arc::new(Inner {
+    let state = AppState(Arc::new(Inner {
         config,
         store,
         keyring,
         signer,
         not_ready,
         github,
-    })))
+        cloud: CredentialResolver::new(sts),
+    }));
+    prune_sessions(&state);
+    Ok(state)
+}
+
+/// Drops expired cloud role sessions every minute while the state is in use.
+fn prune_sessions(state: &AppState) {
+    let weak = Arc::downgrade(&state.0);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match weak.upgrade() {
+                Some(inner) => inner.cloud.prune(),
+                None => break,
+            }
+        }
+    });
 }
 
 async fn session_signer(

@@ -18,7 +18,7 @@ use axum::Router;
 
 pub use api::RouteSpec;
 pub use config::Config;
-pub use state::{AppState, StartupError, start};
+pub use state::{AppState, StartupError, start, start_with};
 
 /// The version reported by the `openporch` binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

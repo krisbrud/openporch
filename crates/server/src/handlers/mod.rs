@@ -381,6 +381,12 @@ pub fn api(state: AppState) -> Api {
             accounts::update_account,
         )
         .route(
+            post(),
+            "/orgs/{org}/resources/accounts/{account}/check",
+            Org(OrgPerm::Administer),
+            accounts::check_account,
+        )
+        .route(
             delete(),
             "/orgs/{org}/resources/accounts/{account}",
             Org(OrgPerm::Administer),
