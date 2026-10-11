@@ -436,6 +436,43 @@ Authorization: Bearer $ADMIN_TOKEN
 Only administrators and org viewers can list grants. A store that definitions,
 cloud accounts, drivers, grants or shared values reference cannot be deleted.
 
+## Transport and rate limits
+
+The server refuses to listen on a non-loopback address over plain HTTP; see
+[The bootstrap administrator](#the-bootstrap-administrator). Its own outbound
+connections, to GitHub and AWS, verify TLS certificates. A connection to a server with an untrusted certificate fails during
+the handshake, before any request or credential is sent, and plain `http://` URLs
+are accepted only for loopback addresses.
+
+Login and token creation are rate limited, and every request body is bounded by
+`max_body_bytes` (1 MiB by default). The limits are set in the configuration
+file, per minute, and `0` turns one off:
+
+```toml
+[rate_limits]
+login_per_minute = 60   # device login start and poll, per client address
+tokens_per_minute = 20  # API tokens created, per calling member
+```
+
+A request over a limit gets `429` with code `API-007` and a `Retry-After` header.
+Behind a reverse proxy (`tls_terminated_by_proxy = true`), the client address is
+the last `X-Forwarded-For` entry, the one the proxy added.
+
+## Master keys
+
+The built-in secret store, the session signing key and other protected records
+are encrypted with master keys. A new installation generates
+`<data_dir>/master.key`, or reads `master_key_file` or the
+`OPENPORCH_MASTER_KEY` environment variable. The file must be readable only by
+the server's user. It holds one base64 key per line: the first seals new data,
+and the others are retired keys that still decrypt older data.
+
+To rotate, run `openporch keygen`, put its output on the first line of the key
+file, keep the old keys below it, and restart. Never remove a retired key while
+data sealed with it remains: the server does not regenerate missing keys.
+Instead `/readyz` reports `master_key_missing:<key id>` and changes are refused
+until the key is restored.
+
 ## Audit log
 
 Every change, and every change that was denied, is recorded with the principal,

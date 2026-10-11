@@ -9,6 +9,7 @@ use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store,
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
+use crate::rate_limit::RateLimiter;
 use openporch_engine::cloud::{AwsSts, CredentialResolver, Sts};
 
 use crate::identity::{Github, IdentityProvider};
@@ -34,6 +35,10 @@ pub struct Inner {
     pub github: Option<Arc<dyn IdentityProvider>>,
     /// Resolves cloud accounts into credentials.
     pub cloud: CredentialResolver,
+    /// Login requests per client address.
+    pub login_limit: RateLimiter,
+    /// Token creation per principal.
+    pub token_limit: RateLimiter,
 }
 
 impl std::ops::Deref for AppState {
@@ -187,6 +192,8 @@ pub async fn start_with(
         finish_bootstrap_file(&config)?;
     }
 
+    let login_limit = RateLimiter::new(config.rate_limits.login_per_minute);
+    let token_limit = RateLimiter::new(config.rate_limits.tokens_per_minute);
     let state = AppState(Arc::new(Inner {
         config,
         store,
@@ -195,6 +202,8 @@ pub async fn start_with(
         not_ready,
         github,
         cloud: CredentialResolver::new(sts),
+        login_limit,
+        token_limit,
     }));
     prune_sessions(&state);
     Ok(state)

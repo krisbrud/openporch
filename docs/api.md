@@ -55,6 +55,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | `API-004` | 409 | Conflict: the object exists, is in use, or changed concurrently. |
 | `API-005` | 405 | The route does not support this method. |
 | `API-006` | 413 | The body is larger than `max_body_bytes`. |
+| `API-007` | 429 | Too many requests. `Retry-After` gives the seconds to wait. |
 | `AUTH-001` | 401 | No valid token or session. |
 | `AUTH-002` | 403 | Authenticated, but not allowed. The message names the missing role. |
 | `SRV-001` | 500 | Internal error. The log has details under the request ID. |

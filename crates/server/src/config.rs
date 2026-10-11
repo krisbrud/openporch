@@ -37,6 +37,40 @@ pub struct Config {
     /// The GitHub identity provider, when GitHub login is enabled.
     #[serde(default)]
     pub github: Option<GithubConfig>,
+    /// Request rate limits.
+    #[serde(default)]
+    pub rate_limits: RateLimits,
+}
+
+/// Per-minute request limits; zero disables one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimits {
+    /// Login requests (device login start and poll) per client address.
+    #[serde(default = "default_login_limit")]
+    pub login_per_minute: u32,
+    /// API tokens created per calling principal.
+    #[serde(default = "default_token_limit")]
+    pub tokens_per_minute: u32,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            login_per_minute: default_login_limit(),
+            tokens_per_minute: default_token_limit(),
+        }
+    }
+}
+
+fn default_login_limit() -> u32 {
+    // A device login polls about every five seconds, so this leaves room for
+    // several people behind one address.
+    60
+}
+
+fn default_token_limit() -> u32 {
+    20
 }
 
 /// The GitHub identity provider: an OAuth app (or GitHub App) with the device flow
@@ -103,6 +137,7 @@ impl Config {
             tls_terminated_by_proxy: false,
             max_body_bytes: default_body_limit(),
             github: None,
+            rate_limits: RateLimits::default(),
         }
     }
 

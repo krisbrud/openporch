@@ -21,6 +21,9 @@ enum Command {
         #[arg(long, env = "OPENPORCH_CONFIG")]
         config: Option<PathBuf>,
     },
+    /// Prints a new master key, for key rotation: put it first in the master key
+    /// file and keep the old keys below it.
+    Keygen,
     /// Prints the version.
     Version,
 }
@@ -29,6 +32,11 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Keygen => {
+            let key = openporch_store::secrets::MasterKey::generate();
+            println!("{}", key.to_base64().as_str());
+            ExitCode::SUCCESS
+        }
         Command::Version => {
             println!("openporch {VERSION}");
             ExitCode::SUCCESS
@@ -59,9 +67,12 @@ async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>
     let (router, specs) = openporch_server::router(state.clone());
     tracing::info!(routes = specs.len(), %listen, ready = state.ready(), "listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 
