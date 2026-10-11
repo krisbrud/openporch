@@ -155,6 +155,7 @@ async fn inputs_are_checked_before_anything_runs() {
 const FAKE_TOFU: &str = r#"#!/bin/sh
 { echo "ARGS $*"; env | sort; for f in "$@"; do case "$f" in -var-file=*) echo "VARFILE ${f#-var-file=}"; cat "${f#-var-file=}"; echo; esac; done; } >> "$FAKE_TOFU_LOG"
 case "$1" in
+  init) cat zzzz_openporch_backend_override.tf >> "$FAKE_TOFU_LOG" ;;
   show) echo '{"resource_changes":[{"address":"random_password.p","change":{"actions":["create"]}}]}' ;;
   output) echo '{"password":{"sensitive":true,"value":"generated-pw-123"},"length":{"sensitive":false,"value":12}}' ;;
   apply) echo "applied password generated-pw-123 with token hunter2-token" ;;
@@ -216,7 +217,7 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
         .filter_map(|l| l.strip_prefix("ARGS "))
         .map(|a| a.split(' ').next().unwrap())
         .collect();
-    assert_eq!(calls, ["init", "plan", "show", "apply", "output"]);
+    assert_eq!(calls, ["init", "state", "plan", "show", "apply", "output"]);
 
     // The log shows the run but none of its secrets.
     let log = lines.lock().unwrap().join("\n");
@@ -530,7 +531,9 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     let req = |cookie| {
         let mut r = request(
             json!({"source": {"url": url, "rev": "main", "path": "modules/pw"},
-                   "variables": {"length": 12}}),
+                   "variables": {"length": 12},
+                   // A backend in the script is overridden like one in the module.
+                   "script": "terraform {\n  backend \"local\" { path = \"script.tfstate\" }\n}\n"}),
             json!({"variables": {"label": "label-secret-value"}}),
         );
         r.cookie = cookie;
@@ -542,6 +545,11 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     assert_eq!(outputs.values["length"], 12);
     let retained: Retained = serde_json::from_str(&cookie.as_ref().unwrap().data).unwrap();
     assert_eq!(retained.source.as_ref().unwrap().commit.len(), 40);
+    assert!(
+        root.path()
+            .join("state/0123456789abcdef0123456789abcdef/terraform.tfstate")
+            .exists()
+    );
 
     // The branch moves on to a broken module; deletion still uses the commit
     // that was applied.
@@ -587,4 +595,229 @@ async fn fake_run_exports_the_default_aws_environment() {
     ] {
         assert!(record.contains(want), "{want}");
     }
+}
+
+#[tokio::test]
+async fn s3_state_uses_a_workspace_per_resource_and_its_own_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = fake_driver(root.path(), str::to_owned);
+    let mut s3 = S3State::new("state-bucket", "eu-north-1");
+    s3.credentials = Some(S3Credentials {
+        access_key_id: "AKIASTATE".into(),
+        secret_access_key: "state-secret-1".into(),
+        session_token: None,
+    });
+    d.config.state = StateBackend::S3(Box::new(s3));
+    let mut req = request(json!({"script": "terraform {}"}), json!({}));
+    req.credentials = Some(SecretMap::new(object(json!({
+        "AccessKeyId": "AKIARESOURCE",
+        "SecretAccessKey": "resource-secret-2",
+    }))));
+    let lines = capture(&mut req);
+    let PutOutcome::Ready { cookie, .. } = d.put(&req).await.unwrap() else {
+        panic!("not ready");
+    };
+    let record = std::fs::read_to_string(root.path().join("record.log")).unwrap();
+    assert!(record.contains(r#"backend "s3""#), "{record}");
+    assert!(record.contains(r#"workspace_key_prefix = "openporch""#));
+    assert!(record.contains("use_lockfile = true"));
+    let calls: Vec<&str> = record
+        .lines()
+        .filter_map(|l| l.strip_prefix("ARGS "))
+        .collect();
+    // The state check lists workspaces without creating one; the run then
+    // selects or creates the resource's own.
+    assert!(calls[1].starts_with("workspace list"), "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|c| c
+                .starts_with("workspace select -or-create=true 0123456789abcdef0123456789abcdef")),
+        "{calls:?}"
+    );
+    assert!(record.contains("TF_WORKSPACE=0123456789abcdef0123456789abcdef"));
+    // Backend credentials go in a file, the resource's in the environment.
+    assert!(calls.iter().all(|c| !c.contains("state-secret-1")));
+    assert!(calls[0].contains("-backend-config="), "{calls:?}");
+    assert!(record.contains("AWS_ACCESS_KEY_ID=AKIARESOURCE"));
+    assert!(!record.contains("AWS_ACCESS_KEY_ID=AKIASTATE"));
+    let log = lines.lock().unwrap().join("\n");
+    assert!(!log.contains("state-secret-1"), "{log}");
+    // The backend is kept with the resource.
+    let retained: Retained = serde_json::from_str(&cookie.unwrap().data).unwrap();
+    assert_eq!(
+        retained.backend,
+        Some(BackendId::S3 {
+            bucket: "state-bucket".into(),
+            key_prefix: "openporch".into(),
+            endpoint: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_changed_state_backend_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = fake_driver(root.path(), str::to_owned);
+    let mut req = request(json!({"script": "terraform {}"}), json!({}));
+    let PutOutcome::Ready { cookie, .. } = d.put(&req).await.unwrap() else {
+        panic!("not ready");
+    };
+    req.cookie = cookie;
+    d.config.state = StateBackend::S3(Box::new(S3State::new("state-bucket", "eu-north-1")));
+    for err in [
+        d.put(&req).await.unwrap_err(),
+        d.delete(&req).await.unwrap_err(),
+    ] {
+        let (code, message) = invalid(err);
+        assert_eq!(code, "TOFU-004");
+        assert!(
+            message.contains("in local state") && message.contains("s3://state-bucket/openporch"),
+            "{message}"
+        );
+    }
+}
+
+const LOCAL_BACKEND_MODULE: &str = r#"
+terraform {
+  backend "local" { path = "module-chosen.tfstate" }
+}
+resource "terraform_data" "x" { input = var.value }
+variable "value" { type = string }
+output "value" { value = terraform_data.x.output }
+"#;
+
+/// Applies [`LOCAL_BACKEND_MODULE`] twice with `d`, checks the second run
+/// plans nothing, then deletes it.
+async fn apply_twice_then_delete(d: &OpenTofu) {
+    let req = |cookie| {
+        let mut r = request(
+            json!({"script": LOCAL_BACKEND_MODULE, "variables": {"value": "v1"}}),
+            json!({}),
+        );
+        r.cookie = cookie;
+        r
+    };
+    let PutOutcome::Ready { outputs, cookie } = d.put(&req(None)).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["value"], "v1");
+    // The second run reads the state the first wrote.
+    assert_eq!(d.plan(&req(cookie.clone())).await.unwrap(), Plan::NoEffects);
+    let PutOutcome::Ready { outputs, cookie } = d.put(&req(cookie)).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["value"], "v1");
+    let Observation::Ready { outputs, .. } = d.get(&req(cookie.clone())).await.unwrap() else {
+        panic!("not observed");
+    };
+    assert_eq!(outputs.values["value"], "v1");
+
+    let mut del = req(cookie);
+    let Plan::Actions { fingerprint, .. } = d.plan_delete(&del).await.unwrap() else {
+        panic!("no destroy actions");
+    };
+    del.permit = Some(fingerprint);
+    assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
+    assert_eq!(d.get(&del).await.unwrap(), Observation::Absent);
+    assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
+}
+
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_local_state_ignores_the_module_backend() {
+    let root = tempfile::tempdir().unwrap();
+    let d = driver(root.path());
+    let req = request(
+        json!({"script": LOCAL_BACKEND_MODULE, "variables": {"value": "v1"}}),
+        json!({}),
+    );
+    d.put(&req).await.unwrap();
+    let state = root
+        .path()
+        .join("state/0123456789abcdef0123456789abcdef/terraform.tfstate");
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "state is owner-only");
+    std::fs::remove_dir_all(root.path().join("state")).unwrap();
+    apply_twice_then_delete(&driver(root.path())).await;
+}
+
+/// Opt-in: set `OPENPORCH_TEST_S3_BUCKET` (and `OPENPORCH_TEST_S3_REGION`,
+/// default `us-east-1`; `OPENPORCH_TEST_S3_ENDPOINT` for an S3-compatible
+/// service) with the backend's keys in `AWS_ACCESS_KEY_ID` and
+/// `AWS_SECRET_ACCESS_KEY`.
+#[tokio::test]
+#[ignore = "needs OpenTofu and an S3 bucket"]
+async fn opentofu_s3_state_applies_twice() {
+    let Ok(bucket) = std::env::var("OPENPORCH_TEST_S3_BUCKET") else {
+        eprintln!("OPENPORCH_TEST_S3_BUCKET is not set; skipping");
+        return;
+    };
+    let region = std::env::var("OPENPORCH_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let mut s3 = S3State::new(bucket, region);
+    s3.endpoint = std::env::var("OPENPORCH_TEST_S3_ENDPOINT").ok();
+    // A prefix of its own, so test runs never share state.
+    s3.key_prefix = format!("openporch-test-{:016x}", rand::random::<u64>());
+    let root = tempfile::tempdir().unwrap();
+    let mut d = driver(root.path());
+    d.config.state = StateBackend::S3(Box::new(s3));
+    // A preview leaves an empty workspace, which is not the resource's state.
+    let mut preview = request(
+        json!({"script": LOCAL_BACKEND_MODULE, "variables": {"value": "v1"}}),
+        json!({}),
+    );
+    preview.guresid = Guresid::new("fedcba9876543210fedcba9876543210").unwrap();
+    assert!(matches!(
+        d.plan(&preview).await.unwrap(),
+        Plan::Actions { .. }
+    ));
+    assert_eq!(d.get(&preview).await.unwrap(), Observation::Absent);
+    assert_eq!(d.delete(&preview).await.unwrap(), DeleteOutcome::Deleted);
+    apply_twice_then_delete(&d).await;
+    // Only recovery metadata stays local.
+    let local = root.path().join("state/0123456789abcdef0123456789abcdef");
+    assert!(!local.join("terraform.tfstate").exists());
+}
+
+#[tokio::test]
+async fn an_empty_s3_workspace_from_a_preview_is_not_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = fake_driver(root.path(), |s| {
+        s.replace(
+            "case \"$1\" in\n",
+            "case \"$1\" in\n  workspace) if [ \"$2\" = list ]; then printf '* default\\n  0123456789abcdef0123456789abcdef\\n'; fi ;;\n  state) echo '{\"version\":4,\"serial\":1,\"lineage\":\"l\",\"outputs\":{},\"resources\":[]}' ;;\n",
+        )
+    });
+    let mut s3 = S3State::new("state-bucket", "eu-north-1");
+    s3.credentials = Some(S3Credentials {
+        access_key_id: "AKIASTATE".into(),
+        secret_access_key: "state-secret-1".into(),
+        session_token: None,
+    });
+    d.config.state = StateBackend::S3(Box::new(s3));
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    assert_eq!(d.get(&req).await.unwrap(), Observation::Absent);
+    assert_eq!(d.plan_delete(&req).await.unwrap(), Plan::NoEffects);
+    // Deleting removes the empty workspace without needing a retained script.
+    assert_eq!(d.delete(&req).await.unwrap(), DeleteOutcome::Deleted);
+    let record = std::fs::read_to_string(root.path().join("record.log")).unwrap();
+    assert!(
+        record.contains("ARGS workspace delete 0123456789abcdef0123456789abcdef"),
+        "{record}"
+    );
+}
+
+#[test]
+fn credentials_config_cannot_redirect_aws_endpoints() {
+    for name in [
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+        "AWS_CA_BUNDLE",
+        "AWS_PROFILE",
+        "TF_WORKSPACE",
+        "AWS_EC2_METADATA_DISABLED",
+    ] {
+        assert!(check_env_name(name).is_err(), "{name}");
+    }
+    assert!(check_env_name("AWS_ACCESS_KEY_ID").is_ok());
 }

@@ -2,15 +2,18 @@
 //! repository or an inline script.
 //!
 //! Each call gets a fresh owner-only run directory under
-//! `<root>/runs/<guresid>`. The module's backend is overridden with orchestrator
-//! state under `<root>/state/<guresid>`, which also keeps the dependency lock
-//! file, the script and the resolved source commit last applied. They are kept
+//! `<root>/runs/<guresid>`. The module's backend, whatever it declares, is
+//! overridden with orchestrator state: `<root>/state/<guresid>` locally, or a
+//! workspace named by the GUResID in an S3 bucket ([`StateBackend`]).
+//! `<root>/state/<guresid>` also keeps the dependency lock file, the script and
+//! the resolved source commit last applied. They are kept
 //! before an apply starts, so deletion plans against what was applied rather
 //! than the current branch tip even after a partial apply; the cookie carries
 //! the same record. Secret variables go into an owner-only variables
 //! file, never onto a command line, and every log line and error is redacted
 //! before it leaves the driver.
 
+mod backend;
 mod exec;
 mod files;
 mod git;
@@ -23,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use self::backend::BackendId;
+pub use self::backend::{S3Credentials, S3State, StateBackend};
 use self::exec::RunLog;
 use crate::{
     Action, Capabilities, Cookie, DeleteOutcome, Driver, DriverError, DriverFuture, DriverInfo,
@@ -39,8 +44,11 @@ const MAX_ERROR_LOG_BYTES: usize = 64 * 1024;
 const CODE_FAILED: &str = "TOFU-001";
 const CODE_PERMIT: &str = "TOFU-002";
 const CODE_INPUT: &str = "TOFU-003";
+const CODE_BACKEND: &str = "TOFU-004";
 /// The override file that points the module at orchestrator state.
-const BACKEND_OVERRIDE: &str = "openporch_backend_override.tf";
+/// Override files merge in lexical order, so this name sorts after a script's
+/// `override.tf`; module and `files` overrides are refused.
+const BACKEND_OVERRIDE: &str = "zzzz_openporch_backend_override.tf";
 const LOCK_FILE: &str = ".terraform.lock.hcl";
 const RETAINED_SCRIPT: &str = "script.tf";
 /// What the last apply ran, as [`Retained`] JSON.
@@ -63,6 +71,9 @@ pub struct Config {
     pub allow_file_sources: bool,
     /// Host keys SSH sources are checked against. Without it SSH sources fail.
     pub ssh_known_hosts: Option<PathBuf>,
+    /// Where state lives. Recovery metadata (the retained script, lock file
+    /// and source commit) stays under `root` either way.
+    pub state: StateBackend,
 }
 
 impl Config {
@@ -74,6 +85,7 @@ impl Config {
             root: root.into(),
             allow_file_sources: false,
             ssh_known_hosts: None,
+            state: StateBackend::Local,
         }
     }
 }
@@ -130,11 +142,35 @@ impl OpenTofu {
         self.state_dir(req).join("terraform.tfstate")
     }
 
-    /// Whether the resource has state, and if not, whether that is expected.
-    fn state(&self, req: &DriverRequest) -> Result<State, DriverError> {
+    /// The resource's state, and if there is none, whether that is expected.
+    /// Refuses state kept in a different backend than the one configured.
+    async fn state(&self, req: &DriverRequest) -> Result<State, DriverError> {
+        let configured = self.config.state.id();
+        if let Some(kept) = self.retained(req)?.backend
+            && kept != configured
+        {
+            return Err(DriverError::Invalid {
+                code: Some(CODE_BACKEND.into()),
+                message: format!(
+                    "this resource's state is in {kept}, but the driver is configured for \
+                     {configured}; move the state before deploying it"
+                ),
+            });
+        }
         let unreadable = |_| DriverError::Uncertain("the resource's state cannot be read".into());
-        if self.state_file(req).try_exists().map_err(unreadable)? {
-            return Ok(State::Present);
+        if let Some(state) = self.read_state(req).await? {
+            // A preview or a failed plan leaves an empty S3 workspace behind;
+            // with no apply ever started it is not the resource's state.
+            let empty = state["resources"].as_array().is_none_or(Vec::is_empty);
+            let started = self
+                .state_dir(req)
+                .join(RETAINED_FILE)
+                .try_exists()
+                .map_err(unreadable)?;
+            if empty && !started {
+                return Ok(State::Unapplied);
+            }
+            return Ok(State::Present(state));
         }
         let deleted = self
             .state_dir(req)
@@ -155,9 +191,12 @@ impl OpenTofu {
 /// See [`OpenTofu::state`].
 #[derive(PartialEq)]
 enum State {
-    Present,
+    /// The state document.
+    Present(Value),
     /// Never applied, or deleted.
     Absent,
+    /// An empty S3 workspace from a preview or a failed plan.
+    Unapplied,
 }
 
 /// A failure inside a run, before redaction.
@@ -228,6 +267,9 @@ struct CredentialsConfig {
 struct Retained {
     /// The source URL, path within it and the commit applied.
     source: Option<RetainedSource>,
+    /// Where the state is. Absent in records from before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend: Option<BackendId>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -424,6 +466,8 @@ struct Run {
     module: PathBuf,
     env: BTreeMap<String, String>,
     var_files: Vec<String>,
+    /// `-backend-config` arguments for `init`.
+    init_args: Vec<String>,
     retained: Retained,
     log: RunLog,
 }
@@ -467,7 +511,11 @@ impl OpenTofu {
             dir,
             env: BTreeMap::new(),
             var_files: Vec::new(),
-            retained: Retained::default(),
+            init_args: Vec::new(),
+            retained: Retained {
+                source: None,
+                backend: Some(self.config.state.id()),
+            },
             log,
         })
     }
@@ -499,7 +547,12 @@ impl OpenTofu {
             },
         };
         let source = match (&inputs.source, at) {
-            (_, SourceAt::Retained(Retained { source: Some(s) })) => {
+            (
+                _,
+                SourceAt::Retained(Retained {
+                    source: Some(s), ..
+                }),
+            ) => {
                 let (current, _) = inputs.source.as_ref().ok_or_else(|| {
                     input("the definition no longer has a `source`; its credentials are needed to fetch the retained commit")
                 })?;
@@ -568,13 +621,7 @@ impl OpenTofu {
             files::write_private(&target, content.as_bytes()).map_err(Failure::io)?;
         }
 
-        // State and lock file live outside the run directory.
-        let backend = format!(
-            "terraform {{\n  backend \"local\" {{\n    path = {}\n  }}\n}}\n",
-            json!(self.state_file(req).display().to_string())
-        );
-        files::write_private(&run.module.join(BACKEND_OVERRIDE), backend.as_bytes())
-            .map_err(Failure::io)?;
+        self.prepare_backend(run, req, &home)?;
         // The lock file applied last, unless the module brings its own.
         let lock = state.join(LOCK_FILE);
         let module_lock = run.module.join(LOCK_FILE);
@@ -641,13 +688,6 @@ impl OpenTofu {
             let name = host.replace('-', "__").replace('.', "_");
             run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
         }
-        run.env.insert("HOME".into(), home.display().to_string());
-        run.env.insert("TF_IN_AUTOMATION".into(), "1".into());
-        run.env.insert("TF_INPUT".into(), "0".into());
-        let cache = self.config.root.join("plugin-cache");
-        files::private_dir(&cache).map_err(Failure::io)?;
-        run.env
-            .insert("TF_PLUGIN_CACHE_DIR".into(), cache.display().to_string());
 
         // Variables: plain and secret in separate files, both outside the module.
         let mut redact = Vec::new();
@@ -670,6 +710,157 @@ impl OpenTofu {
         Ok(())
     }
 
+    /// Points the module at orchestrator state, which lives outside the run
+    /// directory, and sets the environment every run shares.
+    fn prepare_backend(
+        &self,
+        run: &mut Run,
+        req: &DriverRequest,
+        home: &std::path::Path,
+    ) -> Result<(), Failure> {
+        let backend = &self.config.state;
+        backend.check().map_err(Failure::Io)?;
+        let text = backend.override_file(&self.state_file(req));
+        files::write_private(&run.module.join(BACKEND_OVERRIDE), text.as_bytes())
+            .map_err(Failure::io)?;
+        if let Some((creds, redact)) = backend.credentials_file().map_err(Failure::Io)? {
+            run.log.redact_values(redact);
+            let path = run.dir.join("backend.tfbackend");
+            files::write_private(&path, creds.as_bytes()).map_err(Failure::io)?;
+            run.init_args
+                .push(format!("-backend-config={}", path.display()));
+        }
+        run.env.insert("HOME".into(), home.display().to_string());
+        run.env.insert("TF_IN_AUTOMATION".into(), "1".into());
+        run.env.insert("TF_INPUT".into(), "0".into());
+        let cache = self.config.root.join("plugin-cache");
+        files::private_dir(&cache).map_err(Failure::io)?;
+        run.env
+            .insert("TF_PLUGIN_CACHE_DIR".into(), cache.display().to_string());
+        Ok(())
+    }
+
+    /// `tofu init` with the backend configuration.
+    async fn init(&self, run: &mut Run) -> Result<(), Failure> {
+        let mut args = vec!["init".to_owned(), "-input=false".to_owned()];
+        args.extend(run.init_args.iter().cloned());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.tofu(run, "init failed", &args, exec::Stdout::Logged)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the resource's workspace exists; only with S3 state.
+    async fn has_workspace(&self, run: &mut Run, req: &DriverRequest) -> Result<bool, Failure> {
+        let list = self
+            .tofu(
+                run,
+                "listing workspaces failed",
+                &["workspace", "list"],
+                // Lists every resource under the prefix.
+                exec::Stdout::Withheld,
+            )
+            .await?;
+        Ok(list
+            .stdout
+            .lines()
+            .any(|l| l.trim_start_matches('*').trim() == req.guresid.as_str()))
+    }
+
+    /// The resource's state document, if it has one.
+    async fn read_state(&self, req: &DriverRequest) -> Result<Option<Value>, DriverError> {
+        let unreadable = || DriverError::Uncertain("the resource's state is not valid JSON".into());
+        if !self.config.state.workspaces() {
+            return match fs::read_to_string(self.state_file(req)) {
+                Ok(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|_| unreadable()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(DriverError::Uncertain(
+                    "the resource's state cannot be read".into(),
+                )),
+            };
+        }
+        // Remote state: a module holding only the backend, so no source or
+        // provider is needed. Workspaces are listed first, because selecting
+        // a missing one creates it.
+        self.with_bare_run(req, async |run| {
+            if !self.has_workspace(run, req).await? {
+                return Ok(None);
+            }
+            run.env
+                .insert("TF_WORKSPACE".into(), req.guresid.as_str().to_owned());
+            let out = self
+                .tofu(
+                    run,
+                    "reading state failed",
+                    &["state", "pull"],
+                    exec::Stdout::Withheld,
+                )
+                .await?;
+            if out.stdout.trim().is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_str(&out.stdout)
+                .map(Some)
+                .map_err(|_| Failure::Io("`tofu state pull` printed no state".into()))
+        })
+        .await
+    }
+
+    /// Runs `body` in an initialized module that holds only the backend, so
+    /// no source or provider is needed.
+    async fn with_bare_run<T>(
+        &self,
+        req: &DriverRequest,
+        body: impl AsyncFnOnce(&mut Run) -> Result<T, Failure>,
+    ) -> Result<T, DriverError> {
+        let mut run = match self.start(req) {
+            Ok(run) => run,
+            Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
+        };
+        let result = async {
+            let home = run.dir.join("home");
+            files::private_dir(&home).map_err(Failure::io)?;
+            files::private_dir(&run.module).map_err(Failure::io)?;
+            self.prepare_backend(&mut run, req, &home)?;
+            self.init(&mut run).await?;
+            body(&mut run).await
+        }
+        .await;
+        self.finish(req, &run.log, result, false)
+    }
+
+    /// Removes the resource's state and recovery metadata, leaving the deleted
+    /// marker. A remote workspace is removed only while its state is empty;
+    /// OpenTofu refuses otherwise.
+    async fn remove_state(&self, run: &mut Run, req: &DriverRequest) -> Result<(), Failure> {
+        if self.config.state.workspaces() {
+            run.env.remove("TF_WORKSPACE");
+            for args in [
+                ["workspace", "select", "default"].as_slice(),
+                &["workspace", "delete", req.guresid.as_str()],
+            ] {
+                self.tofu(
+                    run,
+                    "removing the resource's state failed",
+                    args,
+                    exec::Stdout::Logged,
+                )
+                .await?;
+            }
+        }
+        let state = self.state_dir(req);
+        let removed = match fs::remove_dir_all(&state) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+        removed
+            .and_then(|()| files::private_dir(&state))
+            .and_then(|()| files::write_private(&state.join(DELETED_MARKER), b""))
+            .map_err(Failure::io)
+    }
+
     /// Starts a run and prepares it, then runs `body`; the log goes to the
     /// request's sink and failures become redacted driver errors.
     async fn with_run<T>(
@@ -686,7 +877,30 @@ impl OpenTofu {
             Ok(()) => body(&mut run).await,
             Err(f) => Err(f),
         };
+        // Even after a failure: a partial apply writes state too.
+        let protected = self.protect_local_state(req);
+        let result = result.and_then(|t| protected.map(|()| t));
         self.finish(req, &run.log, result, Self::append_logs(req))
+    }
+
+    /// Makes local state files owner-only; OpenTofu writes them world-readable
+    /// (inside an owner-only directory).
+    fn protect_local_state(&self, req: &DriverRequest) -> Result<(), Failure> {
+        use std::os::unix::fs::PermissionsExt as _;
+        if self.config.state.workspaces() {
+            return Ok(());
+        }
+        let file = self.state_file(req);
+        let backup = file.with_extension("tfstate.backup");
+        for path in [file, backup] {
+            match fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Failure::io(e).after_apply());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     async fn tofu(
@@ -721,13 +935,35 @@ impl OpenTofu {
         req: &DriverRequest,
         destroy: bool,
     ) -> Result<(Vec<(Action, String)>, String), Failure> {
-        self.tofu(
-            run,
-            "init failed",
-            &["init", "-input=false"],
-            exec::Stdout::Logged,
-        )
-        .await?;
+        self.init(run).await?;
+        if self.config.state.workspaces() {
+            self.tofu(
+                run,
+                "selecting the resource's workspace failed",
+                &[
+                    "workspace",
+                    "select",
+                    "-or-create=true",
+                    req.guresid.as_str(),
+                ],
+                exec::Stdout::Logged,
+            )
+            .await?;
+            run.env
+                .insert("TF_WORKSPACE".into(), req.guresid.as_str().to_owned());
+        }
+        let state = self
+            .tofu(
+                run,
+                "reading state failed",
+                &["state", "pull"],
+                exec::Stdout::Withheld,
+            )
+            .await?;
+        let state_version = serde_json::from_str::<Value>(&state.stdout).map_or_else(
+            |_| "none".into(),
+            |s| format!("{} {}", s["lineage"], s["serial"]),
+        );
         let mut args = vec!["plan", "-input=false", "-out=openporch.tfplan"];
         if destroy {
             args.push("-destroy");
@@ -754,7 +990,7 @@ impl OpenTofu {
             req.guresid.as_str().to_owned(),
             if destroy { "destroy" } else { "apply" }.to_owned(),
             req.operation.fingerprint.clone(),
-            self.state_version(req),
+            state_version,
         ];
         for change in plan["resource_changes"].as_array().into_iter().flatten() {
             let address = change["address"].as_str().unwrap_or_default().to_owned();
@@ -787,17 +1023,6 @@ impl OpenTofu {
         actions.sort_by(|a, b| a.1.cmp(&b.1));
         covered[4..].sort();
         Ok((actions, fingerprint(&covered)))
-    }
-
-    /// The lineage and serial of the resource's state, or `none`.
-    fn state_version(&self, req: &DriverRequest) -> String {
-        fs::read_to_string(self.state_file(req))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .map_or_else(
-                || "none".into(),
-                |s| format!("{} {}", s["lineage"], s["serial"]),
-            )
     }
 
     /// Applies the saved plan, refusing destructive changes without a matching
@@ -1004,7 +1229,20 @@ fn check_env_name(name: &str) -> Result<(), Failure> {
     let ok = !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && !name.as_bytes()[0].is_ascii_digit()
-        && !matches!(name, "PATH" | "HOME" | "AWS_EC2_METADATA_DISABLED")
+        && !matches!(
+            name,
+            "PATH"
+                | "HOME"
+                | "AWS_EC2_METADATA_DISABLED"
+                // These would redirect or break the S3 state backend.
+                | "AWS_CA_BUNDLE"
+                | "AWS_S3_ENDPOINT"
+                | "AWS_STS_ENDPOINT"
+                | "AWS_PROFILE"
+                | "AWS_CONFIG_FILE"
+                | "AWS_SHARED_CREDENTIALS_FILE"
+        )
+        && !name.starts_with("AWS_ENDPOINT_URL")
         && !name.starts_with("TF_");
     if ok {
         Ok(())
@@ -1076,7 +1314,7 @@ impl Driver for OpenTofu {
 
     fn plan<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async move {
-            self.state(req)?;
+            self.state(req).await?;
             let planned = self
                 .with_run(req, SourceAt::Current, async |run| {
                     self.plan_run(run, req, false).await
@@ -1088,7 +1326,7 @@ impl Driver for OpenTofu {
 
     fn plan_delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         Box::pin(async move {
-            if self.state(req)? == State::Absent {
+            if matches!(self.state(req).await?, State::Absent | State::Unapplied) {
                 return Ok(Plan::NoEffects);
             }
             let retained = self.retained(req)?;
@@ -1103,7 +1341,7 @@ impl Driver for OpenTofu {
 
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
         Box::pin(async move {
-            self.state(req)?;
+            self.state(req).await?;
             let (outputs, cookie) = self
                 .with_run(req, SourceAt::Current, async |run| {
                     self.put_inner(req, run).await
@@ -1115,27 +1353,14 @@ impl Driver for OpenTofu {
 
     fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
         Box::pin(async move {
-            match self.state(req) {
-                Ok(State::Present) => {}
-                Ok(State::Absent) => return Ok(Observation::Absent),
+            let state = match self.state(req).await {
+                Ok(State::Present(state)) => state,
+                Ok(State::Absent | State::Unapplied) => return Ok(Observation::Absent),
                 Err(e) => {
                     return Ok(Observation::Unknown {
                         reason: e.to_string(),
                     });
                 }
-            }
-            let text = match fs::read_to_string(self.state_file(req)) {
-                Ok(t) => t,
-                Err(_) => {
-                    return Ok(Observation::Unknown {
-                        reason: "the resource's state cannot be read".into(),
-                    });
-                }
-            };
-            let Ok(state) = serde_json::from_str::<Value>(&text) else {
-                return Ok(Observation::Unknown {
-                    reason: "the resource's state is not valid JSON".into(),
-                });
             };
             let outputs = state["outputs"].as_object().cloned().unwrap_or_default();
             Ok(Observation::Ready {
@@ -1147,21 +1372,27 @@ impl Driver for OpenTofu {
 
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         Box::pin(async move {
-            // Nothing was applied, or an earlier delete finished.
-            if self.state(req)? == State::Absent {
-                return Ok(DeleteOutcome::Deleted);
+            match self.state(req).await? {
+                // Nothing was applied, or an earlier delete finished.
+                State::Absent => return Ok(DeleteOutcome::Deleted),
+                State::Unapplied => {
+                    self.with_bare_run(req, async |run| self.remove_state(run, req).await)
+                        .await?;
+                    return Ok(DeleteOutcome::Deleted);
+                }
+                State::Present(_) => {}
             }
             let retained = self.retained(req)?;
             self.with_run(req, SourceAt::Retained(&retained), async |run| {
                 let (actions, fp) = self.plan_run(run, req, true).await?;
                 self.apply_run(run, req, &actions, &fp).await?;
-                // Only confirmed destruction removes the state, leaving a marker
-                // that it was deleted.
-                let state = self.state_dir(req);
-                let removed = fs::remove_dir_all(&state)
-                    .and_then(|()| files::private_dir(&state))
-                    .and_then(|()| files::write_private(&state.join(DELETED_MARKER), b""));
-                removed.map_err(|e| Failure::io(e).after_apply())
+                // Destruction is confirmed: mark it first, so that a repeated
+                // delete is a no-op even if removing the state fails halfway.
+                let marker = self.state_dir(req).join(DELETED_MARKER);
+                files::write_private(&marker, b"").map_err(|e| Failure::io(e).after_apply())?;
+                self.remove_state(run, req)
+                    .await
+                    .map_err(Failure::after_apply)
             })
             .await?;
             Ok(DeleteOutcome::Deleted)
