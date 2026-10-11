@@ -1,4 +1,5 @@
-//! Runs every request example in `docs/api.md` and `docs/security.md` against a dev
+//! Runs every request example in `docs/api.md`, `docs/security.md` and
+//! `docs/drivers/opentofu.md` against a dev
 //! server listening on a loopback port, in document order, and checks each response.
 //!
 //! An example is an `http` block with a request line, headers, a blank line and an
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-const FILES: &[&str] = &["api.md", "security.md"];
+const FILES: &[&str] = &["api.md", "security.md", "drivers/opentofu.md"];
 const WILDCARD: &str = "…";
 
 struct Example {
@@ -256,4 +257,25 @@ async fn api_examples_run() {
 #[tokio::test]
 async fn security_examples_run() {
     run(&docs().join(FILES[1])).await;
+}
+
+#[tokio::test]
+async fn opentofu_examples_run() {
+    run(&docs().join(FILES[2])).await;
+}
+
+/// The DynamoDB example shows its script as HCL and inside the definition's
+/// JSON; both must be the same script.
+#[test]
+fn opentofu_example_script_matches_its_definition() {
+    let text = std::fs::read_to_string(docs().join(FILES[2])).unwrap();
+    let hcl = text
+        .split("```hcl\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("an hcl block");
+    let start = text.find("\"script\": ").expect("a script input") + "\"script\": ".len();
+    let line = text[start..].lines().next().unwrap().trim_end_matches(',');
+    let script: String = serde_json::from_str(line).unwrap();
+    assert_eq!(script, hcl);
 }

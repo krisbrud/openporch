@@ -34,6 +34,20 @@ pub use opentofu::{
     S3State as OpenTofuS3State, StateBackend as OpenTofuStateBackend,
 };
 pub use registry::{DriverRegistry, RegistryError};
+
+/// Checks a definition's driver inputs for a built-in driver that can check
+/// them without running: `values`, and the names in its secret inputs.
+/// Other drivers' inputs are checked when they run.
+pub fn check_definition_inputs(
+    driver_type: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+    secrets: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    match driver_type {
+        "openporch/opentofu" => opentofu::check_definition(values, secrets),
+        _ => Ok(()),
+    }
+}
 pub use run::{
     DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
 };

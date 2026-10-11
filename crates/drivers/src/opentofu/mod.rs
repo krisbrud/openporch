@@ -303,9 +303,53 @@ fn optional_string(
     }
 }
 
-fn parse(config: &Config, req: &DriverRequest) -> Result<Inputs, Failure> {
-    let values = &req.values;
-    let secrets = req.secrets.expose();
+/// Checks a definition's `driver_inputs` when it is created or changed, so
+/// that mistakes fail with `400` rather than at deployment. `secrets` holds
+/// the secret inputs' structure; leaves are references or placeholders, not
+/// values. Placeholders in `source` are resolved only at deployment, so they
+/// are checked then.
+pub fn check_definition(
+    values: &Map<String, Value>,
+    secrets: &Map<String, Value>,
+) -> Result<(), String> {
+    for key in secrets.keys() {
+        if !matches!(key.as_str(), "source" | "variables" | "files" | "tokens") {
+            return Err(format!("unknown OpenTofu driver secret input `{key}`"));
+        }
+    }
+    let mut values = values.clone();
+    if let Some(Value::Object(source)) = values.get_mut("source") {
+        for (key, stand_in) in [("url", "https://placeholder.invalid/m"), ("rev", "HEAD")] {
+            if source
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.contains("${"))
+            {
+                source.insert(key.into(), stand_in.into());
+            }
+        }
+    }
+    // Secret leaves are references here; only their names are checked.
+    let mut stand_ins = Map::new();
+    for key in ["files", "tokens"] {
+        if let Some(Value::Object(m)) = secrets.get(key) {
+            let names = m.keys().map(|k| (k.clone(), Value::from(""))).collect();
+            stand_ins.insert(key.into(), Value::Object(names));
+        }
+    }
+    parse(&Config::new(""), &values, &stand_ins)
+        .map(|_| ())
+        .map_err(|f| match f {
+            Failure::Input(m) => m,
+            other => format!("{other:?}"),
+        })
+}
+
+fn parse(
+    config: &Config,
+    values: &Map<String, Value>,
+    secrets: &Map<String, Value>,
+) -> Result<Inputs, Failure> {
     for key in values.keys() {
         if !matches!(
             key.as_str(),
@@ -527,7 +571,7 @@ impl OpenTofu {
         req: &DriverRequest,
         at: SourceAt<'_>,
     ) -> Result<(), Failure> {
-        let inputs = parse(&self.config, req)?;
+        let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
         let home = run.dir.join("home");
         files::private_dir(&home).map_err(Failure::io)?;
         let state = self.state_dir(req);
