@@ -187,7 +187,7 @@ pub async fn start_with(
         finish_bootstrap_file(&config)?;
     }
 
-    Ok(AppState(Arc::new(Inner {
+    let state = AppState(Arc::new(Inner {
         config,
         store,
         keyring,
@@ -195,7 +195,24 @@ pub async fn start_with(
         not_ready,
         github,
         cloud: CredentialResolver::new(sts),
-    })))
+    }));
+    prune_sessions(&state);
+    Ok(state)
+}
+
+/// Drops expired cloud role sessions every minute while the state is in use.
+fn prune_sessions(state: &AppState) {
+    let weak = Arc::downgrade(&state.0);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match weak.upgrade() {
+                Some(inner) => inner.cloud.prune(),
+                None => break,
+            }
+        }
+    });
 }
 
 async fn session_signer(

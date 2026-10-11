@@ -279,12 +279,8 @@ impl CredentialResolver {
                 window.as_secs()
             )));
         }
-        let mut sessions = self.sessions();
-        // Drop expired sessions, including those of changed or deleted accounts, so
-        // temporary credentials are not kept past their lifetime.
-        let now = (self.clock)();
-        sessions.retain(|_, s| s.credentials.expires_at.is_some_and(|at| at > now));
-        sessions.insert(
+        self.prune();
+        self.sessions().insert(
             key,
             Session {
                 fingerprint,
@@ -292,6 +288,19 @@ impl CredentialResolver {
             },
         );
         Ok(credentials)
+    }
+
+    /// Drops expired sessions, so temporary credentials are not kept past their
+    /// lifetime. The server calls this periodically.
+    pub fn prune(&self) {
+        let now = (self.clock)();
+        self.sessions()
+            .retain(|_, s| s.credentials.expires_at.is_some_and(|at| at > now));
+    }
+
+    /// Drops the session of an account that was changed or deleted.
+    pub fn forget(&self, account: &str) {
+        self.sessions().remove(account);
     }
 
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {

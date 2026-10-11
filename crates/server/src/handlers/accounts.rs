@@ -213,6 +213,7 @@ async fn write_account(
         } else {
             let audit = ctx.audit(org, "cloud_account.update", &id);
             state.store.update_account(org, &account, audit).await?;
+            state.cloud.forget(&id);
         }
         Ok(())
     }
@@ -305,6 +306,7 @@ pub async fn delete_account(
         .store
         .delete_account(org, &id, ctx.audit(org, "cloud_account.delete", &id))
         .await?;
+    state.cloud.forget(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
