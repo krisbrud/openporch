@@ -28,8 +28,11 @@ mod accounts;
 mod catalog;
 mod envs;
 mod github;
+mod keys;
+mod limits;
 mod secret_use;
 mod sets;
+mod tls;
 mod values;
 
 async fn server_in(dir: TempDir) -> Server {

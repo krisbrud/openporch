@@ -19,6 +19,8 @@ pub mod code {
     pub const METHOD_NOT_ALLOWED: &str = "API-005";
     /// The request body is too large.
     pub const TOO_LARGE: &str = "API-006";
+    /// `429`: too many requests; retry after the `Retry-After` seconds.
+    pub const RATE_LIMITED: &str = "API-007";
     /// No valid credential.
     pub const UNAUTHENTICATED: &str = "AUTH-001";
     /// The principal lacks the permission.
@@ -44,6 +46,8 @@ pub struct ApiError {
     pub code: &'static str,
     /// Human-readable message. Never contains secret values or tokens.
     pub message: String,
+    /// Seconds to wait before retrying, sent as `Retry-After`.
+    pub retry_after: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +63,19 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// `429` with `Retry-After`.
+    pub fn rate_limited(retry_after: u64) -> Self {
+        Self {
+            retry_after: Some(retry_after),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                code::RATE_LIMITED,
+                format!("too many requests; retry after {retry_after} seconds"),
+            )
         }
     }
 
@@ -119,12 +136,18 @@ impl IntoResponse for ApiError {
             message: &self.message,
         })
         .unwrap_or_default();
-        (
+        let mut response = (
             self.status,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
-            .into_response()
+            .into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        response
     }
 }
 

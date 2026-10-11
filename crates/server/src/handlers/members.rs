@@ -261,6 +261,7 @@ pub async fn create_token(
     Path((_, user)): Path<(String, String)>,
     JsonBody(body): JsonBody<CreateToken>,
 ) -> ApiResult<(StatusCode, Json<CreatedToken>)> {
+    state.token_limit.check(&ctx.principal.id)?;
     check_token_access(&state, &ctx, &user, true).await?;
     check_id("token", &body.id)?;
     if body

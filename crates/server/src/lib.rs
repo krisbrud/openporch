@@ -7,6 +7,7 @@ pub mod error;
 mod handlers;
 pub mod identity;
 pub mod login;
+pub mod rate_limit;
 pub mod rbac;
 mod secret_inputs;
 pub mod state;

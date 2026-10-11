@@ -14,6 +14,7 @@ use crate::api::JsonBody;
 use crate::error::{ApiError, ApiResult, code};
 use crate::identity::{DeviceLogin, DevicePoll, IdentityProvider, ProviderError};
 use crate::login::{self, Session};
+use crate::rate_limit::ClientAddr;
 use crate::state::AppState;
 
 const TOKEN_PATH: &str = "/auth/github/token";
@@ -42,7 +43,11 @@ impl From<ProviderError> for ApiError {
 }
 
 /// Starts a GitHub device login.
-pub async fn start(State(state): State<AppState>) -> ApiResult<Json<DeviceLogin>> {
+pub async fn start(
+    State(state): State<AppState>,
+    ClientAddr(addr): ClientAddr,
+) -> ApiResult<Json<DeviceLogin>> {
+    state.login_limit.check(&addr)?;
     Ok(Json(github(&state)?.start_device_login().await?))
 }
 
@@ -70,8 +75,10 @@ fn login_failed(message: &str) -> ApiError {
 /// or invitation matches the GitHub account.
 pub async fn poll(
     State(state): State<AppState>,
+    ClientAddr(addr): ClientAddr,
     JsonBody(body): JsonBody<Poll>,
 ) -> ApiResult<Response> {
+    state.login_limit.check(&addr)?;
     let provider = github(&state)?;
     match provider.poll_device_login(&body.device_code).await? {
         DevicePoll::Pending { interval } => Ok((
