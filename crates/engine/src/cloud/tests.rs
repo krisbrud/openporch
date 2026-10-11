@@ -20,6 +20,8 @@ struct FakeSts {
     issued: AtomicU64,
     /// Whether GetCallerIdentity fails echoing the secret key it was given.
     echo_secret: bool,
+    /// Runs while the next AssumeRole call is in flight.
+    during_assume: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FakeSts {
@@ -31,6 +33,7 @@ impl FakeSts {
             max_session: Mutex::new(None),
             issued: AtomicU64::new(0),
             echo_secret: false,
+            during_assume: Mutex::new(None),
         }
     }
 
@@ -46,6 +49,10 @@ impl Sts for FakeSts {
     ) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(request.clone());
+            let hook = self.during_assume.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             if request.external_id != self.external_id {
                 return Err(CloudError::Rejected(
                     "STS AssumeRole failed: AccessDenied: User: arn:aws:iam::111122223333:user/host \
@@ -351,6 +358,28 @@ async fn role_sessions_are_reused_and_refreshed_before_expiry() {
     changed.config.insert("region".into(), json!("eu-west-1"));
     f.resolve(&changed, window).await.unwrap();
     assert_eq!(f.sts.calls().len(), 6);
+}
+
+#[tokio::test]
+async fn a_session_obtained_while_its_account_changes_is_not_cached() {
+    let now = Arc::new(Mutex::new(SystemTime::UNIX_EPOCH));
+    let sts = Arc::new(FakeSts::new(now.clone()));
+    let resolver = Arc::new(CredentialResolver::with_clock(
+        sts.clone(),
+        Arc::new(move || *now.lock().unwrap()),
+    ));
+    let weak = Arc::downgrade(&resolver);
+    *sts.during_assume.lock().unwrap() = Some(Box::new(move || {
+        if let Some(r) = weak.upgrade() {
+            r.forget("aws-prod");
+        }
+    }));
+    let a = role_account(role_config());
+    let first = resolver.resolve(&a, &secrets(), MINUTE).await.unwrap();
+    assert!(resolver.sessions().is_empty());
+    let second = resolver.resolve(&a, &secrets(), MINUTE).await.unwrap();
+    assert_ne!(first.access_key_id, second.access_key_id);
+    assert_eq!(resolver.sessions().len(), 1);
 }
 
 #[tokio::test]

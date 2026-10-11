@@ -10,6 +10,7 @@ mod aws;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -174,6 +175,9 @@ pub struct CredentialResolver {
     sts: Arc<dyn Sts>,
     clock: Clock,
     sessions: Mutex<HashMap<String, Session>>,
+    /// Counts [`CredentialResolver::forget`] calls, so a session obtained while an
+    /// account was being changed or deleted is not cached afterwards.
+    forgotten: AtomicU64,
 }
 
 impl fmt::Debug for CredentialResolver {
@@ -194,6 +198,7 @@ impl CredentialResolver {
             sts,
             clock,
             sessions: Mutex::new(HashMap::new()),
+            forgotten: AtomicU64::new(0),
         }
     }
 
@@ -260,6 +265,7 @@ impl CredentialResolver {
         {
             return Ok(s.credentials.clone());
         }
+        let generation = self.forgotten.load(Ordering::SeqCst);
         let mut credentials = self.sts.assume_role(request.clone()).await?;
         credentials.region = request.region;
         let Some(expires_at) = credentials.expires_at else {
@@ -280,13 +286,19 @@ impl CredentialResolver {
             )));
         }
         self.prune();
-        self.sessions().insert(
-            key,
-            Session {
-                fingerprint,
-                credentials: credentials.clone(),
-            },
-        );
+        let mut sessions = self.sessions();
+        // Checked under the lock `forget` takes, so a session obtained while its
+        // account was changed or deleted is returned once but never cached.
+        if self.forgotten.load(Ordering::SeqCst) == generation {
+            sessions.insert(
+                key,
+                Session {
+                    fingerprint,
+                    credentials: credentials.clone(),
+                },
+            );
+        }
+        drop(sessions);
         Ok(credentials)
     }
 
@@ -300,7 +312,9 @@ impl CredentialResolver {
 
     /// Drops the session of an account that was changed or deleted.
     pub fn forget(&self, account: &str) {
-        self.sessions().remove(account);
+        let mut sessions = self.sessions();
+        self.forgotten.fetch_add(1, Ordering::SeqCst);
+        sessions.remove(account);
     }
 
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
