@@ -23,6 +23,9 @@ group. The examples run in order against a fresh dev server in
   one that does not exist. An object you can see but not change returns `403`.
 - **Secrets.** Secret values are accepted on write and never returned. Responses
   show secret references `{store, ref, version}` instead.
+- **Work in progress.** This page covers the configuration API. Deployments,
+  driver execution and external secret store adapters are not implemented yet;
+  where a route registers something the server cannot use yet, its section says so.
 
 ### Errors
 
@@ -1062,8 +1065,10 @@ Authorization: Bearer $ADMIN_TOKEN
 | DELETE | `/orgs/{org}/resources/drivers/{driver}` | administer |
 
 The built-in drivers are `openporch/echo`, `openporch/none`, `openporch/template`
-and `openporch/opentofu`. An external driver is reached over HTTPS. Its `token`,
-sent as a bearer token, is a secret reference or `{value}`.
+and `openporch/opentofu`. An external driver will be reached over HTTPS, with its
+`token` sent as a bearer token; the token is a secret reference or `{value}`.
+External drivers can be registered now, but the server does not call them until
+the HTTP driver adapter is implemented.
 
 ```http
 POST /orgs/acme/resources/drivers
