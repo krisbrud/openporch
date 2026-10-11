@@ -104,8 +104,8 @@ impl PlannedSecret {
             SecretInput::Value(v) => {
                 if is_template(v.value.expose()) {
                     return Err(ApiError::invalid(format!(
-                        "{what} is a `{{value}}` with a placeholder; put placeholder templates \
-                         under `driver_inputs.secrets`"
+                        "{what} is a `{{value}}` with a placeholder; secret values cannot hold \
+                         placeholders (a definition takes templates under `driver_inputs.secrets`)"
                     )));
                 }
                 Planned::Write(v.value)

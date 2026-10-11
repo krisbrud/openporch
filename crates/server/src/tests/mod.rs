@@ -24,6 +24,7 @@ struct Server {
     admin: String,
 }
 
+mod accounts;
 mod catalog;
 mod envs;
 mod github;
