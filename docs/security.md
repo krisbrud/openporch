@@ -456,7 +456,8 @@ tokens_per_minute = 20  # API tokens created, per calling member
 
 A request over a limit gets `429` with code `API-007` and a `Retry-After` header.
 Behind a reverse proxy (`tls_terminated_by_proxy = true`), the client address is
-the last `X-Forwarded-For` entry, the one the proxy added.
+the last `X-Forwarded-For` entry, the one the proxy added, so the server must be
+reachable only through that proxy. IPv6 clients are limited per /64 network.
 
 ## Master keys
 

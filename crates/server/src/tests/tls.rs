@@ -32,11 +32,11 @@ async fn untrusted_certificate_is_rejected_before_any_request() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         match acceptor.accept(tcp).await {
-            // The handshake failed: no request bytes were ever readable.
-            Err(_) => 0,
+            // The client aborted the handshake, so no request bytes were readable.
+            Err(e) => Err(e.to_string()),
             Ok(mut tls) => {
                 let mut buf = vec![0u8; 4096];
-                tls.read(&mut buf).await.unwrap_or(0)
+                Ok(tls.read(&mut buf).await.unwrap_or(0))
             }
         }
     });
@@ -48,7 +48,19 @@ async fn untrusted_certificate_is_rejected_before_any_request() {
         web_url: base,
     })
     .unwrap();
-    let err = github.start_device_login().await.unwrap_err();
+    let limit = std::time::Duration::from_secs(20);
+    let err = tokio::time::timeout(limit, github.start_device_login())
+        .await
+        .expect("the client neither connected nor failed")
+        .unwrap_err();
     assert!(!err.to_string().contains("Iv1.test-client"), "{err}");
-    assert_eq!(server.await.unwrap(), 0, "the client sent a request");
+    let handshake = tokio::time::timeout(limit, server)
+        .await
+        .expect("the client never connected")
+        .unwrap();
+    // The client connected and then rejected the certificate with a TLS alert.
+    match handshake {
+        Err(e) => assert!(e.contains("alert"), "{e}"),
+        Ok(n) => panic!("the handshake succeeded and the client sent {n} bytes"),
+    }
 }

@@ -3,7 +3,7 @@
 //! refills evenly; a request that finds it empty gets `429` with `Retry-After`.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -13,14 +13,24 @@ use axum::http::request::Parts;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Buckets kept before full ones are dropped, so the map stays bounded.
+/// Buckets kept at most. When the map is full, full buckets are dropped (at most
+/// once a second), and keys that still find no room share one overflow bucket, so
+/// memory stays bounded however many addresses a client cycles through.
 const MAX_KEYS: usize = 10_000;
+/// The key shared by requests that find the map full.
+const OVERFLOW: &str = "overflow";
 
 /// A per-key limit of `per_minute` requests. Zero disables the limit.
 #[derive(Debug)]
 pub struct RateLimiter {
     per_minute: u32,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<Buckets>,
+}
+
+#[derive(Debug, Default)]
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    swept: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,7 +44,7 @@ impl RateLimiter {
     pub fn new(per_minute: u32) -> Self {
         Self {
             per_minute,
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(Buckets::default()),
         }
     }
 
@@ -49,14 +59,27 @@ impl RateLimiter {
         }
         let capacity = f64::from(self.per_minute);
         let per_second = capacity / 60.0;
-        let mut buckets = self
+        let mut guard = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buckets.len() >= MAX_KEYS && !buckets.contains_key(key) {
-            buckets.retain(|_, b| refill(*b, now, per_second, capacity) < capacity);
+        let buckets = &mut *guard;
+        let mut key = key;
+        if buckets.map.len() >= MAX_KEYS && !buckets.map.contains_key(key) {
+            let due = buckets
+                .swept
+                .is_none_or(|t| now.saturating_duration_since(t).as_secs() >= 1);
+            if due {
+                buckets
+                    .map
+                    .retain(|_, b| refill(*b, now, per_second, capacity) < capacity);
+                buckets.swept = Some(now);
+            }
+            if buckets.map.len() >= MAX_KEYS {
+                key = OVERFLOW;
+            }
         }
-        let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {
+        let bucket = buckets.map.entry(key.to_owned()).or_insert(Bucket {
             tokens: capacity,
             updated: now,
         });
@@ -79,7 +102,8 @@ fn refill(b: Bucket, now: Instant, per_second: f64, capacity: f64) -> f64 {
 
 /// The client's address, the key for unauthenticated limits. Behind a trusted
 /// TLS-terminating proxy it is the last `X-Forwarded-For` entry, the one that proxy
-/// added; otherwise the peer address.
+/// added; otherwise the peer address. IPv6 addresses are keyed by their /64, since
+/// one host can usually use every address in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAddr(pub String);
 
@@ -100,13 +124,32 @@ impl FromRequestParts<AppState> for ClientAddr {
                 .map(str::trim)
                 .rfind(|v| !v.is_empty())
         {
-            return Ok(Self(last.to_owned()));
+            return Ok(Self(client_key(last)));
         }
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map_or_else(|| "unknown".to_owned(), |c| c.0.ip().to_string());
+            .map_or_else(
+                || "unknown".to_owned(),
+                |c| client_key(&c.0.ip().to_string()),
+            );
         Ok(Self(peer))
+    }
+}
+
+/// The limit key for an address: IPv4 as is, IPv6 by its /64.
+fn client_key(addr: &str) -> String {
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                let net = Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+                format!("{net}/64")
+            }
+        },
+        Ok(IpAddr::V4(v4)) => v4.to_string(),
+        Err(_) => addr.to_owned(),
     }
 }
 
@@ -153,6 +196,27 @@ mod tests {
         }
         let later = t0 + Duration::from_secs(5);
         limiter.check_at("new", later).unwrap();
-        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+        assert_eq!(limiter.buckets.lock().unwrap().map.len(), 1);
+    }
+
+    #[test]
+    fn a_full_map_of_busy_keys_stays_bounded() {
+        let limiter = RateLimiter::new(1);
+        let t0 = Instant::now();
+        for i in 0..MAX_KEYS {
+            limiter.check_at(&i.to_string(), t0).unwrap();
+        }
+        // No bucket has refilled, so new keys share the overflow bucket.
+        limiter.check_at("fresh-1", t0).unwrap();
+        assert!(limiter.check_at("fresh-2", t0).is_err());
+        assert_eq!(limiter.buckets.lock().unwrap().map.len(), MAX_KEYS + 1);
+    }
+
+    #[test]
+    fn ipv6_clients_are_keyed_by_their_64() {
+        assert_eq!(client_key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(client_key("2001:db8:1:2:bbbb::9"), "2001:db8:1:2::/64");
+        assert_eq!(client_key("::ffff:192.0.2.1"), "192.0.2.1");
+        assert_eq!(client_key("192.0.2.1"), "192.0.2.1");
     }
 }
