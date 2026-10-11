@@ -227,7 +227,7 @@ pub trait CatalogStore: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
-fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
+pub(crate) fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(format!("{what}: {e}"))
 }
 
@@ -320,7 +320,10 @@ async fn check_driver_and_account(
 }
 
 /// The stores named by the references in `secret_refs`.
-fn referenced_stores(refs: &serde_json::Map<String, serde_json::Value>, out: &mut Vec<String>) {
+pub(crate) fn referenced_stores(
+    refs: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<String>,
+) {
     for v in refs.values() {
         if let Some(m) = v.as_object() {
             match m.get("store").and_then(serde_json::Value::as_str) {
@@ -339,8 +342,17 @@ async fn check_secret_stores(
     org: &str,
     inputs: &DriverInputs,
 ) -> Result<()> {
+    check_ref_stores(conn, org, &inputs.secret_refs).await
+}
+
+/// Checks that every store the references in `refs` name is registered.
+pub(crate) async fn check_ref_stores(
+    conn: &mut SqliteConnection,
+    org: &str,
+    refs: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let mut stores = Vec::new();
-    referenced_stores(&inputs.secret_refs, &mut stores);
+    referenced_stores(refs, &mut stores);
     stores.sort();
     stores.dedup();
     for store in stores {
@@ -595,7 +607,7 @@ async fn definition_exists(conn: &mut SqliteConnection, org: &str, id: &str) -> 
 }
 
 /// Up to five definitions matching `filter`, for in-use errors.
-async fn definitions_using(
+pub(crate) async fn definitions_using(
     conn: &mut SqliteConnection,
     org: &str,
     column: &str,

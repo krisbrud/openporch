@@ -14,6 +14,7 @@ mod identity;
 mod ownership;
 pub mod secrets;
 mod sqlite;
+mod sqlite_accounts;
 mod sqlite_catalog;
 mod sqlite_identity;
 
@@ -30,6 +31,7 @@ pub use identity::{
 };
 pub use ownership::Ownership;
 pub use sqlite::SqliteStore;
+pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
 

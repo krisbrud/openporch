@@ -1,5 +1,6 @@
 //! Route handlers and the route table.
 
+mod accounts;
 mod apps;
 mod audit;
 mod catalog;
@@ -353,6 +354,85 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/resources/defs/{def}/criteria/{criterion}",
             Org(OrgPerm::Administer),
             catalog::delete_criterion,
+        )
+        // Cloud accounts, secret stores and secret-use grants.
+        .route(
+            get(),
+            "/orgs/{org}/resources/accounts",
+            Org(OrgPerm::ReadMembers),
+            accounts::accounts,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/resources/accounts",
+            Org(OrgPerm::Administer),
+            accounts::create_account,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/accounts/{account}",
+            Org(OrgPerm::ReadMembers),
+            accounts::get_account,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/resources/accounts/{account}",
+            Org(OrgPerm::Administer),
+            accounts::update_account,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/resources/accounts/{account}",
+            Org(OrgPerm::Administer),
+            accounts::delete_account,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/secretstores",
+            Org(OrgPerm::ReadMembers),
+            accounts::stores,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/secretstores",
+            Org(OrgPerm::Administer),
+            accounts::create_store,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/secretstores/{store}",
+            Org(OrgPerm::ReadMembers),
+            accounts::get_store,
+        )
+        .route(
+            patch(),
+            "/orgs/{org}/secretstores/{store}",
+            Org(OrgPerm::Administer),
+            accounts::update_store,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/secretstores/{store}",
+            Org(OrgPerm::Administer),
+            accounts::delete_store,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/secretstores/{store}/grants",
+            Org(OrgPerm::ReadAll),
+            accounts::grants,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/secretstores/{store}/grants",
+            Org(OrgPerm::Administer),
+            accounts::create_grant,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/secretstores/{store}/grants/{grant}",
+            Org(OrgPerm::Administer),
+            accounts::delete_grant,
         )
         // Audit log.
         .route(
