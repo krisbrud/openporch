@@ -821,3 +821,22 @@ fn credentials_config_cannot_redirect_aws_endpoints() {
     }
     assert!(check_env_name("AWS_ACCESS_KEY_ID").is_ok());
 }
+
+#[tokio::test]
+async fn deleting_a_script_resource_never_fetches_a_newer_source() {
+    let root = tempfile::tempdir().unwrap();
+    let d = fake_driver(root.path(), str::to_owned);
+    let req = request(json!({"script": "terraform {}"}), json!({}));
+    let PutOutcome::Ready { cookie, .. } = d.put(&req).await.unwrap() else {
+        panic!("not ready");
+    };
+    let state = root.path().join("state/0123456789abcdef0123456789abcdef");
+    std::fs::write(state.join("terraform.tfstate"), r#"{"resources":[]}"#).unwrap();
+    // The definition has since gained a source that cannot be fetched.
+    let mut del = request(
+        json!({"source": {"url": "https://git.invalid/m"}, "script": "changed"}),
+        json!({}),
+    );
+    del.cookie = cookie;
+    assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
+}

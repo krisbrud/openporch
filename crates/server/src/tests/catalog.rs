@@ -824,3 +824,72 @@ async fn secrets_of_rejected_changes_are_discarded() {
     crate::secret_inputs::discard(&primary, vec![r.clone()]).await;
     assert!(primary.read(&r).await.is_err());
 }
+
+#[tokio::test]
+async fn opentofu_definition_inputs_are_checked_when_written() {
+    // `Neither source nor script` in `opentofu-driver`, and the update path.
+    let s = server().await;
+    let def = |inputs: Value| {
+        json!({"id": "tofu-queue", "type": "sqs", "driver_type": "openporch/opentofu",
+               "driver_inputs": inputs, "criteria": [{}]})
+    };
+    for (inputs, want) in [
+        (json!({"values": {}}), "set `source`, `script` or both"),
+        (
+            json!({"values": {"script": "", "files": {"override.tf": ""}}}),
+            "would replace the script, the backend",
+        ),
+        (
+            json!({"values": {"source": {"url": "https://user:pw@git.example/m"}}}),
+            "must not contain credentials",
+        ),
+        (
+            json!({"values": {"script": ""}, "secrets": {"password": "${resources.x.outputs.y}"}}),
+            "unknown OpenTofu driver secret input `password`",
+        ),
+        (
+            json!({"values": {"script": "", "timeout": "15 minutes"}}),
+            "`timeout` must be",
+        ),
+        (
+            json!({"values": {"script": "", "credentials_config": {"environment": {"AWS_ENDPOINT_URL": "Region"}}}}),
+            "cannot be set by `credentials_config`",
+        ),
+        (
+            json!({"values": {"script": ""}, "secret_refs": {"files": {"main.tf": {"value": "x"}}},
+                   "secrets": {"files": {"ok.txt": "${resources.x.outputs.y}"}}}),
+            "would replace the script",
+        ),
+    ] {
+        let (status, b) = s
+            .post("/orgs/acme/resources/defs", &s.admin, def(inputs))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+        assert!(b["message"].as_str().unwrap().contains(want), "{b}");
+    }
+    // A placeholder can stand for a whole input.
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "tofu-vars", "type": "sqs", "driver_type": "openporch/opentofu",
+               "driver_inputs": {"values": {"script": "", "variables": "${resources.cfg.outputs.vars}"}},
+               "criteria": [{}]}),
+    )
+    .await;
+    // Placeholders in `source` are left to deployment.
+    s.created(
+        "/orgs/acme/resources/defs",
+        def(
+            json!({"values": {"source": {"url": "${resources.repo.outputs.url}"}},
+                   "secret_refs": {"source": {"password": {"value": "token-1"}}}}),
+        ),
+    )
+    .await;
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/defs/tofu-queue",
+            &s.admin,
+            json!({"driver_type": "openporch/opentofu", "driver_inputs": {"values": {}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+}

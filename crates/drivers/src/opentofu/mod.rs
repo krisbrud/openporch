@@ -303,9 +303,69 @@ fn optional_string(
     }
 }
 
-fn parse(config: &Config, req: &DriverRequest) -> Result<Inputs, Failure> {
-    let values = &req.values;
-    let secrets = req.secrets.expose();
+/// Checks a definition's `driver_inputs` when it is created or changed, so
+/// that mistakes fail with `400` rather than at deployment. `secrets` holds
+/// the secret inputs' structure; leaves are references or placeholders, not
+/// values. Placeholders in `source` are resolved only at deployment, so they
+/// are checked then.
+pub fn check_definition(
+    values: &Map<String, Value>,
+    secrets: &Map<String, Value>,
+) -> Result<(), String> {
+    let placeholder = |v: &Value| v.as_str().is_some_and(|s| s.contains("${"));
+    for key in secrets.keys() {
+        if !matches!(key.as_str(), "source" | "variables" | "files" | "tokens") {
+            return Err(format!("unknown OpenTofu driver secret input `{key}`"));
+        }
+    }
+    // A placeholder can stand for a whole input of any type, so inputs that
+    // are placeholders are checked at deployment.
+    let mut values = values.clone();
+    values.retain(|_, v| !placeholder(v));
+    if let Some(Value::Object(source)) = values.get_mut("source") {
+        for (key, stand_in) in [("url", "https://placeholder.invalid/m"), ("rev", "HEAD")] {
+            if source.get(key).is_some_and(placeholder) {
+                source.insert(key.into(), stand_in.into());
+            }
+        }
+        source.retain(|_, v| !placeholder(v));
+    }
+    // Secret leaves are references here; only their names are checked.
+    let mut stand_ins = Map::new();
+    for key in ["files", "tokens"] {
+        if let Some(Value::Object(m)) = secrets.get(key) {
+            let names = m.keys().map(|k| (k.clone(), Value::from(""))).collect();
+            stand_ins.insert(key.into(), Value::Object(names));
+        }
+    }
+    let inputs = parse(&Config::new(""), &values, &stand_ins).map_err(|f| match f {
+        Failure::Input(m) => m,
+        other => format!("{other:?}"),
+    })?;
+    if let Some(cc) = &inputs.credentials_config {
+        for name in cc.environment.keys() {
+            check_env_name(name).map_err(|f| match f {
+                Failure::Input(m) => m,
+                other => format!("{other:?}"),
+            })?;
+        }
+    }
+    if values
+        .get("append_logs_to_error")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
+        return Err("`append_logs_to_error` must be true or false".into());
+    }
+    crate::call_timeout(&values, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn parse(
+    config: &Config,
+    values: &Map<String, Value>,
+    secrets: &Map<String, Value>,
+) -> Result<Inputs, Failure> {
     for key in values.keys() {
         if !matches!(
             key.as_str(),
@@ -527,7 +587,7 @@ impl OpenTofu {
         req: &DriverRequest,
         at: SourceAt<'_>,
     ) -> Result<(), Failure> {
-        let inputs = parse(&self.config, req)?;
+        let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
         let home = run.dir.join("home");
         files::private_dir(&home).map_err(Failure::io)?;
         let state = self.state_dir(req);
@@ -567,7 +627,9 @@ impl OpenTofu {
                     s.path.clone(),
                 ))
             }
-            (Some((s, path)), _) => Some((
+            // Applied from a script alone: never the definition's newer source.
+            (_, SourceAt::Retained(_)) => None,
+            (Some((s, path)), SourceAt::Current) => Some((
                 git::Source {
                     url: s.url.clone(),
                     rev: s.rev.clone(),

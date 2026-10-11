@@ -422,6 +422,16 @@ pub async fn get_definition(
     Ok(Json(definition_or_404(&state, &id).await?))
 }
 
+/// Checks a built-in driver's inputs, so mistakes fail with `400` when the
+/// definition is written rather than at deployment.
+fn check_driver_inputs(driver_type: &str, inputs: &DriverInputs) -> ApiResult<()> {
+    for secrets in [&inputs.secret_refs, &inputs.secrets] {
+        openporch_drivers::check_definition_inputs(driver_type, &inputs.values, secrets)
+            .map_err(|m| ApiError::invalid(format!("`driver_inputs`: {m}")))?;
+    }
+    Ok(())
+}
+
 /// Creates a definition. Inline secrets and `{value}` references are written to the
 /// primary store; the stored definition and the response hold references only.
 pub async fn create_definition(
@@ -432,6 +442,7 @@ pub async fn create_definition(
     let mut def: ResourceDefinition = secret_inputs::parse_body(body)?;
     let org = state.org();
     let id = def.id.to_string();
+    check_driver_inputs(&def.driver_type, &def.driver_inputs)?;
     let planned = PlannedInputs::new(std::mem::take(&mut def.driver_inputs))?;
     def.driver_inputs = planned.references();
     // Check everything before secrets are written, so a request that will be
@@ -500,6 +511,7 @@ pub async fn update_definition(
 ) -> ApiResult<Json<DefinitionRecord>> {
     let body: UpdateDefinition = secret_inputs::parse_body(body)?;
     let org = state.org();
+    check_driver_inputs(&body.driver_type, &body.driver_inputs)?;
     let planned = PlannedInputs::new(body.driver_inputs)?;
     let current = definition_or_404(&state, &id).await?.definition;
     let mut update = DefinitionUpdate {
