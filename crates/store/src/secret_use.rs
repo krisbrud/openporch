@@ -88,7 +88,9 @@ impl SecretUseStore for SqliteStore {
     }
 }
 
-/// Checks one use of `r` by `owner` for `app`/`env`.
+/// Checks one use of `r` by `owner` for `app`/`env`. An object's own secrets need no
+/// grant: for a definition, the consumer scope is its criteria, which the executor
+/// matched before it asks.
 pub(crate) async fn check_use(
     conn: &mut SqliteConnection,
     org: &str,

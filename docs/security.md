@@ -356,7 +356,9 @@ optionally one environment. An org-wide grant is meant for platform definitions.
 Grants are checked twice. When an object is assigned a reference, shared values
 need a grant covering their application or environment, and definitions, cloud
 accounts and drivers need some grant for any secret they did not write
-themselves. When a deployment runs, the executor checks every reference again for
+themselves; which application and environment that grant covers is checked only
+when the secret is resolved. A definition's own secrets serve the deployments its
+criteria match. When a deployment runs, the executor checks every reference again for
 the deploying application and environment immediately before reading it, so a
 production-only grant never serves development, and removing a grant blocks
 every later resolution, including replays of earlier deployments. Deployments
