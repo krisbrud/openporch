@@ -125,6 +125,8 @@ fn request(cookie: Option<Cookie>) -> DriverRequest {
         credentials: None,
         context: DriverContext::default(),
         cookie,
+        permit: None,
+        log: LogSink::default(),
     }
 }
 
