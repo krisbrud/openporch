@@ -49,7 +49,7 @@ The server refuses to listen on a non-loopback address over plain HTTP unless
 | Scope | Role | Grants |
 | --- | --- | --- |
 | Organization | `administrator` | Everything. |
-| Organization | `manager` | Invites and removes members below their own authority, creates applications, and issues tokens for service users within their ceiling. |
+| Organization | `manager` | Invites members below their own authority, removes any member who is not an administrator, creates applications, and issues tokens for service users within their ceiling. |
 | Organization | `orgViewer` | Reads everything, including the audit log. |
 | Organization | `member` | Sees only applications where they hold a role. |
 | Application | `viewer` | Reads the application, its environments, sets, deltas and values. |

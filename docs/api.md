@@ -614,7 +614,8 @@ returns the ID of the resulting set.
 
 A delta has `modules.add` (workloads by ID), `modules.remove` (IDs),
 `modules.update` (JSON Patch operations by workload ID) and `shared` (JSON Patch
-operations on the shared map). They apply in that order. Adding a workload that
+operations on the shared map). They apply in the order remove, add, update,
+shared, so a delta can remove a workload and add it back. Adding a workload that
 exists, or removing or updating one that does not, fails with `400` naming it.
 
 ```http
