@@ -1856,6 +1856,10 @@ name = "openporch-drivers"
 version = "0.1.0"
 dependencies = [
  "openporch-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
