@@ -740,6 +740,23 @@ impl AccountStore for SqliteStore {
                 "drivers",
                 referencing_store(&mut tx, org, "drivers", "body", "/token", id).await?,
             ),
+            ("shared values", {
+                // Current values and the value set versions deployments may replay.
+                sqlx::query_scalar(
+                    "SELECT DISTINCT app_id || CASE env_id WHEN '' THEN '' \
+                         ELSE '/' || env_id END FROM ( \
+                       SELECT app_id, env_id FROM app_values WHERE org_id = ?1 \
+                         AND json_extract(secret_ref, '$.store') = ?2 \
+                       UNION SELECT v.app_id, v.env_id FROM value_set_versions v, \
+                         json_each(v.content) e WHERE v.org_id = ?1 \
+                         AND json_extract(e.value, '$.secret_ref.store') = ?2) \
+                     ORDER BY 1 LIMIT 5",
+                )
+                .bind(org)
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?
+            }),
             ("grants", {
                 sqlx::query_scalar(
                     "SELECT id FROM secret_grants WHERE org_id = ? AND store_id = ? \

@@ -773,3 +773,42 @@ async fn account_check_returns_the_caller_identity() {
         .await;
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
 }
+
+#[tokio::test]
+async fn delete_a_store_used_by_shared_values() {
+    let s = server().await;
+    s.static_account("aws-prod").await;
+    s.aws_store("vault", "aws-prod").await;
+    s.app("shop").await;
+    let grant = s
+        .ok(
+            Method::POST,
+            &format!("{STORES}/vault/grants"),
+            json!({"ref": "shop/db", "app_id": "shop"}),
+        )
+        .await;
+    let value = "/orgs/acme/apps/shop/values";
+    let (status, b) = s
+        .post(
+            value,
+            &s.admin,
+            json!({"key": "DB", "secret_ref": {"store": "vault", "ref": "shop/db"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    s.ok(
+        Method::DELETE,
+        &format!("{STORES}/vault/grants/{}", grant["id"].as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+    let (status, b) = s.delete(&format!("{STORES}/vault"), &s.admin).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(message(&b).contains("shared values shop"), "{b}");
+
+    // Value set versions keep the reference after the value is gone.
+    let (status, _) = s.delete(&format!("{value}/DB"), &s.admin).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, b) = s.delete(&format!("{STORES}/vault"), &s.admin).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+}
