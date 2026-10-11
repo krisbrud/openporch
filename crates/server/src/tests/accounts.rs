@@ -411,10 +411,19 @@ async fn delete_a_store_in_use() {
                "driver_inputs": {"secret_refs": {"password": {"store": "prod-sm", "ref": "db"}}}}),
     )
     .await;
+    // Plain values shaped like a reference do not keep the store.
+    s.ok(
+        Method::POST,
+        "/orgs/acme/resources/defs",
+        json!({"id": "lookalike", "type": "postgres", "driver_type": "openporch/echo",
+               "driver_inputs": {"values": {"source": {"store": "prod-sm", "ref": "branch"}}}}),
+    )
+    .await;
     let path = format!("{STORES}/prod-sm");
     let (status, b) = s.delete(&path, &s.admin).await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
     assert!(message(&b).contains("prod-postgres"), "{b}");
+    assert!(!message(&b).contains("lookalike"), "{b}");
     s.ok(
         Method::DELETE,
         "/orgs/acme/resources/defs/prod-postgres",

@@ -419,13 +419,15 @@ async fn check_store_config(
     check_credential_graph(conn, org, (Node::Store(id.to_owned()), store_edges(config))).await
 }
 
-/// Up to five `kind` objects, by ID, whose JSON column `column` names `store` in
-/// a secret reference.
+/// IDs of rows in `table` whose secret references, at `pointer` inside the JSON
+/// `column`, name `store`. Only reference positions are scanned, so ordinary
+/// values shaped like `{store, ref}` do not count.
 async fn referencing_store(
     conn: &mut SqliteConnection,
     org: &str,
     table: &str,
     column: &str,
+    pointer: &str,
     store: &str,
 ) -> Result<Vec<String>> {
     let rows: Vec<(String, String)> = sqlx::query_as(&format!(
@@ -438,8 +440,15 @@ async fn referencing_store(
     for (id, body) in rows {
         let value: Value = serde_json::from_str(&body)?;
         let mut stores = Vec::new();
-        if let Some(m) = value.as_object() {
-            referenced_stores(m, &mut stores);
+        match value.pointer(pointer) {
+            // A single reference, such as a driver token.
+            Some(Value::Object(m)) if m.get("ref").is_some_and(Value::is_string) => {
+                if let Some(s) = m.get("store").and_then(Value::as_str) {
+                    stores.push(s.to_owned());
+                }
+            }
+            Some(Value::Object(m)) => referenced_stores(m, &mut stores),
+            _ => {}
         }
         if stores.iter().any(|s| s == store) {
             out.push(id);
@@ -713,15 +722,23 @@ impl AccountStore for SqliteStore {
         let users = [
             (
                 "definitions",
-                referencing_store(&mut tx, org, "definitions", "driver_inputs", id).await?,
+                referencing_store(
+                    &mut tx,
+                    org,
+                    "definitions",
+                    "driver_inputs",
+                    "/secret_refs",
+                    id,
+                )
+                .await?,
             ),
             (
                 "cloud accounts",
-                referencing_store(&mut tx, org, "cloud_accounts", "secret_refs", id).await?,
+                referencing_store(&mut tx, org, "cloud_accounts", "secret_refs", "", id).await?,
             ),
             (
                 "drivers",
-                referencing_store(&mut tx, org, "drivers", "body", id).await?,
+                referencing_store(&mut tx, org, "drivers", "body", "/token", id).await?,
             ),
             ("grants", {
                 sqlx::query_scalar(
