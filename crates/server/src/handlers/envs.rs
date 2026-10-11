@@ -89,7 +89,7 @@ async fn view(state: &AppState, env: EnvRecord) -> ApiResult<EnvView> {
     })
 }
 
-async fn env_or_404(state: &AppState, app: &str, env: &str) -> ApiResult<EnvRecord> {
+pub(super) async fn env_or_404(state: &AppState, app: &str, env: &str) -> ApiResult<EnvRecord> {
     state
         .store
         .env(state.org(), app, env)

@@ -29,6 +29,7 @@ mod catalog;
 mod envs;
 mod github;
 mod sets;
+mod values;
 
 async fn server_in(dir: TempDir) -> Server {
     let config = Config::new("acme", dir.path());
