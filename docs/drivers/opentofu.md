@@ -270,9 +270,10 @@ configured with a different backend, the driver refuses that resource with
 
 The same applies when state disappears. A resource whose cookie shows it was
 applied, but whose state is missing, is reported as needing recovery instead of
-being treated as new, which would create every object a second time. Detecting
-lost state for a resource whose first apply failed partway, before it had a
-cookie, arrives later in this milestone.
+being treated as new, which would create every object a second time. So is a
+resource whose first apply started, even one that failed partway before it had
+a cookie. To recover, restore the state, or delete what the resource created and
+remove its record under the driver's `state` directory.
 
 The `backend` input, for state in a backend that the module chooses, is not
 supported yet.
@@ -298,6 +299,19 @@ checks its permit and applies exactly that plan. State is removed only after the
 destroy succeeds, and a remote workspace only once its state is empty. If the
 destroy fails, state and the retained record stay, and the delete can be retried.
 Deleting again after a successful delete does nothing.
+
+## Timeouts and locks
+
+Calls for one resource run one at a time. When a call times out, its commands
+are interrupted with `SIGINT`, so that OpenTofu writes state and releases its
+lock. Whatever is still running after a grace period, one minute by default, is
+killed, including provider processes. The next call for the resource waits
+until all of them are gone.
+
+If another process holds the resource's state lock, the call waits for it
+(30 seconds by default), then fails as a conflict naming the lock ID. The driver
+never breaks a lock. When you are sure no run is using the state, release it
+with `tofu force-unlock <id>`.
 
 ## Errors and logs
 
@@ -333,8 +347,4 @@ registries and module sources such as `app.terraform.io` work as usual.
 
 - The deployment executor, which calls the driver, passes it permits and
   configures its state backend from the server's settings.
-- Ending a timed-out run gracefully. Today only the `tofu` process is killed:
-  provider processes can keep running and changing infrastructure, and a state
-  lock can be left behind. Stopping and reaping the whole process group arrives
-  later in this milestone.
 - The `backend` input.

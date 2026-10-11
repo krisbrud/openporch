@@ -21,6 +21,7 @@ mod git;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -71,6 +72,11 @@ pub struct Config {
     pub allow_file_sources: bool,
     /// Host keys SSH sources are checked against. Without it SSH sources fail.
     pub ssh_known_hosts: Option<PathBuf>,
+    /// How long a run abandoned on timeout has to stop after `SIGINT`, so that
+    /// OpenTofu can write state and release its lock, before it is killed.
+    pub stop_grace: std::time::Duration,
+    /// How long a run waits for a state lock that another run holds.
+    pub lock_timeout: std::time::Duration,
     /// Where state lives. Recovery metadata (the retained script, lock file
     /// and source commit) stays under `root` either way.
     pub state: StateBackend,
@@ -85,6 +91,8 @@ impl Config {
             root: root.into(),
             allow_file_sources: false,
             ssh_known_hosts: None,
+            stop_grace: std::time::Duration::from_secs(60),
+            lock_timeout: std::time::Duration::from_secs(30),
             state: StateBackend::Local,
         }
     }
@@ -95,6 +103,9 @@ impl Config {
 pub struct OpenTofu {
     info: DriverInfo,
     config: Config,
+    /// One run per resource at a time; a run abandoned on timeout keeps its
+    /// resource's lock until its processes are gone.
+    resources: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl OpenTofu {
@@ -131,6 +142,7 @@ impl OpenTofu {
                 },
             },
             config,
+            resources: std::sync::Mutex::default(),
         }
     }
 
@@ -177,12 +189,23 @@ impl OpenTofu {
             .join(DELETED_MARKER)
             .try_exists()
             .map_err(unreadable)?;
-        // A cookie means an apply succeeded, so its state must exist.
-        if req.cookie.is_some() && !deleted {
-            return Err(DriverError::Uncertain(
-                "the resource was applied but its OpenTofu state is missing; it needs recovery"
-                    .into(),
-            ));
+        // A cookie means an apply succeeded, and a retained record that an
+        // apply started; OpenTofu writes state even when an apply fails. Either
+        // way state must exist, and starting afresh would duplicate objects.
+        let started = self
+            .state_dir(req)
+            .join(RETAINED_FILE)
+            .try_exists()
+            .map_err(unreadable)?;
+        if (req.cookie.is_some() || started) && !deleted {
+            return Err(DriverError::Uncertain(format!(
+                "the resource was applied but its OpenTofu state is missing from {}; it needs \
+                 recovery: an operator restores the state, or confirms that nothing was created \
+                 and removes the resource's recovery record (`{}` under the driver's state \
+                 directory)",
+                self.config.state.id(),
+                req.guresid.as_str()
+            )));
         }
         Ok(State::Absent)
     }
@@ -206,6 +229,8 @@ pub(crate) enum Failure {
     Input(String),
     /// A command failed: its name, what it was doing and its stderr.
     Command { what: String, stderr: String },
+    /// Another run holds the state lock; OpenTofu's error output.
+    Locked(String),
     /// A failure once an apply started: infrastructure may have changed.
     Uncertain { what: String, stderr: String },
     /// The plan needs a permit the request does not carry.
@@ -232,6 +257,8 @@ impl Failure {
             Self::Command { what, stderr } | Self::Uncertain { what, stderr } => {
                 Self::Uncertain { what, stderr }
             }
+            // Nothing ran without the lock.
+            Self::Locked(stderr) => Self::Locked(stderr),
             Self::Input(what) | Self::Permit(what) | Self::Io(what) => Self::Uncertain {
                 what,
                 stderr: String::new(),
@@ -530,12 +557,21 @@ struct Run {
     init_args: Vec<String>,
     retained: Retained,
     log: RunLog,
+    /// How the run's processes stop if the call is abandoned.
+    stop: exec::Stop,
 }
 
 impl Drop for Run {
-    /// Run directories hold secret files and are not reused.
+    /// Run directories hold secret files and are not reused. A directory an
+    /// abandoned command still runs in is removed once it has stopped.
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if !self
+            .stop
+            .abandoned
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -549,8 +585,27 @@ enum SourceAt<'a> {
 }
 
 impl OpenTofu {
-    /// Creates the run directory and a log that redacts the request's secrets.
-    fn start(&self, req: &DriverRequest) -> Result<Run, Failure> {
+    /// Waits until no run, nor an abandoned run's processes, use the resource,
+    /// and keeps others out until the guard drops.
+    async fn hold(&self, req: &DriverRequest) -> Result<tokio::sync::OwnedMutexGuard<()>, Failure> {
+        let resource = {
+            let mut resources = self
+                .resources
+                .lock()
+                .map_err(|_| Failure::Io("the driver's resource locks are poisoned".into()))?;
+            resources
+                .entry(req.guresid.as_str().to_owned())
+                .or_default()
+                .clone()
+        };
+        Ok(resource.lock_owned().await)
+    }
+
+    /// Waits until no other run, or abandoned run's processes, use the
+    /// resource, then creates the run directory and a log that redacts the
+    /// request's secrets.
+    async fn start(&self, req: &DriverRequest) -> Result<Run, Failure> {
+        let hold = self.hold(req).await?;
         let mut log = RunLog::default();
         let mut redact = secret_strings(&[&req.secrets, &req.resource_secrets]);
         if let Some(c) = &req.credentials {
@@ -568,6 +623,12 @@ impl OpenTofu {
         files::private_dir(&dir).map_err(Failure::io)?;
         Ok(Run {
             module: dir.join("module"),
+            stop: exec::Stop {
+                grace: self.config.stop_grace,
+                hold: Arc::new(hold),
+                dir: dir.clone(),
+                abandoned: Arc::default(),
+            },
             dir,
             env: BTreeMap::new(),
             var_files: Vec::new(),
@@ -644,8 +705,16 @@ impl OpenTofu {
         match &source {
             Some((s, path)) => {
                 let checkout = run.dir.join("source");
-                let commit =
-                    git::fetch(&self.config, &mut run.log, s, &s.rev, &checkout, &home).await?;
+                let commit = git::fetch(
+                    &self.config,
+                    &mut run.log,
+                    &run.stop,
+                    s,
+                    &s.rev,
+                    &checkout,
+                    &home,
+                )
+                .await?;
                 run.module = match path {
                     Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
                     None => checkout.canonicalize().map_err(Failure::io)?,
@@ -833,6 +902,10 @@ impl OpenTofu {
     async fn read_state(&self, req: &DriverRequest) -> Result<Option<Value>, DriverError> {
         let unreadable = || DriverError::Uncertain("the resource's state is not valid JSON".into());
         if !self.config.state.workspaces() {
+            // An abandoned run may still be writing the file.
+            let _hold = self.hold(req).await.map_err(|_| {
+                DriverError::Uncertain("the resource's state cannot be read".into())
+            })?;
             return match fs::read_to_string(self.state_file(req)) {
                 Ok(text) => serde_json::from_str(&text)
                     .map(Some)
@@ -877,7 +950,7 @@ impl OpenTofu {
         req: &DriverRequest,
         body: impl AsyncFnOnce(&mut Run) -> Result<T, Failure>,
     ) -> Result<T, DriverError> {
-        let mut run = match self.start(req) {
+        let mut run = match self.start(req).await {
             Ok(run) => run,
             Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
         };
@@ -931,7 +1004,7 @@ impl OpenTofu {
         at: SourceAt<'_>,
         body: impl AsyncFnOnce(&mut Run) -> Result<T, Failure>,
     ) -> Result<T, DriverError> {
-        let mut run = match self.start(req) {
+        let mut run = match self.start(req).await {
             Ok(run) => run,
             Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
         };
@@ -981,10 +1054,14 @@ impl OpenTofu {
             &run.module,
             &run.env,
             stdout,
+            &run.stop,
         )
         .await
         .map_err(|e| Failure::Io(format!("running `tofu`: {e}")))?;
         if !out.success {
+            if out.stderr.contains("Error acquiring the state lock") {
+                return Err(Failure::Locked(out.stderr));
+            }
             return Err(Failure::command("tofu", what, &out.stderr));
         }
         Ok(out)
@@ -1026,7 +1103,13 @@ impl OpenTofu {
             |_| "none".into(),
             |s| format!("{} {}", s["lineage"], s["serial"]),
         );
-        let mut args = vec!["plan", "-input=false", "-out=openporch.tfplan"];
+        let lock_timeout = format!("-lock-timeout={}s", self.config.lock_timeout.as_secs());
+        let mut args = vec![
+            "plan",
+            "-input=false",
+            "-out=openporch.tfplan",
+            &lock_timeout,
+        ];
         if destroy {
             args.push("-destroy");
         }
@@ -1109,10 +1192,11 @@ impl OpenTofu {
             )));
         }
         self.retain(req, run)?;
+        let lock_timeout = format!("-lock-timeout={}s", self.config.lock_timeout.as_secs());
         self.tofu(
             run,
             "apply failed",
-            &["apply", "-input=false", "openporch.tfplan"],
+            &["apply", "-input=false", &lock_timeout, "openporch.tfplan"],
             exec::Stdout::Logged,
         )
         .await
@@ -1203,6 +1287,7 @@ impl OpenTofu {
                     code: Some(CODE_PERMIT.into()),
                     message: m,
                 },
+                Failure::Locked(stderr) => DriverError::Conflict(locked(&log.redact(&stderr))),
                 Failure::Io(m) => DriverError::Invalid {
                     code: Some(CODE_FAILED.into()),
                     message: log.redact(&m),
@@ -1312,6 +1397,23 @@ fn check_env_name(name: &str) -> Result<(), Failure> {
         Err(input(format!(
             "`{name}` cannot be set by `credentials_config`"
         )))
+    }
+}
+
+/// The conflict message for a held state lock: never bypassed, so it names the
+/// lock for an operator to inspect and, if no run holds it, release.
+fn locked(stderr: &str) -> String {
+    let id = stderr
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ID:"))
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    match id {
+        Some(id) => format!(
+            "the resource's OpenTofu state is locked by another run (lock {id}); if no run \
+             holds it, an operator can release it with `tofu force-unlock {id}`"
+        ),
+        None => "the resource's OpenTofu state is locked by another run".into(),
     }
 }
 

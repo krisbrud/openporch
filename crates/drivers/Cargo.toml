@@ -12,6 +12,7 @@ publish.workspace = true
 openporch-core.workspace = true
 base64.workspace = true
 minijinja.workspace = true
+nix.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

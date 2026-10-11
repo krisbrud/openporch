@@ -56,6 +56,7 @@ toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+nix = { version = "0.30", default-features = false, features = ["signal"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 zeroize = "1"
 
