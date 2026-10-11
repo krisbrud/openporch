@@ -38,7 +38,7 @@ The server refuses to listen on a non-loopback address over plain HTTP unless
 | Organization | `member` | Sees only applications where they hold a role. |
 | Application | `viewer` | Reads the application, its environments, sets, deltas and values. |
 | Application | `developer` | Also edits sets, deltas, values and environments. |
-| Application | `owner` | Also manages application users and deletes the application. |
+| Application | `owner` | Also manages application users and deletes the application, which also needs `deployer` on every environment type the application has environments of. |
 | Environment type | `deployer` | Lets developers and owners deploy to, create and delete environments of the type and change their values. Changing application-wide values needs it on every type the application has environments of. |
 
 Every route declares the permission it needs (see the tables in [api.md](api.md)),
@@ -158,9 +158,11 @@ Denied changes are recorded in the audit log.
 
 ## Delegation
 
-Managers act only on members whose every permission they hold themselves. They
-cannot create or promote administrators, and they cannot issue tokens for a
-service user with more authority than their own.
+Managers invite, create, change the roles of and issue tokens for members only
+when they hold every permission the member has or would get. They cannot create
+or promote administrators, and they cannot issue tokens for a service user with
+more authority than their own. Removal grants nothing, so a manager may remove
+any member who is not an administrator.
 
 ```http
 POST /orgs/acme/users

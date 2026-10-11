@@ -1304,7 +1304,9 @@ Authorization: Bearer $ADMIN_TOKEN
 | DELETE | `/orgs/{org}/secretstores/{store}/grants/{grant}` | administer |
 
 The built-in store `openporch` is the primary store, where `{value}` secrets are
-written. External stores are read through a cloud account. A store that
+written. External stores such as `aws-secrets-manager` can be registered with the
+cloud account that reads them, but their adapters are not implemented yet, so
+references to them do not resolve. A store that
 definitions, accounts, drivers, grants or shared values still reference cannot be
 deleted. Grants are described in [security.md](security.md#secret-use-grants).
 
