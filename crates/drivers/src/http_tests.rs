@@ -388,14 +388,16 @@ fn unsupported_protocol_versions_and_targets_are_refused() {
     for bad in [
         "ftp://driver.internal/x",
         "https://user:pw@driver.internal/x",
-        "https://driver.internal/x?token=1",
+        "https://driver.internal/x?token=secret1",
+        "https://driver.internal/x#frag",
         "not a url",
     ] {
-        assert!(matches!(
-            HttpDriver::new(info(Capabilities::default()), bad, None),
-            Err(HttpDriverError::InvalidTarget(_))
-        ));
+        let err = HttpDriver::new(info(Capabilities::default()), bad, None).unwrap_err();
+        assert!(matches!(err, HttpDriverError::InvalidTarget(_)), "{bad}");
+        // The error never repeats the URL, which may hold credentials.
+        assert!(!err.to_string().contains("driver.internal"), "{err}");
     }
+    check_target("HTTPS://driver.internal/x/").unwrap();
 }
 
 #[tokio::test]
@@ -413,4 +415,60 @@ async fn connection_failures_are_transient_and_tokens_are_not_printed() {
     let err = driver.put(&request(None)).await.unwrap_err();
     assert!(err.is_retryable(), "{err:?}");
     assert!(!format!("{driver:?}").contains(TOKEN));
+}
+
+/// A driver that reads each request and then fails as `mode` says: closing the
+/// connection without answering, or answering with an oversized body.
+async fn broken(mode: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0; 64 * 1024];
+                let _ = sock.read(&mut buf).await;
+                if mode == "huge" {
+                    let size = 5 * 1024 * 1024;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {size}\r\n\r\n"
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&vec![b' '; size]).await;
+                }
+                // "drop": close without answering.
+            });
+        }
+    });
+    format!("http://{addr}/drivers/pg")
+}
+
+#[tokio::test]
+async fn lost_or_oversized_responses_to_mutations_are_uncertain() {
+    for mode in ["drop", "huge"] {
+        let target = broken(mode).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let req = request(None);
+        // The driver read the request, so it may have acted.
+        let err = driver.put(&req).await.unwrap_err();
+        assert!(matches!(err, DriverError::Uncertain(_)), "{mode}: {err:?}");
+        let err = driver.delete(&req).await.unwrap_err();
+        assert!(matches!(err, DriverError::Uncertain(_)), "{mode}: {err:?}");
+        // A read changes nothing, so it may be retried.
+        let err = driver.get(&req).await.unwrap_err();
+        assert!(err.is_retryable(), "{mode}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn cancel_needs_the_capability() {
+    let driver =
+        HttpDriver::new(info(Capabilities::default()), "http://127.0.0.1:9/x", None).unwrap();
+    assert_eq!(
+        driver.cancel(&request(None)).await.unwrap_err(),
+        DriverError::Unsupported("cancellation".into())
+    );
 }

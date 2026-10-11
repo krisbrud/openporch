@@ -25,7 +25,7 @@ mod template;
 pub use echo::Echo;
 pub use http::{
     COOKIE_HEADER, FINGERPRINT_HEADER, HttpDriver, HttpDriverError, OPERATION_HEADER,
-    PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER,
+    PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER, check_target,
 };
 pub use none::NoneDriver;
 pub use registry::{DriverRegistry, RegistryError};

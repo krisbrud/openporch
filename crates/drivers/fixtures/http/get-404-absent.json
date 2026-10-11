@@ -1,7 +1,17 @@
 {
-  "description": "GET 404 means nothing exists for the GUResID.",
+  "description": "GET 404 means nothing exists for the GUResID. The response must carry Openporch-Protocol.",
   "call": "get",
-  "request": {"method": "GET", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
-  "response": {"status": 404},
-  "expect": {"absent": null}
+  "request": {
+    "method": "GET",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "openporch-protocol": "openporch-http/1"
+    }
+  },
+  "expect": {
+    "absent": null
+  }
 }

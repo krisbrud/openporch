@@ -1,0 +1,19 @@
+{
+  "description": "Refused credentials on a read are permanent.",
+  "call": "get",
+  "request": {
+    "method": "GET",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 401
+  },
+  "expect": {
+    "error": {
+      "kind": "invalid",
+      "code": null,
+      "message": "the driver refused the credentials (401)",
+      "retryable": false
+    }
+  }
+}

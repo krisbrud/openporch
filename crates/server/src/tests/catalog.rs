@@ -678,6 +678,9 @@ async fn external_drivers_are_registered() {
         ("vault-secret", "https://driver.internal"),
         ("acme/plain", "http://driver.internal"),
         ("acme/creds", "https://user:pw@driver.internal"),
+        // The GUResID is appended to the path, so neither may be set.
+        ("acme/query", "https://driver.internal/x?k=v"),
+        ("acme/fragment", "https://driver.internal/x#f"),
     ] {
         let (status, b) = s
             .post(

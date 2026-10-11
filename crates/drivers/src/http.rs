@@ -39,14 +39,43 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// The longest driver error message passed on, in characters.
 const MAX_MESSAGE_CHARS: usize = 1000;
+/// How long to wait for a connection; a driver that cannot be reached in this
+/// time was not called, so the call may be retried.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Secret values shorter than this are not redacted from driver messages, since
+/// replacing them would garble the text.
+const MIN_REDACTED_CHARS: usize = 4;
+
+/// Checks an external driver's target URL: `http` or `https` with a host, and no
+/// credentials, query or fragment, since the GUResID is appended to its path.
+/// The error never repeats the URL, which may hold credentials.
+pub fn check_target(target: &str) -> Result<Url, HttpDriverError> {
+    let url = Url::parse(target).map_err(|_| HttpDriverError::InvalidTarget("it is not a URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(HttpDriverError::InvalidTarget(
+            "it must be an http or https URL with a host",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(HttpDriverError::InvalidTarget(
+            "it must not contain credentials; use `token`",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(HttpDriverError::InvalidTarget(
+            "it must not contain a query or fragment",
+        ));
+    }
+    Ok(url)
+}
 
 /// Why an external driver cannot be set up.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HttpDriverError {
     #[error("driver `{id}` uses protocol `{version}`; this server supports `{PROTOCOL_VERSION}`")]
     UnsupportedProtocol { id: String, version: String },
-    #[error("driver target `{0}` must be an http or https URL without credentials")]
-    InvalidTarget(String),
+    #[error("the driver target is invalid: {0}")]
+    InvalidTarget(&'static str),
     #[error("building the HTTP client: {0}")]
     Client(String),
 }
@@ -78,18 +107,21 @@ impl HttpDriver {
         target: &str,
         token: Option<String>,
     ) -> Result<Self, HttpDriverError> {
+        let https = check_target(target)?.scheme() == "https";
         // `ring` is the crypto provider; installing it twice is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = Client::builder()
             .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
-            .https_only(target.starts_with("https:"))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .https_only(https)
             .build()
             .map_err(|e| HttpDriverError::Client(e.to_string()))?;
         Self::with_client(info, target, token, client)
     }
 
-    /// Like [`HttpDriver::new`], with a caller-built client.
+    /// Like [`HttpDriver::new`], with a caller-built client. The caller decides
+    /// its redirect, HTTPS and timeout settings.
     pub fn with_client(
         info: DriverInfo,
         target: &str,
@@ -102,16 +134,7 @@ impl HttpDriver {
                 version: info.protocol_version.clone(),
             });
         }
-        let target = Url::parse(target)
-            .ok()
-            .filter(|u| {
-                matches!(u.scheme(), "http" | "https")
-                    && u.host_str().is_some()
-                    && u.username().is_empty()
-                    && u.password().is_none()
-                    && u.query().is_none()
-            })
-            .ok_or_else(|| HttpDriverError::InvalidTarget(target.to_owned()))?;
+        let target = check_target(target)?;
         Ok(Self {
             info,
             target,
@@ -222,6 +245,7 @@ impl HttpDriver {
         };
         Ok(Reply {
             status,
+            spoken: headers.contains_key(PROTOCOL_HEADER),
             retry_after: retry_after(&headers),
             cookie,
             body,
@@ -264,16 +288,25 @@ impl HttpDriver {
 
     /// A failure status as a driver error. A server error after a mutation is
     /// uncertain unless the driver deduplicates retried operations.
-    fn failure(&self, reply: &Reply) -> DriverError {
+    /// Secret values the driver was sent never come back in its messages.
+    fn failure(&self, req: &DriverRequest, reply: &Reply) -> DriverError {
         let status = reply.status.as_u16();
         let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap_or_default();
+        let secrets = secret_strings(req);
         let message = body
             .message
-            .map(|m| m.chars().take(MAX_MESSAGE_CHARS).collect::<String>())
+            .map(|m| {
+                redact(
+                    &m.chars().take(MAX_MESSAGE_CHARS).collect::<String>(),
+                    &secrets,
+                )
+            })
             .unwrap_or_else(|| format!("the driver answered {status}"));
         match status {
             400 | 422 => DriverError::Invalid {
-                code: body.error.map(|c| c.chars().take(64).collect()),
+                code: body
+                    .error
+                    .map(|c| redact(&c.chars().take(64).collect::<String>(), &secrets)),
                 message,
             },
             401 | 403 => DriverError::Invalid {
@@ -311,17 +344,54 @@ impl HttpDriver {
                 poll_after: reply.poll_after(),
                 cookie: reply.cookie,
             }),
-            StatusCode::NOT_FOUND => Ok(Observation::Absent),
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Ok(Observation::Failed {
-                error: self.failure(&reply),
+            // Only a driver's own 404 means absent: a proxy or a wrong path
+            // must not make openporch forget a live resource.
+            StatusCode::NOT_FOUND if reply.spoken => Ok(Observation::Absent),
+            StatusCode::NOT_FOUND => Ok(Observation::Unknown {
+                reason: NOT_A_DRIVER_404.into(),
             }),
-            _ => Err(self.failure(&reply)),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Ok(Observation::Failed {
+                error: self.failure(req, &reply),
+            }),
+            _ => Err(self.failure(req, &reply)),
         }
     }
 }
 
+const NOT_A_DRIVER_404: &str = "the target answered 404 without `Openporch-Protocol`, so it \
+     may not be the driver; check the driver's target";
+
+/// The string secret values of a request, at any depth.
+fn secret_strings(req: &DriverRequest) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) if s.chars().count() >= MIN_REDACTED_CHARS => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            Value::Object(m) => m.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for map in [&req.secrets, &req.resource_secrets]
+        .into_iter()
+        .chain(req.credentials.as_ref())
+    {
+        map.expose().values().for_each(|v| walk(v, &mut out));
+    }
+    // Longest first, so a secret containing another is replaced whole.
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out
+}
+
+fn redact(text: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .fold(text.to_owned(), |t, s| t.replace(s.as_str(), "[REDACTED]"))
+}
+
 /// The request body: `{type, resource, driver: {values, secrets}}`. Resource
-/// inputs that resolved from secrets are merged into `resource`.
+/// inputs that resolved from secrets are merged into `resource`, replacing a
+/// plain input of the same name.
 fn body(req: &DriverRequest) -> Value {
     let mut resource = req.resource.clone();
     resource.extend(req.resource_secrets.expose().clone());
@@ -334,6 +404,9 @@ fn body(req: &DriverRequest) -> Value {
 
 struct Reply {
     status: StatusCode,
+    /// Whether the response carried `Openporch-Protocol`, so it came from a
+    /// driver rather than, say, a proxy or a wrong path.
+    spoken: bool,
     retry_after: Option<Duration>,
     cookie: Option<Cookie>,
     body: Vec<u8>,
@@ -411,7 +484,7 @@ impl Driver for HttpDriver {
                     outputs: DriverOutputs::default(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(&reply)),
+                _ => Err(self.failure(req, &reply)),
             }
         })
     }
@@ -427,15 +500,15 @@ impl Driver for HttpDriver {
         Box::pin(async move {
             let reply = self.call(Method::DELETE, req, "", None, true).await?;
             match reply.status {
-                // A 404 means it is already gone.
-                StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => {
-                    Ok(DeleteOutcome::Deleted)
-                }
+                StatusCode::OK | StatusCode::NO_CONTENT => Ok(DeleteOutcome::Deleted),
+                // The driver's own 404 means it is already gone.
+                StatusCode::NOT_FOUND if reply.spoken => Ok(DeleteOutcome::Deleted),
+                StatusCode::NOT_FOUND => Err(DriverError::Uncertain(NOT_A_DRIVER_404.into())),
                 StatusCode::ACCEPTED => Ok(DeleteOutcome::InProgress {
                     poll_after: reply.poll_after(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(&reply)),
+                _ => Err(self.failure(req, &reply)),
             }
         })
     }

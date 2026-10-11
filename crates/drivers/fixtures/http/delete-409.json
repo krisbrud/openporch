@@ -1,0 +1,21 @@
+{
+  "description": "A 409 to DELETE is a conflict to observe.",
+  "call": "delete",
+  "request": {
+    "method": "DELETE",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 409,
+    "body": {
+      "message": "still provisioning"
+    }
+  },
+  "expect": {
+    "error": {
+      "kind": "conflict",
+      "message": "still provisioning",
+      "retryable": false
+    }
+  }
+}

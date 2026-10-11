@@ -344,6 +344,9 @@ pub async fn create_driver(
             "`target` must not contain credentials; use `token`",
         ));
     }
+    // The adapter appends the GUResID to the path, so it must accept the target.
+    openporch_drivers::check_target(&body.target)
+        .map_err(|e| ApiError::invalid(format!("`target`: {e}")))?;
     if body.inputs_schema.as_ref().is_some_and(|s| !s.is_object()) {
         return Err(ApiError::invalid("`inputs_schema` must be a JSON object"));
     }

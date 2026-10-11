@@ -24,8 +24,8 @@ openporch calls the driver's target URL with the resource's GUResID appended:
 | Remove | `DELETE {target}/{guresid}` | Delete the resource |
 | Cancel | `POST {target}/{guresid}/cancel` | Stop a timed-out operation, for drivers that declare the `cancel` capability |
 
-The GUResID is a stable 32-character hexadecimal ID. Key everything the driver
-creates by it.
+The target must not contain credentials, a query or a fragment. The GUResID is a
+stable 32-character hexadecimal ID. Key everything the driver creates by it.
 
 Every request carries these headers:
 
@@ -51,7 +51,7 @@ The `PUT` body is:
 ```
 
 `resource` holds the resource's resolved inputs, including those that resolved from
-secrets. `driver.values` and `driver.secrets` hold the definition's resolved
+secrets; a secret input replaces a plain input of the same name. `driver.values` and `driver.secrets` hold the definition's resolved
 `driver_inputs`. Secret values are resolved immediately before the call and travel
 only in the request body.
 
@@ -87,24 +87,31 @@ another protocol version, the response is rejected.
 | `204` | Ready, with no outputs | | Deleted |
 | `400`, `422` | Invalid inputs; fails without retry | The last operation failed | Fails without retry |
 | `401`, `403` | Fails without retry | Fails without retry | Fails without retry |
-| `404` | | Absent | Already deleted |
-| `409` | A conflicting operation; openporch observes before mutating again | | Same as `PUT` |
+| `404` | Uncertain | Absent | Already deleted |
+| `409` | A conflicting operation; openporch observes before mutating again | A conflict | Same as `PUT` |
 | `429` | May be retried after `Retry-After` | May be retried | May be retried |
 | `5xx` | Uncertain, unless the driver deduplicates operations | May be retried | Uncertain, unless the driver deduplicates operations |
+
+Any other status to a `PUT` or `DELETE` leaves the outcome uncertain; to a `GET`, it
+fails the call. A `404` counts as absent or deleted only when the response carries
+`Openporch-Protocol`, so a proxy or a mistyped target cannot make openporch forget a
+live resource; without it the outcome is unknown.
 
 `202` and `429` responses may carry `Retry-After` in seconds; a `202` without it is
 polled after 10 seconds.
 
 Error responses carry `{"error": "RES-101", "message": "…"}`. A `400` fails the
-resource with that code and message, shown in the deployment. Do not put secret
-values in messages.
+resource with that code and message, shown in the deployment. Any secret value sent
+in the request is replaced with `[REDACTED]` in the code and message, but drivers
+should not echo inputs in messages at all.
 
 A `5xx` to a `PUT` or `DELETE` may mean the driver acted before failing. openporch
 retries it only when the driver declares that it recovers retried operations: the
 same `Openporch-Operation-Id` and fingerprint must converge on the same object, and
 a changed fingerprint under a known operation ID must get `409`. Otherwise the
 outcome is uncertain and must be established before another mutation. A request
-that never connected is always safe to retry.
+that never connected, including one that could not connect within 30 seconds, is
+always safe to retry.
 
 ## Differences from Humanitec's Driver API 0.9.3
 

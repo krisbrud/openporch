@@ -1,7 +1,17 @@
 {
-  "description": "DELETE 404 means the resource is already absent.",
+  "description": "DELETE 404 means the resource is already absent. The response must carry Openporch-Protocol.",
   "call": "delete",
-  "request": {"method": "DELETE", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
-  "response": {"status": 404},
-  "expect": {"deleted": null}
+  "request": {
+    "method": "DELETE",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef"
+  },
+  "response": {
+    "status": 404,
+    "headers": {
+      "openporch-protocol": "openporch-http/1"
+    }
+  },
+  "expect": {
+    "deleted": null
+  }
 }
