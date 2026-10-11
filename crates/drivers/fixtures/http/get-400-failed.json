@@ -1,0 +1,7 @@
+{
+  "description": "GET 400 reports that the last operation failed.",
+  "call": "get",
+  "request": {"method": "GET", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 400, "body": {"error": "RES-102", "message": "quota exceeded"}},
+  "expect": {"failed": {"kind": "invalid", "code": "RES-102", "message": "quota exceeded", "retryable": false}}
+}

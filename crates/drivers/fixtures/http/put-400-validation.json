@@ -1,0 +1,7 @@
+{
+  "description": "The Driver error scenario: a 400 is a permanent failure with the driver's code and message.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 400, "body": {"error": "RES-101", "message": "version 9 is not supported"}},
+  "expect": {"error": {"kind": "invalid", "code": "RES-101", "message": "version 9 is not supported", "retryable": false}}
+}

@@ -1,0 +1,8 @@
+{
+  "description": "A driver that deduplicates operations by ID can have a 5xx retried with the same operation identity.",
+  "call": "put",
+  "capabilities": {"recover": true},
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 503, "headers": {"retry-after": "2"}},
+  "expect": {"error": {"kind": "transient", "message": "the driver answered 503", "retry_after_secs": 2, "retryable": true}}
+}

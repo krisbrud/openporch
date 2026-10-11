@@ -1,0 +1,7 @@
+{
+  "description": "DELETE 404 means the resource is already absent.",
+  "call": "delete",
+  "request": {"method": "DELETE", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 404},
+  "expect": {"deleted": null}
+}

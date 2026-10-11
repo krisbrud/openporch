@@ -1,0 +1,7 @@
+{
+  "description": "GET reports an operation in progress.",
+  "call": "get",
+  "request": {"method": "GET", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 202, "headers": {"retry-after": "15"}},
+  "expect": {"in_progress": {"poll_after_secs": 15, "cookie": null}}
+}

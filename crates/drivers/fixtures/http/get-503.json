@@ -1,0 +1,7 @@
+{
+  "description": "A 5xx to a read is transient whatever the driver's capabilities.",
+  "call": "get",
+  "request": {"method": "GET", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 503},
+  "expect": {"error": {"kind": "transient", "message": "the driver answered 503", "retry_after_secs": null, "retryable": true}}
+}

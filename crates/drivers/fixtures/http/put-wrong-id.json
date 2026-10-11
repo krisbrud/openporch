@@ -1,0 +1,7 @@
+{
+  "description": "A response for another resource ID is not accepted.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 200, "body": {"id": "ffffffffffffffffffffffffffffffff", "resource": {"values": {}}}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver's response names a different resource ID than the GUResID", "retryable": false}}
+}

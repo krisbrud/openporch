@@ -1,0 +1,7 @@
+{
+  "description": "The Conflict after a lost response scenario: a 409 is a conflict to observe, not to repeat.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 409, "body": {"message": "operation op-0 is still running"}},
+  "expect": {"error": {"kind": "conflict", "message": "operation op-0 is still running", "retryable": false}}
+}

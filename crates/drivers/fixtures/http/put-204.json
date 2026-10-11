@@ -1,0 +1,7 @@
+{
+  "description": "A 204 to PUT provisions a resource with no outputs.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 204},
+  "expect": {"ready": {"values": {}, "secrets": {}, "manifests": [], "cookie": null}}
+}

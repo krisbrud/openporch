@@ -1071,8 +1071,9 @@ Authorization: Bearer $ADMIN_TOKEN
 The built-in drivers are `openporch/echo`, `openporch/none`, `openporch/template`
 and `openporch/opentofu`. An external driver will be reached over HTTPS, with its
 `token` sent as a bearer token; the token is a secret reference or `{value}`.
-External drivers can be registered now, but the server does not call them until
-the HTTP driver adapter is implemented.
+[docs/drivers/http.md](drivers/http.md) describes the protocol. External drivers
+can be registered now, but deployments do not call any driver until the deployment
+executor is implemented.
 
 ```http
 POST /orgs/acme/resources/drivers

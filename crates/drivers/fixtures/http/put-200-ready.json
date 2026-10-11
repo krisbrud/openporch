@@ -1,0 +1,26 @@
+{
+  "description": "A PUT that provisions at once. The body follows the Humanitec 0.9.3 shape, resource secrets are merged into resource, the previous cookie is sent, and a new one is returned.",
+  "call": "put",
+  "cookie": {"version": 1, "data": "abc"},
+  "request": {
+    "method": "PUT",
+    "path": "/drivers/pg/0123456789abcdef0123456789abcdef",
+    "headers": {"openporch-driver-cookie": "1.YWJj", "content-type": "application/json"},
+    "body": {
+      "type": "postgres",
+      "resource": {"name": "shop", "admin_password": "hunter2"},
+      "driver": {"values": {"version": "16"}, "secrets": {"master": "s3cret"}}
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {"set-openporch-driver-cookie": "1.ZGVm", "openporch-protocol": "openporch-http/1"},
+    "body": {
+      "id": "0123456789abcdef0123456789abcdef",
+      "type": "postgres",
+      "resource": {"values": {"host": "pg.internal", "port": 5432}, "secrets": {"password": "pw"}},
+      "manifests": [{"location": "namespace", "data": {"kind": "ConfigMap"}}]
+    }
+  },
+  "expect": {"ready": {"values": {"host": "pg.internal", "port": 5432}, "secrets": {"password": "pw"}, "manifests": [{"location": "namespace", "data": {"kind": "ConfigMap"}}], "cookie": {"version": 1, "data": "def"}}}
+}
