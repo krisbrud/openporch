@@ -54,15 +54,18 @@ pub async fn get(
     Ok(Json(SetView { id: set.id(), set }))
 }
 
-/// Applies a delta to a set and stores the result.
+/// Applies a delta to a set and stores the result, audited with the new set ID.
 pub async fn apply(
     State(state): State<AppState>,
+    ctx: Ctx,
     Path((_, app, id)): Path<(String, String, String)>,
     JsonBody(delta): JsonBody<Delta>,
 ) -> ApiResult<Json<SetId>> {
     let base = set_or_404(&state, &app, &id).await?;
     let next = apply_delta(&base, &delta).map_err(|e| ApiError::invalid(e.to_string()))?;
-    let id = state.store.put_set(state.org(), &app, &next).await?;
+    let org = state.org();
+    let audit = ctx.audit(org, "set.create", format!("{app}/{}", next.id()));
+    let id = state.store.put_set_audited(org, &app, &next, audit).await?;
     Ok(Json(SetId { id }))
 }
 

@@ -49,6 +49,21 @@ async fn add_to_an_empty_environment() {
     assert_eq!(status, StatusCode::OK, "{set}");
     assert_eq!(set["id"], id.as_str());
     assert_eq!(set["modules"], json!({"web": web("10")}));
+
+    // Deriving a set is audited with its ID.
+    let (_, entries) = s
+        .get(
+            "/orgs/acme/audit-logs?path_prefix=/orgs/acme/apps/shop/sets",
+            &s.admin,
+        )
+        .await;
+    let entry = entries["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "set.create")
+        .unwrap_or_else(|| panic!("{entries}"));
+    assert_eq!(entry["target"], format!("shop/{id}"));
 }
 
 #[tokio::test]

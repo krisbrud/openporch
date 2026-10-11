@@ -720,6 +720,33 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
+    async fn put_set_audited(
+        &self,
+        org: &str,
+        app: &str,
+        set: &DeploymentSet,
+        audit: AuditIntent,
+    ) -> Result<String> {
+        self.check_org(org)?;
+        let id = set.id();
+        let mut tx = self.begin().await?;
+        sqlx::query(
+            "INSERT INTO sets (org_id, app_id, id, algorithm, content, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, app_id, id) DO NOTHING",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(&id)
+        .bind(SET_ID_ALGORITHM)
+        .bind(set.canonical_json())
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     async fn put_delta(
         &self,
         org: &str,

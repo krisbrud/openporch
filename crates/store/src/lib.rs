@@ -174,6 +174,17 @@ pub trait Store: Send + Sync {
         set: &openporch_core::sets::DeploymentSet,
     ) -> impl Future<Output = Result<String>> + Send;
 
+    /// Stores a set derived through the API, with its audit intent, in one
+    /// transaction. Like [`Store::put_set`], storing an existing set is a no-op, but
+    /// the request is still audited.
+    fn put_set_audited(
+        &self,
+        org: &str,
+        app: &str,
+        set: &openporch_core::sets::DeploymentSet,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<String>> + Send;
+
     /// Stores or replaces a draft delta with its audit intent. A frozen delta cannot
     /// be replaced.
     fn put_delta(
