@@ -10,7 +10,9 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use openporch_drivers::DriverRegistry;
-use openporch_engine::planner::{Deployment, Executor, PermitCheck, PermitRequest, Planner};
+use openporch_engine::planner::{
+    Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, Planner,
+};
 use openporch_engine::preview::DriverFacts;
 use openporch_store::{
     ApprovalRequest, DeploymentKind, PermitStore, PermitUse, SqliteStore, Store, StoreError,
@@ -270,9 +272,16 @@ impl PermitCheck for StorePermits {
             let error = match used {
                 Ok(()) => return Ok(()),
                 Err(StoreError::ApprovalRequired(e)) => e,
-                Err(e) => format!("the permit could not be checked: {e}"),
+                Err(e) => return Err(format!("the permit could not be checked: {e}")),
             };
-            if let (Some(fingerprint), Some(guresid)) = (req.plan, req.guresid) {
+            // A plan no permit covers shows in the next preview, so a permit
+            // can be issued for it; an unknown impact has no fingerprint.
+            let refused = match (req.plan, req.action) {
+                (Some(fingerprint), _) => Some(fingerprint),
+                (None, DestructiveAction::Unknown) => Some(""),
+                (None, _) => None,
+            };
+            if let (Some(fingerprint), Some(guresid)) = (refused, req.guresid) {
                 let request = ApprovalRequest {
                     descriptor: req.descriptor.to_owned(),
                     guresid: guresid.to_owned(),

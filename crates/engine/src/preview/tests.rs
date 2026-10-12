@@ -153,6 +153,7 @@ fn a_known_driver_plan_shows_as_a_replacement() {
     )]);
     let db = active(DB, "openporch/opentofu");
     let plan = DriverPlan {
+        action: "replace".into(),
         fingerprint: "fp-1".into(),
         actions: vec![("replace".into(), "aws_db_instance.main".into())],
     };
@@ -344,4 +345,42 @@ fn a_digest_follows_the_configuration() {
     let detached = detach(&db);
     assert_eq!(detached.action.permit_action(), Some("detach"));
     assert_ne!(detached.digest, first);
+}
+
+#[test]
+fn refused_driver_plans_keep_their_action() {
+    let d = deployment(&[(
+        node(DB, "pg", "openporch/opentofu"),
+        def("pg", "openporch/opentofu", None),
+    )]);
+    let db = active(DB, "openporch/opentofu");
+    let run = |action: &str, db: &ActiveResource| {
+        let plan = DriverPlan {
+            action: action.into(),
+            fingerprint: if action == "unknown" {
+                String::new()
+            } else {
+                "fp-1".into()
+            },
+            actions: Vec::new(),
+        };
+        preview(
+            &d,
+            std::slice::from_ref(db),
+            facts,
+            &BTreeMap::from([(db.guresid.clone(), plan)]),
+        )
+        .unwrap()
+        .remove(0)
+    };
+    let e = run("delete", &db);
+    assert_eq!(e.action, Change::Delete);
+    assert!(e.permit_required && e.driver_plan.is_some());
+    let e = run("unknown", &db);
+    assert_eq!(e.action, Change::Unknown);
+    assert!(e.permit_required && e.driver_plan.is_none());
+    // A first attempt that never provisioned keeps its refused plan too.
+    let mut fresh = db.clone();
+    fresh.last_deploy_id = None;
+    assert_eq!(run("replace", &fresh).action, Change::Replace);
 }

@@ -317,3 +317,64 @@ async fn a_driver_that_cannot_preview_needs_an_unknown_impact_permit() {
     let (status, d) = s.post(&format!("{ENV_DEV}/deploys"), &s.admin, body).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{d}");
 }
+
+#[tokio::test]
+async fn a_refused_deletion_in_a_driver_plan_gets_a_delete_permit() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", true).await;
+    let guresid = s.resource(DB).await["guresid"].as_str().unwrap().to_owned();
+    let latest = s.get(&format!("{ENV_DEV}/deploys"), &s.admin).await.1["deployments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let check = StorePermits(s.state.store.clone());
+    let planned = vec![("delete".to_owned(), "aws_db_parameter_group.old".to_owned())];
+    let request = |deployment: String| {
+        let deployment: &'static str = Box::leak(deployment.into_boxed_str());
+        let guresid: &'static str = Box::leak(guresid.clone().into_boxed_str());
+        let planned: &'static [(String, String)] = Box::leak(planned.clone().into_boxed_slice());
+        PermitRequest {
+            org: "acme",
+            app: "shop",
+            env: "development",
+            descriptor: DB,
+            guresid: Some(guresid),
+            deployment: Some(deployment),
+            action: DestructiveAction::Delete,
+            permits: &[],
+            plan: Some("fp-del"),
+            planned,
+        }
+    };
+    check.check(request(latest)).await.unwrap_err();
+
+    // The preview shows the deletion the plan makes, and a permit for it is
+    // the one the run asks for.
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    assert_eq!(entry(&plan, DB)["action"], "delete", "{plan}");
+    let mut body = s.redeploy_body().await;
+    body["expected_generation"] = s.dev_generation().await;
+    body["permits"] = json!(s.permits_for(ENV_DEV, s.redeploy_body().await).await);
+    let deploys = format!("{ENV_DEV}/deploys");
+    let retry = || {
+        s.call_with(
+            axum::http::Method::POST,
+            &deploys,
+            Some(&s.admin),
+            Some(body.clone()),
+            &[("idempotency-key", "fix-db")],
+        )
+    };
+    let (status, d) = retry().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    // A retry with the same key returns the deployment its permits are bound to.
+    let (status, again) = retry().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(again["id"], d["id"]);
+    check
+        .check(request(d["id"].as_str().unwrap().to_owned()))
+        .await
+        .unwrap();
+}

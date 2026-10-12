@@ -344,6 +344,7 @@ pub(super) async fn preflight(
             (
                 r.guresid,
                 DriverPlan {
+                    action: r.action,
                     fingerprint: r.fingerprint,
                     actions: r.actions,
                 },

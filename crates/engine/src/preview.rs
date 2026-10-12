@@ -59,6 +59,9 @@ impl Change {
 /// A driver's plan from an earlier attempt that needed a permit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DriverPlan {
+    /// The permit action it needs: `replace`, `delete`, or `unknown` when the
+    /// driver could not tell, which has no fingerprint.
+    pub action: String,
     /// The plan's fingerprint, which a permit for it names.
     pub fingerprint: String,
     /// The planned actions on named objects.
@@ -140,6 +143,36 @@ pub fn preview(
         };
         let existing = current
             .filter(|r| r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some());
+        // A driver plan an earlier attempt could not run without a permit:
+        // the change needs a permit for that action, whatever else is true.
+        if let Some(plan) = current.and_then(|r| plans.get(&r.guresid)) {
+            let refused = match plan.action.as_str() {
+                "delete" => Some((
+                    Change::Delete,
+                    "an earlier attempt's driver plan deletes objects",
+                )),
+                "replace" => Some((
+                    Change::Replace,
+                    "an earlier attempt's driver plan destroys or replaces objects",
+                )),
+                "unknown" => Some((
+                    Change::Unknown,
+                    "an earlier attempt's driver could not tell what the change does",
+                )),
+                _ => None,
+            };
+            if let Some((action, reason)) = refused {
+                let fingerprinted = action != Change::Unknown;
+                entries.push(entry(
+                    action,
+                    fingerprinted,
+                    reason,
+                    true,
+                    fingerprinted.then(|| plan.clone()),
+                ));
+                continue;
+            }
+        }
         let Some(r) = existing else {
             // A failed first attempt may have left state the driver finds when
             // it plans, so only a resource with no record is known to be new.
@@ -193,15 +226,7 @@ pub fn preview(
             ));
             continue;
         }
-        if let Some(plan) = plans.get(&r.guresid) {
-            entries.push(entry(
-                Change::Replace,
-                true,
-                "an earlier attempt's driver plan destroys or replaces objects",
-                true,
-                Some(plan.clone()),
-            ));
-        } else if driver.is_some_and(|f| f.preview) {
+        if driver.is_some_and(|f| f.preview) {
             entries.push(entry(
                 Change::Update,
                 false,
