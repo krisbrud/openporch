@@ -470,3 +470,60 @@ async fn a_crash_during_deletion_keeps_the_rest_tracked_and_deletes_nothing_twic
     assert_eq!(f.env_state().await, None);
     assert!(fake.objects.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn nothing_found_by_a_driver_that_cannot_recover_waits_for_an_administrator() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("postgres", Behavior::Crash)]);
+    let planner = Arc::new(planner(&f, &fake, fast()));
+    crash(&f, &planner, f.accept().await, || async {
+        fake.objects.lock().unwrap().values().any(|d| d == DB)
+            && f.provisioned(&[BASE, DNS, ROUTE]).await
+    })
+    .await;
+    // The creation may still be on its way, and repeating it could
+    // duplicate it.
+    fake.observations
+        .lock()
+        .unwrap()
+        .insert("postgres".into(), Observed::Absent { repeatable: false });
+    let recovered = f.recover(&planner, DB).await.unwrap();
+    assert!(
+        matches!(&recovered, Recovered::RecoveryRequired(r) if r.contains("duplicated")),
+        "{recovered:?}"
+    );
+    assert_eq!(f.active(DB).await.unwrap().status, "recovery_required");
+}
+
+#[tokio::test]
+async fn an_interrupted_update_is_repeated_rather_than_recorded() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let planner = Arc::new(planner(&f, &fake, fast()));
+    planner.run(f.accept().await).await;
+    let db = f.active(DB).await.unwrap();
+    // The update crashes after it reached the driver.
+    fake.behavior
+        .lock()
+        .unwrap()
+        .insert("postgres".into(), Behavior::Crash);
+    crash(&f, &planner, f.accept().await, || async {
+        fake.attempts(DB) == 2
+    })
+    .await;
+    // The resource exists, which says nothing about whether the update
+    // applied, so its last success stays recorded and the update repeats.
+    let recovered = f.recover(&planner, DB).await.unwrap();
+    assert!(
+        matches!(&recovered, Recovered::Repeatable(r) if r.contains("update")),
+        "{recovered:?}"
+    );
+    let after = f.active(DB).await.unwrap();
+    assert_eq!(after.status, "failed");
+    assert_eq!(after.last_deploy_id, db.last_deploy_id);
+    fake.behavior.lock().unwrap().clear();
+    let outcomes = planner.run(f.accept().await).await;
+    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    assert_eq!(f.guresid(DB).await, db.guresid);
+    assert_eq!(fake.creations(DB), 1);
+}

@@ -852,20 +852,21 @@ async fn a_restart_observes_resources_left_with_an_unknown_outcome() {
     state.store.pool().close().await;
     drop((state, router));
 
-    // The restart marks it unknown, then observes it and finds it in place.
+    // The restart marks it unknown, then observes it. It exists, which says
+    // nothing about whether the update applied, and its driver can repeat
+    // it safely, so the next deployment does.
     let s = server_in(dir).await;
     let mut status = Value::Null;
     for _ in 0..200 {
         let (st, db) = s.get(db_path, &s.admin).await;
         assert_eq!(st, StatusCode::OK, "{db}");
         status = db["status"].clone();
-        if status == "provisioned" {
-            assert_eq!(db["outputs"]["host"], "db.internal");
+        if status == "failed" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert_eq!(status, "provisioned");
+    assert_eq!(status, "failed");
     let (_, audit) = s.get("/orgs/acme/audit-logs", &s.admin).await;
     assert!(audit.to_string().contains("resource.recover"), "{audit}");
 }

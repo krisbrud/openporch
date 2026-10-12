@@ -587,22 +587,31 @@ where
                     error: format!("the resource could not be observed: {e}"),
                     retry_after: None,
                 })?;
+        let repeatable = driver.info().capabilities.recover;
         Ok(match observation {
-            Observation::Absent => Observed::Absent,
+            Observation::Absent => Observed::Absent { repeatable },
             Observation::InProgress { .. } => Observed::InProgress,
             Observation::Failed { error } => Observed::Failed {
                 error: error.to_string(),
-                repeatable: driver.info().capabilities.recover,
+                repeatable,
             },
             Observation::Unknown { reason } => Observed::Unknown(reason),
-            Observation::Ready { .. } if deleting => Observed::Ready(Box::default()),
+            // Only a creation's result is kept: for a resource that existed
+            // before, nothing is stored.
+            Observation::Ready { .. } if deleting || job.existing => Observed::Ready {
+                result: Box::default(),
+                repeatable,
+            },
             Observation::Ready { outputs, cookie } => {
                 // A driver that returns no cookie leaves the last one in place.
                 let cookie = cookie.or(req.cookie.clone());
-                Observed::Ready(Box::new(
-                    self.provisioned(job, outputs, cookie.as_ref(), target, log)
-                        .await?,
-                ))
+                Observed::Ready {
+                    result: Box::new(
+                        self.provisioned(job, outputs, cookie.as_ref(), target, log)
+                            .await?,
+                    ),
+                    repeatable,
+                }
             }
         })
     }

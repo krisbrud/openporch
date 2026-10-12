@@ -1932,9 +1932,17 @@ impl Store for SqliteStore {
             .await?;
         }
         #[allow(clippy::type_complexity)]
-        let uncertain: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+        let uncertain: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            // An operation whose resource record is gone is closed too.
             "SELECT o.id, o.deployment_id, o.guresid, r.app_id, r.env_id, r.descriptor \
-             FROM operations o JOIN active_resources r ON r.guresid = o.guresid \
+             FROM operations o LEFT JOIN active_resources r ON r.guresid = o.guresid \
              WHERE o.org_id = ? AND o.state = 'started' ORDER BY o.started_at",
         )
         .bind(&self.org)
@@ -2010,16 +2018,16 @@ impl Store for SqliteStore {
             failed_deployments: running.into_iter().map(|r| r.2).collect(),
             uncertain: uncertain
                 .into_iter()
-                .map(
+                .filter_map(
                     |(operation_id, deployment_id, guresid, app, env, descriptor)| {
-                        UncertainOperation {
+                        Some(UncertainOperation {
                             operation_id,
                             deployment_id,
                             guresid,
-                            app,
-                            env,
-                            descriptor,
-                        }
+                            app: app?,
+                            env: env?,
+                            descriptor: descriptor?,
+                        })
                     },
                 )
                 .collect(),

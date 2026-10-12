@@ -90,55 +90,80 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             Err(reason) => required(reason),
             Ok(job) => {
                 let account = job.driver_account.as_ref().map(ToString::to_string);
+                // A resource that existed before the operation says nothing,
+                // by existing, about whether an update took effect.
+                let updating = !deleting && job.existing;
                 let observed = self.executor.observe(job, deleting).await;
-                match (observed, deleting) {
-                    (Ok(Observed::InProgress), _) => return Ok(Recovered::InProgress),
-                    (Ok(Observed::Absent), true) => (
+                match observed {
+                    Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
+                    Ok(Observed::Absent { .. }) if deleting => (
                         Resolution::Observed(CheckpointResult::Deleted),
                         Recovered::Deleted,
                     ),
-                    (Ok(Observed::Absent), false) => repeatable(
+                    Ok(Observed::Absent { repeatable: true }) => repeatable_reason(
                         "nothing exists for the resource's identity, so the next deployment \
                          provisions it with the same identity",
                     ),
-                    (Ok(Observed::Ready(_)), true) => repeatable(
-                        "the resource still exists, so the next deployment that leaves it out \
-                         deletes it again",
+                    Ok(Observed::Absent { repeatable: false }) => required(
+                        "nothing exists for the resource's identity yet, but its driver cannot \
+                         guarantee that a creation still on its way is not duplicated"
+                            .into(),
                     ),
-                    (Ok(Observed::Ready(result)), false) => (
+                    Ok(Observed::Ready { repeatable, .. }) if deleting => {
+                        if repeatable {
+                            repeatable_reason(
+                                "the resource still exists, so the next deployment that leaves \
+                                 it out deletes it again",
+                            )
+                        } else {
+                            required(
+                                "the resource still exists, but its driver cannot guarantee \
+                                 that repeating the deletion is safe"
+                                    .into(),
+                            )
+                        }
+                    }
+                    Ok(Observed::Ready { repeatable, .. }) if updating => {
+                        if repeatable {
+                            repeatable_reason(
+                                "the resource exists, but whether the update took effect is \
+                                 unknown, so the next deployment repeats it with the same \
+                                 identity",
+                            )
+                        } else {
+                            required(
+                                "the resource exists, but whether the update took effect is \
+                                 unknown and its driver cannot guarantee that repeating it is \
+                                 safe"
+                                    .into(),
+                            )
+                        }
+                    }
+                    Ok(Observed::Ready { result, .. }) => (
                         Resolution::Observed(CheckpointResult::Provisioned(Box::new(provisioned(
                             &op, *result, account,
                         )))),
                         Recovered::Provisioned,
                     ),
-                    (
-                        Ok(Observed::Failed {
-                            error,
-                            repeatable: true,
-                        }),
-                        _,
-                    ) => repeatable(&format!(
+                    Ok(Observed::Failed {
+                        error,
+                        repeatable: true,
+                    }) => repeatable_reason(&format!(
                         "the driver reports that the operation failed and can be repeated: \
                          {error}"
                     )),
-                    (
-                        Ok(Observed::Failed {
-                            error,
-                            repeatable: false,
-                        }),
-                        _,
-                    ) => required(format!(
+                    Ok(Observed::Failed {
+                        error,
+                        repeatable: false,
+                    }) => required(format!(
                         "the driver reports that the operation failed, but cannot guarantee \
                          that repeating it is safe: {error}"
                     )),
-                    (Ok(Observed::Unknown(reason)), _) => required(reason),
-                    (Err(ExecFailure::Permanent(e)), _) => {
+                    Ok(Observed::Unknown(reason)) => required(reason),
+                    Err(ExecFailure::Permanent(e)) => {
                         required(format!("the resource cannot be observed: {e}"))
                     }
-                    (
-                        Err(ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain(error)),
-                        _,
-                    ) => {
+                    Err(ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain(error)) => {
                         return Err(RecoverError::Observation(error));
                     }
                 }
@@ -228,7 +253,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 }
 
-fn repeatable(reason: &str) -> (Resolution, Recovered) {
+fn repeatable_reason(reason: &str) -> (Resolution, Recovered) {
     (
         Resolution::Repeatable {
             reason: reason.to_owned(),

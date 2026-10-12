@@ -1213,7 +1213,7 @@ async fn an_unknown_outcome_is_recovered_or_resolved() {
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["outcome"], "in_progress", "{b}");
     assert_eq!(b["resource"]["status"], "unknown", "{b}");
-    *fake.observation.lock().unwrap() = Some(Observed::Absent);
+    *fake.observation.lock().unwrap() = Some(Observed::Absent { repeatable: true });
     let (status, b) = s.post(&recover, &s.admin, json!({})).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["outcome"], "repeatable", "{b}");

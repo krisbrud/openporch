@@ -420,9 +420,12 @@ impl Executor for Fake {
             .unwrap()
             .contains_key(job.guresid.as_str());
         Ok(if exists {
-            Observed::Ready(Box::new(self.result(&ty, job.guresid.as_str()).await))
+            Observed::Ready {
+                result: Box::new(self.result(&ty, job.guresid.as_str()).await),
+                repeatable: true,
+            }
         } else {
-            Observed::Absent
+            Observed::Absent { repeatable: true }
         })
     }
 }

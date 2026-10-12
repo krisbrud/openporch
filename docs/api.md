@@ -1966,25 +1966,34 @@ A resource with an unknown outcome blocks every deployment and deletion of its
 environment that would touch it, with `409` `DPL-004`, until the outcome is
 known. Nothing repeats the operation automatically.
 
-After a restart the server observes each such resource with its driver's
-read-only `get`, using the identity, driver, cloud account and inputs the
-operation recorded. `POST .../recover` does the same on request and returns
+After a restart the server observes each resource whose operation the
+restart interrupted with its driver's read-only `get`, using the identity,
+driver, cloud account and inputs the operation recorded, and the definition's
+own secrets even if the definition no longer matches the resource, as a
+deletion does. One that cannot be settled then, for example because a
+deployment started first, and one left unknown by a timeout, waits for an
+explicit recovery. `POST .../recover` does the same on request and returns
 what the observation established as `outcome`, with the resource as it is now
 (absent once deleted) and the observation's `reason`:
 
-- `provisioned`: the creation or update took effect. The resource is
-  `provisioned` with what the driver reports.
+- `provisioned`: the creation took effect. The resource is `provisioned`
+  with what the driver reports. A resource that existed before the operation
+  proves nothing about an update by existing, so an interrupted update is
+  `repeatable` instead and keeps its last successful result.
 - `deleted`: the deletion took effect. The record is replaced by a tombstone,
   and the next deletion of the environment does not delete it again.
 - `repeatable`: the operation can safely be repeated with the same `guresid`,
   because a creation left nothing behind, a deletion left the resource in
-  place, or the driver reports a failure it guarantees can be retried. The
+  place, an update's outcome is unknown, or the driver reports a failure, and
+  the driver has the `recover` capability: repeating with the same identity
+  converges instead of duplicating. The
   resource is `failed` or `deletion_failed`, and the next deployment repeats
   the operation.
 - `in_progress`: the operation is still running. Nothing changed; recover
   again later.
 - `recovery_required`: the driver cannot tell, as for a driver without the
-  `observe` capability. The resource stays blocked with status
+  `observe` capability, or the outcome would be `repeatable` but the driver
+  lacks the `recover` capability. The resource stays blocked with status
   `recovery_required`.
 
 `POST .../recover` returns `409` when the resource has no unknown outcome or a

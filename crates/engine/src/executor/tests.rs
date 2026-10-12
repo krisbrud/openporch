@@ -24,7 +24,9 @@ use serde_json::json;
 
 use super::*;
 use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, Sts};
-use crate::planner::{Deployment, JobInputs, JobLog, Limits, NoPermits, Outcome, Planner};
+use crate::planner::{
+    Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
+};
 use openporch_store::secrets::BoxFuture;
 
 const ORG: &str = "acme";
@@ -64,6 +66,8 @@ struct FakeDriver {
     fail: Mutex<Option<String>>,
     puts: Mutex<Vec<DriverRequest>>,
     deletes: Mutex<Vec<DriverRequest>>,
+    /// `get` cannot tell, and says so with the secrets it received.
+    unsure: Mutex<bool>,
 }
 
 impl FakeDriver {
@@ -92,6 +96,7 @@ impl FakeDriver {
             fail: Mutex::new(None),
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            unsure: Mutex::new(false),
         })
     }
 
@@ -168,7 +173,13 @@ impl Driver for FakeDriver {
     }
 
     fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        let unsure = *self.unsure.lock().unwrap();
         Box::pin(async move {
+            if unsure {
+                return Ok(Observation::Unknown {
+                    reason: format!("cannot tell with {}", secret_values(req).join(", ")),
+                });
+            }
             Ok(Observation::Ready {
                 outputs: Self::outputs(req),
                 cookie: None,
@@ -836,6 +847,43 @@ async fn a_driver_failure_is_redacted() {
         "{recorded}"
     );
     assert!(!recorded.contains(MASTER), "{recorded}");
+}
+
+#[tokio::test]
+async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource() {
+    let f = Fixture::new().await;
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "openporch", "ref": "defs/pg/master"}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let job = provision_job(&db, db.guresid.parse().unwrap());
+    let executor = f.executor(allow());
+
+    // The resource existed before, so its state proves nothing about an
+    // update and nothing is stored for it.
+    match executor.observe(job.clone(), false).await.unwrap() {
+        Observed::Ready { result, repeatable } => {
+            assert!(repeatable);
+            assert!(result.secret_outputs.is_empty(), "{result:?}");
+            assert!(result.outputs.is_empty(), "{result:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // What a driver says while observing is redacted like any failure.
+    *f.driver.unsure.lock().unwrap() = true;
+    match executor.observe(job, false).await.unwrap() {
+        Observed::Unknown(reason) => {
+            assert!(reason.contains("[REDACTED]"), "{reason}");
+            assert!(!reason.contains(MASTER), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// A job for `db`'s inputs under another identity, outside a deployment.

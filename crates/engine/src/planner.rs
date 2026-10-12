@@ -343,10 +343,22 @@ pub trait Executor: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub enum Observed {
     /// Nothing exists for the GUResID.
-    Absent,
-    /// The resource exists. For a creation or update, with its outputs,
-    /// secret outputs already stored and cookie sealed, as after provisioning.
-    Ready(Box<ProvisionResult>),
+    Absent {
+        /// Whether the driver guarantees that repeating the operation with
+        /// the same identity converges, so that a creation still on its way
+        /// cannot be duplicated.
+        repeatable: bool,
+    },
+    /// The resource exists. After a creation, with its outputs, secret
+    /// outputs already stored and cookie sealed, as after provisioning. The
+    /// state of a resource that existed before says nothing about whether an
+    /// update or deletion took effect, so its result is left empty.
+    Ready {
+        /// What the creation provisioned.
+        result: Box<ProvisionResult>,
+        /// Whether repeating the operation with the same identity is safe.
+        repeatable: bool,
+    },
     /// An operation is still running; observe again later.
     InProgress,
     /// The driver's last operation failed.
