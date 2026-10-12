@@ -1145,13 +1145,16 @@ impl Store for SqliteStore {
                      THEN COALESCE(?3, definition_version) ELSE definition_version END, \
                      driver_type = CASE WHEN last_deploy_id IS NULL \
                      THEN COALESCE(?4, driver_type) ELSE driver_type END, \
-                     recovery = ?5, updated_at = ?6 WHERE guresid = ?7",
+                     cleanup_pending = CASE WHEN ?5 = 'put' THEN 0 ELSE cleanup_pending END, \
+                     updated_at = ?6 WHERE guresid = ?7",
                 )
+                // The resource keeps the recovery metadata of its last
+                // provisioning; the operation records its own.
                 .bind(resource_status)
                 .bind(&start.definition_id)
                 .bind(start.definition_version)
                 .bind(&start.driver_type)
-                .bind(serde_json::to_string(&start.recovery)?)
+                .bind(start.kind.as_str())
                 .bind(now)
                 .bind(&guresid)
                 .execute(&mut *tx)
@@ -1373,13 +1376,10 @@ impl Store for SqliteStore {
                 None,
             ),
             CheckpointResult::CleanupPending { error } => {
-                sqlx::query(
-                    "UPDATE active_resources SET recovery = json_set(recovery, \
-                     '$.cleanup_pending', json('true')) WHERE guresid = ?",
-                )
-                .bind(&guresid)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE active_resources SET cleanup_pending = 1 WHERE guresid = ?")
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
                 (
                     "failed",
                     Some("deletion_failed"),
@@ -1673,7 +1673,7 @@ impl Store for SqliteStore {
             "SELECT o.id, o.deployment_id, o.guresid FROM operations o \
              JOIN active_resources r ON r.guresid = o.guresid \
              WHERE o.org_id = ? AND o.state = 'started' AND o.kind = 'delete' \
-             AND COALESCE(json_extract(r.recovery, '$.cleanup_pending'), 0) = 1",
+             AND r.cleanup_pending = 1",
         )
         .bind(&self.org)
         .fetch_all(&mut *tx)
@@ -1871,7 +1871,7 @@ async fn finish_in_tx(
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
      definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
-     COALESCE(json_extract(recovery, '$.cleanup_pending'), 0) AS cleanup_pending, \
+     cleanup_pending, \
      observed_at, created_at FROM active_resources";
 
 /// An `active_resources` row.

@@ -404,8 +404,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                         "driver_type": driver_type,
                         "driver_account": r.driver_account,
                         "inputs": r.inputs,
-                        // Kept so that an interrupted cleanup is retried as one.
-                        "cleanup_pending": r.cleanup_pending,
+                        "cleanup_only": r.cleanup_pending,
                     }),
                 })
                 .await

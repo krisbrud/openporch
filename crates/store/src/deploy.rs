@@ -269,8 +269,8 @@ pub enum CheckpointResult {
         error: String,
     },
     /// The driver confirmed a deletion, but the record could not be removed.
-    /// The resource stays `deletion_failed` and is marked so that the next
-    /// attempt removes the record without calling the driver again.
+    /// The resource stays `deletion_failed` with `cleanup_pending` set, so the
+    /// next attempt removes the record without calling the driver again.
     CleanupPending {
         /// The redacted error.
         error: String,

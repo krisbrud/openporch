@@ -1231,7 +1231,7 @@ async fn a_confirmed_deletion_is_finished_without_the_driver() {
             driver_type: None,
             kind: OperationKind::Delete,
             input_fingerprint: "delete".into(),
-            recovery: json!({"cleanup_pending": true}),
+            recovery: json!({}),
         })
         .await
         .unwrap();
@@ -1376,4 +1376,43 @@ async fn a_removed_workload_that_something_kept_uses_fails_the_deployment() {
     );
     assert!(fake.deletions().is_empty());
     assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn deletion_keeps_the_drivers_recovery_metadata_and_ignores_lookalikes() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    fake.deletions
+        .lock()
+        .unwrap()
+        .insert("postgres".into(), Behavior::Permanent);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // Driver recovery metadata that happens to look like the cleanup marker.
+    let recovery = json!({"cleanup_pending": true, "plan": "tfplan-7"});
+    sqlx::query("UPDATE active_resources SET recovery = ? WHERE descriptor = ?")
+        .bind(recovery.to_string())
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    assert!(!f.active(DB).await.unwrap().cleanup_pending);
+    f.schedule(DB).await;
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    // The driver was asked and failed; nothing was removed without it.
+    assert!(
+        matches!(outcomes[&d(DB)], Outcome::Failed(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(fake.deletions(), vec![DB.to_owned()]);
+    let db = f.active(DB).await.unwrap();
+    assert_eq!(db.status, "deletion_failed");
+    let kept: String =
+        sqlx::query_scalar("SELECT recovery FROM active_resources WHERE descriptor = ?")
+            .bind(DB)
+            .fetch_one(f.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&kept).unwrap(), recovery);
 }
