@@ -63,10 +63,18 @@ impl Fixture {
     /// Accepts the deletion of the application, as the server does, and
     /// returns the deletions it started, by environment.
     async fn accept_app_teardown(&self) -> Result<Vec<(String, Deployment)>, StoreError> {
+        // The permits themselves are checked when the planner deletes.
+        let permits = self
+            .store
+            .envs(ORG, "shop")
+            .await?
+            .into_iter()
+            .map(|e| (e.id, Default::default()))
+            .collect();
         let deletion = self
             .store
             .accept_app_deletion(AppDeletionRequest {
-                permits: Default::default(),
+                permits,
                 org: ORG.into(),
                 app: "shop".into(),
                 actor: "root".into(),

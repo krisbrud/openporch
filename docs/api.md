@@ -61,6 +61,9 @@ Authorization: Bearer $ADMIN_TOKEN
 | `SRV-001` | 500 | Internal error. The log has details under the request ID. |
 | `SRV-002` | 503 | Not ready, for example because the master key is missing. |
 | `SRV-003` | 502 | The identity provider could not be reached. |
+| `DPL-001` | 409 | `approval_required`: a destructive or unknown-impact change has no permit. Preview and request one. |
+| `DPL-002` | 409 | `migration_required`: the change moves a resource to another driver, cloud account or state backend. |
+| `DPL-003` | 409 | A presented permit is unknown, expired, stale or already used. Preview again. |
 | `CLD-001` | 422 | The cloud refused a request, such as an account check. |
 | `CLD-002` | 502 | The cloud could not be reached. |
 
@@ -465,7 +468,8 @@ only the applications the caller can see.
 Deleting an application needs `owner` on it and `deployer` on every
 environment type it uses. The optional body is `{"permits": [...], "comment":
 "..."}`, with the destructive-action permits for deleting the resources of
-every environment. Each environment, `development` included, is then deleted
+every environment, each from a `delete_env` [preview](#previews-and-permits) of
+its environment; a missing one is `409` `DPL-001`. Each environment, `development` included, is then deleted
 as by its own deletion (see [Environments](#environments)), and the response
 is `202 Accepted` with each environment's deletion and what it leaves in
 place. The application's `state` becomes `deleting`: it takes no new
@@ -567,7 +571,8 @@ its application exists (`409`).
 
 Deleting an environment runs like a deployment, so the request needs a body
 like a deployment's: `expected_generation`, the `permits` for deleting its
-resources and an optional `comment`, with an optional `Idempotency-Key` header
+resources from a `delete_env` [preview](#previews-and-permits) and an optional
+`comment`, with an optional `Idempotency-Key` header
 that returns the same deletion to a retry while the environment exists.
 Without the body the request is `400`, and a stale generation, a running
 deployment or a resource that needs recovery is `409`. It returns `202` with
@@ -1483,7 +1488,16 @@ environment, its desired set and the delta are unchanged. With an `Idempotency-K
 caller retrying the same request gets the original deployment back, even after
 the generation moved on. The same key with a different request gets `409`.
 `mode` is `full`; `incremental` is not supported and returns `400`. `permits`
-holds destructive-action permits, and `comment` is free text.
+holds destructive-action permits from a [preview](#previews-and-permits), and
+`comment` is free text.
+
+Acceptance runs the same preflight as a preview. A change that moves a resource
+to another driver, cloud account or state backend is refused with `409`
+`DPL-002`. Every deletion, replacement and unknown-impact change the preflight
+finds needs one of the presented permits: without it the request fails with
+`409` `DPL-001`, and a permit that is unknown, expired, issued at another
+generation, already bound, or for a resource whose configuration changed since
+the preview fails with `409` `DPL-003`. Nothing is accepted in either case.
 
 Acceptance builds the set's resource graph and rejects a set that cannot be
 deployed, such as one with a resource that no definition matches, with `400`.
@@ -1694,6 +1708,125 @@ Authorization: Bearer $ADMIN_TOKEN
 }
 ```
 
+## Previews and permits
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans` | app deploy |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}` | app read |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits` | app deploy; `detach` needs administer |
+
+A preview runs a deployment's preflight without provisioning anything: it
+resolves the set, builds the resource graph and classifies each resource's
+change. `kind` is `deploy` (the default, with one of `delta_id`, `set_id` and
+`deploy_id` as for a deployment), `delete_env`, or `detach` with the resource's
+`descriptor`. `expected_generation` must be the environment's current
+generation. A move to another driver, cloud account or state backend is refused
+with `409` `DPL-002`.
+
+Each resource's `action` is `create`, `update`, `delete`, `replace`, `unknown`
+or `detach`, with a `reason`:
+
+- `update` means its driver plans the change when the deployment runs. A
+  replacement it finds then fails the deployment with `approval_required`, and
+  the next preview shows that plan as a `replace` with its `driver_plan`.
+- `unknown` is a change to an existing resource whose driver cannot preview.
+- `delete` covers removed workloads, what they owned, and resources scheduled
+  for deletion.
+
+`permit_required` marks the changes that need a permit. A preview is never a
+complete infrastructure plan, so `complete` is always `false`.
+
+```http
+GET /orgs/acme/apps/blog/envs/development
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"id": "development", "generation": "$BLOG_GENERATION"}
+```
+
+```http
+POST /orgs/acme/apps/blog/envs/development/plans
+Authorization: Bearer $ADMIN_TOKEN
+
+{"deploy_id": "+0", "expected_generation": $BLOG_GENERATION}
+```
+
+```http-response
+201 Created
+
+{
+  "id": "$BLOG_PLAN",
+  "kind": "deploy",
+  "base_generation": "$BLOG_GENERATION",
+  "set_id": "…",
+  "created_by": "…",
+  "created_at": "…",
+  "expires_at": "…",
+  "complete": false,
+  "resources": [
+    {"descriptor": "…", "definition": "…", "action": "create", "known": true,
+     "reason": "not provisioned yet", "permit_required": false, "digest": "…"},
+    "…"
+  ]
+}
+```
+
+```http
+GET /orgs/acme/apps/blog/envs/development/plans/$BLOG_PLAN
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"id": "$BLOG_PLAN", "kind": "deploy", "complete": false, "resources": ["…"]}
+```
+
+`POST .../plans/{plan}/permits` issues permits for changes the preview marked,
+each `{"descriptor", "action"}` with the preview's action. A `replace` permit
+covers the preview's driver plan, which `fingerprint` may name. The issuer needs
+the deploy permission, and an administrator for `detach`. A permit expires an
+hour after it is issued unless a deployment binds it first. It binds only at
+the preview's generation and while the resource's configuration is the one
+previewed. Once bound, it authorizes that change in that deployment and its
+retries, as long as its issuer keeps the authority. A permit issued for a
+deployment that failed is not reused: preview again.
+
+For a preview whose database is deleted, the request and its response look
+like this:
+
+```text
+POST /orgs/acme/apps/shop/envs/development/plans/pln-5f0c2a9d81e4b7c6a3d2e1f0/permits
+
+{"permits": [{"descriptor": "postgres.default#modules.web.externals.db", "action": "delete"}]}
+
+201 Created
+
+{"permits": [{"id": "prm-0d4c…", "plan": "pln-5f0c2a9d81e4b7c6a3d2e1f0",
+  "descriptor": "postgres.default#modules.web.externals.db", "guresid": "5a1f…",
+  "action": "delete", "plan_fingerprint": null, "base_generation": 4,
+  "issuer": "alice", "expires_at": 1760283600000, "bound_to": null}]}
+```
+
+The blog's preview has nothing that needs a permit, so asking for one is `400`:
+
+```http
+POST /orgs/acme/apps/blog/envs/development/plans/$BLOG_PLAN/permits
+Authorization: Bearer $ADMIN_TOKEN
+
+{"permits": [{"descriptor": "workload.default#modules.web", "action": "delete"}]}
+```
+
+```http-response
+400 Bad Request
+
+{"error": "API-003", "message": "…"}
+```
+
 ## Active resources
 
 | Method | Path | Permission |
@@ -1748,10 +1881,9 @@ leaves it out removes the record without deleting in the cloud again. External r
 the environment's `generation`, except when the resource is already scheduled,
 and returns `409` while a deployment is running.
 
-Every deletion needs a destructive-action permit in the deployment's `permits`.
-Without one the resource fails with `approval_required` and the deployment
-fails. Permits are issued from deployment plans, which are not implemented yet,
-so until then deployments that delete resources fail.
+Every deletion needs a destructive-action permit in the deployment's `permits`,
+issued from a [preview](#previews-and-permits) of that deployment. Without one
+the deployment is refused with `409` `DPL-001`.
 
 Detaching stops openporch from managing a resource without calling its driver,
 so the real object keeps running. It needs an administrator, a `reason` and a
@@ -1774,8 +1906,9 @@ the application can list tombstones. Object IDs and
 the state backend are reported by the executor, which is not implemented yet,
 so until then they are empty. A deployment that still includes a detached resource fails for it rather
 than creating a second object; bringing it back under management is an explicit
-adoption, which is not implemented yet. Like deletion, detaching needs a permit,
-so it is refused until permits can be issued.
+adoption, which is not implemented yet. The permit comes from a `detach`
+[preview](#previews-and-permits) and is used with the detach, so a refused
+detach keeps it; without one the request fails with `409` `DPL-001`.
 
 `GET .../tombstones` lists what remains of the environment's deleted and
 detached resources, oldest first.

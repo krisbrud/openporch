@@ -319,3 +319,29 @@ fn cleanup_and_drivers_without_facts() {
     assert!(!e[BUCKET].permit_required);
     assert!(e[BUCKET].reason.contains("only its record is removed"));
 }
+
+#[test]
+fn a_digest_follows_the_configuration() {
+    let d = deployment(&[(
+        node(DB, "pg", "openporch/opentofu"),
+        def("pg", "openporch/opentofu", None),
+    )]);
+    let db = active(DB, "openporch/opentofu");
+    let run = |d: &Deployment| {
+        preview(d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap()[0]
+            .digest
+            .clone()
+    };
+    let first = run(&d);
+    assert_eq!(first, run(&d));
+    // A new definition version is a different configuration.
+    let mut changed = d.clone();
+    for (version, _) in changed.definitions.values_mut() {
+        *version = 2;
+    }
+    assert_ne!(first, run(&changed));
+    // A detach names its own action.
+    let detached = detach(&db);
+    assert_eq!(detached.action.permit_action(), Some("detach"));
+    assert_ne!(detached.digest, first);
+}

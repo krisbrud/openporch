@@ -31,6 +31,13 @@ pub mod code {
     pub const NOT_READY: &str = "SRV-002";
     /// An external identity provider could not be reached.
     pub const PROVIDER_UNAVAILABLE: &str = "SRV-003";
+    /// A destructive action has no permit that covers it.
+    pub const APPROVAL_REQUIRED: &str = "DPL-001";
+    /// The change moves a resource to another driver, cloud account or state
+    /// backend, which only an explicit migration does.
+    pub const MIGRATION_REQUIRED: &str = "DPL-002";
+    /// A presented permit is unknown, expired, stale or already used.
+    pub const PERMIT_INVALID: &str = "DPL-003";
     /// The cloud provider refused a request made with an account's credentials.
     pub const CLOUD_REJECTED: &str = "CLD-001";
     /// The cloud provider or the host identity could not be reached.
@@ -160,11 +167,19 @@ impl From<StoreError> for ApiError {
             | StoreError::StaleGeneration { .. }
             | StoreError::Busy(_)
             | StoreError::RecoveryRequired(_)
-            | StoreError::MigrationRequired { .. }
             | StoreError::Detached(_)
-            | StoreError::PermitInvalid(_)
-            | StoreError::ApprovalRequired(_)
             | StoreError::IdempotencyMismatch(_) => Self::conflict(e.to_string()),
+            StoreError::MigrationRequired { .. } => Self::new(
+                StatusCode::CONFLICT,
+                code::MIGRATION_REQUIRED,
+                e.to_string(),
+            ),
+            StoreError::ApprovalRequired(_) => {
+                Self::new(StatusCode::CONFLICT, code::APPROVAL_REQUIRED, e.to_string())
+            }
+            StoreError::PermitInvalid(_) => {
+                Self::new(StatusCode::CONFLICT, code::PERMIT_INVALID, e.to_string())
+            }
             StoreError::Forbidden(_) => Self::forbidden(e.to_string()),
             StoreError::Invalid(_) => Self::invalid(e.to_string()),
             other => Self::internal(other),

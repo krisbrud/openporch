@@ -200,6 +200,15 @@ pub trait PermitStore: Send + Sync {
     /// hold the authority that issued it. Marks the permit used.
     fn use_permit(&self, permit: PermitUse<'_>) -> impl Future<Output = Result<()>> + Send;
 
+    /// The environment each of the application's permits `ids` was issued
+    /// for; IDs it did not issue are left out.
+    fn permit_envs(
+        &self,
+        org: &str,
+        app: &str,
+        ids: &[String],
+    ) -> impl Future<Output = Result<BTreeMap<String, String>>> + Send;
+
     /// Records a driver plan that needed a permit, replacing older ones for
     /// the resource.
     fn record_approval_request(
@@ -449,6 +458,30 @@ impl PermitStore for SqliteStore {
         consume_permit(&mut tx, &u).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn permit_envs(
+        &self,
+        org: &str,
+        app: &str,
+        ids: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        self.check_org(org)?;
+        let mut envs = BTreeMap::new();
+        for id in ids {
+            let env: Option<String> = sqlx::query_scalar(
+                "SELECT env_id FROM permits WHERE org_id = ? AND app_id = ? AND id = ?",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+            if let Some(env) = env {
+                envs.insert(id.clone(), env);
+            }
+        }
+        Ok(envs)
     }
 
     async fn record_approval_request(
