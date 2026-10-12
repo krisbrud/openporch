@@ -45,7 +45,11 @@ impl Runner for Unimplemented {
             finish(
                 &state,
                 &job,
-                Some("provisioning resources is not implemented yet; nothing changed".into()),
+                Some(
+                    "provisioning resources is not implemented yet; nothing changed; \
+                     deploy again once the server runs with an executor"
+                        .into(),
+                ),
             )
             .await;
         })
@@ -76,7 +80,10 @@ impl<E: Executor> Runner for PlannerRunner<E> {
                 Ok(deployment) => {
                     planner.run(deployment).await;
                 }
-                Err(error) => finish(&state, &job, Some(format!("{error}; nothing changed"))).await,
+                Err(error) => {
+                    let error = format!("{error}; nothing changed; fix the cause and deploy again");
+                    finish(&state, &job, Some(error)).await;
+                }
             }
         })
     }
