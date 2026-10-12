@@ -1739,7 +1739,15 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 200 OK
 
-{"deployment_id": "…", "status": "…", "nodes": "…", "edges": "…"}
+{
+  "deployment_id": "…",
+  "status": "…",
+  "nodes": [
+    {"descriptor": "…", "definition_id": "…", "driver_type": "…", "guresid": "…", "status": "…", "error": "…"},
+    "…"
+  ],
+  "edges": ["…"]
+}
 ```
 
 ```http

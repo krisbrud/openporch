@@ -608,7 +608,19 @@ async fn inspect_the_graph_after_a_failed_deployment() {
         .map(|n| (n["descriptor"].as_str().unwrap().to_owned(), n.clone()))
         .collect();
     // Every node shows its status, and the failed one its error.
-    assert!(nodes.values().all(|n| n["status"].is_string()), "{g}");
+    let statuses: std::collections::BTreeMap<&str, &str> = nodes
+        .iter()
+        .map(|(k, n)| (k.as_str(), n["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        statuses,
+        std::collections::BTreeMap::from([
+            ("base-env.default#base-env", "provisioned"),
+            (DB, "failed"),
+            ("workload.default#modules.web", "pending"),
+        ])
+    );
+    assert!(nodes["base-env.default#base-env"]["error"].is_null(), "{g}");
     assert_eq!(nodes[DB]["status"], "failed", "{g}");
     assert_eq!(nodes[DB]["definition_id"], "pg");
     assert!(

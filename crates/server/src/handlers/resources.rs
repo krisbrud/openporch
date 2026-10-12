@@ -292,6 +292,12 @@ pub async fn graph(
         .deployment_snapshot(org, &env.app, &env.id, &d.id)
         .await?
         .unwrap_or_default();
+    if !snapshot["graph"].is_object() {
+        return Err(ApiError::conflict(format!(
+            "deployment `{}` recorded no graph",
+            d.id
+        )));
+    }
     let graph: ResourceGraph = serde_json::from_value(snapshot["graph"].clone()).map_err(|e| {
         ApiError::internal(format!("deployment `{}` has no readable graph: {e}", d.id))
     })?;
