@@ -1509,7 +1509,13 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 Every graph has a `base-env` node, and every workload is a `workload` node, so
-both need a matching definition:
+both need a matching definition. A workload's class picks its definition like
+any other resource's, and that definition's driver receives the workload's spec
+as its resource inputs, resolved at deploy time: the placeholders take its
+dependencies' outputs, secret outputs stay references that only the executor
+reads, and each trigger that names one of its resources gets that resource's
+outputs under `outputs`. `openporch/none` creates nothing and returns that
+document as the workload's outputs.
 
 ```http
 POST /orgs/acme/resources/defs

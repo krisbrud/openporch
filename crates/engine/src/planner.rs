@@ -934,14 +934,12 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         } else {
             Dialect::Definition
         };
-        let resource = resolve_value(
-            node.params.as_ref().unwrap_or(&Value::Null),
-            dialect,
-            scope,
-            Sink::Secret,
-            "params",
-        )
-        .map_err(|e| format!("`{}`: {e}", node.descriptor))?;
+        let mut params = node.params.clone().unwrap_or(Value::Null);
+        if node.descriptor.ty.as_str() == "workload" {
+            add_trigger_outputs(&mut params, scope);
+        }
+        let resource = resolve_value(&params, dialect, scope, Sink::Secret, "params")
+            .map_err(|e| format!("`{}`: {e}", node.descriptor))?;
         Ok(ProvisionJob {
             operation_id: started.operation_id.clone(),
             attempt: started.attempt,
@@ -1082,6 +1080,31 @@ fn references(value: &Value) -> Resolved {
             }
         }
         other => Resolved::Value(other.clone()),
+    }
+}
+
+/// Gives each trigger of a workload spec that names one of its resources
+/// that resource's outputs, as placeholders resolved with the rest of the
+/// spec, so secret outputs stay references.
+fn add_trigger_outputs(spec: &mut Value, scope: &MapScope) {
+    let Some(triggers) = spec.get_mut("triggers").and_then(Value::as_object_mut) else {
+        return;
+    };
+    // Each trigger is `{<kind>: {...}}`.
+    for trigger in triggers.values_mut().filter_map(Value::as_object_mut) {
+        for body in trigger.values_mut().filter_map(Value::as_object_mut) {
+            let Some(key) = body.get("resource").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(outputs) = scope.externals.get(key) else {
+                continue;
+            };
+            let names = outputs.values.keys().chain(outputs.secrets.keys());
+            let placeholders = names
+                .map(|name| (name.clone(), json!(format!("${{externals.{key}.{name}}}"))))
+                .collect();
+            body.insert("outputs".into(), Value::Object(placeholders));
+        }
     }
 }
 

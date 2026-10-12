@@ -187,7 +187,8 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
     for (wid, module) in &input.set.modules {
         let w = Descriptor::new(ty("workload"), module.class.clone(), ResId::workload(wid));
         let wpath = format!("modules.{wid}");
-        b.request(&w, &wpath, None)?;
+        // The workload's inputs are its spec, resolved at deploy time.
+        b.request(&w, &wpath, Some(Value::Object(module.spec.clone())))?;
         for (key, ext) in &module.externals {
             let res_id = match &ext.id {
                 Some(id) => ResId::shared(id),
