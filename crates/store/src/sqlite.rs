@@ -1102,13 +1102,15 @@ impl Store for SqliteStore {
                 .fetch_optional(&mut *tx)
                 .await?;
                 if let Some(op) = open {
-                    let (deployment, op_kind, deployment_status, cleanup_pending): (
+                    let (deployment, op_kind, deployment_status, cleanup_pending, has_inputs): (
                         String,
                         String,
                         String,
                         bool,
+                        bool,
                     ) = sqlx::query_as(
-                        "SELECT o.deployment_id, o.kind, d.status, r.cleanup_pending \
+                        "SELECT o.deployment_id, o.kind, d.status, r.cleanup_pending, \
+                         json_type(o.recovery, '$.inputs') IS NOT NULL \
                          FROM operations o JOIN deployments d ON d.id = o.deployment_id \
                          JOIN active_resources r ON r.guresid = o.guresid WHERE o.id = ?",
                     )
@@ -1128,6 +1130,10 @@ impl Store for SqliteStore {
                     let (op_state, resource_status, error) =
                         if op_kind == "delete" && cleanup_pending {
                             ("failed", "deletion_failed", "abandoned; cleanup pending")
+                        } else if op_kind == "put" && !has_inputs {
+                            // Its inputs are recorded right before the driver
+                            // runs, so the driver was never called.
+                            ("failed", "failed", "abandoned before the driver was called")
                         } else {
                             ("unknown", "unknown", "abandoned without a recorded result")
                         };
@@ -1278,194 +1284,8 @@ impl Store for SqliteStore {
         operation_id: &str,
         result: CheckpointResult,
     ) -> Result<()> {
-        let now = now_ms();
         let mut tx = self.begin().await?;
-        #[allow(clippy::type_complexity)]
-        let op: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind FROM operations \
-             WHERE id = ?",
-        )
-        .bind(operation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (org, app, env, deployment_id, guresid, state, kind) =
-            op.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
-        self.check_org(&org)?;
-        if state != "started" && state != "unknown" {
-            return Err(StoreError::Conflict(format!(
-                "operation `{operation_id}` is already {state}"
-            )));
-        }
-        match (&result, kind.as_str()) {
-            (CheckpointResult::Provisioned(_), "put") | (CheckpointResult::Deleted, "delete") => {}
-            (CheckpointResult::CleanupPending { .. }, "delete") if state == "started" => {}
-            (
-                CheckpointResult::Provisioned(_)
-                | CheckpointResult::Deleted
-                | CheckpointResult::CleanupPending { .. },
-                _,
-            ) => {
-                return Err(StoreError::Conflict(format!(
-                    "operation `{operation_id}` is a {kind}; the result does not match it"
-                )));
-            }
-            // An operation whose outcome is unknown is resolved only by observing the
-            // resource: a guess or another failure leaves it blocking.
-            (CheckpointResult::Failed { .. } | CheckpointResult::Unknown { .. }, _)
-                if state == "unknown" =>
-            {
-                return Err(StoreError::Conflict(format!(
-                    "operation `{operation_id}` has an unknown outcome; it is resolved only by \
-                     an observation of the resource"
-                )));
-            }
-            _ => {}
-        }
-        let descriptor: String =
-            sqlx::query_scalar("SELECT descriptor FROM active_resources WHERE guresid = ?")
-                .bind(&guresid)
-                .fetch_one(&mut *tx)
-                .await?;
-        let (op_state, resource_status, run_status, error, outputs) = match &result {
-            CheckpointResult::Provisioned(p) => {
-                let Provisioned {
-                    outputs,
-                    secret_outputs,
-                    cookie,
-                    recovery,
-                    inputs,
-                    dependencies,
-                    snapshot,
-                    account,
-                    target,
-                    backend,
-                    external_ids,
-                } = &**p;
-                sqlx::query(
-                    "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
-                     secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
-                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, target = ?, \
-                     backend = ?, external_ids = ?, \
-                     definition_id = COALESCE(o.definition_id, active_resources.definition_id), \
-                     definition_version = COALESCE(o.definition_version, \
-                     active_resources.definition_version), \
-                     driver_type = COALESCE(o.driver_type, active_resources.driver_type), \
-                     last_deploy_id = ?, observed_at = ?, updated_at = ? \
-                     FROM (SELECT definition_id, definition_version, driver_type FROM operations \
-                     WHERE id = ?) AS o WHERE guresid = ?",
-                )
-                .bind(serde_json::to_string(outputs)?)
-                .bind(serde_json::to_string(secret_outputs)?)
-                .bind(cookie.as_ref().map(|c| c.key_id.clone()))
-                .bind(cookie.as_ref().map(|c| c.nonce.clone()))
-                .bind(cookie.as_ref().map(|c| c.ciphertext.clone()))
-                .bind(serde_json::to_string(recovery)?)
-                .bind(serde_json::to_string(inputs)?)
-                .bind(serde_json::to_string(dependencies)?)
-                .bind(serde_json::to_string(snapshot)?)
-                .bind(account)
-                .bind(target)
-                .bind(backend)
-                .bind(serde_json::to_string(external_ids)?)
-                .bind(&deployment_id)
-                .bind(now)
-                .bind(now)
-                .bind(operation_id)
-                .bind(&guresid)
-                .execute(&mut *tx)
-                .await?;
-                (
-                    "succeeded",
-                    None,
-                    "provisioned",
-                    None,
-                    Some(outputs.clone()),
-                )
-            }
-            CheckpointResult::Deleted => {
-                sqlx::query(
-                    "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
-                     actor_id, body, at) SELECT org_id, app_id, env_id, descriptor, guresid, \
-                     'deleted', NULL, json_object('definition_id', definition_id, 'driver_type', \
-                     driver_type, 'external_ids', json(external_ids), 'backend', backend), ? \
-                     FROM active_resources WHERE guresid = ?",
-                )
-                .bind(now)
-                .bind(&guresid)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query("DELETE FROM active_resources WHERE guresid = ?")
-                    .bind(&guresid)
-                    .execute(&mut *tx)
-                    .await?;
-                ("succeeded", None, "deleted", None, None)
-            }
-            CheckpointResult::Failed { error } => (
-                "failed",
-                Some(if kind == "delete" {
-                    "deletion_failed"
-                } else {
-                    "failed"
-                }),
-                "failed",
-                Some(error.clone()),
-                None,
-            ),
-            CheckpointResult::CleanupPending { error } => {
-                sqlx::query("UPDATE active_resources SET cleanup_pending = 1 WHERE guresid = ?")
-                    .bind(&guresid)
-                    .execute(&mut *tx)
-                    .await?;
-                (
-                    "failed",
-                    Some("deletion_failed"),
-                    "failed",
-                    Some(format!("cleanup pending: {error}")),
-                    None,
-                )
-            }
-            CheckpointResult::Unknown { error } => (
-                "unknown",
-                Some("unknown"),
-                "unknown",
-                Some(error.clone()),
-                None,
-            ),
-        };
-        if let Some(status) = resource_status {
-            sqlx::query(
-                "UPDATE active_resources SET status = ?, observed_at = ?, updated_at = ? \
-                 WHERE guresid = ?",
-            )
-            .bind(status)
-            .bind(now)
-            .bind(now)
-            .bind(&guresid)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query("UPDATE operations SET state = ?, error = ?, finished_at = ? WHERE id = ?")
-            .bind(op_state)
-            .bind(&error)
-            .bind(now)
-            .bind(operation_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE deployment_resources SET status = ?, error = ?, outputs = ?, observed_at = ? \
-             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? AND descriptor = ?",
-        )
-        .bind(run_status)
-        .bind(&error)
-        .bind(outputs.map(|o| o.to_string()))
-        .bind(now)
-        .bind(&org)
-        .bind(&app)
-        .bind(&env)
-        .bind(&deployment_id)
-        .bind(&descriptor)
-        .execute(&mut *tx)
-        .await?;
+        self.checkpoint_in_tx(&mut tx, operation_id, result).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1493,6 +1313,167 @@ impl Store for SqliteStore {
                 "operation `{operation_id}` is no longer started"
             )));
         }
+        Ok(())
+    }
+
+    async fn unknown_operation(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+    ) -> Result<Option<UnknownOperation>> {
+        self.check_org(org)?;
+        let Some(resource) = self.active_resource(org, app, env, descriptor).await? else {
+            return Ok(None);
+        };
+        #[allow(clippy::type_complexity)]
+        let row: Option<(String, String, String, i64, String, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, deployment_id, kind, attempt, input_fingerprint, recovery, error \
+                 FROM operations WHERE guresid = ? AND state = 'unknown' \
+                 ORDER BY started_at DESC LIMIT 1",
+            )
+            .bind(&resource.guresid)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some((operation_id, deployment_id, kind, attempt, input_fingerprint, recovery, error)) =
+            row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(UnknownOperation {
+            operation_id,
+            deployment_id,
+            kind: if kind == "delete" {
+                OperationKind::Delete
+            } else {
+                OperationKind::Put
+            },
+            attempt,
+            input_fingerprint,
+            recovery: serde_json::from_str(&recovery)?,
+            error,
+            resource,
+        }))
+    }
+
+    async fn resolve_operation(
+        &self,
+        operation_id: &str,
+        resolution: Resolution,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let op: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind FROM operations \
+             WHERE id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (org, app, env, deployment_id, guresid, state, kind) =
+            op.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        self.check_org(&org)?;
+        if state != "unknown" {
+            return Err(StoreError::Conflict(format!(
+                "operation `{operation_id}` is {state}; its outcome is already known"
+            )));
+        }
+        let running: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status = 'in_progress'",
+        )
+        .bind(&org)
+        .bind(&app)
+        .bind(&env)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = running {
+            return Err(StoreError::Busy(id));
+        }
+        let now = now_ms();
+        let repeat = match resolution {
+            Resolution::Observed(result) => {
+                self.checkpoint_in_tx(&mut tx, operation_id, result).await?;
+                None
+            }
+            Resolution::Repeatable { reason } => Some(format!("recovered: {reason}")),
+            Resolution::Operator { reason } => {
+                let Some(actor) = audit.actor.as_deref() else {
+                    return Err(StoreError::Forbidden(
+                        "only an administrator resolves an unknown outcome".into(),
+                    ));
+                };
+                check_admin_authority(&mut tx, &org, Some(actor)).await?;
+                Some(format!("resolved by `{actor}`: {reason}"))
+            }
+            Resolution::RecoveryRequired { reason } => {
+                let error = format!("recovery required: {reason}");
+                sqlx::query("UPDATE operations SET error = ? WHERE id = ?")
+                    .bind(&error)
+                    .bind(operation_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE active_resources SET status = 'recovery_required', observed_at = ?, \
+                     updated_at = ? WHERE guresid = ?",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&guresid)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE deployment_resources SET error = ? \
+                     WHERE deployment_id = ? AND guresid = ?",
+                )
+                .bind(&error)
+                .bind(&deployment_id)
+                .bind(&guresid)
+                .execute(&mut *tx)
+                .await?;
+                None
+            }
+        };
+        if let Some(error) = repeat {
+            // The next deployment repeats the operation with the same
+            // identity.
+            let status = if kind == "delete" {
+                "deletion_failed"
+            } else {
+                "failed"
+            };
+            sqlx::query(
+                "UPDATE operations SET state = 'failed', error = ?, finished_at = ? WHERE id = ?",
+            )
+            .bind(&error)
+            .bind(now)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE active_resources SET status = ?, observed_at = ?, updated_at = ? \
+                 WHERE guresid = ?",
+            )
+            .bind(status)
+            .bind(now)
+            .bind(now)
+            .bind(&guresid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE deployment_resources SET status = 'failed', error = ? \
+                 WHERE deployment_id = ? AND guresid = ?",
+            )
+            .bind(&error)
+            .bind(&deployment_id)
+            .bind(&guresid)
+            .execute(&mut *tx)
+            .await?;
+        }
+        audit::insert(&mut tx, &audit, Some(operation_id), None).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1903,14 +1884,63 @@ impl Store for SqliteStore {
             )
             .await?;
         }
-        let uncertain: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? AND state = 'started' \
-             ORDER BY started_at",
+        // A creation or update records its inputs right before the driver
+        // runs, so one without them never reached the driver: it failed, and
+        // the next deployment repeats it with the same identity.
+        let unstarted: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? \
+             AND state = 'started' AND kind = 'put' AND json_type(recovery, '$.inputs') IS NULL",
         )
         .bind(&self.org)
         .fetch_all(&mut *tx)
         .await?;
-        for (op, deployment, guresid) in &uncertain {
+        for (op, deployment, guresid) in &unstarted {
+            let error = "interrupted by a restart before the driver was called; nothing changed";
+            sqlx::query(
+                "UPDATE operations SET state = 'failed', error = ?, finished_at = ? WHERE id = ?",
+            )
+            .bind(error)
+            .bind(now)
+            .bind(op)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE active_resources SET status = 'failed', updated_at = ? WHERE guresid = ?",
+            )
+            .bind(now)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE deployment_resources SET status = 'failed', error = ? \
+                 WHERE deployment_id = ? AND guresid = ?",
+            )
+            .bind(error)
+            .bind(deployment)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+            log_in_tx(
+                &mut tx,
+                &self.org,
+                deployment,
+                Some((op, guresid)),
+                "warn",
+                "interrupted by a restart before the driver was called; nothing changed, so \
+                 deploy again",
+            )
+            .await?;
+        }
+        #[allow(clippy::type_complexity)]
+        let uncertain: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT o.id, o.deployment_id, o.guresid, r.app_id, r.env_id, r.descriptor \
+             FROM operations o JOIN active_resources r ON r.guresid = o.guresid \
+             WHERE o.org_id = ? AND o.state = 'started' ORDER BY o.started_at",
+        )
+        .bind(&self.org)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (op, deployment, guresid, ..) in &uncertain {
             sqlx::query(
                 "UPDATE operations SET state = 'unknown', error = 'interrupted by a restart' \
                  WHERE id = ?",
@@ -1947,7 +1977,8 @@ impl Store for SqliteStore {
         }
         for (app, env, id) in &running {
             // Cleanups were closed before, so count them separately.
-            let open = uncertain.iter().filter(|(_, d, _)| d == id).count();
+            let open = uncertain.iter().filter(|(_, d, ..)| d == id).count();
+            let unstarted = unstarted.iter().filter(|(_, d, _)| d == id).count();
             let cleanup = cleanups.iter().filter(|(_, d, _)| d == id).count();
             let mut parts = vec!["interrupted by a server restart".to_owned()];
             if open > 0 {
@@ -1962,7 +1993,13 @@ impl Store for SqliteStore {
                      deployment finishes the cleanup"
                 ));
             }
-            if open == 0 && cleanup == 0 {
+            if unstarted > 0 {
+                parts.push(format!(
+                    "{unstarted} resource(s) had not reached their driver and are retried by the \
+                     next deployment"
+                ));
+            }
+            if open == 0 && cleanup == 0 && unstarted == 0 {
                 parts.push("no operation was in flight, so deploy again to continue".to_owned());
             }
             let error = parts.join("; ");
@@ -1974,10 +2011,15 @@ impl Store for SqliteStore {
             uncertain: uncertain
                 .into_iter()
                 .map(
-                    |(operation_id, deployment_id, guresid)| UncertainOperation {
-                        operation_id,
-                        deployment_id,
-                        guresid,
+                    |(operation_id, deployment_id, guresid, app, env, descriptor)| {
+                        UncertainOperation {
+                            operation_id,
+                            deployment_id,
+                            guresid,
+                            app,
+                            env,
+                            descriptor,
+                        }
                     },
                 )
                 .collect(),
@@ -1992,6 +2034,205 @@ impl Store for SqliteStore {
         )
         .fetch_all(&self.pool)
         .await?)
+    }
+}
+
+impl SqliteStore {
+    /// Checkpoints an operation's result in `tx`.
+    async fn checkpoint_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        operation_id: &str,
+        result: CheckpointResult,
+    ) -> Result<()> {
+        let now = now_ms();
+        #[allow(clippy::type_complexity)]
+        let op: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind FROM operations \
+             WHERE id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (org, app, env, deployment_id, guresid, state, kind) =
+            op.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        self.check_org(&org)?;
+        if state != "started" && state != "unknown" {
+            return Err(StoreError::Conflict(format!(
+                "operation `{operation_id}` is already {state}"
+            )));
+        }
+        match (&result, kind.as_str()) {
+            (CheckpointResult::Provisioned(_), "put") | (CheckpointResult::Deleted, "delete") => {}
+            (CheckpointResult::CleanupPending { .. }, "delete") if state == "started" => {}
+            (
+                CheckpointResult::Provisioned(_)
+                | CheckpointResult::Deleted
+                | CheckpointResult::CleanupPending { .. },
+                _,
+            ) => {
+                return Err(StoreError::Conflict(format!(
+                    "operation `{operation_id}` is a {kind}; the result does not match it"
+                )));
+            }
+            // An operation whose outcome is unknown is resolved only by observing the
+            // resource: a guess or another failure leaves it blocking.
+            (CheckpointResult::Failed { .. } | CheckpointResult::Unknown { .. }, _)
+                if state == "unknown" =>
+            {
+                return Err(StoreError::Conflict(format!(
+                    "operation `{operation_id}` has an unknown outcome; it is resolved only by \
+                     an observation of the resource"
+                )));
+            }
+            _ => {}
+        }
+        let descriptor: String =
+            sqlx::query_scalar("SELECT descriptor FROM active_resources WHERE guresid = ?")
+                .bind(&guresid)
+                .fetch_one(&mut **tx)
+                .await?;
+        let (op_state, resource_status, run_status, error, outputs) = match &result {
+            CheckpointResult::Provisioned(p) => {
+                let Provisioned {
+                    outputs,
+                    secret_outputs,
+                    cookie,
+                    recovery,
+                    inputs,
+                    dependencies,
+                    snapshot,
+                    account,
+                    target,
+                    backend,
+                    external_ids,
+                } = &**p;
+                sqlx::query(
+                    "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
+                     secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
+                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, target = ?, \
+                     backend = ?, external_ids = ?, \
+                     definition_id = COALESCE(o.definition_id, active_resources.definition_id), \
+                     definition_version = COALESCE(o.definition_version, \
+                     active_resources.definition_version), \
+                     driver_type = COALESCE(o.driver_type, active_resources.driver_type), \
+                     last_deploy_id = ?, observed_at = ?, updated_at = ? \
+                     FROM (SELECT definition_id, definition_version, driver_type FROM operations \
+                     WHERE id = ?) AS o WHERE guresid = ?",
+                )
+                .bind(serde_json::to_string(outputs)?)
+                .bind(serde_json::to_string(secret_outputs)?)
+                .bind(cookie.as_ref().map(|c| c.key_id.clone()))
+                .bind(cookie.as_ref().map(|c| c.nonce.clone()))
+                .bind(cookie.as_ref().map(|c| c.ciphertext.clone()))
+                .bind(serde_json::to_string(recovery)?)
+                .bind(serde_json::to_string(inputs)?)
+                .bind(serde_json::to_string(dependencies)?)
+                .bind(serde_json::to_string(snapshot)?)
+                .bind(account)
+                .bind(target)
+                .bind(backend)
+                .bind(serde_json::to_string(external_ids)?)
+                .bind(&deployment_id)
+                .bind(now)
+                .bind(now)
+                .bind(operation_id)
+                .bind(&guresid)
+                .execute(&mut **tx)
+                .await?;
+                (
+                    "succeeded",
+                    None,
+                    "provisioned",
+                    None,
+                    Some(outputs.clone()),
+                )
+            }
+            CheckpointResult::Deleted => {
+                sqlx::query(
+                    "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
+                     actor_id, body, at) SELECT org_id, app_id, env_id, descriptor, guresid, \
+                     'deleted', NULL, json_object('definition_id', definition_id, 'driver_type', \
+                     driver_type, 'external_ids', json(external_ids), 'backend', backend), ? \
+                     FROM active_resources WHERE guresid = ?",
+                )
+                .bind(now)
+                .bind(&guresid)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query("DELETE FROM active_resources WHERE guresid = ?")
+                    .bind(&guresid)
+                    .execute(&mut **tx)
+                    .await?;
+                ("succeeded", None, "deleted", None, None)
+            }
+            CheckpointResult::Failed { error } => (
+                "failed",
+                Some(if kind == "delete" {
+                    "deletion_failed"
+                } else {
+                    "failed"
+                }),
+                "failed",
+                Some(error.clone()),
+                None,
+            ),
+            CheckpointResult::CleanupPending { error } => {
+                sqlx::query("UPDATE active_resources SET cleanup_pending = 1 WHERE guresid = ?")
+                    .bind(&guresid)
+                    .execute(&mut **tx)
+                    .await?;
+                (
+                    "failed",
+                    Some("deletion_failed"),
+                    "failed",
+                    Some(format!("cleanup pending: {error}")),
+                    None,
+                )
+            }
+            CheckpointResult::Unknown { error } => (
+                "unknown",
+                Some("unknown"),
+                "unknown",
+                Some(error.clone()),
+                None,
+            ),
+        };
+        if let Some(status) = resource_status {
+            sqlx::query(
+                "UPDATE active_resources SET status = ?, observed_at = ?, updated_at = ? \
+                 WHERE guresid = ?",
+            )
+            .bind(status)
+            .bind(now)
+            .bind(now)
+            .bind(&guresid)
+            .execute(&mut **tx)
+            .await?;
+        }
+        sqlx::query("UPDATE operations SET state = ?, error = ?, finished_at = ? WHERE id = ?")
+            .bind(op_state)
+            .bind(&error)
+            .bind(now)
+            .bind(operation_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "UPDATE deployment_resources SET status = ?, error = ?, outputs = ?, observed_at = ? \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? AND descriptor = ?",
+        )
+        .bind(run_status)
+        .bind(&error)
+        .bind(outputs.map(|o| o.to_string()))
+        .bind(now)
+        .bind(&org)
+        .bind(&app)
+        .bind(&env)
+        .bind(&deployment_id)
+        .bind(&descriptor)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 }
 

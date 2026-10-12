@@ -123,6 +123,9 @@ enum Behavior {
     /// Fails with the secret values it read in its error, as a careless driver
     /// would.
     Leak,
+    /// Takes effect in the cloud, then never answers, as when the server
+    /// stops during the call.
+    Crash,
 }
 
 /// An executor that provisions nothing and records every job it is handed.
@@ -140,6 +143,15 @@ struct Fake {
     deletions: Mutex<BTreeMap<String, Behavior>>,
     /// Every deletion job, in the order they started.
     deleted: Mutex<Vec<DeprovisionJob>>,
+    /// The cloud objects that exist: descriptor by GUResID.
+    objects: Mutex<BTreeMap<String, String>>,
+    /// Every object created, as descriptor and GUResID, in order.
+    created: Mutex<Vec<(String, String)>>,
+    /// How observations answer, by resource type, instead of from the
+    /// objects.
+    observations: Mutex<BTreeMap<String, Observed>>,
+    /// The descriptors observed, in order.
+    observed: Mutex<Vec<String>>,
 }
 
 /// The secret references in `r`.
@@ -170,6 +182,61 @@ impl Fake {
         jobs.iter()
             .filter(|j| j.descriptor.to_string() == descriptor)
             .count()
+    }
+
+    /// Creates the object for `guresid` unless it exists: puts are
+    /// idempotent per GUResID.
+    fn create(&self, descriptor: &str, guresid: &str) {
+        let mut objects = self.objects.lock().unwrap();
+        if !objects.contains_key(guresid) {
+            objects.insert(guresid.to_owned(), descriptor.to_owned());
+            self.created
+                .lock()
+                .unwrap()
+                .push((descriptor.to_owned(), guresid.to_owned()));
+        }
+    }
+
+    /// How many objects were ever created for `descriptor`.
+    fn creations(&self, descriptor: &str) -> usize {
+        let created = self.created.lock().unwrap();
+        created.iter().filter(|(d, _)| d == descriptor).count()
+    }
+
+    /// The result of provisioning a resource of type `ty`.
+    async fn result(&self, ty: &str, guresid: &str) -> ProvisionResult {
+        let mut provisioned = ProvisionResult::default();
+        provisioned
+            .outputs
+            .insert("host".into(), json!(format!("{ty}.internal")));
+        if ty == "dns" {
+            provisioned.target = Some("111122223333".into());
+        }
+        provisioned.recovery = json!({"state": format!("{ty}-state")});
+        provisioned.backend = Some(format!("s3://state/{guresid}"));
+        provisioned.external_ids = vec![format!("arn:aws:{ty}:{guresid}")];
+        provisioned.cookie = Some(Sealed {
+            key_id: "k1".into(),
+            nonce: vec![0; 12],
+            ciphertext: format!("{ty}-cookie").into_bytes(),
+        });
+        let secret = match ty {
+            "dns" => Some(("token", "dns-token", TOKEN)),
+            "postgres" => Some(("password", "pg-password", PASSWORD)),
+            _ => None,
+        };
+        if let Some((output, name, value)) = secret {
+            let reference = match &self.secrets {
+                Some(store) => store.write(name, &SecretValue::new(value)).await.unwrap(),
+                None => SecretRef {
+                    store: "openporch".into(),
+                    reference: name.into(),
+                    version: None,
+                },
+            };
+            provisioned.secret_outputs.insert(output.into(), reference);
+        }
+        provisioned
     }
 
     fn job(&self, descriptor: &str) -> ProvisionJob {
@@ -233,6 +300,7 @@ impl Executor for Fake {
             .cloned()
             .unwrap_or(Behavior::Succeed);
         let ty = job.descriptor.ty.to_string();
+        let descriptor = job.descriptor.to_string();
         let guresid = job.guresid.clone();
         let driver_type = job.driver_type.to_string();
         let resource = job.inputs.resource.clone();
@@ -275,6 +343,10 @@ impl Executor for Fake {
             }),
             Behavior::Permanent => Err(ExecFailure::Permanent("400: invalid zone".into())),
             Behavior::Hang => std::future::pending().await,
+            Behavior::Crash => {
+                self.create(&descriptor, guresid.as_str());
+                std::future::pending().await
+            }
             Behavior::Panic => panic!("the driver crashed"),
             Behavior::Leak => Err(ExecFailure::Permanent(format!(
                 "Error: authentication failed for {}",
@@ -283,6 +355,7 @@ impl Executor for Fake {
         };
         self.running.fetch_sub(1, Ordering::SeqCst);
         result.map_err(|f| log.failure(f))?;
+        self.create(&descriptor, guresid.as_str());
         let mut provisioned = ProvisionResult::default();
         // As `openporch/none` does through the executor: the resolved inputs
         // are the outputs, with what resolved from secrets kept as references.
@@ -294,37 +367,7 @@ impl Executor for Fake {
             provisioned.secret_outputs = secrets;
             return Ok(provisioned);
         }
-        provisioned
-            .outputs
-            .insert("host".into(), json!(format!("{ty}.internal")));
-        if ty == "dns" {
-            provisioned.target = Some("111122223333".into());
-        }
-        provisioned.recovery = json!({"state": format!("{ty}-state")});
-        provisioned.backend = Some(format!("s3://state/{guresid}"));
-        provisioned.external_ids = vec![format!("arn:aws:{ty}:{guresid}")];
-        provisioned.cookie = Some(Sealed {
-            key_id: "k1".into(),
-            nonce: vec![0; 12],
-            ciphertext: format!("{ty}-cookie").into_bytes(),
-        });
-        let secret = match ty.as_str() {
-            "dns" => Some(("token", "dns-token", TOKEN)),
-            "postgres" => Some(("password", "pg-password", PASSWORD)),
-            _ => None,
-        };
-        if let Some((output, name, value)) = secret {
-            let reference = match &self.secrets {
-                Some(store) => store.write(name, &SecretValue::new(value)).await.unwrap(),
-                None => SecretRef {
-                    store: "openporch".into(),
-                    reference: name.into(),
-                    version: None,
-                },
-            };
-            provisioned.secret_outputs.insert(output.into(), reference);
-        }
-        Ok(provisioned)
+        Ok(self.result(&ty, guresid.as_str()).await)
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
@@ -335,9 +378,17 @@ impl Executor for Fake {
             .get(job.job.descriptor.ty.as_str())
             .cloned()
             .unwrap_or(Behavior::Succeed);
+        let guresid = job.job.guresid.to_string();
         self.deleted.lock().unwrap().push(job);
         match behavior {
-            Behavior::Succeed => Ok(()),
+            Behavior::Succeed => {
+                self.objects.lock().unwrap().remove(&guresid);
+                Ok(())
+            }
+            Behavior::Crash => {
+                self.objects.lock().unwrap().remove(&guresid);
+                std::future::pending().await
+            }
             Behavior::Meet(barrier) => {
                 barrier.wait().await;
                 Ok(())
@@ -352,6 +403,27 @@ impl Executor for Fake {
             Behavior::Hang => std::future::pending().await,
             Behavior::Panic => panic!("the driver crashed"),
         }
+    }
+
+    async fn observe(&self, job: ProvisionJob, _deleting: bool) -> Result<Observed, ExecFailure> {
+        let ty = job.descriptor.ty.to_string();
+        self.observed
+            .lock()
+            .unwrap()
+            .push(job.descriptor.to_string());
+        if let Some(observed) = self.observations.lock().unwrap().get(&ty) {
+            return Ok(observed.clone());
+        }
+        let exists = self
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key(job.guresid.as_str());
+        Ok(if exists {
+            Observed::Ready(Box::new(self.result(&ty, job.guresid.as_str()).await))
+        } else {
+            Observed::Absent
+        })
     }
 }
 
@@ -2024,5 +2096,6 @@ async fn lost_log_lines_fail_the_deployment() {
     assert_eq!(lines[0].message, format!("deployment failed: {error}"));
 }
 
+mod recovery;
 mod teardown;
 mod workloads;

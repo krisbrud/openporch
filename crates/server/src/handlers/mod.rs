@@ -272,6 +272,18 @@ pub fn api(state: AppState) -> Api {
             resources::detach,
         )
         .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/recover",
+            App(AppPerm::Deploy),
+            resources::recover,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/resolve",
+            Org(OrgPerm::Administer),
+            resources::resolve,
+        )
+        .route(
             get(),
             "/orgs/{org}/apps/{app}/envs/{env}/tombstones",
             App(AppPerm::Read),

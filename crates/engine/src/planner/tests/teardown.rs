@@ -34,7 +34,7 @@ fn teardown_of(record: &DeploymentRecord) -> Deployment {
 
 impl Fixture {
     /// Accepts the deletion of the fixture's environment, as the server does.
-    async fn accept_teardown(&self) -> Result<Deployment, StoreError> {
+    pub(super) async fn accept_teardown(&self) -> Result<Deployment, StoreError> {
         let env = self.store.env(ORG, "shop", self.env).await?.unwrap();
         let snapshot = teardown_snapshot();
         let accepted = self
@@ -100,7 +100,7 @@ impl Fixture {
     }
 
     /// The environment's state, or `None` once it is gone.
-    async fn env_state(&self) -> Option<String> {
+    pub(super) async fn env_state(&self) -> Option<String> {
         self.store
             .env(ORG, "shop", self.env)
             .await

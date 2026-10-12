@@ -8,11 +8,13 @@ use openporch_drivers::DriverRegistry;
 use openporch_engine::executor::LocalExecutor;
 use openporch_engine::planner::{Limits, PermitCheck, Planner};
 use openporch_store::secrets::{BuiltinSecretStore, Keyring, MasterKey, Sealed, SecretError};
-use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError};
+use openporch_store::{
+    AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError, UncertainOperation,
+};
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
-use crate::deploy::{PlannerRunner, StorePermits};
+use crate::deploy::{PlannerRunner, Recovery, StorePermits};
 use crate::rate_limit::RateLimiter;
 use openporch_engine::cloud::{AwsSts, CredentialResolver, Sts};
 
@@ -218,8 +220,63 @@ pub async fn start_with(
     prune_sessions(&state);
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {
         run_deployments(&state, keyring);
+        recover_uncertain(&state, report.uncertain);
     }
     Ok(state)
+}
+
+/// Observes, in the background, each resource whose operation the restart
+/// left with an unknown outcome, and records what the observation
+/// establishes. Nothing is mutated; a resource observation cannot settle
+/// stays blocked for an operator.
+fn recover_uncertain(state: &AppState, uncertain: Vec<UncertainOperation>) {
+    if uncertain.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        for op in uncertain {
+            let org = state.org();
+            let mut audit = AuditIntent::accepted(
+                org,
+                "system",
+                "POST",
+                &format!(
+                    "/orgs/{org}/apps/{}/envs/{}/resources/{}/recover",
+                    op.app, op.env, op.descriptor
+                ),
+                "resource.recover",
+            );
+            audit.actor = None;
+            audit.target = Some(format!("{}/{}/{}", op.app, op.env, op.descriptor));
+            audit.reason = Some("restart".into());
+            let recovered = state
+                .runners
+                .recover(Recovery {
+                    app: op.app.clone(),
+                    env: op.env.clone(),
+                    descriptor: op.descriptor.clone(),
+                    audit,
+                })
+                .await;
+            match recovered {
+                Ok(outcome) => tracing::info!(
+                    resource = %op.descriptor,
+                    guresid = %op.guresid,
+                    operation = %op.operation_id,
+                    ?outcome,
+                    "recovered a resource after the restart"
+                ),
+                Err(e) => tracing::warn!(
+                    resource = %op.descriptor,
+                    guresid = %op.guresid,
+                    operation = %op.operation_id,
+                    error = %e,
+                    "could not recover a resource after the restart; recover it explicitly"
+                ),
+            }
+        }
+    });
 }
 
 /// Runs accepted deployments with the built-in drivers and the OpenTofu

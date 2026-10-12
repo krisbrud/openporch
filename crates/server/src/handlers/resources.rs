@@ -10,14 +10,18 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::Descriptor;
-use openporch_store::{ActiveResource, DeploymentStatus, Detach, EnvRecord, Store, Tombstone};
+use openporch_engine::planner::{RecoverError, Recovered};
+use openporch_store::{
+    ActiveResource, DeploymentStatus, Detach, EnvRecord, Resolution, Store, Tombstone,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::catalog::definition_or_404;
 use super::envs::env_or_404;
 use crate::api::{Ctx, JsonBody};
-use crate::error::{ApiError, ApiResult};
+use crate::deploy::Recovery;
+use crate::error::{ApiError, ApiResult, code};
 use crate::state::AppState;
 
 /// An active resource as clients see it.
@@ -408,6 +412,145 @@ pub async fn detach(
         )
         .await?;
     Ok(Json(tombstone))
+}
+
+/// What recovering a resource established.
+#[derive(Debug, Serialize)]
+pub struct RecoveryView {
+    /// `provisioned`, `deleted`, `repeatable` (the next deployment repeats
+    /// the operation with the same identity), `in_progress` (nothing changed;
+    /// recover again later) or `recovery_required` (an administrator must
+    /// resolve it).
+    pub outcome: &'static str,
+    /// What the observation found.
+    pub reason: Option<String>,
+    /// The resource as it is now; absent once it is deleted.
+    pub resource: Option<ResourceView>,
+}
+
+/// `POST /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/recover`:
+/// observes a resource whose last operation has an unknown outcome, without
+/// changing it, and records the outcome the observation establishes.
+pub async fn recover(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env, ty, res_id)): Path<(String, String, String, String, String)>,
+) -> ApiResult<Json<RecoveryView>> {
+    let env = env_or_404(&state, &app, &env).await?;
+    let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
+    let org = state.org();
+    let audit = ctx.audit(
+        org,
+        "resource.recover",
+        format!("{}/{}/{}", env.app, env.id, resource.descriptor),
+    );
+    let recovered = state
+        .runners
+        .recover(Recovery {
+            app: env.app.clone(),
+            env: env.id.clone(),
+            descriptor: resource.descriptor.clone(),
+            audit,
+        })
+        .await
+        .map_err(|e| match e {
+            RecoverError::NothingToRecover(_) => ApiError::conflict(e.to_string()),
+            RecoverError::Observation(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                code::OBSERVATION_FAILED,
+                e.to_string(),
+            ),
+            RecoverError::Store(e) => e.into(),
+        })?;
+    let (outcome, reason) = match recovered {
+        Recovered::Provisioned => ("provisioned", None),
+        Recovered::Deleted => ("deleted", None),
+        Recovered::Repeatable(r) => ("repeatable", Some(r)),
+        Recovered::InProgress => ("in_progress", None),
+        Recovered::RecoveryRequired(r) => ("recovery_required", Some(r)),
+    };
+    let resource = current_view(&state, &env, &resource.descriptor).await?;
+    Ok(Json(RecoveryView {
+        outcome,
+        reason,
+        resource,
+    }))
+}
+
+/// The request to resolve an unknown outcome.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRequest {
+    /// How the administrator established that repeating the operation is
+    /// safe; recorded with the operation and in the audit log.
+    pub reason: String,
+}
+
+/// `POST /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/resolve`:
+/// an administrator states that repeating the resource's operation with the
+/// same identity is safe, which unblocks it; the next deployment repeats it.
+pub async fn resolve(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env, ty, res_id)): Path<(String, String, String, String, String)>,
+    JsonBody(req): JsonBody<ResolveRequest>,
+) -> ApiResult<Json<ResourceView>> {
+    let reason = req.reason.trim();
+    if reason.is_empty() || reason.chars().count() > MAX_REASON {
+        return Err(ApiError::invalid(format!(
+            "`reason` must hold 1 to {MAX_REASON} characters"
+        )));
+    }
+    let env = env_or_404(&state, &app, &env).await?;
+    let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
+    let org = state.org();
+    let op = state
+        .store
+        .unknown_operation(org, &env.app, &env.id, &resource.descriptor)
+        .await?
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "`{}` has no operation with an unknown outcome",
+                resource.descriptor
+            ))
+        })?;
+    let mut audit = ctx.audit(
+        org,
+        "resource.resolve",
+        format!("{}/{}/{}", env.app, env.id, resource.descriptor),
+    );
+    audit.reason = Some(reason.to_owned());
+    state
+        .store
+        .resolve_operation(
+            &op.operation_id,
+            Resolution::Operator {
+                reason: reason.to_owned(),
+            },
+            audit,
+        )
+        .await?;
+    current_view(&state, &env, &resource.descriptor)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("active resource `{}`", resource.descriptor)))
+}
+
+/// The resource's current view; `None` once it is gone.
+async fn current_view(
+    state: &AppState,
+    env: &EnvRecord,
+    descriptor: &str,
+) -> ApiResult<Option<ResourceView>> {
+    let Some(resource) = state
+        .store
+        .active_resource(state.org(), &env.app, &env.id, descriptor)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let usage = EnvUsage::load(state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
+    Ok(Some(usage.view(resource)))
 }
 
 /// A list of tombstones.

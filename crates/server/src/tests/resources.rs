@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use openporch_core::model::SecretRef;
 use openporch_engine::planner::{
-    DeprovisionJob, ExecFailure, Executor, Limits, Planner, ProvisionJob, ProvisionResult,
+    DeprovisionJob, ExecFailure, Executor, Limits, Observed, Planner, ProvisionJob, ProvisionResult,
 };
 use serde_json::{Value, json};
 
@@ -24,6 +24,10 @@ pub(super) struct Fake {
     /// A secret value the executor resolves for postgres, and then leaks into
     /// its output and error.
     leak: Mutex<Option<String>>,
+    /// Types whose provisioning ends with an unknown outcome.
+    uncertain: Mutex<BTreeSet<String>>,
+    /// What observing a resource finds.
+    observation: Mutex<Option<Observed>>,
 }
 
 impl Executor for Fake {
@@ -44,6 +48,9 @@ impl Executor for Fake {
         }
         if self.failing.lock().unwrap().contains(&ty) {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
+        }
+        if self.uncertain.lock().unwrap().contains(&ty) {
+            return Err(ExecFailure::Uncertain(format!("{ty} timed out")));
         }
         let mut result = ProvisionResult::default();
         if job.driver_type == "openporch/opentofu" {
@@ -77,6 +84,15 @@ impl Executor for Fake {
             .unwrap()
             .push(job.job.descriptor.to_string());
         Ok(())
+    }
+
+    async fn observe(&self, _: ProvisionJob, _: bool) -> Result<Observed, ExecFailure> {
+        Ok(self
+            .observation
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Observed::Unknown("nothing to observe".into())))
     }
 }
 
@@ -1115,4 +1131,97 @@ impl Server {
         }
         panic!("{path} did not finish");
     }
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_is_recovered_or_resolved() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    fake.uncertain.lock().unwrap().insert("postgres".into());
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    let db = s.resource(DB).await;
+    assert_eq!(db["status"], "unknown", "{db}");
+    let path = format!("{RESOURCES}/postgres/modules.web.externals.db");
+    let (recover, resolve) = (format!("{path}/recover"), format!("{path}/resolve"));
+
+    // Nothing changes it until its outcome is known.
+    let (status, b) = s
+        .try_deploy_web("development", "nginx:2", true, false)
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-004");
+
+    // The driver cannot tell, so it waits for an administrator.
+    let (status, b) = s.post(&recover, &s.admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["outcome"], "recovery_required", "{b}");
+    assert!(
+        b["reason"].as_str().unwrap().contains("nothing to observe"),
+        "{b}"
+    );
+    assert_eq!(b["resource"]["status"], "recovery_required", "{b}");
+
+    // Only an administrator resolves it, with a reason.
+    let developer = s.member("dev", "member").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/users",
+            &s.admin,
+            json!({"id": "dev", "role": "developer"}),
+        )
+        .await;
+    assert!(status.is_success(), "{b}");
+    let (status, b) = s
+        .post(&resolve, &developer, json!({"reason": "checked"}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{b}");
+    let (status, b) = s.post(&resolve, &s.admin, json!({"reason": " "})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    let (status, b) = s
+        .post(
+            &resolve,
+            &s.admin,
+            json!({"reason": "no database exists in the console"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["status"], "failed", "{b}");
+    assert_eq!(b["guresid"], db["guresid"], "{b}");
+    let (status, b) = s.post(&resolve, &s.admin, json!({"reason": "again"})).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let (_, audit) = s.get("/orgs/acme/audit-logs?method=POST", &s.admin).await;
+    assert!(
+        audit
+            .to_string()
+            .contains("no database exists in the console"),
+        "{audit}"
+    );
+
+    // The next deployment repeats it with the same identity.
+    fake.uncertain.lock().unwrap().clear();
+    let d = s.deploy_web("nginx:2", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(s.resource(DB).await["guresid"], db["guresid"]);
+
+    // Observation settles an outcome by itself when it can.
+    fake.uncertain.lock().unwrap().insert("postgres".into());
+    let d = s.deploy_web("nginx:3", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    *fake.observation.lock().unwrap() = Some(Observed::InProgress);
+    let (status, b) = s.post(&recover, &s.admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["outcome"], "in_progress", "{b}");
+    assert_eq!(b["resource"]["status"], "unknown", "{b}");
+    *fake.observation.lock().unwrap() = Some(Observed::Absent);
+    let (status, b) = s.post(&recover, &s.admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["outcome"], "repeatable", "{b}");
+    assert_eq!(b["resource"]["status"], "failed", "{b}");
+    let (status, b) = s.post(&recover, &s.admin, json!({})).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    fake.uncertain.lock().unwrap().clear();
+    let d = s.deploy_web("nginx:4", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(s.resource(DB).await["guresid"], db["guresid"]);
 }

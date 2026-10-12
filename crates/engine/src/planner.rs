@@ -37,6 +37,7 @@ use tokio::time::Instant;
 
 mod deprovision;
 mod log;
+mod recover;
 #[cfg(test)]
 mod tests;
 
@@ -45,6 +46,7 @@ pub use deprovision::{
 };
 use log::DeploymentLog;
 pub use log::{JobLog, RedactingLog};
+pub use recover::{RecoverError, Recovered};
 
 /// A deployment as the planner runs it: the accepted configuration, never the
 /// current one.
@@ -318,6 +320,45 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         job: DeprovisionJob,
     ) -> impl Future<Output = Result<(), ExecFailure>> + Send;
+
+    /// Observes one resource without changing it, to resolve an operation
+    /// whose outcome is unknown. `deleting` is set when that operation was a
+    /// deletion: a resource found then is only reported, its outputs are not
+    /// kept. An executor that cannot observe reports [`Observed::Unknown`].
+    fn observe(
+        &self,
+        job: ProvisionJob,
+        deleting: bool,
+    ) -> impl Future<Output = Result<Observed, ExecFailure>> + Send {
+        let _ = (job, deleting);
+        async {
+            Ok(Observed::Unknown(
+                "this executor cannot observe resources".into(),
+            ))
+        }
+    }
+}
+
+/// What observing a resource found.
+#[derive(Debug, Clone)]
+pub enum Observed {
+    /// Nothing exists for the GUResID.
+    Absent,
+    /// The resource exists. For a creation or update, with its outputs,
+    /// secret outputs already stored and cookie sealed, as after provisioning.
+    Ready(Box<ProvisionResult>),
+    /// An operation is still running; observe again later.
+    InProgress,
+    /// The driver's last operation failed.
+    Failed {
+        /// The redacted error.
+        error: String,
+        /// Whether the driver guarantees that repeating the operation with
+        /// the same identity converges instead of duplicating effects.
+        repeatable: bool,
+    },
+    /// The driver cannot tell; an operator must establish the outcome.
+    Unknown(String),
 }
 
 /// Planner limits.
@@ -887,6 +928,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     json!({
                         "definition_id": def.id,
                         "definition_version": version,
+                        "definition": def,
                         "driver_type": def.driver_type,
                         "driver_account": job.driver_account,
                         "guresid": job.guresid,

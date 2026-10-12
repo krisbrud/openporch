@@ -26,8 +26,8 @@ pub use deploy::{
     Acceptance, ActiveResource, AppDeletion, AppDeletionRequest, CheckpointResult, DeltaRecord,
     DeploymentKind, DeploymentRecord, DeploymentRequest, DeploymentResource, DeploymentStatus,
     Detach, DraftDelta, EnvRecord, LogLine, NewEnv, OperationKind, OperationStart,
-    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
-    UncertainOperation,
+    OperationStarted, Provisioned, RecoveryReport, Resolution, ResourceRunStatus, Tombstone,
+    UncertainOperation, UnknownOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -309,6 +309,26 @@ pub trait Store: Send + Sync {
         &self,
         operation_id: &str,
         recovery: serde_json::Value,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The operation on `descriptor` whose outcome is unknown, if one is, with
+    /// what recovering it needs.
+    fn unknown_operation(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+    ) -> impl Future<Output = Result<Option<UnknownOperation>>> + Send;
+
+    /// Resolves an operation whose outcome is unknown, with its audit intent,
+    /// in one transaction. Refused while a deployment runs in the
+    /// environment.
+    fn resolve_operation(
+        &self,
+        operation_id: &str,
+        resolution: Resolution,
+        audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Records the status of a resource that no operation decided in a

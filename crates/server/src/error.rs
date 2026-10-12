@@ -38,6 +38,10 @@ pub mod code {
     pub const MIGRATION_REQUIRED: &str = "DPL-002";
     /// A presented permit is unknown, expired, stale or already used.
     pub const PERMIT_INVALID: &str = "DPL-003";
+    /// A resource's last operation has an unknown outcome; recover it first.
+    pub const RECOVERY_REQUIRED: &str = "DPL-004";
+    /// A resource could not be observed; nothing changed.
+    pub const OBSERVATION_FAILED: &str = "DPL-005";
     /// The cloud provider refused a request made with an account's credentials.
     pub const CLOUD_REJECTED: &str = "CLD-001";
     /// The cloud provider or the host identity could not be reached.
@@ -166,9 +170,11 @@ impl From<StoreError> for ApiError {
             | StoreError::Conflict(_)
             | StoreError::StaleGeneration { .. }
             | StoreError::Busy(_)
-            | StoreError::RecoveryRequired(_)
             | StoreError::Detached(_)
             | StoreError::IdempotencyMismatch(_) => Self::conflict(e.to_string()),
+            StoreError::RecoveryRequired(_) => {
+                Self::new(StatusCode::CONFLICT, code::RECOVERY_REQUIRED, e.to_string())
+            }
             StoreError::MigrationRequired { .. } => Self::new(
                 StatusCode::CONFLICT,
                 code::MIGRATION_REQUIRED,

@@ -518,6 +518,63 @@ pub struct UncertainOperation {
     pub deployment_id: String,
     /// The resource.
     pub guresid: String,
+    /// The resource's application.
+    pub app: String,
+    /// The resource's environment.
+    pub env: String,
+    /// The resource's descriptor.
+    pub descriptor: String,
+}
+
+/// An operation whose outcome is unknown, with what recovering it needs.
+#[derive(Debug, Clone)]
+pub struct UnknownOperation {
+    /// Operation ID.
+    pub operation_id: String,
+    /// The deployment it belonged to.
+    pub deployment_id: String,
+    /// Whether it created or deleted.
+    pub kind: OperationKind,
+    /// Its attempt number.
+    pub attempt: i64,
+    /// The fingerprint of its inputs.
+    pub input_fingerprint: String,
+    /// What it recorded before the driver ran: definition, driver, account,
+    /// inputs (secret references only) and dependency outputs.
+    pub recovery: Value,
+    /// Why its outcome is unknown.
+    pub error: Option<String>,
+    /// The resource as recorded, with the cookie of its last operation.
+    pub resource: ActiveResource,
+}
+
+/// How an operation whose outcome was unknown is resolved.
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Observing the resource established the outcome:
+    /// [`CheckpointResult::Provisioned`] for a creation or update,
+    /// [`CheckpointResult::Deleted`] for a deletion.
+    Observed(CheckpointResult),
+    /// Observing the resource established that repeating the operation with
+    /// the same identity is safe, as when a creation left nothing behind or a
+    /// deletion left the resource in place. The operation fails, so the next
+    /// deployment repeats it.
+    Repeatable {
+        /// What the observation found.
+        reason: String,
+    },
+    /// Observation could not establish the outcome. The resource needs an
+    /// operator before it changes again.
+    RecoveryRequired {
+        /// Why.
+        reason: String,
+    },
+    /// An administrator established that repeating the operation with the
+    /// same identity is safe. The audit intent's actor must be one.
+    Operator {
+        /// The administrator's reason.
+        reason: String,
+    },
 }
 
 /// What [`crate::Store::recover_interrupted`] found.
