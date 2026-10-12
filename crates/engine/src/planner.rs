@@ -151,6 +151,10 @@ pub struct ProvisionJob {
     /// refuses the job with a permanent failure if the account now resolves to
     /// another target: moving a resource is an explicit migration.
     pub target: Option<String>,
+    /// Whether the resource provisioned before. A change to an existing
+    /// resource whose impact the driver cannot preview needs a permit; a
+    /// first creation destroys nothing and does not.
+    pub existing: bool,
     /// When the deployment's time runs out.
     pub deadline: Instant,
     /// Where the executor writes the resource's log. Before writing, it
@@ -1087,6 +1091,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             input_fingerprint: fingerprint.to_owned(),
             cookie: None,
             target: None,
+            existing: false,
             deadline: self.deadline,
             log: log.clone(),
         })
@@ -1157,6 +1162,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         }
         job.cookie = resource.cookie;
         job.target = resource.target;
+        job.existing = resource.last_deploy_id.is_some();
         Ok(job)
     }
 

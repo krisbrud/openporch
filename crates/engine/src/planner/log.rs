@@ -366,6 +366,16 @@ impl RedactingLog {
         }
     }
 
+    /// A sink for a driver's run log, redacting the values registered so
+    /// far.
+    pub fn sink(&self) -> openporch_drivers::LogSink {
+        let log = RedactingLog {
+            log: self.log.clone(),
+            redactor: self.redactor.clone(),
+        };
+        openporch_drivers::LogSink::new(move |line| log.info(line))
+    }
+
     /// Writes an informational line.
     pub fn info(&self, message: &str) {
         self.write("info", message);

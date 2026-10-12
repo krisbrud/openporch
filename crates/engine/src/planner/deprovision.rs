@@ -497,6 +497,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 input_fingerprint: "delete".into(),
                 cookie: r.cookie.clone(),
                 target: r.target.clone(),
+                existing: true,
                 deadline: self.deadline,
                 log: log.clone(),
             };

@@ -101,3 +101,5 @@ jobs:
           curl -sf -X PUT http://localhost:4566/openporch-state
       - name: End-to-end OpenTofu runs
         run: cargo test -p openporch-drivers opentofu -- --ignored
+      - name: OpenTofu behind the local executor
+        run: cargo test -p openporch-engine opentofu -- --ignored

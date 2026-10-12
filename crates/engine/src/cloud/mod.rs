@@ -237,10 +237,18 @@ impl CredentialResolver {
         let credentials = self
             .resolve(account, read_at, secrets, CHECK_WINDOW)
             .await?;
+        self.identity(&credentials).await
+    }
+
+    /// Asks STS who `credentials` belong to.
+    pub async fn identity(
+        &self,
+        credentials: &AwsCredentials,
+    ) -> Result<CallerIdentity, CloudError> {
         self.sts
-            .caller_identity(&credentials)
+            .caller_identity(credentials)
             .await
-            .map_err(|e| redacted(e, &credentials))
+            .map_err(|e| redacted(e, credentials))
     }
 
     async fn role_session(
