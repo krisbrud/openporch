@@ -24,7 +24,7 @@ pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
     DeploymentStatus, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
-    OperationStarted, Provisioned, RecoveryReport, UncertainOperation,
+    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -262,6 +262,20 @@ pub trait Store: Send + Sync {
         &self,
         operation_id: &str,
         result: CheckpointResult,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Records the status of a resource that no operation ran for in a
+    /// deployment, such as `pending` behind a failed dependency.
+    #[allow(clippy::too_many_arguments)]
+    fn record_resource_status(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        descriptor: &str,
+        status: ResourceRunStatus,
+        error: Option<String>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Reads an active resource.

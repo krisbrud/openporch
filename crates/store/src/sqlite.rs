@@ -1375,6 +1375,41 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn record_resource_status(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        descriptor: &str,
+        status: ResourceRunStatus,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        // A resource that never ran has a GUResID only if an earlier deployment
+        // provisioned it.
+        sqlx::query(
+            "INSERT INTO deployment_resources (org_id, app_id, env_id, deployment_id, descriptor, \
+             guresid, status, error, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, \
+             COALESCE((SELECT guresid FROM active_resources WHERE org_id = ?1 AND app_id = ?2 \
+             AND env_id = ?3 AND descriptor = ?5), ''), ?6, ?7, ?8) \
+             ON CONFLICT (org_id, app_id, env_id, deployment_id, descriptor) \
+             DO UPDATE SET status = excluded.status, error = excluded.error, \
+             observed_at = excluded.observed_at",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(deployment_id)
+        .bind(descriptor)
+        .bind(status.as_str())
+        .bind(error)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn active_resource(
         &self,
         org: &str,
