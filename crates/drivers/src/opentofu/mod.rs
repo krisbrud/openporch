@@ -309,6 +309,24 @@ struct RetainedSource {
     commit: String,
 }
 
+/// The version of the code a run applied, reported as the footprint's pin: a
+/// replay of the deployment runs the same commit with the same lock file.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+struct Pinned {
+    /// The source and the commit it resolved to; none for a script alone.
+    #[serde(default)]
+    source: Option<RetainedSource>,
+    /// The dependency lock file; none when the module has no providers.
+    #[serde(default)]
+    lock: Option<String>,
+}
+
+/// Whether `commit` is a full commit ID, which `git fetch` cannot read as an
+/// option.
+fn is_commit(commit: &str) -> bool {
+    matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn input(message: impl Into<String>) -> Failure {
     Failure::Input(message.into())
 }
@@ -654,6 +672,35 @@ impl OpenTofu {
         at: SourceAt<'_>,
     ) -> Result<(), Failure> {
         let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
+        // A replay runs the version its deployment ran, from the same source.
+        let pinned = match (at, &req.pin) {
+            (SourceAt::Current, Some(pin)) => {
+                let pinned: Pinned = serde_json::from_value(pin.clone())
+                    .map_err(|_| input("the pinned module version is unreadable"))?;
+                let current = inputs
+                    .source
+                    .as_ref()
+                    .map(|(s, path)| (s.url.as_str(), path.as_deref()));
+                let recorded = pinned
+                    .source
+                    .as_ref()
+                    .map(|s| (s.url.as_str(), s.path.as_deref()));
+                if current != recorded {
+                    return Err(input(
+                        "the definition's `source` is not the one the pinned version came from",
+                    ));
+                }
+                if pinned
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| !is_commit(&s.commit))
+                {
+                    return Err(input("the pinned module version names no commit"));
+                }
+                Some(pinned)
+            }
+            _ => None,
+        };
         let home = run.dir.join("home");
         files::private_dir(&home).map_err(Failure::io)?;
         let state = self.state_dir(req);
@@ -698,7 +745,10 @@ impl OpenTofu {
             (Some((s, path)), SourceAt::Current) => Some((
                 git::Source {
                     url: s.url.clone(),
-                    rev: s.rev.clone(),
+                    rev: pinned
+                        .as_ref()
+                        .and_then(|p| p.source.as_ref())
+                        .map_or_else(|| s.rev.clone(), |p| p.commit.clone()),
                     username: s.username.clone(),
                     password: s.password.clone(),
                     ssh_key: s.ssh_key.clone(),
@@ -763,10 +813,19 @@ impl OpenTofu {
         let module_lock = run.module.join(LOCK_FILE);
         let use_retained = match at {
             SourceAt::Retained(_) => true,
-            SourceAt::Current => !module_lock.exists(),
+            SourceAt::Current => pinned.is_none() && !module_lock.exists(),
         };
         if use_retained && lock.exists() {
             fs::copy(&lock, &module_lock).map_err(Failure::io)?;
+        }
+        // A pinned lock file is used as it is: providers it does not select
+        // fail `init` rather than being selected anew.
+        if let Some(Pinned {
+            lock: Some(pinned), ..
+        }) = &pinned
+        {
+            files::write_private(&module_lock, pinned.as_bytes()).map_err(Failure::io)?;
+            run.init_args.push("-lockfile=readonly".into());
         }
 
         // Credentials: as configured, or the default AWS environment.
@@ -1312,6 +1371,20 @@ impl OpenTofu {
         }
     }
 
+    /// The version `run` applied: its source commit and lock file.
+    fn pinned(run: &Run) -> Result<Value, Failure> {
+        let lock = match fs::read_to_string(run.module.join(LOCK_FILE)) {
+            Ok(lock) => Some(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Failure::io(e)),
+        };
+        serde_json::to_value(Pinned {
+            source: run.retained.source.clone(),
+            lock,
+        })
+        .map_err(|e| Failure::Io(e.to_string()))
+    }
+
     /// The cookie recording what `run` applied.
     fn cookie(run: &Run) -> Result<Option<Cookie>, Failure> {
         let data = serde_json::to_string(&run.retained).map_err(|e| Failure::Io(e.to_string()))?;
@@ -1422,7 +1495,8 @@ impl OpenTofu {
     ) -> Result<(DriverOutputs, Option<Cookie>), Failure> {
         let (actions, fp) = self.plan_run(run, req, false).await?;
         self.apply_run(run, req, &actions, &fp).await?;
-        let outputs = self.outputs(run).await.map_err(Failure::after_apply)?;
+        let mut outputs = self.outputs(run).await.map_err(Failure::after_apply)?;
+        outputs.footprint.pin = Some(Self::pinned(run).map_err(Failure::after_apply)?);
         let cookie = Self::cookie(run).map_err(Failure::after_apply)?;
         Ok((outputs, cookie))
     }

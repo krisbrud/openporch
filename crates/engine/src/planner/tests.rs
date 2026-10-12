@@ -215,6 +215,7 @@ impl Fake {
         provisioned.recovery = json!({"state": format!("{ty}-state")});
         provisioned.backend = Some(format!("s3://state/{guresid}"));
         provisioned.external_ids = vec![format!("arn:aws:{ty}:{guresid}")];
+        provisioned.pin = Some(json!({"commit": format!("{ty}-commit")}));
         provisioned.cookie = Some(Sealed {
             key_id: "k1".into(),
             nonce: vec![0; 12],
@@ -2109,6 +2110,7 @@ async fn lost_log_lines_fail_the_deployment() {
 }
 
 mod coprovision;
+mod pins;
 mod recovery;
 mod teardown;
 mod workloads;

@@ -177,6 +177,7 @@ fn provisioned(host: &str) -> CheckpointResult {
         target: None,
         backend: None,
         external_ids: Vec::new(),
+        pin: None,
     }))
 }
 

@@ -56,6 +56,7 @@ fn deployment(nodes: &[(Node, ResourceDefinition)]) -> Deployment {
             .collect(),
         values: BTreeMap::new(),
         permits: Vec::new(),
+        pins: BTreeMap::new(),
         teardown: false,
     }
 }

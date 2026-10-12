@@ -327,6 +327,9 @@ pub struct Provisioned {
     pub backend: Option<String>,
     /// The cloud objects the resource consists of, such as ARNs.
     pub external_ids: Vec<String>,
+    /// The version of the code the driver ran, recorded in the deployment's
+    /// snapshot so that a replay runs it again.
+    pub pin: Option<Value>,
 }
 
 /// The outcome of a driver operation.

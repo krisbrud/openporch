@@ -113,10 +113,12 @@ impl FakeDriver {
             values,
             secrets: SecretMap::new(secrets),
             manifests: Vec::new(),
-            footprint: openporch_drivers::Footprint {
+            footprint: Box::new(openporch_drivers::Footprint {
                 backend: Some(format!("fake://{}", req.guresid)),
                 external_ids: vec![format!("arn:fake:{}", req.guresid)],
-            },
+                // The version it ran: the one it was given, or its own.
+                pin: Some(req.pin.clone().unwrap_or_else(|| json!({"commit": "tip"}))),
+            }),
         }
     }
 }
@@ -909,6 +911,7 @@ fn provision_job(db: &openporch_store::ActiveResource, guresid: Guresid) -> Prov
         input_fingerprint: "f".into(),
         cookie: None,
         target: None,
+        pin: None,
         existing: true,
         deadline: Instant::now() + Duration::from_secs(60),
         log: JobLog::discard(),
@@ -1024,6 +1027,7 @@ fn provision_job_empty() -> ProvisionJob {
         input_fingerprint: String::new(),
         cookie: None,
         target: None,
+        pin: None,
         existing: false,
         deadline: Instant::now(),
         log: JobLog::discard(),
@@ -1090,4 +1094,36 @@ fn a_failure_after_the_driver_accepted_a_change_is_uncertain() {
         mutation_failure(DriverError::Conflict("state is locked".into()), false),
         ExecFailure::Permanent(_)
     ));
+}
+
+#[tokio::test]
+async fn a_pin_reaches_the_driver_and_the_version_it_ran_comes_back() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    // Unpinned, the driver ran its own version, which the deployment records.
+    assert_eq!(f.driver.puts()[0].pin, None);
+    let snapshot = f
+        .store
+        .deployment_snapshot(ORG, "shop", "development", &deployment.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot["pins"][DB], json!({"commit": "tip"}));
+
+    let db = f.active(DB).await;
+    let other = Guresid::new("0123456789abcdef0123456789abcdef").unwrap();
+    let mut job = provision_job(&db, other);
+    job.pin = Some(json!({"commit": "recorded"}));
+    let result = f
+        .executor(Arc::new(NoPermits))
+        .provision(job)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.driver.puts().last().unwrap().pin,
+        Some(json!({"commit": "recorded"}))
+    );
+    assert_eq!(result.pin, Some(json!({"commit": "recorded"})));
 }

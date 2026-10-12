@@ -151,6 +151,7 @@ where
             },
             cookie,
             permit: None,
+            pin: job.pin.clone(),
             log: log.sink(),
         };
         Ok(Call {
@@ -524,6 +525,7 @@ where
             target,
             backend: outputs.footprint.backend,
             external_ids: outputs.footprint.external_ids,
+            pin: outputs.footprint.pin,
             ..ProvisionResult::default()
         };
         let secrets = outputs.secrets.expose();

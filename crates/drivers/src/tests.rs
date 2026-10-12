@@ -29,6 +29,7 @@ fn request() -> DriverRequest {
         context: DriverContext::default(),
         cookie: None,
         permit: None,
+        pin: None,
         log: LogSink::default(),
     }
 }
