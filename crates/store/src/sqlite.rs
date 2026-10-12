@@ -1297,11 +1297,12 @@ impl Store for SqliteStore {
                     dependencies,
                     snapshot,
                     account,
+                    target,
                 } = &**p;
                 sqlx::query(
                     "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
                      secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
-                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, \
+                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, target = ?, \
                      definition_id = COALESCE(o.definition_id, active_resources.definition_id), \
                      definition_version = COALESCE(o.definition_version, \
                      active_resources.definition_version), \
@@ -1320,6 +1321,7 @@ impl Store for SqliteStore {
                 .bind(serde_json::to_string(dependencies)?)
                 .bind(serde_json::to_string(snapshot)?)
                 .bind(account)
+                .bind(target)
                 .bind(&deployment_id)
                 .bind(now)
                 .bind(now)
@@ -1716,7 +1718,7 @@ async fn finish_in_tx(
 }
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
-     definition_version, driver_type, driver_account, status, inputs, outputs, secret_outputs, cookie_key_id, \
+     definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
      observed_at, created_at FROM active_resources";
 
@@ -1731,6 +1733,7 @@ struct ResourceRow {
     definition_version: Option<i64>,
     driver_type: Option<String>,
     driver_account: Option<String>,
+    target: Option<String>,
     status: String,
     inputs: String,
     outputs: String,
@@ -1766,6 +1769,7 @@ impl ResourceRow {
             definition_version: self.definition_version,
             driver_type: self.driver_type,
             driver_account: self.driver_account,
+            target: self.target,
             status: self.status,
             inputs: serde_json::from_str(&self.inputs)?,
             outputs: serde_json::from_str(&self.outputs)?,

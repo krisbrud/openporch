@@ -171,6 +171,7 @@ fn provisioned(host: &str) -> CheckpointResult {
         dependencies: vec!["postgres-instance.default#modules.web.externals.db".into()],
         snapshot: json!({"definition_version": 1}),
         account: None,
+        target: None,
     }))
 }
 

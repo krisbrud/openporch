@@ -125,6 +125,11 @@ pub struct ProvisionJob {
     pub input_fingerprint: String,
     /// The driver's cookie from the last successful operation, encrypted.
     pub cookie: Option<Sealed>,
+    /// What the cloud account resolved to when the resource last provisioned,
+    /// such as an AWS account number. Before calling the driver, the executor
+    /// refuses the job with a permanent failure if the account now resolves to
+    /// another target: moving a resource is an explicit migration.
+    pub target: Option<String>,
     /// When the deployment's time runs out.
     pub deadline: Instant,
 }
@@ -153,6 +158,8 @@ pub struct ProvisionResult {
     pub cookie: Option<Sealed>,
     /// Non-secret recovery metadata.
     pub recovery: Value,
+    /// What the cloud account resolved to, such as an AWS account number.
+    pub target: Option<String>,
 }
 
 /// Why provisioning failed. Messages are already redacted.
@@ -623,6 +630,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                     .map(ToString::to_string)
                                     .collect(),
                                 account: account.as_ref().map(ToString::to_string),
+                                target: provisioned.target,
                                 snapshot: json!({
                                     "deployment_id": deployment.id,
                                     "definition_version": version,
@@ -775,6 +783,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             },
             input_fingerprint: fingerprint.to_owned(),
             cookie: None,
+            target: None,
             deadline: self.deadline,
         })
     }
@@ -842,6 +851,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             )));
         }
         job.cookie = resource.cookie;
+        job.target = resource.target;
         Ok(job)
     }
 

@@ -352,3 +352,40 @@ async fn resources_of_a_definition() {
     let (status, b) = s.get(RESOURCES, &dev).await;
     assert_eq!(status, StatusCode::OK, "{b}");
 }
+
+#[tokio::test]
+async fn an_account_holding_resources_is_not_deleted() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.static_account("aws-prod").await;
+    let def = |account: Value| json!({"driver_type": "openporch/echo", "driver_account": account});
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(def(json!("aws-prod"))),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(s.resource(DB).await["driver_account"], "aws-prod");
+
+    // The definition no longer names the account, but the database still
+    // lives in it.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(def(Value::Null)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let (status, b) = s
+        .delete("/orgs/acme/resources/accounts/aws-prod", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+    assert!(b["message"].as_str().unwrap().contains(DB), "{b}");
+}

@@ -612,6 +612,26 @@ impl AccountStore for SqliteStore {
                 stores.join(", ")
             )));
         }
+        // Resources provisioned in the account need it to be updated, recovered
+        // or deprovisioned, whatever their definitions say now.
+        let resources: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT app_id, env_id, descriptor FROM active_resources WHERE org_id = ? \
+             AND driver_account = ? ORDER BY app_id, env_id, descriptor LIMIT 5",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !resources.is_empty() {
+            let names: Vec<String> = resources
+                .iter()
+                .map(|(app, env, d)| format!("{app}/{env}/{d}"))
+                .collect();
+            return Err(StoreError::Conflict(format!(
+                "cloud account `{id}` holds active resources {}",
+                names.join(", ")
+            )));
+        }
         sqlx::query("DELETE FROM cloud_accounts WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)

@@ -252,6 +252,8 @@ pub struct Provisioned {
     pub snapshot: Value,
     /// The cloud account it was provisioned in.
     pub account: Option<String>,
+    /// What the account resolved to, such as an AWS account number.
+    pub target: Option<String>,
 }
 
 /// The outcome of a driver operation.
@@ -317,6 +319,8 @@ pub struct ActiveResource {
     pub driver_type: Option<String>,
     /// The cloud account it was provisioned in.
     pub driver_account: Option<String>,
+    /// What that account resolved to, such as an AWS account number.
+    pub target: Option<String>,
     /// Status.
     pub status: String,
     /// The inputs of the last successful operation, secrets as references.

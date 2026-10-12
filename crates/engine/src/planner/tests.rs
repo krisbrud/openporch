@@ -196,6 +196,9 @@ impl Executor for Fake {
         provisioned
             .outputs
             .insert("host".into(), json!(format!("{ty}.internal")));
+        if ty == "dns" {
+            provisioned.target = Some("111122223333".into());
+        }
         let secret = match ty.as_str() {
             "dns" => Some(("token", "dns-token", TOKEN)),
             "postgres" => Some(("password", "pg-password", PASSWORD)),
@@ -723,4 +726,19 @@ async fn a_resource_does_not_move_to_another_account() {
         .unwrap()
         .unwrap();
     assert_eq!(dns.driver_account.as_deref(), Some("aws-dns"));
+}
+
+#[tokio::test]
+async fn the_executor_learns_the_previous_target() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let first = f.accept().await;
+    planner(&f, &fake, fast()).run(first).await;
+    assert_eq!(fake.job(DNS).target, None);
+    let next = f.accept().await;
+    planner(&f, &fake, fast()).run(next).await;
+    let jobs = fake.jobs.lock().unwrap().clone();
+    let dns: Vec<_> = jobs.iter().filter(|j| j.descriptor == d(DNS)).collect();
+    assert_eq!(dns.len(), 2);
+    assert_eq!(dns[1].target.as_deref(), Some("111122223333"));
 }

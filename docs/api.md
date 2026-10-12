@@ -1254,6 +1254,8 @@ Authorization: Bearer $ADMIN_TOKEN
 Account types, credential handling and the `check` endpoint, which calls AWS STS,
 are described in [cloud-accounts.md](cloud-accounts.md). Secrets go in `secrets`
 (values) or `secret_refs` (references or `{value}`) and come back as references.
+An account that a definition or secret store names, or that active resources
+were provisioned in, cannot be deleted (`409`).
 
 ```http
 POST /orgs/acme/resources/accounts
