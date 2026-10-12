@@ -1870,7 +1870,7 @@ async fn finish_in_tx(
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
      definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
-     cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
+     cookie_nonce, cookie, snapshot, recovery, ownership, dependencies, last_deploy_id, scheduled_deletion, \
      cleanup_pending, \
      observed_at, created_at FROM active_resources";
 
@@ -1894,6 +1894,7 @@ struct ResourceRow {
     cookie_nonce: Option<Vec<u8>>,
     cookie: Option<Vec<u8>>,
     snapshot: String,
+    recovery: String,
     ownership: String,
     dependencies: String,
     last_deploy_id: Option<String>,
@@ -1929,6 +1930,7 @@ impl ResourceRow {
             secret_outputs: serde_json::from_str(&self.secret_outputs)?,
             cookie,
             snapshot: serde_json::from_str(&self.snapshot)?,
+            recovery: serde_json::from_str(&self.recovery)?,
             ownership: self.ownership,
             dependencies: serde_json::from_str(&self.dependencies)?,
             last_deploy_id: self.last_deploy_id,

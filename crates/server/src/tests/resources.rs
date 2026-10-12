@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use openporch_core::model::SecretRef;
 use openporch_engine::planner::{
-    ExecFailure, Executor, Limits, PermitCheck, PermitRequest, Planner, ProvisionJob,
-    ProvisionResult,
+    DeprovisionJob, ExecFailure, Executor, Limits, PermitCheck, PermitRequest, Planner,
+    ProvisionJob, ProvisionResult,
 };
 use serde_json::{Value, json};
 
@@ -49,11 +49,11 @@ impl Executor for Fake {
         Ok(result)
     }
 
-    async fn deprovision(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+    async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         self.deleted
             .lock()
             .unwrap()
-            .push(job.descriptor.to_string());
+            .push(job.job.descriptor.to_string());
         Ok(())
     }
 }

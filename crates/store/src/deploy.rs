@@ -340,6 +340,9 @@ pub struct ActiveResource {
     pub cookie: Option<Sealed>,
     /// The configuration of the last successful operation.
     pub snapshot: Value,
+    /// The driver's non-secret recovery metadata from the last successful
+    /// operation.
+    pub recovery: Value,
     /// `owned`, `adopted` or `external`.
     pub ownership: String,
     /// The descriptors of the resources it depends on.

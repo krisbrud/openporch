@@ -145,6 +145,21 @@ pub struct ProvisionJob {
     pub deadline: Instant,
 }
 
+/// Everything the executor needs to delete one resource: the job it was
+/// provisioned with, plus what its last successful operation retained, since
+/// the definition may have changed since.
+#[derive(Debug, Clone)]
+pub struct DeprovisionJob {
+    /// The resource's identity, driver, account, inputs and cookie as last
+    /// provisioned.
+    pub job: ProvisionJob,
+    /// The configuration of the last successful operation, including the
+    /// definition as it was then.
+    pub snapshot: Value,
+    /// The driver's non-secret recovery metadata from that operation.
+    pub recovery: Value,
+}
+
 /// A resource's resolved inputs.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct JobInputs {
@@ -198,11 +213,12 @@ pub trait Executor: Send + Sync + 'static {
         job: ProvisionJob,
     ) -> impl Future<Output = Result<ProvisionResult, ExecFailure>> + Send;
 
-    /// Deletes one resource with the driver and state it was provisioned with.
-    /// `Ok` means the deletion is confirmed.
+    /// Deletes one resource with the driver, definition and state it was
+    /// provisioned with, as retained in the job, not with the current
+    /// definition. `Ok` means the deletion is confirmed.
     fn deprovision(
         &self,
-        job: ProvisionJob,
+        job: DeprovisionJob,
     ) -> impl Future<Output = Result<(), ExecFailure>> + Send;
 }
 

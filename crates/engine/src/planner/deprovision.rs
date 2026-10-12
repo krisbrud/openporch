@@ -24,7 +24,8 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use super::{
-    Deployment, ExecFailure, Executor, JobInputs, Limits, Outcome, Planner, ProvisionJob, backoff,
+    Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, Limits, Outcome, Planner,
+    ProvisionJob, backoff,
 };
 
 /// A destructive action that needs a permit.
@@ -434,6 +435,13 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 target: r.target.clone(),
                 deadline: self.deadline,
             };
+            // The driver deletes against what was retained, not the current
+            // definition.
+            let job = DeprovisionJob {
+                job,
+                snapshot: r.snapshot.clone(),
+                recovery: r.recovery.clone(),
+            };
             let result = if r.cleanup_pending {
                 Ok(())
             } else {
@@ -553,7 +561,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
 
     /// Runs the executor until the deadline; a panic or the deadline leaves the
     /// outcome uncertain.
-    async fn execute(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+    async fn execute(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let executor = self.executor.clone();
         let task = tokio::spawn(async move { executor.deprovision(job).await });
         let abort = task.abort_handle();

@@ -124,7 +124,7 @@ struct Fake {
     /// How deletions answer, by resource type.
     deletions: Mutex<BTreeMap<String, Behavior>>,
     /// Every deletion job, in the order they started.
-    deleted: Mutex<Vec<ProvisionJob>>,
+    deleted: Mutex<Vec<DeprovisionJob>>,
 }
 
 /// The secret references in `r`.
@@ -216,6 +216,7 @@ impl Executor for Fake {
         if ty == "dns" {
             provisioned.target = Some("111122223333".into());
         }
+        provisioned.recovery = json!({"state": format!("{ty}-state")});
         let secret = match ty.as_str() {
             "dns" => Some(("token", "dns-token", TOKEN)),
             "postgres" => Some(("password", "pg-password", PASSWORD)),
@@ -235,12 +236,12 @@ impl Executor for Fake {
         Ok(provisioned)
     }
 
-    async fn deprovision(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+    async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let behavior = self
             .deletions
             .lock()
             .unwrap()
-            .get(job.descriptor.ty.as_str())
+            .get(job.job.descriptor.ty.as_str())
             .cloned()
             .unwrap_or(Behavior::Succeed);
         self.deleted.lock().unwrap().push(job);
@@ -856,7 +857,7 @@ impl Fake {
     /// The descriptors of deletion jobs, in the order they started.
     fn deletions(&self) -> Vec<String> {
         let jobs = self.deleted.lock().unwrap();
-        jobs.iter().map(|j| j.descriptor.to_string()).collect()
+        jobs.iter().map(|j| j.job.descriptor.to_string()).collect()
     }
 }
 
@@ -890,9 +891,13 @@ async fn a_scheduled_resource_is_deleted_by_the_next_deployment_without_it() {
     // The driver deleted it with the identity and inputs it was provisioned with.
     let deleted = fake.deleted.lock().unwrap().clone();
     assert_eq!(deleted.len(), 1);
-    assert_eq!(deleted[0].guresid.as_str(), db.guresid);
-    assert_eq!(deleted[0].inputs, provisioned.inputs);
-    assert_eq!(deleted[0].driver_type, "openporch/echo");
+    assert_eq!(deleted[0].job.guresid.as_str(), db.guresid);
+    assert_eq!(deleted[0].job.inputs, provisioned.inputs);
+    assert_eq!(deleted[0].job.driver_type, "openporch/echo");
+    // It also got the definition and driver state the resource retained.
+    assert_eq!(deleted[0].snapshot, db.snapshot);
+    assert_eq!(deleted[0].snapshot["definition"]["id"], "pg");
+    assert_eq!(deleted[0].recovery, json!({"state": "postgres-state"}));
     assert_eq!(
         checks.asked.lock().unwrap().clone(),
         vec![(
@@ -1013,10 +1018,14 @@ async fn a_failed_deletion_blocks_what_it_uses_until_retried() {
     let deleted = fake.deleted.lock().unwrap().clone();
     let routes: Vec<_> = deleted
         .iter()
-        .filter(|j| j.descriptor == d(ROUTE))
+        .filter(|j| j.job.descriptor == d(ROUTE))
         .collect();
     assert_eq!(routes.len(), 4);
-    assert!(routes.iter().all(|j| j.guresid.as_str() == route.guresid));
+    assert!(
+        routes
+            .iter()
+            .all(|j| j.job.guresid.as_str() == route.guresid)
+    );
     assert_eq!(
         fake.deletions().iter().filter(|d| *d == WORKLOAD).count(),
         1
@@ -1272,8 +1281,8 @@ async fn a_workload_that_never_provisioned_is_deleted_by_its_identity() {
     assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
     let deleted = fake.deleted.lock().unwrap().clone();
     assert_eq!(deleted.len(), 1);
-    assert_eq!(deleted[0].guresid.as_str(), workload.guresid);
-    assert_eq!(deleted[0].inputs.values, Value::Null);
+    assert_eq!(deleted[0].job.guresid.as_str(), workload.guresid);
+    assert_eq!(deleted[0].job.inputs.values, Value::Null);
 }
 
 #[tokio::test]
