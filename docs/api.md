@@ -1475,9 +1475,11 @@ of:
   environment of the application, `+0` for the latest attempt in this environment,
   `+1` for the one before it, and so on up to `+499`, or `last-successful`; one
   that does not exist is `404`. By default (`"replay": "snapshot"`) the
-  deployment reuses the configuration recorded by the earlier one, which only
-  works in the same environment and while the definitions it used still exist.
-  `"replay": "current"` matches definitions again as they are now. `replay` is
+  deployment reuses the configuration recorded by the earlier one: the
+  definitions it matched and the shared values it resolved, at their value set
+  versions. This only works in the same environment and while the definitions
+  it used still exist. `"replay": "current"` matches definitions and reads
+  values again as they are now. `replay` is
   only valid with `deploy_id`.
 
 `expected_generation` must be the environment's current `generation`. If it is
@@ -1528,9 +1530,12 @@ that only the executor reads, and each trigger that names one of its resources
 gets that resource's outputs under `outputs`. Content of files marked
 `noExpand` is passed on as written, and `${pod.*}` needs a target that supports
 pod references. `openporch/none` creates nothing and returns these inputs as
-the workload's outputs. Deployments accepted before workloads received their
-inputs cannot be replayed from their snapshot; redeploy them with
-`"replay": "current"`.
+the workload's outputs. `${values.KEY}` in a workload resolves to the
+environment's value for `KEY` when it has one, and otherwise to the
+application's; the values are read when the deployment is accepted, so later
+edits apply to the next deployment. Deployments accepted before workloads
+received their inputs, or before deployments recorded their values, cannot be
+replayed from their snapshot; redeploy them with `"replay": "current"`.
 
 ```http
 POST /orgs/acme/resources/defs

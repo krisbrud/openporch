@@ -9,9 +9,6 @@ Templates use the [MiniJinja](https://docs.rs/minijinja) dialect of Jinja2. Huma
 template driver uses Go templates, so examples written for it need translating. The
 [table below](#translating-go-templates) covers the common constructs.
 
-The driver is implemented and tested, but deployments do not call drivers until the
-deployment executor lands, so definitions using it cannot be deployed yet.
-
 ## Inputs
 
 All templates go under `driver_inputs.values.templates`. Each template is a string

@@ -16,7 +16,7 @@ use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, EnvRecord, LogLine, Store, StoreError,
+    DeploymentStatus, EnvRecord, LogLine, Store, StoreError, ValueStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,7 +30,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The snapshot format this server writes and replays.
-pub(super) const SNAPSHOT_VERSION: u64 = 2;
+pub(super) const SNAPSHOT_VERSION: u64 = 3;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -423,7 +423,44 @@ async fn snapshot(
         "permits": req.permits,
         "graph": graph,
         "definitions": used,
+        "values": values(state, env).await?,
     }))
+}
+
+/// The shared values a deployment to `env` resolves: the latest value set
+/// version of the application and of the environment, whose values override
+/// the application's. Secrets stay references.
+async fn values(state: &AppState, env: &EnvRecord) -> ApiResult<Value> {
+    let org = state.org();
+    let mut resolved = serde_json::Map::new();
+    let mut versions = serde_json::Map::new();
+    for (scope, env_id) in [("app", None), ("env", Some(env.id.as_str()))] {
+        let latest = state
+            .store
+            .value_versions(org, &env.app, env_id)
+            .await?
+            .into_iter()
+            .next();
+        versions.insert(
+            scope.to_owned(),
+            json!(latest.as_ref().map(|v| v.id.clone())),
+        );
+        for (key, entry) in latest
+            .map(|v| v.values)
+            .and_then(|v| match v {
+                Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default()
+        {
+            let mut entry = entry;
+            if let Some(fields) = entry.as_object_mut() {
+                fields.remove("description");
+            }
+            resolved.insert(key, entry);
+        }
+    }
+    Ok(json!({"versions": versions, "resolved": resolved}))
 }
 
 /// A deployment by ID (in any environment of the application), `+n` (the nth

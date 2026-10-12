@@ -27,6 +27,7 @@ struct Server {
 mod accounts;
 mod catalog;
 mod deploys;
+mod e2e;
 mod envs;
 mod github;
 mod keys;

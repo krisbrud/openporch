@@ -98,6 +98,24 @@ impl Deployment {
                 .map_err(|e| format!("the snapshot's definition `{id}` is unreadable: {e}"))?;
             definitions.insert(def.id.clone(), (version, def));
         }
+        let mut values = BTreeMap::new();
+        for (key, entry) in snapshot["values"]["resolved"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            let value = match (entry.get("value"), entry.get("secret_ref")) {
+                (Some(Value::String(text)), None) => {
+                    SharedValue::Value(Value::String(text.clone()))
+                }
+                (None, Some(reference)) => SharedValue::Secret(
+                    serde_json::from_value(reference.clone())
+                        .map_err(|e| format!("the snapshot's value `{key}` is unreadable: {e}"))?,
+                ),
+                _ => return Err(format!("the snapshot's value `{key}` is unreadable")),
+            };
+            values.insert(key.clone(), value);
+        }
         Ok(Self {
             org,
             app,
@@ -107,7 +125,7 @@ impl Deployment {
             set_id,
             graph,
             definitions,
-            values: BTreeMap::new(),
+            values,
             permits: snapshot["permits"]
                 .as_array()
                 .into_iter()
