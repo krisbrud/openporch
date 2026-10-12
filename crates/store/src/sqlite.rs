@@ -2046,19 +2046,23 @@ impl Store for SqliteStore {
             // Cleanups were closed before, so count them separately.
             let open = uncertain.iter().filter(|(_, d, _)| d == id).count();
             let cleanup = cleanups.iter().filter(|(_, d, _)| d == id).count();
-            let error = match (open, cleanup) {
-                (0, 0) => "interrupted by a server restart; no operation was in flight, so \
-                           deploy again to continue"
-                    .to_owned(),
-                (0, n) => format!(
-                    "interrupted by a server restart; {n} deleted resource(s) keep their \
-                     records until the next deployment finishes the cleanup"
-                ),
-                (n, _) => format!(
-                    "interrupted by a server restart; {n} resource(s) may have changed and need \
-                     recovery before the environment is deployed again"
-                ),
-            };
+            let mut parts = vec!["interrupted by a server restart".to_owned()];
+            if open > 0 {
+                parts.push(format!(
+                    "{open} resource(s) may have changed and need recovery before the \
+                     environment is deployed again"
+                ));
+            }
+            if cleanup > 0 {
+                parts.push(format!(
+                    "{cleanup} deleted resource(s) keep their records until the next \
+                     deployment finishes the cleanup"
+                ));
+            }
+            if open == 0 && cleanup == 0 {
+                parts.push("no operation was in flight, so deploy again to continue".to_owned());
+            }
+            let error = parts.join("; ");
             finish_in_tx(&mut tx, &self.org, app, env, id, Some(&error)).await?;
         }
         tx.commit().await?;

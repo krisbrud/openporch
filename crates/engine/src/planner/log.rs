@@ -10,7 +10,7 @@
 //! final status lines are written past it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,8 +38,10 @@ enum Message {
 struct Writer {
     tx: mpsc::UnboundedSender<Message>,
     quota: usize,
-    /// Bytes of messages accepted so far.
-    used: AtomicUsize,
+    /// Bytes of messages accepted so far. Held while a line is checked
+    /// against the quota and queued, so no line is queued after the
+    /// truncation warning.
+    used: Mutex<usize>,
     truncated: AtomicBool,
     closed: AtomicBool,
 }
@@ -58,8 +60,12 @@ impl Writer {
             let _ = self.tx.send(Message::Line(line));
             return;
         }
-        let used = self.used.fetch_add(line.message.len(), Ordering::SeqCst) + line.message.len();
-        if used > self.quota {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        if self.truncated.load(Ordering::SeqCst) {
+            return;
+        }
+        *used += line.message.len();
+        if *used > self.quota {
             if !self.truncated.swap(true, Ordering::SeqCst) {
                 let _ = self.tx.send(Message::Line(LogLine {
                     seq: 0,
@@ -132,7 +138,7 @@ impl DeploymentLog {
             writer: Arc::new(Writer {
                 tx,
                 quota,
-                used: AtomicUsize::new(0),
+                used: Mutex::new(0),
                 truncated: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
             }),
@@ -242,7 +248,7 @@ impl JobLog {
         let writer = Writer {
             tx,
             quota: 0,
-            used: AtomicUsize::new(0),
+            used: Mutex::new(0),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(true),
         };
