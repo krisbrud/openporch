@@ -700,6 +700,66 @@ impl Store for SqliteStore {
         .await?)
     }
 
+    async fn append_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        lines: Vec<LogLine>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin().await?;
+        for line in lines {
+            sqlx::query(
+                "INSERT INTO logs (org_id, app_id, env_id, deployment_id, operation_id, \
+                 descriptor, guresid, at, level, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .bind(deployment_id)
+            .bind(&line.operation_id)
+            .bind(&line.descriptor)
+            .bind(&line.guresid)
+            .bind(line.at)
+            .bind(&line.level)
+            .bind(&line.message)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn deployment_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<LogLine>> {
+        self.check_org(org)?;
+        Ok(sqlx::query_as(
+            "SELECT seq, operation_id, descriptor, guresid, at, level, message FROM logs \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? AND seq > ? \
+             ORDER BY seq LIMIT ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(deployment_id)
+        .bind(after.unwrap_or(0))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn deployment_snapshot(
         &self,
         org: &str,

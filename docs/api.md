@@ -1421,6 +1421,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/deploys` | app read |
 | POST | `/orgs/{org}/apps/{app}/envs/{env}/deploys` | app deploy |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}` | app read |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}/logs` | app read |
 
 A deployment converges an environment to a set. The request names exactly one
 of:
@@ -1609,6 +1610,34 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"id": "$DEPLOY", "set_id": "$BLOG_SET"}
+```
+
+A deployment's log is read oldest first, by the same references. Each line has
+a sequence number, its level, its message, and the resource, GUResID and
+operation it is about, which lines about the deployment as a whole do not have.
+`limit` defaults to 500 and is at most 5000. Pass `next` as `after` to read the
+lines that follow; `finished` is `true` once the deployment has finished and
+there are no more lines. Every secret value the executor resolved for a
+resource is replaced with `[REDACTED]`, also in its escaped forms, before a
+line is stored, and so are the driver errors recorded for the resource. A log
+keeps at most 16 MiB of messages; past that, one warning says later lines were
+dropped.
+
+```http
+GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs?limit=1
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{
+  "lines": [
+    {"seq": "…", "operation_id": null, "descriptor": null, "guresid": null, "at": "…", "level": "…", "message": "…"}
+  ],
+  "next": "…",
+  "finished": false
+}
 ```
 
 ## Active resources

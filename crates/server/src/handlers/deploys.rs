@@ -16,7 +16,7 @@ use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentRecord, DeploymentRequest, DeploymentStatus, EnvRecord,
-    Store, StoreError,
+    LogLine, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -477,4 +477,66 @@ pub async fn get(
         )));
     }
     Ok(Json(d))
+}
+
+/// Log lines returned by default, and at most.
+const DEFAULT_LOG_LIMIT: i64 = 500;
+const MAX_LOG_LIMIT: i64 = 5000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogQuery {
+    after: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// A page of a deployment's log, oldest first. Pass `next` as `after` for
+/// the lines that follow.
+#[derive(Serialize)]
+pub struct LogPage {
+    lines: Vec<LogLine>,
+    next: i64,
+    /// The deployment has finished and there are no more lines.
+    finished: bool,
+}
+
+/// `GET .../deploys/{deploy}/logs`. Lines are redacted before they are
+/// written, so they are returned as stored.
+pub async fn logs(
+    State(state): State<AppState>,
+    Path((_, app, env, reference)): Path<(String, String, String, String)>,
+    QueryParams(q): QueryParams<LogQuery>,
+) -> ApiResult<Json<LogPage>> {
+    let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT);
+    if !(1..=MAX_LOG_LIMIT).contains(&limit) {
+        return Err(ApiError::invalid(format!(
+            "`limit` must be between 1 and {MAX_LOG_LIMIT}"
+        )));
+    }
+    let after = q.after.unwrap_or(0);
+    if after < 0 {
+        return Err(ApiError::invalid("`after` must not be negative"));
+    }
+    let env = env_or_404(&state, &app, &env).await?;
+    let d = deployment_by_ref(&state, &env, &reference).await?;
+    if d.env != env.id {
+        return Err(ApiError::not_found(format!(
+            "deployment `{reference}` not found in `{}/{}`",
+            env.app, env.id
+        )));
+    }
+    // The log is complete before the deployment finishes, so a deployment
+    // read as finished before its lines has no lines still to come.
+    let done = d.status != DeploymentStatus::InProgress;
+    let lines = state
+        .store
+        .deployment_logs(state.org(), &env.app, &env.id, &d.id, Some(after), limit)
+        .await?;
+    let next = lines.last().map_or(after, |l| l.seq);
+    let finished = done && lines.len() < limit as usize;
+    Ok(Json(LogPage {
+        lines,
+        next,
+        finished,
+    }))
 }

@@ -214,6 +214,12 @@ pub fn api(state: AppState) -> Api {
             App(AppPerm::Read),
             deploys::get,
         )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}/logs",
+            App(AppPerm::Read),
+            deploys::logs,
+        )
         // Active resources.
         .route(
             get(),

@@ -36,10 +36,13 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 mod deprovision;
+mod log;
 #[cfg(test)]
 mod tests;
 
 pub use deprovision::{DestructiveAction, NoPermits, PermitCheck, PermitRequest};
+use log::DeploymentLog;
+pub use log::JobLog;
 
 /// A deployment as the planner runs it: the accepted configuration, never the
 /// current one.
@@ -143,6 +146,10 @@ pub struct ProvisionJob {
     pub target: Option<String>,
     /// When the deployment's time runs out.
     pub deadline: Instant,
+    /// Where the executor writes the resource's log. Before writing, it
+    /// registers every secret value it resolves with [`JobLog::secret`], so
+    /// that no line or error carries one.
+    pub log: JobLog,
 }
 
 /// Everything the executor needs to delete one resource: the job it was
@@ -240,6 +247,9 @@ pub struct Limits {
     pub max_backoff: Duration,
     /// How long one deployment may run.
     pub deadline: Duration,
+    /// The most log text kept per deployment, in bytes; later lines are
+    /// dropped after a line saying so.
+    pub log_bytes: usize,
 }
 
 impl Default for Limits {
@@ -250,6 +260,7 @@ impl Default for Limits {
             backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             deadline: Duration::from_secs(30 * 60),
+            log_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -320,6 +331,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     pub async fn run(&self, deployment: Deployment) -> BTreeMap<Descriptor, Outcome> {
         let deadline = Instant::now() + self.limits.deadline;
         let deployment = Arc::new(deployment);
+        let log = DeploymentLog::start(self.store.clone(), &deployment, self.limits.log_bytes);
+        log.deployment().info(&format!(
+            "deployment `{}` started with {} resources",
+            deployment.id,
+            deployment.graph.nodes.len()
+        ));
         let mut outcomes: BTreeMap<Descriptor, Outcome> = BTreeMap::new();
         let mut done: BTreeMap<Descriptor, Done> = BTreeMap::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
@@ -350,6 +367,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         .filter_map(|d| done.get(d).map(|x| (d.clone(), x.outputs.clone())))
                         .collect(),
                     deadline,
+                    log: log.resource(&node.descriptor),
                 };
                 let d = node.descriptor.clone();
                 let task = running.spawn({
@@ -410,7 +428,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // it includes provisioned.
         let converged = outcomes.values().all(|o| *o == Outcome::Provisioned);
         let listed = self
-            .deprovision(&deployment, deadline, converged, &mut outcomes)
+            .deprovision(&deployment, deadline, converged, &mut outcomes, &log)
             .await;
 
         // Every resource gets a record, also those that ended before an
@@ -423,6 +441,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
                 Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
             };
+            let resource_log = log.resource(d);
+            match status {
+                ResourceRunStatus::Failed => resource_log.error(&format!("failed: {reason}")),
+                ResourceRunStatus::Unknown => {
+                    resource_log.error(&format!("outcome unknown: {reason}"));
+                }
+                ResourceRunStatus::Pending => resource_log.warn(&format!("pending: {reason}")),
+                ResourceRunStatus::Skipped => resource_log.info(&format!("kept: {reason}")),
+            }
             if let Err(e) = self
                 .store
                 .record_resource_status(
@@ -445,6 +472,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             (None, Err(e)) => Some(e),
             (Some(error), Err(e)) => Some(format!("{error}; {e}")),
         };
+        match &error {
+            None => log.deployment().info("deployment succeeded"),
+            Some(e) => log.deployment().error(&format!("deployment failed: {e}")),
+        }
+        // The log is complete before the deployment is.
+        log.flush().await;
         if let Err(e) = self
             .store
             .finish_deployment(
@@ -460,6 +493,24 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         }
         outcomes
     }
+}
+
+/// `failure` with every secret value registered with `log` replaced.
+fn redacted(failure: ExecFailure, log: &JobLog) -> ExecFailure {
+    let failure = match failure {
+        ExecFailure::Permanent(e) => ExecFailure::Permanent(log.redact(&e)),
+        ExecFailure::Uncertain(e) => ExecFailure::Uncertain(log.redact(&e)),
+        ExecFailure::Retryable { error, retry_after } => ExecFailure::Retryable {
+            error: log.redact(&error),
+            retry_after,
+        },
+    };
+    // A final failure is logged with the resource's status at the end of the
+    // run, or when its deletion ends; a retryable one only here.
+    if let ExecFailure::Retryable { error, .. } = &failure {
+        log.warn(&format!("failed, retryable: {error}"));
+    }
+    failure
 }
 
 /// The deployment's error, or `None` when every resource provisioned.
@@ -561,6 +612,7 @@ struct NodeRun<S, E> {
     scope: MapScope,
     dependencies: BTreeMap<Descriptor, ResourceOutputs>,
     deadline: Instant,
+    log: JobLog,
 }
 
 impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
@@ -631,9 +683,17 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             self.scope
                 .context
                 .insert(ContextKey::ResGuresid, json!(started.guresid.as_str()));
-            let job = match self.job(node, *version, def, &fingerprint, &started) {
+            let log = self
+                .log
+                .operation(&started.operation_id, started.guresid.as_str());
+            log.info(&format!(
+                "provisioning with `{}` (attempt {attempt})",
+                def.driver_type
+            ));
+            let job = match self.job(node, *version, def, &fingerprint, &started, &log) {
                 Ok(job) => job,
                 Err(error) => {
+                    log.error(&error);
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Failed {
@@ -708,9 +768,11 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         )
                         .await;
                     if recorded {
+                        log.info("provisioned");
                         return Ok(outputs);
                     }
                     let error = "the resource provisioned, but its result could not be recorded";
+                    log.error(error);
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Unknown {
@@ -722,6 +784,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 }
                 Err(f) => f,
             };
+            let failure = redacted(failure, &log);
             match failure {
                 ExecFailure::Permanent(error) => {
                     self.checkpoint(
@@ -776,6 +839,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         def: &ResourceDefinition,
         fingerprint: &str,
         started: &openporch_store::OperationStarted,
+        log: &JobLog,
     ) -> Result<ProvisionJob, String> {
         let at = |what: &str| format!("definition `{}`: {what}", def.id);
         let scope = &self.scope;
@@ -853,6 +917,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             cookie: None,
             target: None,
             deadline: self.deadline,
+            log: log.clone(),
         })
     }
 

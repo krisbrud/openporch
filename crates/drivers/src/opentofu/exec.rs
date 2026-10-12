@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use openporch_core::redact::Redactor;
 use tokio::io::AsyncReadExt as _;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
@@ -43,22 +44,14 @@ pub(super) struct Output {
 #[derive(Default)]
 pub(super) struct RunLog {
     text: String,
-    secrets: Vec<String>,
+    secrets: Redactor,
 }
 
 impl RunLog {
     /// Adds values that must never appear in the log or in errors, together
     /// with the escaped forms `tofu` prints them in.
     pub fn redact_values(&mut self, values: impl IntoIterator<Item = String>) {
-        for v in values {
-            if v.chars().count() < 4 {
-                continue;
-            }
-            self.secrets.extend(escaped_forms(&v));
-            self.secrets.push(v);
-        }
-        self.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        self.secrets.dedup();
+        self.secrets.add(values);
     }
 
     /// Appends `text`, redacted first so truncation cannot split a secret.
@@ -80,33 +73,13 @@ impl RunLog {
 
     /// `text` with every secret value replaced.
     pub fn redact(&self, text: &str) -> String {
-        self.secrets
-            .iter()
-            .fold(text.to_owned(), |t, s| t.replace(s.as_str(), "[REDACTED]"))
+        self.secrets.redact(text)
     }
 
     /// The whole log, redacted.
     pub fn redacted(&self) -> String {
         self.redact(&self.text)
     }
-}
-
-/// The forms a secret takes in JSON and HCL output: escaped quotes, backslashes
-/// and control characters, Go's HTML-safe `\u003c`, `\u003e` and `\u0026`, and
-/// HCL's `$${` and `%%{`.
-fn escaped_forms(v: &str) -> Vec<String> {
-    let json = serde_json::to_string(v).unwrap_or_default();
-    let json = json
-        .strip_prefix('"')
-        .and_then(|j| j.strip_suffix('"'))
-        .unwrap_or_default()
-        .to_owned();
-    let html = json
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026");
-    let hcl = json.replace("${", "$${").replace("%{", "%%{");
-    [json, html, hcl].into_iter().filter(|f| f != v).collect()
 }
 
 /// Whether a command's standard output goes into the log.

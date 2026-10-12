@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use openporch_engine::planner::{Deployment, Executor, NoPermits, PermitCheck, Planner};
-use openporch_store::{SqliteStore, Store};
+use openporch_store::{LogLine, SqliteStore, Store, now_ms};
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -112,9 +112,28 @@ async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
     )
 }
 
-/// Finishes `job`'s deployment; a failure to record it leaves the deployment
-/// running until restart recovery fails it.
+/// Finishes `job`'s deployment, with its error as its only log line; a
+/// failure to record it leaves the deployment running until restart recovery
+/// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
+    if let Some(error) = &error {
+        let line = LogLine {
+            seq: 0,
+            operation_id: None,
+            descriptor: None,
+            guresid: None,
+            at: now_ms(),
+            level: "error".into(),
+            message: format!("deployment failed: {error}"),
+        };
+        if let Err(e) = state
+            .store
+            .append_logs(state.org(), &job.app, &job.env, &job.id, vec![line])
+            .await
+        {
+            tracing::error!(deployment = %job.id, error = %e, "could not write a log line");
+        }
+    }
     if let Err(e) = state
         .store
         .finish_deployment(state.org(), &job.app, &job.env, &job.id, error)
