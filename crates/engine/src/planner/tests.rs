@@ -1827,25 +1827,53 @@ async fn a_driver_error_with_a_secret_is_redacted() {
 }
 
 #[tokio::test]
-async fn the_log_stops_at_its_quota() {
+async fn the_log_stops_at_its_quota_but_keeps_the_outcome() {
     let f = Fixture::new().await;
-    let fake = Arc::new(Fake::default());
+    let fake = Fake::with(&[("dns", Behavior::Permanent)]);
     let deployment = f.accept().await;
     let limits = Limits {
         log_bytes: 120,
         ..fast()
     };
-    let outcomes = planner(&f, &fake, limits).run(deployment.clone()).await;
-    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    planner(&f, &fake, limits).run(deployment.clone()).await;
     let lines = logs(&f, &deployment).await;
-    let last = lines.last().unwrap();
-    assert_eq!(last.level, "warn");
-    assert!(last.message.contains("quota of 120 bytes"), "{last:?}");
-    let kept: usize = lines[..lines.len() - 1]
+    let quota = lines
         .iter()
-        .map(|l| l.message.len())
-        .sum();
+        .position(|l| l.message.contains("quota of 120 bytes"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    let warning = &lines[quota];
+    assert_eq!(warning.level, "warn");
+    assert_eq!((&warning.descriptor, &warning.operation_id), (&None, &None));
+    let kept: usize = lines[..quota].iter().map(|l| l.message.len()).sum();
     assert!(kept <= 120, "{lines:?}");
-    // The deployment itself is unaffected.
-    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Succeeded);
+    // The final status lines are written past the quota.
+    let after: Vec<_> = lines[quota + 1..]
+        .iter()
+        .map(|l| l.message.as_str())
+        .collect();
+    assert!(after.contains(&"failed: 400: invalid zone"), "{after:?}");
+    assert!(
+        after.last().unwrap().starts_with("deployment failed"),
+        "{after:?}"
+    );
+    assert!(after.iter().all(|m| !m.contains("attempt")), "{after:?}");
+}
+
+#[tokio::test]
+async fn nothing_is_logged_after_the_log_closes() {
+    let f = Fixture::new().await;
+    let deployment = f.accept().await;
+    let log = DeploymentLog::start(f.store.clone(), &deployment, 1 << 20);
+    let db = log.resource(&d(DB));
+    db.info("before");
+    log.close().await;
+    db.info("after");
+    log.deployment().status("info", "after");
+    tokio::task::yield_now().await;
+    let messages: Vec<_> = logs(&f, &deployment)
+        .await
+        .into_iter()
+        .map(|l| l.message)
+        .collect();
+    assert_eq!(messages, ["before"]);
 }

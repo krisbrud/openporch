@@ -264,7 +264,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Err(e) => {
                     // The deletion may have started: only an observation can
                     // tell, and a restart marks its open operation unknown.
-                    tracing::error!(error = %e, "a deletion task stopped unexpectedly");
+                    // A panic message could hold a secret, so it is not logged.
+                    tracing::error!(
+                        panicked = e.is_panic(),
+                        "a deletion task stopped unexpectedly"
+                    );
                     let Some(descriptor) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
@@ -612,7 +616,8 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                tracing::error!(error = %e, "the executor stopped unexpectedly");
+                // A panic message could hold a secret, so it is not logged.
+                tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
                 Err(ExecFailure::Uncertain(
                     "the executor stopped unexpectedly while the resource was being deleted".into(),
                 ))

@@ -1621,7 +1621,8 @@ there are no more lines. Every secret value the executor resolved for a
 resource is replaced with `[REDACTED]`, also in its escaped forms, before a
 line is stored, and so are the driver errors recorded for the resource. A log
 keeps at most 16 MiB of messages; past that, one warning says later lines were
-dropped.
+dropped, and only each resource's final status and the deployment's outcome
+follow it.
 
 ```http
 GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs?limit=1

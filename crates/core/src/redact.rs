@@ -15,8 +15,7 @@ pub const MIN_CHARS: usize = 4;
 /// Known secret values and how to recognize them in text.
 #[derive(Clone, Default)]
 pub struct Redactor {
-    /// Every form of every value, longest first, so that a secret containing
-    /// another is replaced whole.
+    /// Every form of every value, each once.
     forms: Vec<String>,
 }
 
@@ -38,7 +37,7 @@ impl Redactor {
             self.forms.extend(escaped_forms(v));
             self.forms.push(v.to_owned());
         }
-        self.forms.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        self.forms.sort();
         self.forms.dedup();
     }
 
@@ -47,11 +46,45 @@ impl Redactor {
         self.forms.is_empty()
     }
 
-    /// `text` with every known value replaced by [`REDACTED`].
+    /// `text` with every known value replaced by [`REDACTED`]. Matches are
+    /// found in the original text and overlapping or adjacent ones merged, so
+    /// no part of a secret that overlaps another is left behind.
     pub fn redact(&self, text: &str) -> String {
-        self.forms
+        let mut ranges: Vec<(usize, usize)> = self
+            .forms
             .iter()
-            .fold(text.to_owned(), |t, s| t.replace(s.as_str(), REDACTED))
+            .flat_map(|form| {
+                // Every occurrence, also those overlapping each other.
+                let mut found = Vec::new();
+                let mut from = 0;
+                while let Some(i) = text[from..].find(form.as_str()) {
+                    let start = from + i;
+                    found.push((start, start + form.len()));
+                    from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+                }
+                found
+            })
+            .collect();
+        if ranges.is_empty() {
+            return text.to_owned();
+        }
+        ranges.sort_unstable();
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        let mut i = 0;
+        while i < ranges.len() {
+            let (start, mut end) = ranges[i];
+            while i + 1 < ranges.len() && ranges[i + 1].0 <= end {
+                i += 1;
+                end = end.max(ranges[i].1);
+            }
+            out.push_str(&text[at..start]);
+            out.push_str(REDACTED);
+            at = end;
+            i += 1;
+        }
+        out.push_str(&text[at..]);
+        out
     }
 }
 
@@ -64,7 +97,8 @@ impl std::fmt::Debug for Redactor {
 
 /// The forms a secret takes in JSON and HCL output: escaped quotes, backslashes
 /// and control characters, Go's HTML-safe `<`, `>` and `&`, and
-/// HCL's `$${` and `%%{`.
+/// HCL's `$${` and `%%{`. Not covered: Go's escaping of U+2028 and U+2029, and
+/// HTML-safe and HCL escaping applied together.
 fn escaped_forms(v: &str) -> Vec<String> {
     let json = serde_json::to_string(v).unwrap_or_default();
     let json = json
@@ -87,9 +121,19 @@ mod tests {
     #[test]
     fn redacts_escaped_forms() {
         let r = Redactor::new(["a<b&c\"d\\e"]);
-        for text in ["a<b&c\"d\\e", r#"a<b&c\"d\\e"#, r#"a<b&c\"d\\e"#] {
+        for text in ["a<b&c\"d\\e", r#"a<b&c\"d\\e"#, r#"a\u003cb\u0026c\"d\\e"#] {
             assert_eq!(r.redact(text), REDACTED, "{text}");
         }
+        let r = Redactor::new(["x${y}%{z}"]);
+        assert_eq!(r.redact("x$${y}%%{z}"), REDACTED);
+    }
+
+    #[test]
+    fn overlapping_secrets_are_redacted_whole() {
+        let r = Redactor::new(["aaaa1111", "1111bbbb"]);
+        assert_eq!(r.redact("<aaaa1111bbbb>"), "<[REDACTED]>");
+        let r = Redactor::new(["abab"]);
+        assert_eq!(r.redact("ababab ab"), "[REDACTED] ab");
     }
 
     #[test]

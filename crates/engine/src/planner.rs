@@ -385,7 +385,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // The executor's own panics are caught; this is the planner's.
                     // Its operation, if one started, stays open for restart
                     // recovery, and the resource may have changed.
-                    tracing::error!(error = %e, "a provisioning task stopped unexpectedly");
+                    // A panic message could hold a secret, so it is not logged.
+                    tracing::error!(
+                        panicked = e.is_panic(),
+                        "a provisioning task stopped unexpectedly"
+                    );
                     let Some(d) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
@@ -443,12 +447,18 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             };
             let resource_log = log.resource(d);
             match status {
-                ResourceRunStatus::Failed => resource_log.error(&format!("failed: {reason}")),
-                ResourceRunStatus::Unknown => {
-                    resource_log.error(&format!("outcome unknown: {reason}"));
+                ResourceRunStatus::Failed => {
+                    resource_log.status("error", &format!("failed: {reason}"))
                 }
-                ResourceRunStatus::Pending => resource_log.warn(&format!("pending: {reason}")),
-                ResourceRunStatus::Skipped => resource_log.info(&format!("kept: {reason}")),
+                ResourceRunStatus::Unknown => {
+                    resource_log.status("error", &format!("outcome unknown: {reason}"));
+                }
+                ResourceRunStatus::Pending => {
+                    resource_log.status("warn", &format!("pending: {reason}"))
+                }
+                ResourceRunStatus::Skipped => {
+                    resource_log.status("info", &format!("kept: {reason}"))
+                }
             }
             if let Err(e) = self
                 .store
@@ -473,11 +483,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             (Some(error), Err(e)) => Some(format!("{error}; {e}")),
         };
         match &error {
-            None => log.deployment().info("deployment succeeded"),
-            Some(e) => log.deployment().error(&format!("deployment failed: {e}")),
+            None => log.deployment().status("info", "deployment succeeded"),
+            Some(e) => log
+                .deployment()
+                .status("error", &format!("deployment failed: {e}")),
         }
         // The log is complete before the deployment is.
-        log.flush().await;
+        log.close().await;
         if let Err(e) = self
             .store
             .finish_deployment(
@@ -930,7 +942,8 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                tracing::error!(error = %e, "the executor stopped unexpectedly");
+                // A panic message could hold a secret, so it is not logged.
+                tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
                 Err(ExecFailure::Uncertain(
                     "the executor stopped unexpectedly while the resource was provisioning".into(),
                 ))
