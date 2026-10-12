@@ -1387,7 +1387,8 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         self.check_org(org)?;
         // A resource that never ran has a GUResID only if an earlier deployment
-        // provisioned it.
+        // provisioned it; otherwise the row's GUResID is empty. A status an
+        // operation recorded is kept.
         sqlx::query(
             "INSERT INTO deployment_resources (org_id, app_id, env_id, deployment_id, descriptor, \
              guresid, status, error, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, \
@@ -1395,7 +1396,8 @@ impl Store for SqliteStore {
              AND env_id = ?3 AND descriptor = ?5), ''), ?6, ?7, ?8) \
              ON CONFLICT (org_id, app_id, env_id, deployment_id, descriptor) \
              DO UPDATE SET status = excluded.status, error = excluded.error, \
-             observed_at = excluded.observed_at",
+             observed_at = excluded.observed_at \
+             WHERE deployment_resources.status IN ('pending', 'skipped')",
         )
         .bind(org)
         .bind(app)

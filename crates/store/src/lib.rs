@@ -264,8 +264,10 @@ pub trait Store: Send + Sync {
         result: CheckpointResult,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Records the status of a resource that no operation ran for in a
-    /// deployment, such as `pending` behind a failed dependency.
+    /// Records the status of a resource that no operation decided in a
+    /// deployment, such as `pending` behind a failed dependency. A status an
+    /// operation recorded is kept. A resource with no GUResID yet is recorded
+    /// with an empty one.
     #[allow(clippy::too_many_arguments)]
     fn record_resource_status(
         &self,

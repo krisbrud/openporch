@@ -102,7 +102,8 @@ impl Deployment {
 /// references, never secret values.
 #[derive(Debug, Clone)]
 pub struct ProvisionJob {
-    /// The durable operation ID, the driver's idempotency identity.
+    /// The durable operation ID of this attempt; each retry gets a new one. The
+    /// GUResID is the identity that stays the same across attempts.
     pub operation_id: String,
     /// The attempt within the deployment, from 1.
     pub attempt: i64,
@@ -159,7 +160,8 @@ pub struct ProvisionResult {
 pub enum ExecFailure {
     /// Nothing changed, and retrying cannot help.
     Permanent(String),
-    /// Nothing changed, or retrying the same operation converges; retry later.
+    /// Nothing changed; retry later. A driver that cannot tell whether something
+    /// changed returns [`ExecFailure::Uncertain`] instead.
     Retryable {
         /// The error.
         error: String,
@@ -263,6 +265,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut done: BTreeMap<Descriptor, Done> = BTreeMap::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
+        let mut tasks: BTreeMap<tokio::task::Id, Descriptor> = BTreeMap::new();
         loop {
             // Start every node whose dependencies provisioned, unless time is up.
             for node in deployment.graph.nodes.values() {
@@ -290,19 +293,31 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     deadline,
                 };
                 let d = node.descriptor.clone();
-                running.spawn(async move { (d, ctx.run().await) });
+                let task = running.spawn({
+                    let d = d.clone();
+                    async move { (d, ctx.run().await) }
+                });
+                tasks.insert(task.id(), d);
             }
-            let Some(joined) = running.join_next().await else {
+            let Some(joined) = running.join_next_with_id().await else {
                 break;
             };
             let (d, result) = match joined {
-                Ok(r) => r,
+                Ok((_, r)) => r,
                 Err(e) => {
-                    // A panicking task leaves its node undecided; the deployment
-                    // fails and the node's operation, if any, is still open for
-                    // restart recovery.
+                    // The executor's own panics are caught; this is the planner's.
+                    // Its operation, if one started, stays open for restart
+                    // recovery, and the resource may have changed.
                     tracing::error!(error = %e, "a provisioning task stopped unexpectedly");
-                    continue;
+                    let Some(d) = tasks.get(&e.id()).cloned() else {
+                        continue;
+                    };
+                    (
+                        d,
+                        Err(Outcome::Unknown(
+                            "provisioning stopped unexpectedly; recover the resource".into(),
+                        )),
+                    )
                 }
             };
             match result {
@@ -330,6 +345,17 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 None if Instant::now() >= deadline => "the deployment ran out of time".into(),
                 None => "not started".into(),
             };
+            outcomes.insert(node.descriptor.clone(), Outcome::Pending(reason));
+        }
+        // Every resource gets a record, also those that ended before an
+        // operation was recorded; the store keeps any status an operation set.
+        for (d, outcome) in &outcomes {
+            let (status, reason) = match outcome {
+                Outcome::Provisioned => continue,
+                Outcome::Pending(r) => (ResourceRunStatus::Pending, r),
+                Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
+                Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
+            };
             if let Err(e) = self
                 .store
                 .record_resource_status(
@@ -337,15 +363,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     deployment.app.as_str(),
                     deployment.env.as_str(),
                     &deployment.id,
-                    &node.descriptor.to_string(),
-                    ResourceRunStatus::Pending,
+                    &d.to_string(),
+                    status,
                     Some(reason.clone()),
                 )
                 .await
             {
-                tracing::error!(resource = %node.descriptor, error = %e, "could not record a pending resource");
+                tracing::error!(resource = %d, error = %e, "could not record a resource's status");
             }
-            outcomes.insert(node.descriptor.clone(), Outcome::Pending(reason));
         }
 
         let error = summary(&outcomes);
@@ -493,8 +518,12 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let Ok(_permit) = self.permits.clone().acquire_owned().await else {
-                return Err(Outcome::Failed("the planner is shutting down".into()));
+            let permit =
+                tokio::time::timeout_at(self.deadline, self.permits.clone().acquire_owned()).await;
+            let permit = match permit {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => return Err(Outcome::Failed("the planner is shutting down".into())),
+                Err(_) => return Err(Outcome::Pending("the deployment ran out of time".into())),
             };
             if Instant::now() >= self.deadline {
                 return Err(Outcome::Pending("the deployment ran out of time".into()));
@@ -541,11 +570,17 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     return Err(Outcome::Failed(error));
                 }
             };
-            let job = self.with_cookie(job, node).await;
-            let result = tokio::time::timeout_at(self.deadline, self.executor.provision(job)).await;
-            drop(_permit);
+            let result = match self.with_cookie(job, node).await {
+                Ok(job) => self.provision(job).await,
+                // Without the cookie the driver might create a duplicate.
+                Err(error) => Err(ExecFailure::Retryable {
+                    error,
+                    retry_after: None,
+                }),
+            };
+            drop(permit);
             let failure = match result {
-                Ok(Ok(provisioned)) => {
+                Ok(provisioned) => {
                     let outputs = ResourceOutputs {
                         values: provisioned.outputs.clone(),
                         secrets: provisioned.secret_outputs.clone(),
@@ -563,18 +598,20 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                             })),
                         )
                         .await;
-                    return if recorded {
-                        Ok(outputs)
-                    } else {
-                        Err(Outcome::Unknown(
-                            "the resource provisioned, but its result could not be recorded".into(),
-                        ))
-                    };
+                    if recorded {
+                        return Ok(outputs);
+                    }
+                    let error = "the resource provisioned, but its result could not be recorded";
+                    self.checkpoint(
+                        &started.operation_id,
+                        CheckpointResult::Unknown {
+                            error: error.into(),
+                        },
+                    )
+                    .await;
+                    return Err(Outcome::Unknown(error.into()));
                 }
-                Ok(Err(f)) => f,
-                Err(_) => ExecFailure::Uncertain(
-                    "the deployment ran out of time while the resource was provisioning".into(),
-                ),
+                Err(f) => f,
             };
             match failure {
                 ExecFailure::Permanent(error) => {
@@ -708,10 +745,37 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         })
     }
 
+    /// Runs the executor until the deadline. A panic or the deadline leaves the
+    /// outcome uncertain, since the driver may have changed something.
+    async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
+        let executor = self.executor.clone();
+        let task = tokio::spawn(async move { executor.provision(job).await });
+        let abort = task.abort_handle();
+        match tokio::time::timeout_at(self.deadline, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "the executor stopped unexpectedly");
+                Err(ExecFailure::Uncertain(
+                    "the executor stopped unexpectedly while the resource was provisioning".into(),
+                ))
+            }
+            Err(_) => {
+                abort.abort();
+                Err(ExecFailure::Uncertain(
+                    "the deployment ran out of time while the resource was provisioning".into(),
+                ))
+            }
+        }
+    }
+
     /// Adds the cookie of the resource's last successful operation.
-    async fn with_cookie(&self, mut job: ProvisionJob, node: &Node) -> ProvisionJob {
+    async fn with_cookie(
+        &self,
+        mut job: ProvisionJob,
+        node: &Node,
+    ) -> Result<ProvisionJob, String> {
         let d = &self.deployment;
-        match self
+        let resource = self
             .store
             .active_resource(
                 d.org.as_str(),
@@ -720,14 +784,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 &node.descriptor.to_string(),
             )
             .await
-        {
-            Ok(Some(r)) => job.cookie = r.cookie,
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(resource = %node.descriptor, error = %e, "could not read the resource's cookie");
-            }
-        }
-        job
+            .map_err(|e| format!("the resource's driver state could not be read: {e}"))?;
+        job.cookie = resource.and_then(|r| r.cookie);
+        Ok(job)
     }
 
     /// Records an operation's outcome; whether it was recorded.

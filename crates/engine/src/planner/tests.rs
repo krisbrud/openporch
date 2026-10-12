@@ -7,6 +7,9 @@ use openporch_core::graph::{GraphInput, build_graph};
 use openporch_core::placeholder::SecretPart;
 use openporch_core::sets::DeploymentSet;
 use openporch_core::workload::Workload;
+use openporch_store::secrets::{
+    BuiltinSecretStore, Keyring, MasterKey, SecretStore as _, SecretValue,
+};
 use openporch_store::{AuditIntent, DeploymentRequest, DeploymentStatus, Ownership, SqliteStore};
 use tokio::sync::Barrier;
 
@@ -14,8 +17,11 @@ use super::*;
 
 const ORG: &str = "acme";
 
-/// The plaintext behind `pg-password`, known only to the fake executor.
-const PASSWORD: &str = "hunter2-plaintext";
+/// Plaintexts in the built-in secret store: the definition's master password,
+/// seeded before the deployment, and the secret outputs the executor writes.
+const MASTER: &str = "master-plaintext-31";
+const PASSWORD: &str = "password-plaintext-47";
+const TOKEN: &str = "token-plaintext-59";
 
 const WEB: &str = r#"
 apiVersion: openporch.dev/v1
@@ -80,17 +86,35 @@ enum Behavior {
     Retryable(Option<Duration>),
     Permanent,
     Hang,
+    Panic,
     /// Waits until every resource sharing the barrier is provisioning at once.
     Meet(Arc<Barrier>),
 }
 
 /// An executor that provisions nothing and records every job it is handed.
-#[derive(Debug, Default)]
+/// With a secret store, it reads every secret input and writes secret outputs
+/// as a real executor does.
+#[derive(Default)]
 struct Fake {
     behavior: Mutex<BTreeMap<String, Behavior>>,
     jobs: Mutex<Vec<ProvisionJob>>,
     running: AtomicUsize,
     most: AtomicUsize,
+    secrets: Option<BuiltinSecretStore>,
+    read: Mutex<Vec<String>>,
+}
+
+/// The secret references in `r`.
+fn secret_refs(r: &Resolved, out: &mut Vec<SecretRef>) {
+    match r {
+        Resolved::Value(_) => {}
+        Resolved::Secret(e) => out.extend(e.parts.iter().filter_map(|p| match p {
+            SecretPart::Secret(r) => Some(r.clone()),
+            SecretPart::Literal(_) => None,
+        })),
+        Resolved::Array(items) => items.iter().for_each(|i| secret_refs(i, out)),
+        Resolved::Object(items) => items.iter().for_each(|(_, i)| secret_refs(i, out)),
+    }
 }
 
 impl Fake {
@@ -129,7 +153,21 @@ impl Executor for Fake {
             .cloned()
             .unwrap_or(Behavior::Succeed);
         let ty = job.descriptor.ty.to_string();
+        let mut refs = Vec::new();
+        for input in [
+            &job.inputs.secrets,
+            &job.inputs.secret_refs,
+            &job.inputs.resource,
+        ] {
+            secret_refs(input, &mut refs);
+        }
         self.jobs.lock().unwrap().push(job);
+        if let Some(store) = &self.secrets {
+            for r in refs {
+                let value = store.read(&r).await.unwrap();
+                self.read.lock().unwrap().push(value.expose().to_owned());
+            }
+        }
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
         let result = match behavior {
@@ -144,6 +182,7 @@ impl Executor for Fake {
             }),
             Behavior::Permanent => Err(ExecFailure::Permanent("400: invalid zone".into())),
             Behavior::Hang => std::future::pending().await,
+            Behavior::Panic => panic!("the driver crashed"),
         };
         self.running.fetch_sub(1, Ordering::SeqCst);
         result?;
@@ -151,34 +190,28 @@ impl Executor for Fake {
         provisioned
             .outputs
             .insert("host".into(), json!(format!("{ty}.internal")));
-        if ty == "dns" {
-            provisioned.secret_outputs.insert(
-                "token".into(),
-                SecretRef {
+        let secret = match ty.as_str() {
+            "dns" => Some(("token", "dns-token", TOKEN)),
+            "postgres" => Some(("password", "pg-password", PASSWORD)),
+            _ => None,
+        };
+        if let Some((output, name, value)) = secret {
+            let reference = match &self.secrets {
+                Some(store) => store.write(name, &SecretValue::new(value)).await.unwrap(),
+                None => SecretRef {
                     store: "openporch".into(),
-                    reference: "dns-token".into(),
+                    reference: name.into(),
                     version: None,
                 },
-            );
-        }
-        if ty == "postgres" {
-            // A real executor writes `PASSWORD` to a secret store and returns only
-            // the reference.
-            provisioned.secret_outputs.insert(
-                "password".into(),
-                SecretRef {
-                    store: "openporch".into(),
-                    reference: "pg-password".into(),
-                    version: None,
-                },
-            );
+            };
+            provisioned.secret_outputs.insert(output.into(), reference);
         }
         Ok(provisioned)
     }
 }
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     store: Arc<SqliteStore>,
 }
 
@@ -222,7 +255,7 @@ impl Fixture {
             sqlx::query(query).execute(store.pool()).await.unwrap();
         }
         Self {
-            dir,
+            _dir: dir,
             store: Arc::new(store),
         }
     }
@@ -523,12 +556,27 @@ async fn a_timeout_leaves_the_resource_unknown_until_recovered() {
 #[tokio::test]
 async fn no_secret_value_reaches_the_planner() {
     let f = Fixture::new().await;
-    let fake = Fake::with(&[]);
+    let secrets = BuiltinSecretStore::new(
+        &f.store,
+        Arc::new(Keyring::new(MasterKey::from_bytes([7; 32]), [])),
+        ORG,
+    );
+    secrets
+        .write("pg-master", &SecretValue::new(MASTER))
+        .await
+        .unwrap();
+    let fake = Arc::new(Fake {
+        secrets: Some(secrets),
+        ..Fake::default()
+    });
     let deployment = f.accept().await;
-    let outcomes = planner(&f, &fake, fast()).run(deployment).await;
-    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(
+        outcomes.values().all(|o| *o == Outcome::Provisioned),
+        "{outcomes:?}"
+    );
 
-    // Secret inputs reach the executor as references.
+    // Secret inputs reach the executor as references, which only it reads.
     let db = fake.job(DB);
     let Resolved::Object(refs) = &db.inputs.secret_refs else {
         panic!("{:?}", db.inputs.secret_refs);
@@ -549,20 +597,44 @@ async fn no_secret_value_reaches_the_planner() {
         matches!(&secrets[0].1, Resolved::Secret(e) if matches!(&e.parts[..],
         [SecretPart::Literal(l), SecretPart::Secret(r)] if l == "Bearer " && r.reference == "dns-token"))
     );
+    let mut read = fake.read.lock().unwrap().clone();
+    read.sort();
+    assert_eq!(read, [MASTER, TOKEN]);
 
-    // The plaintext is in no job and nowhere in the database.
-    let jobs = format!("{:?}", fake.jobs.lock().unwrap());
-    assert!(!jobs.contains(PASSWORD));
-    for entry in std::fs::read_dir(f.dir.path()).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_file() {
-            let bytes = std::fs::read(&path).unwrap();
-            let found = bytes
-                .windows(PASSWORD.len())
-                .any(|w| w == PASSWORD.as_bytes());
-            assert!(!found, "{}", path.display());
-        }
+    // The plaintexts are in no job, outcome or deployment record.
+    let jobs = fake.jobs.lock().unwrap().clone();
+    let mut seen = format!("{jobs:?} {outcomes:?} {:?}", f.status(&deployment).await);
+    for job in &jobs {
+        seen.push_str(&serde_json::to_string(&job.inputs).unwrap());
     }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT COALESCE(outputs, '') || COALESCE(error, '') FROM deployment_resources",
+    )
+    .fetch_all(f.store.pool())
+    .await
+    .unwrap();
+    seen.extend(rows.into_iter().map(|(r,)| r));
+    for plaintext in [MASTER, PASSWORD, TOKEN] {
+        assert!(!seen.contains(plaintext), "{plaintext}");
+    }
+}
+
+#[tokio::test]
+async fn an_executor_panic_leaves_the_resource_unknown() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("dns", Behavior::Panic)]);
+    let deployment = f.accept().await;
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(
+        matches!(outcomes[&d(DNS)], Outcome::Unknown(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(f.resources(&deployment).await[DNS], "unknown");
+    assert_eq!(outcomes[&d(DB)], Outcome::Provisioned);
+    assert!(matches!(
+        f.try_accept().await,
+        Err(StoreError::RecoveryRequired(r)) if r == DNS
+    ));
 }
 
 #[test]

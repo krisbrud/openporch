@@ -271,6 +271,10 @@ pub enum ResourceRunStatus {
     Pending,
     /// Deliberately not visited.
     Skipped,
+    /// Failed before an operation was recorded.
+    Failed,
+    /// Its outcome is unknown.
+    Unknown,
 }
 
 impl ResourceRunStatus {
@@ -278,6 +282,8 @@ impl ResourceRunStatus {
         match self {
             Self::Pending => "pending",
             Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
         }
     }
 }
