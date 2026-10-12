@@ -125,6 +125,11 @@ pub struct ProvisionJob {
     pub input_fingerprint: String,
     /// The driver's cookie from the last successful operation, encrypted.
     pub cookie: Option<Sealed>,
+    /// What the cloud account resolved to when the resource last provisioned,
+    /// such as an AWS account number. Before calling the driver, the executor
+    /// refuses the job with a permanent failure if the account now resolves to
+    /// another target: moving a resource is an explicit migration.
+    pub target: Option<String>,
     /// When the deployment's time runs out.
     pub deadline: Instant,
 }
@@ -153,6 +158,8 @@ pub struct ProvisionResult {
     pub cookie: Option<Sealed>,
     /// Non-secret recovery metadata.
     pub recovery: Value,
+    /// What the cloud account resolved to, such as an AWS account number.
+    pub target: Option<String>,
 }
 
 /// Why provisioning failed. Messages are already redacted.
@@ -552,6 +559,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     StoreError::RecoveryRequired(_) => Outcome::Failed(format!(
                         "an earlier operation's outcome is unknown; recover the resource first ({e})"
                     )),
+                    StoreError::MigrationRequired { .. } => Outcome::Failed(e.to_string()),
                     other => Outcome::Failed(format!("the operation was not recorded: {other}")),
                 })?;
             self.scope
@@ -571,6 +579,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 }
             };
             let account = job.driver_account.clone();
+            let inputs = serde_json::to_value(&job.inputs).unwrap_or(Value::Null);
             let recorded = self
                 .store
                 .record_operation_inputs(
@@ -592,13 +601,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     error,
                     retry_after: None,
                 }),
-                Ok(()) => match self.with_cookie(job, node).await {
+                Ok(()) => match self.with_prior_state(job, node).await {
                     Ok(job) => self.provision(job).await,
-                    // Without the cookie the driver might create a duplicate.
-                    Err(error) => Err(ExecFailure::Retryable {
-                        error,
-                        retry_after: None,
-                    }),
+                    Err(failure) => Err(failure),
                 },
             };
             drop(permit);
@@ -608,7 +613,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         values: provisioned.outputs.clone(),
                         secrets: provisioned.secret_outputs.clone(),
                         guresid: Some(started.guresid.clone()),
-                        account,
+                        account: account.clone(),
                     };
                     let recorded = self
                         .checkpoint(
@@ -618,6 +623,19 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                 secret_outputs: provisioned.secret_outputs,
                                 cookie: provisioned.cookie,
                                 recovery: provisioned.recovery,
+                                inputs: inputs.clone(),
+                                dependencies: node
+                                    .depends_on
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect(),
+                                account: account.as_ref().map(ToString::to_string),
+                                target: provisioned.target,
+                                snapshot: json!({
+                                    "deployment_id": deployment.id,
+                                    "definition_version": version,
+                                    "definition": def,
+                                }),
                             })),
                         )
                         .await;
@@ -765,6 +783,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             },
             input_fingerprint: fingerprint.to_owned(),
             cookie: None,
+            target: None,
             deadline: self.deadline,
         })
     }
@@ -792,12 +811,13 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         }
     }
 
-    /// Adds the cookie of the resource's last successful operation.
-    async fn with_cookie(
+    /// Adds the cookie of the resource's last successful operation, and refuses
+    /// to move a provisioned resource to another cloud account.
+    async fn with_prior_state(
         &self,
         mut job: ProvisionJob,
         node: &Node,
-    ) -> Result<ProvisionJob, String> {
+    ) -> Result<ProvisionJob, ExecFailure> {
         let d = &self.deployment;
         let resource = self
             .store
@@ -808,8 +828,30 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 &node.descriptor.to_string(),
             )
             .await
-            .map_err(|e| format!("the resource's driver state could not be read: {e}"))?;
-        job.cookie = resource.and_then(|r| r.cookie);
+            // Without the cookie the driver might create a duplicate.
+            .map_err(|e| ExecFailure::Retryable {
+                error: format!("the resource's driver state could not be read: {e}"),
+                retry_after: None,
+            })?;
+        let Some(resource) = resource else {
+            return Ok(job);
+        };
+        let account = job.driver_account.as_ref().map(ToString::to_string);
+        if resource.last_deploy_id.is_some() && resource.driver_account != account {
+            let name = |a: &Option<String>| match a {
+                Some(a) => format!("cloud account `{a}`"),
+                None => "no cloud account".to_owned(),
+            };
+            return Err(ExecFailure::Permanent(format!(
+                "`{}` was provisioned in {}, but its definition now uses {}; migrate or \
+                 replace the resource explicitly",
+                node.descriptor,
+                name(&resource.driver_account),
+                name(&account),
+            )));
+        }
+        job.cookie = resource.cookie;
+        job.target = resource.target;
         Ok(job)
     }
 

@@ -298,6 +298,22 @@ pub trait Store: Send + Sync {
         descriptor: &str,
     ) -> impl Future<Output = Result<Option<ActiveResource>>> + Send;
 
+    /// Lists an environment's active resources by descriptor.
+    fn active_resources(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+    ) -> impl Future<Output = Result<Vec<ActiveResource>>> + Send;
+
+    /// Lists the active resources a definition provisioned, in every
+    /// environment.
+    fn definition_resources(
+        &self,
+        org: &str,
+        definition: &str,
+    ) -> impl Future<Output = Result<Vec<ActiveResource>>> + Send;
+
     /// Finishes a deployment and records its correlated audit outcome. Success also
     /// sets the environment's last successful deployment and set.
     fn finish_deployment(

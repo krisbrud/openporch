@@ -403,7 +403,7 @@ pub async fn delete_driver(
 
 // Definitions ---------------------------------------------------------------------
 
-async fn definition_or_404(state: &AppState, id: &str) -> ApiResult<DefinitionRecord> {
+pub(super) async fn definition_or_404(state: &AppState, id: &str) -> ApiResult<DefinitionRecord> {
     state
         .store
         .definition(state.org(), id)

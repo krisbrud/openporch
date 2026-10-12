@@ -31,6 +31,7 @@ mod envs;
 mod github;
 mod keys;
 mod limits;
+mod resources;
 mod secret_use;
 mod sets;
 mod tls;
@@ -472,7 +473,8 @@ async fn tokens_are_shown_once_and_revocable() {
 async fn expired_tokens_are_rejected() {
     let s = server().await;
     s.member("ci", "member").await;
-    let soon = openporch_store::now_ms() + 50;
+    // Long enough that a slow runner still creates the token before it expires.
+    let soon = openporch_store::now_ms() + 1_000;
     let (status, body) = s
         .post(
             "/orgs/acme/users/ci/tokens",
@@ -482,7 +484,7 @@ async fn expired_tokens_are_rejected() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let token = body["token"].as_str().unwrap().to_owned();
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     assert_eq!(
         s.get("/orgs/acme/current-user", &token).await.0,
         StatusCode::UNAUTHORIZED

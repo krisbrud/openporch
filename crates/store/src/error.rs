@@ -38,6 +38,20 @@ pub enum StoreError {
     /// Resources with uncertain outcomes must be resolved first.
     #[error("resources need recovery before new changes: {0}")]
     RecoveryRequired(String),
+    /// A resource's definition now names another driver; the resource keeps
+    /// its driver and state until an operator migrates or replaces it.
+    #[error(
+        "`{descriptor}` is managed by driver `{from}`, but its definition now uses `{to}`; \
+         migrate or replace the resource explicitly"
+    )]
+    MigrationRequired {
+        /// The resource.
+        descriptor: String,
+        /// Its current driver.
+        from: String,
+        /// The definition's driver.
+        to: String,
+    },
     /// The idempotency key was used before with different content.
     #[error("idempotency key `{0}` was already used for a different request")]
     IdempotencyMismatch(String),

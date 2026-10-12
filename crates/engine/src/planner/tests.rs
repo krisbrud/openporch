@@ -196,6 +196,9 @@ impl Executor for Fake {
         provisioned
             .outputs
             .insert("host".into(), json!(format!("{ty}.internal")));
+        if ty == "dns" {
+            provisioned.target = Some("111122223333".into());
+        }
         let secret = match ty.as_str() {
             "dns" => Some(("token", "dns-token", TOKEN)),
             "postgres" => Some(("password", "pg-password", PASSWORD)),
@@ -273,13 +276,16 @@ impl Fixture {
     }
 
     async fn try_accept(&self) -> Result<Deployment, StoreError> {
+        self.accept_with(definitions()).await
+    }
+
+    async fn accept_with(&self, defs: Vec<ResourceDefinition>) -> Result<Deployment, StoreError> {
         let mut set = DeploymentSet::default();
         let c = Workload::parse(WEB, None)
             .unwrap()
             .to_module(&builtin_types())
             .unwrap();
         set.modules.insert(c.id, c.module);
-        let defs = definitions();
         let (org, app, env, env_type) = (
             ORG.parse().unwrap(),
             "shop".parse().unwrap(),
@@ -683,4 +689,56 @@ fn secret_references_mirror_the_input_structure() {
     assert_eq!(items[0], ("a".to_owned(), Resolved::Value(json!(1))));
     assert!(matches!(items[1].1, Resolved::Secret(_)));
     assert!(matches!(&items[2].1, Resolved::Array(a) if matches!(a[0], Resolved::Secret(_))));
+}
+
+#[tokio::test]
+async fn a_resource_does_not_move_to_another_account() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let deployment = f.accept().await;
+    planner(&f, &fake, fast()).run(deployment).await;
+    let dns = f
+        .store
+        .active_resource(ORG, "shop", "development", DNS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dns.driver_account.as_deref(), Some("aws-dns"));
+
+    let mut defs = definitions();
+    for def in &mut defs {
+        if def.id.as_str() == "dns" {
+            def.driver_account = Some("aws-other".into());
+        }
+    }
+    let next = f.accept_with(defs).await.unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(next).await;
+    assert!(
+        matches!(&outcomes[&d(DNS)], Outcome::Failed(e)
+            if e.contains("cloud account `aws-dns`") && e.contains("`aws-other`")),
+        "{outcomes:?}"
+    );
+    assert_eq!(fake.attempts(DNS), 1);
+    let dns = f
+        .store
+        .active_resource(ORG, "shop", "development", DNS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dns.driver_account.as_deref(), Some("aws-dns"));
+}
+
+#[tokio::test]
+async fn the_executor_learns_the_previous_target() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let first = f.accept().await;
+    planner(&f, &fake, fast()).run(first).await;
+    assert_eq!(fake.job(DNS).target, None);
+    let next = f.accept().await;
+    planner(&f, &fake, fast()).run(next).await;
+    let jobs = fake.jobs.lock().unwrap().clone();
+    let dns: Vec<_> = jobs.iter().filter(|j| j.descriptor == d(DNS)).collect();
+    assert_eq!(dns.len(), 2);
+    assert_eq!(dns[1].target.as_deref(), Some("111122223333"));
 }

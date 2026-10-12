@@ -24,7 +24,7 @@ impl Server {
         b
     }
 
-    async fn static_account(&self, id: &str) -> Value {
+    pub(super) async fn static_account(&self, id: &str) -> Value {
         self.ok(
             Method::POST,
             ACCOUNTS,

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use openporch_core::ids::Descriptor;
+use openporch_core::model::SecretRef;
 use openporch_core::sets::DeploymentSet;
 use serde_json::json;
 
@@ -166,6 +167,11 @@ fn provisioned(host: &str) -> CheckpointResult {
         )]),
         cookie: None,
         recovery: json!({}),
+        inputs: json!({"values": {"size": "small"}}),
+        dependencies: vec!["postgres-instance.default#modules.web.externals.db".into()],
+        snapshot: json!({"definition_version": 1}),
+        account: None,
+        target: None,
     }))
 }
 

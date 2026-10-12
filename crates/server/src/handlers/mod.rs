@@ -9,6 +9,7 @@ mod envs;
 mod health;
 mod login;
 mod members;
+mod resources;
 mod sets;
 mod values;
 
@@ -212,6 +213,19 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}",
             App(AppPerm::Read),
             deploys::get,
+        )
+        // Active resources.
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources",
+            App(AppPerm::Read),
+            resources::list,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}",
+            App(AppPerm::Read),
+            resources::get,
         )
         // Sets and deltas.
         .route(
@@ -480,6 +494,12 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/resources/defs/{def}",
             Org(OrgPerm::Administer),
             catalog::delete_definition,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/resources/defs/{def}/resources",
+            Org(OrgPerm::ReadAll),
+            resources::for_definition,
         )
         .route(
             post(),
