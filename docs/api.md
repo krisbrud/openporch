@@ -1510,12 +1510,17 @@ Authorization: Bearer $ADMIN_TOKEN
 
 Every graph has a `base-env` node, and every workload is a `workload` node, so
 both need a matching definition. A workload's class picks its definition like
-any other resource's, and that definition's driver receives the workload's spec
-as its resource inputs, resolved at deploy time: the placeholders take its
-dependencies' outputs, secret outputs stay references that only the executor
-reads, and each trigger that names one of its resources gets that resource's
-outputs under `outputs`. `openporch/none` creates nothing and returns that
-document as the workload's outputs.
+any other resource's, and that definition's driver receives the resource
+inputs `id`, `class`, `spec` (the workload document) and `dependencies` (the
+outputs of its direct dependencies by key), resolved at deploy time: the
+placeholders take its dependencies' outputs, secret outputs stay references
+that only the executor reads, and each trigger that names one of its resources
+gets that resource's outputs under `outputs`. Content of files marked
+`noExpand` is passed on as written, and `${pod.*}` needs a target that supports
+pod references. `openporch/none` creates nothing and returns these inputs as
+the workload's outputs. Deployments accepted before workloads received their
+inputs cannot be replayed from their snapshot; redeploy them with
+`"replay": "current"`.
 
 ```http
 POST /orgs/acme/resources/defs

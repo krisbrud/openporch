@@ -29,7 +29,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The snapshot format this server writes and replays.
-pub(super) const SNAPSHOT_VERSION: u64 = 1;
+pub(super) const SNAPSHOT_VERSION: u64 = 2;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;

@@ -73,8 +73,25 @@ async fn a_lambda_class_workload_gets_its_resolved_document() {
     assert_eq!(job.driver_type.to_string(), "openporch/opentofu");
     // Its inputs are the workload document with the database's outputs
     // filled in; the password stays a reference.
-    let Resolved::Object(doc) = &job.inputs.resource else {
+    let Resolved::Object(inputs) = &job.inputs.resource else {
         panic!("{:?}", job.inputs.resource);
+    };
+    let input = |name: &str| &inputs.iter().find(|(k, _)| k == name).unwrap().1;
+    assert_eq!(input("id"), &Resolved::Value(json!("worker")));
+    assert_eq!(input("class"), &Resolved::Value(json!("aws-lambda")));
+    // Its direct dependencies' outputs, by key.
+    let Resolved::Object(dependencies) = input("dependencies") else {
+        panic!("{inputs:?}");
+    };
+    let dependency = |key: &str| &dependencies.iter().find(|(k, _)| k == key).unwrap().1;
+    assert_eq!(
+        dependency("queue"),
+        &Resolved::Value(json!({"host": "sqs.internal"}))
+    );
+    assert!(matches!(dependency("db"), Resolved::Object(db)
+        if db.iter().any(|(k, r)| k == "password" && matches!(r, Resolved::Secret(_)))));
+    let Resolved::Object(doc) = input("spec") else {
+        panic!("{inputs:?}");
     };
     let field = |name: &str| &doc.iter().find(|(k, _)| k == name).unwrap().1;
     let Resolved::Object(function) = field("function") else {
@@ -162,10 +179,54 @@ async fn a_none_workload_stores_its_resolved_document() {
     // The workload's outputs show the database host; the password is a
     // secret output, kept as a reference.
     let workload = f.active(WORKLOAD).await.unwrap();
-    let variables = &workload.outputs["containers"]["web"]["variables"];
+    assert_eq!(workload.outputs["id"], "web");
+    assert_eq!(
+        workload.outputs["dependencies"]["db"]["host"],
+        "postgres.internal"
+    );
+    let spec = &workload.outputs["spec"];
+    let variables = &spec["containers"]["web"]["variables"];
     assert_eq!(variables["DB_HOST"], "postgres.internal", "{variables}");
     assert!(variables.get("DB_PASSWORD").is_none(), "{variables}");
-    assert_eq!(workload.outputs["containers"]["web"]["image"], "nginx");
-    let password = &workload.secret_outputs["containers.web.variables.DB_PASSWORD"];
+    assert_eq!(spec["containers"]["web"]["image"], "nginx");
+    let password = &workload.secret_outputs["spec.containers.web.variables.DB_PASSWORD"];
     assert_eq!(password.reference, "pg-password");
+}
+
+#[tokio::test]
+async fn file_content_marked_no_expand_reaches_the_driver_literally() {
+    const TEMPLATED: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web:
+    image: nginx
+    files:
+      /etc/nginx/conf.d/app.conf:
+        content: "root ${HOME}; ${context.env.id} ${"
+        noExpand: true
+      /etc/app/db:
+        content: "host=${resources.db.host}"
+resources:
+  db: {type: postgres}
+"#;
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let deployment = f
+        .accept_set(Some(TEMPLATED), with_workloads("openporch/none"))
+        .await
+        .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+    assert!(
+        outcomes.values().all(|o| *o == Outcome::Provisioned),
+        "{outcomes:?}"
+    );
+    let workload = f.active(WORKLOAD).await.unwrap();
+    let files = &workload.outputs["spec"]["containers"]["web"]["files"];
+    assert_eq!(
+        files["/etc/nginx/conf.d/app.conf"]["content"],
+        "root ${HOME}; ${context.env.id} ${"
+    );
+    assert_eq!(files["/etc/app/db"]["content"], "host=postgres.internal");
 }

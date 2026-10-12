@@ -822,10 +822,11 @@ async fn no_secret_value_reaches_the_planner() {
         matches!(&secrets[0].1, Resolved::Secret(e) if matches!(&e.parts[..],
         [SecretPart::Literal(l), SecretPart::Secret(r)] if l == "Bearer " && r.reference == "dns-token"))
     );
-    // The workload's variables use the database password.
+    // The workload gets the database password with its dependencies'
+    // outputs and in its variables.
     let mut read = fake.read.lock().unwrap().clone();
     read.sort();
-    assert_eq!(read, [MASTER, PASSWORD, TOKEN]);
+    assert_eq!(read, [MASTER, PASSWORD, PASSWORD, TOKEN]);
 
     // The plaintexts are in no job, outcome or deployment record.
     let jobs = fake.jobs.lock().unwrap().clone();
