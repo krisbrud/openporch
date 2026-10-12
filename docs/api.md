@@ -1452,8 +1452,8 @@ later edits do not affect it. The deployment is returned at once with status
 `in_progress`. It then becomes `succeeded` or `failed`, and only success changes
 the environment's last successful deployment and set.
 
-Provisioning resources is not implemented yet, so for now every deployment
-fails once accepted.
+The server does not provision resources yet, so for now every deployment fails
+once accepted.
 
 ```http
 POST /orgs/acme/apps
@@ -1607,6 +1607,48 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"id": "$DEPLOY", "set_id": "$BLOG_SET"}
+```
+
+## Active resources
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/resources` | app read |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | app read |
+| GET | `/orgs/{org}/resources/defs/{def}/resources` | org read all |
+
+An active resource is something a deployment provisioned in an environment. It
+keeps its `guresid`, a permanent ID that drivers and OpenTofu state are keyed
+by, in every later deployment. Each resource shows its definition and driver, its
+`status`, its non-secret `outputs`, the names of its `secret_outputs` (never
+their values or references), the resources it depends on, and its `usage`:
+
+- `last_deploy_id`: the deployment that last provisioned it.
+- `deploys_ago`: how many of the environment's deployments came after that one.
+  `0` means the latest deployment provisioned it. After a failed update it
+  counts from the last success, and `outputs` are still that success's.
+- `referenced`: whether the environment's latest deployment includes it.
+
+A resource that a later deployment no longer includes stays tracked, with
+`referenced: false`, because it still exists and may cost money. Including it
+again reuses it with its data. If a definition switches an existing resource to
+a different driver, the deployment fails with a conflict and the resource keeps
+its driver and state, since moving it is an explicit migration. Scheduling
+deletion and detaching resources are not implemented yet.
+
+Resources are listed by descriptor. The single-resource path takes the type and
+resource ID, such as `postgres/modules.web.externals.db`. Listing a definition's
+resources across every application needs organization-wide read access.
+
+```http
+GET /orgs/acme/apps/blog/envs/development/resources
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"resources": []}
 ```
 
 ## Audit log

@@ -160,6 +160,7 @@ impl From<StoreError> for ApiError {
             | StoreError::StaleGeneration { .. }
             | StoreError::Busy(_)
             | StoreError::RecoveryRequired(_)
+            | StoreError::MigrationRequired { .. }
             | StoreError::IdempotencyMismatch(_) => Self::conflict(e.to_string()),
             StoreError::Forbidden(_) => Self::forbidden(e.to_string()),
             StoreError::Invalid(_) => Self::invalid(e.to_string()),

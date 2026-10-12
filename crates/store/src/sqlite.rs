@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use openporch_core::ids::Guresid;
-use openporch_core::model::SecretRef;
 use openporch_core::sets::{DeploymentSet, SET_ID_ALGORITHM};
 use rand::RngCore;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -1095,8 +1093,8 @@ impl Store for SqliteStore {
                 )));
             }
         }
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT guresid, status FROM active_resources \
+        let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT guresid, status, driver_type FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1110,10 +1108,22 @@ impl Store for SqliteStore {
             OperationKind::Delete => "deleting",
         };
         let guresid = match existing {
-            Some((_, status)) if status == "unknown" || status == "recovery_required" => {
+            Some((_, status, _)) if status == "unknown" || status == "recovery_required" => {
                 return Err(StoreError::RecoveryRequired(descriptor));
             }
-            Some((guresid, _)) => {
+            // A different driver cannot take over a resource another driver
+            // manages: that is a migration, which only an operator starts.
+            Some((_, _, Some(current)))
+                if start.kind == OperationKind::Put
+                    && start.driver_type.as_ref().is_some_and(|d| *d != current) =>
+            {
+                return Err(StoreError::MigrationRequired {
+                    descriptor,
+                    from: current,
+                    to: start.driver_type.clone().unwrap_or_default(),
+                });
+            }
+            Some((guresid, _, _)) => {
                 let open: Option<String> = sqlx::query_scalar(
                     "SELECT id FROM operations WHERE guresid = ? AND state = 'started'",
                 )
@@ -1273,12 +1283,15 @@ impl Store for SqliteStore {
                     secret_outputs,
                     cookie,
                     recovery,
+                    inputs,
+                    dependencies,
+                    snapshot,
                 } = &**p;
                 sqlx::query(
                     "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
                      secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
-                     recovery = ?, last_deploy_id = ?, observed_at = ?, updated_at = ? \
-                     WHERE guresid = ?",
+                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, \
+                     last_deploy_id = ?, observed_at = ?, updated_at = ? WHERE guresid = ?",
                 )
                 .bind(serde_json::to_string(outputs)?)
                 .bind(serde_json::to_string(secret_outputs)?)
@@ -1286,6 +1299,9 @@ impl Store for SqliteStore {
                 .bind(cookie.as_ref().map(|c| c.nonce.clone()))
                 .bind(cookie.as_ref().map(|c| c.ciphertext.clone()))
                 .bind(serde_json::to_string(recovery)?)
+                .bind(serde_json::to_string(inputs)?)
+                .bind(serde_json::to_string(dependencies)?)
+                .bind(serde_json::to_string(snapshot)?)
                 .bind(&deployment_id)
                 .bind(now)
                 .bind(now)
@@ -1446,52 +1462,51 @@ impl Store for SqliteStore {
         descriptor: &str,
     ) -> Result<Option<ActiveResource>> {
         self.check_org(org)?;
-        #[allow(clippy::type_complexity)]
-        let row: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<String>,
-            Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT guresid, definition_id, driver_type, status, outputs, secret_outputs, \
-             cookie_key_id, cookie_nonce, cookie, last_deploy_id, observed_at FROM active_resources \
-             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
-        )
+        let row: Option<ResourceRow> = sqlx::query_as(&format!(
+            "{RESOURCE_COLUMNS} WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?"
+        ))
         .bind(org)
         .bind(app)
         .bind(env)
         .bind(descriptor)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(r) = row else { return Ok(None) };
-        let secret_outputs: BTreeMap<String, SecretRef> = serde_json::from_str(&r.5)?;
-        let cookie = match (r.6, r.7, r.8) {
-            (Some(key_id), Some(nonce), Some(ciphertext)) => Some(Sealed {
-                key_id,
-                nonce,
-                ciphertext,
-            }),
-            _ => None,
-        };
-        Ok(Some(ActiveResource {
-            descriptor: descriptor.to_owned(),
-            guresid: r.0,
-            definition_id: r.1,
-            driver_type: r.2,
-            status: r.3,
-            outputs: serde_json::from_str(&r.4)?,
-            secret_outputs,
-            cookie,
-            last_deploy_id: r.9,
-            observed_at: r.10,
-        }))
+        row.map(ResourceRow::into_resource).transpose()
+    }
+
+    async fn active_resources(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+    ) -> Result<Vec<ActiveResource>> {
+        self.check_org(org)?;
+        let rows: Vec<ResourceRow> = sqlx::query_as(&format!(
+            "{RESOURCE_COLUMNS} WHERE org_id = ? AND app_id = ? AND env_id = ? ORDER BY descriptor"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ResourceRow::into_resource).collect()
+    }
+
+    async fn definition_resources(
+        &self,
+        org: &str,
+        definition: &str,
+    ) -> Result<Vec<ActiveResource>> {
+        self.check_org(org)?;
+        let rows: Vec<ResourceRow> = sqlx::query_as(&format!(
+            "{RESOURCE_COLUMNS} WHERE org_id = ? AND definition_id = ? \
+             ORDER BY app_id, env_id, descriptor"
+        ))
+        .bind(org)
+        .bind(definition)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ResourceRow::into_resource).collect()
     }
 
     async fn finish_deployment(
@@ -1679,6 +1694,71 @@ async fn finish_in_tx(
     };
     audit::insert(conn, &intent, Some(id), correlates.as_deref()).await?;
     Ok(())
+}
+
+const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
+     definition_version, driver_type, status, inputs, outputs, secret_outputs, cookie_key_id, \
+     cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
+     observed_at, created_at FROM active_resources";
+
+/// An `active_resources` row.
+#[derive(sqlx::FromRow)]
+struct ResourceRow {
+    app_id: String,
+    env_id: String,
+    descriptor: String,
+    guresid: String,
+    definition_id: Option<String>,
+    definition_version: Option<i64>,
+    driver_type: Option<String>,
+    status: String,
+    inputs: String,
+    outputs: String,
+    secret_outputs: String,
+    cookie_key_id: Option<String>,
+    cookie_nonce: Option<Vec<u8>>,
+    cookie: Option<Vec<u8>>,
+    snapshot: String,
+    ownership: String,
+    dependencies: String,
+    last_deploy_id: Option<String>,
+    scheduled_deletion: bool,
+    observed_at: Option<i64>,
+    created_at: i64,
+}
+
+impl ResourceRow {
+    fn into_resource(self) -> Result<ActiveResource> {
+        let cookie = match (self.cookie_key_id, self.cookie_nonce, self.cookie) {
+            (Some(key_id), Some(nonce), Some(ciphertext)) => Some(Sealed {
+                key_id,
+                nonce,
+                ciphertext,
+            }),
+            _ => None,
+        };
+        Ok(ActiveResource {
+            app: self.app_id,
+            env: self.env_id,
+            descriptor: self.descriptor,
+            guresid: self.guresid,
+            definition_id: self.definition_id,
+            definition_version: self.definition_version,
+            driver_type: self.driver_type,
+            status: self.status,
+            inputs: serde_json::from_str(&self.inputs)?,
+            outputs: serde_json::from_str(&self.outputs)?,
+            secret_outputs: serde_json::from_str(&self.secret_outputs)?,
+            cookie,
+            snapshot: serde_json::from_str(&self.snapshot)?,
+            ownership: self.ownership,
+            dependencies: serde_json::from_str(&self.dependencies)?,
+            last_deploy_id: self.last_deploy_id,
+            scheduled_deletion: self.scheduled_deletion,
+            observed_at: self.observed_at,
+            created_at: self.created_at,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -552,6 +552,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     StoreError::RecoveryRequired(_) => Outcome::Failed(format!(
                         "an earlier operation's outcome is unknown; recover the resource first ({e})"
                     )),
+                    StoreError::MigrationRequired { .. } => Outcome::Failed(e.to_string()),
                     other => Outcome::Failed(format!("the operation was not recorded: {other}")),
                 })?;
             self.scope
@@ -571,6 +572,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 }
             };
             let account = job.driver_account.clone();
+            let inputs = serde_json::to_value(&job.inputs).unwrap_or(Value::Null);
             let recorded = self
                 .store
                 .record_operation_inputs(
@@ -618,6 +620,17 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                 secret_outputs: provisioned.secret_outputs,
                                 cookie: provisioned.cookie,
                                 recovery: provisioned.recovery,
+                                inputs: inputs.clone(),
+                                dependencies: node
+                                    .depends_on
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect(),
+                                snapshot: json!({
+                                    "deployment_id": deployment.id,
+                                    "definition_version": version,
+                                    "definition": def,
+                                }),
                             })),
                         )
                         .await;

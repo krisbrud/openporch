@@ -31,6 +31,7 @@ mod envs;
 mod github;
 mod keys;
 mod limits;
+mod resources;
 mod secret_use;
 mod sets;
 mod tls;

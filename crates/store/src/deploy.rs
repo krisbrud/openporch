@@ -243,6 +243,13 @@ pub struct Provisioned {
     pub cookie: Option<Sealed>,
     /// Recovery metadata after the operation.
     pub recovery: Value,
+    /// The inputs it was provisioned with, secrets as references.
+    pub inputs: Value,
+    /// The descriptors of the resources it depends on.
+    pub dependencies: Vec<String>,
+    /// The configuration it was provisioned from, such as its definition and
+    /// version.
+    pub snapshot: Value,
 }
 
 /// The outcome of a driver operation.
@@ -291,16 +298,24 @@ impl ResourceRunStatus {
 /// An active resource.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveResource {
+    /// Application.
+    pub app: String,
+    /// Environment.
+    pub env: String,
     /// `<type>.<class>#<res_id>`.
     pub descriptor: String,
     /// Permanent identity.
     pub guresid: String,
     /// The matched definition.
     pub definition_id: Option<String>,
+    /// The definition's version.
+    pub definition_version: Option<i64>,
     /// The driver.
     pub driver_type: Option<String>,
     /// Status.
     pub status: String,
+    /// The inputs of the last successful operation, secrets as references.
+    pub inputs: Value,
     /// Non-secret outputs.
     pub outputs: Value,
     /// Secret outputs as references.
@@ -308,10 +323,20 @@ pub struct ActiveResource {
     /// The encrypted cookie.
     #[serde(skip)]
     pub cookie: Option<Sealed>,
+    /// The configuration of the last successful operation.
+    pub snapshot: Value,
+    /// `owned`, `adopted` or `external`.
+    pub ownership: String,
+    /// The descriptors of the resources it depends on.
+    pub dependencies: Vec<String>,
     /// The deployment that last provisioned it.
     pub last_deploy_id: Option<String>,
+    /// Whether it is deleted by the next deployment that leaves it out.
+    pub scheduled_deletion: bool,
     /// When the status was last observed.
     pub observed_at: Option<i64>,
+    /// When it was first recorded.
+    pub created_at: i64,
 }
 
 /// A driver operation whose outcome is unknown after a restart.

@@ -9,7 +9,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use openporch_store::Store;
+use openporch_engine::planner::{Deployment, Executor, Planner};
+use openporch_store::{SqliteStore, Store};
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -49,6 +50,66 @@ impl Runner for Unimplemented {
             .await;
         })
     }
+}
+
+/// Runs deployments through the planner with executor `E`.
+pub struct PlannerRunner<E>(Arc<Planner<SqliteStore, E>>);
+
+impl<E> PlannerRunner<E> {
+    /// A runner over `planner`.
+    pub fn new(planner: Arc<Planner<SqliteStore, E>>) -> Self {
+        Self(planner)
+    }
+}
+
+impl<E> std::fmt::Debug for PlannerRunner<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PlannerRunner").field(&self.0).finish()
+    }
+}
+
+impl<E: Executor> Runner for PlannerRunner<E> {
+    fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let planner = self.0.clone();
+        Box::pin(async move {
+            match deployment(&state, &job).await {
+                Ok(deployment) => {
+                    planner.run(deployment).await;
+                }
+                Err(error) => finish(&state, &job, Some(error)).await,
+            }
+        })
+    }
+}
+
+/// The planner's view of `job`, from its execution snapshot.
+async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
+    let org = state.org();
+    let env = state
+        .store
+        .env(org, &job.app, &job.env)
+        .await
+        .map_err(|e| format!("the environment could not be read: {e}"))?
+        .ok_or_else(|| format!("environment `{}/{}` no longer exists", job.app, job.env))?;
+    let set_id = state
+        .store
+        .deployment(org, &job.app, &job.env, &job.id)
+        .await
+        .map_err(|e| format!("the deployment could not be read: {e}"))?
+        .and_then(|d| d.set_id)
+        .unwrap_or_default();
+    let invalid = |what: &str| format!("the stored {what} ID is invalid");
+    Deployment::from_snapshot(
+        org.parse().map_err(|_| invalid("organization"))?,
+        job.app.parse().map_err(|_| invalid("application"))?,
+        job.env.parse().map_err(|_| invalid("environment"))?,
+        env.env_type
+            .parse()
+            .map_err(|_| invalid("environment type"))?,
+        job.id.clone(),
+        set_id,
+        &job.snapshot,
+    )
 }
 
 /// Finishes `job`'s deployment; a failure to record it leaves the deployment
