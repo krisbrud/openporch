@@ -1223,6 +1223,9 @@ impl Store for SqliteStore {
                     "active resource `{descriptor}`"
                 )));
             }
+            None if detached(&mut tx, org, app, env, &descriptor).await? => {
+                return Err(StoreError::Detached(descriptor));
+            }
             None => {
                 let guresid = new_guresid();
                 sqlx::query(
@@ -1364,11 +1367,14 @@ impl Store for SqliteStore {
                     snapshot,
                     account,
                     target,
+                    backend,
+                    external_ids,
                 } = &**p;
                 sqlx::query(
                     "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
                      secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
                      recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, target = ?, \
+                     backend = ?, external_ids = ?, \
                      definition_id = COALESCE(o.definition_id, active_resources.definition_id), \
                      definition_version = COALESCE(o.definition_version, \
                      active_resources.definition_version), \
@@ -1388,6 +1394,8 @@ impl Store for SqliteStore {
                 .bind(serde_json::to_string(snapshot)?)
                 .bind(account)
                 .bind(target)
+                .bind(backend)
+                .bind(serde_json::to_string(external_ids)?)
                 .bind(&deployment_id)
                 .bind(now)
                 .bind(now)
@@ -1607,6 +1615,137 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(ResourceRow::into_resource).collect()
+    }
+
+    async fn detach_resource(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        detach: Detach<'_>,
+        audit: AuditIntent,
+    ) -> Result<Tombstone> {
+        let Detach {
+            descriptor,
+            guresid: expected,
+            reason,
+        } = detach;
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        let running: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status = 'in_progress'",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = running {
+            return Err(StoreError::Busy(id));
+        }
+        let row: Option<(String, String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT guresid, status, cleanup_pending, last_deploy_id FROM active_resources \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(descriptor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (guresid, status, cleanup_pending, last_deploy) =
+            row.ok_or_else(|| StoreError::NotFound(format!("active resource `{descriptor}`")))?;
+        if guresid != expected {
+            return Err(StoreError::Conflict(format!(
+                "`{descriptor}` was replaced by another resource; check it again"
+            )));
+        }
+        if status == "unknown" || status == "recovery_required" {
+            return Err(StoreError::RecoveryRequired(descriptor.to_owned()));
+        }
+        // Nothing was created, so nothing is left to manage elsewhere; a
+        // tombstone would only block the descriptor.
+        if last_deploy.is_none() {
+            return Err(StoreError::Conflict(format!(
+                "`{descriptor}` never provisioned; delete it or deploy it instead"
+            )));
+        }
+        // The object is already gone; only its record remains to be removed.
+        if cleanup_pending {
+            return Err(StoreError::Conflict(format!(
+                "`{descriptor}` was already deleted; the next deployment that leaves it out \
+                 removes its record"
+            )));
+        }
+        let open: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM operations WHERE guresid = ? AND state IN ('started', 'unknown')",
+        )
+        .bind(&guresid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(op) = open {
+            return Err(StoreError::Conflict(format!(
+                "operation `{op}` on `{descriptor}` has not finished"
+            )));
+        }
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
+             actor_id, body, at, cookie_key_id, cookie_nonce, cookie, secret_outputs) \
+             SELECT org_id, app_id, \
+             env_id, descriptor, guresid, 'detached', ?, json_object('definition_id', \
+             definition_id, 'definition_version', definition_version, 'driver_type', \
+             driver_type, 'driver_account', driver_account, 'target', target, 'ownership', \
+             ownership, 'external_ids', json(external_ids), 'backend', backend, 'outputs', \
+             json(outputs), 'snapshot', json(snapshot), 'recovery', json(recovery), \
+             'dependencies', json(dependencies), 'reason', ?), ?, cookie_key_id, \
+             cookie_nonce, cookie, secret_outputs \
+             FROM active_resources WHERE guresid = ?",
+        )
+        .bind(&audit.actor)
+        .bind(reason)
+        .bind(now)
+        .bind(&guresid)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM active_resources WHERE guresid = ?")
+            .bind(&guresid)
+            .execute(&mut *tx)
+            .await?;
+        // What the next deployment does changes.
+        sqlx::query(
+            "UPDATE envs SET generation = generation + 1 WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        let tombstone = sqlx::query_as::<_, TombstoneRow>(&format!(
+            "{TOMBSTONE_COLUMNS} WHERE guresid = ? ORDER BY seq DESC LIMIT 1"
+        ))
+        .bind(&guresid)
+        .fetch_one(&mut *tx)
+        .await?
+        .into_tombstone()?;
+        tx.commit().await?;
+        Ok(tombstone)
+    }
+
+    async fn tombstones(&self, org: &str, app: &str, env: &str) -> Result<Vec<Tombstone>> {
+        self.check_org(org)?;
+        let rows: Vec<TombstoneRow> = sqlx::query_as(&format!(
+            "{TOMBSTONE_COLUMNS} WHERE org_id = ? AND app_id = ? AND env_id = ? ORDER BY seq"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TombstoneRow::into_tombstone).collect()
     }
 
     async fn schedule_deletion(
@@ -2001,3 +2140,55 @@ impl ResourceRow {
 
 #[cfg(test)]
 mod tests;
+
+const TOMBSTONE_COLUMNS: &str =
+    "SELECT app_id, env_id, descriptor, guresid, reason, actor_id, body, at FROM tombstones";
+
+#[derive(sqlx::FromRow)]
+struct TombstoneRow {
+    app_id: String,
+    env_id: String,
+    descriptor: String,
+    guresid: String,
+    reason: String,
+    actor_id: Option<String>,
+    body: String,
+    at: i64,
+}
+
+impl TombstoneRow {
+    fn into_tombstone(self) -> Result<Tombstone> {
+        Ok(Tombstone {
+            app: self.app_id,
+            env: self.env_id,
+            descriptor: self.descriptor,
+            guresid: self.guresid,
+            reason: self.reason,
+            actor: self.actor_id,
+            body: serde_json::from_str(&self.body)?,
+            at: self.at,
+        })
+    }
+}
+
+/// Whether `descriptor` was detached and not managed since: its latest
+/// tombstone is a detach.
+async fn detached(
+    conn: &mut SqliteConnection,
+    org: &str,
+    app: &str,
+    env: &str,
+    descriptor: &str,
+) -> Result<bool> {
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT reason FROM tombstones WHERE org_id = ? AND app_id = ? AND env_id = ? \
+         AND descriptor = ? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .bind(descriptor)
+    .fetch_optional(conn)
+    .await?;
+    Ok(reason.as_deref() == Some("detached"))
+}

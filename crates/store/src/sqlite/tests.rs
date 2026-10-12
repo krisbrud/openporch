@@ -172,6 +172,8 @@ fn provisioned(host: &str) -> CheckpointResult {
         snapshot: json!({"definition_version": 1}),
         account: None,
         target: None,
+        backend: None,
+        external_ids: Vec::new(),
     }))
 }
 

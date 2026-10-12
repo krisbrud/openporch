@@ -254,6 +254,10 @@ pub struct Provisioned {
     pub account: Option<String>,
     /// What the account resolved to, such as an AWS account number.
     pub target: Option<String>,
+    /// Where the driver keeps the resource's state, such as an S3 location.
+    pub backend: Option<String>,
+    /// The cloud objects the resource consists of, such as ARNs.
+    pub external_ids: Vec<String>,
 }
 
 /// The outcome of a driver operation.
@@ -304,6 +308,39 @@ impl ResourceRunStatus {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// A request to detach a resource.
+#[derive(Debug, Clone, Copy)]
+pub struct Detach<'a> {
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: &'a str,
+    /// The identity the caller checked its permit against.
+    pub guresid: &'a str,
+    /// Why; recorded in the tombstone and the audit log.
+    pub reason: &'a str,
+}
+
+/// What remains of a resource that was deleted or detached.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Tombstone {
+    /// Application.
+    pub app: String,
+    /// Environment.
+    pub env: String,
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: String,
+    /// The resource's permanent identity.
+    pub guresid: String,
+    /// `deleted` or `detached`.
+    pub reason: String,
+    /// Who detached it.
+    pub actor: Option<String>,
+    /// Definition, driver, cloud account, object IDs and state location, plus
+    /// the operator's reason for a detach. Never secrets.
+    pub body: serde_json::Value,
+    /// When.
+    pub at: i64,
 }
 
 /// An active resource. It holds secret references and the encrypted cookie,

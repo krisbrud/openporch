@@ -184,7 +184,19 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             return Ok(());
         }
         // Who uses each resource, by the dependencies recorded when they last
-        // provisioned.
+        // provisioned. A detached resource keeps running outside openporch, so
+        // it still uses what it depended on.
+        let tombstones = match self
+            .store
+            .tombstones(d.org.as_str(), d.app.as_str(), d.env.as_str())
+            .await
+        {
+            Ok(tombstones) => tombstones,
+            Err(e) => {
+                tracing::error!(deployment = %d.id, error = %e, "could not list tombstones");
+                return Err(format!("the resources to delete could not be listed: {e}"));
+            }
+        };
         let mut users: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for r in &active {
             for dep in &r.dependencies {
@@ -192,6 +204,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     .entry(dep.clone())
                     .or_default()
                     .insert(r.descriptor.clone());
+            }
+        }
+        for t in tombstones.iter().filter(|t| t.reason == "detached") {
+            for dep in t.body["dependencies"].as_array().into_iter().flatten() {
+                if let Some(dep) = dep.as_str() {
+                    users
+                        .entry(dep.to_owned())
+                        .or_default()
+                        .insert(format!("{} (detached)", t.descriptor));
+                }
             }
         }
         let candidate_names: BTreeSet<String> =

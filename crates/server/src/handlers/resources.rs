@@ -9,13 +9,14 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::ids::Descriptor;
-use openporch_store::{ActiveResource, EnvRecord, Store};
-use serde::Serialize;
+use openporch_engine::planner::{DestructiveAction, PermitRequest};
+use openporch_store::{ActiveResource, Detach, EnvRecord, Store, Tombstone};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::catalog::definition_or_404;
 use super::envs::env_or_404;
-use crate::api::Ctx;
+use crate::api::{Ctx, JsonBody};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -228,6 +229,95 @@ pub async fn schedule_deletion(
     };
     let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
     Ok((StatusCode::ACCEPTED, Json(usage.view(resource))))
+}
+
+/// The longest detach reason accepted.
+const MAX_REASON: usize = 1000;
+
+/// A request to detach a resource.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachRequest {
+    /// Why; recorded in the tombstone and the audit log.
+    pub reason: String,
+    /// Destructive-action permits.
+    #[serde(default)]
+    pub permits: Vec<String>,
+}
+
+/// `POST /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/detach`:
+/// stops managing the resource without calling its driver, so the real object
+/// stays, and returns its tombstone.
+pub async fn detach(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env, ty, res_id)): Path<(String, String, String, String, String)>,
+    JsonBody(req): JsonBody<DetachRequest>,
+) -> ApiResult<Json<Tombstone>> {
+    let reason = req.reason.trim();
+    if reason.is_empty() || reason.chars().count() > MAX_REASON {
+        return Err(ApiError::invalid(format!(
+            "`reason` must hold 1 to {MAX_REASON} characters"
+        )));
+    }
+    let env = env_or_404(&state, &app, &env).await?;
+    let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
+    let org = state.org();
+    state
+        .permits
+        .get()
+        .check(PermitRequest {
+            org,
+            app: &env.app,
+            env: &env.id,
+            descriptor: &resource.descriptor,
+            action: DestructiveAction::Detach,
+            permits: &req.permits,
+        })
+        .await
+        .map_err(|e| ApiError::conflict(format!("approval_required: {e}")))?;
+    let mut audit = ctx.audit(
+        org,
+        "resource.detach",
+        format!("{}/{}/{}", env.app, env.id, resource.descriptor),
+    );
+    audit.reason = Some(reason.to_owned());
+    let tombstone = state
+        .store
+        .detach_resource(
+            org,
+            &env.app,
+            &env.id,
+            Detach {
+                descriptor: &resource.descriptor,
+                guresid: &resource.guresid,
+                reason,
+            },
+            audit,
+        )
+        .await?;
+    Ok(Json(tombstone))
+}
+
+/// A list of tombstones.
+#[derive(Debug, Serialize)]
+pub struct TombstoneList {
+    /// The tombstones, oldest first.
+    pub tombstones: Vec<Tombstone>,
+}
+
+/// `GET /orgs/{org}/apps/{app}/envs/{env}/tombstones`: what remains of the
+/// environment's deleted and detached resources.
+pub async fn tombstones(
+    State(state): State<AppState>,
+    Path((_, app, env)): Path<(String, String, String)>,
+) -> ApiResult<Json<TombstoneList>> {
+    let env = env_or_404(&state, &app, &env).await?;
+    let tombstones = state
+        .store
+        .tombstones(state.org(), &env.app, &env.id)
+        .await?;
+    Ok(Json(TombstoneList { tombstones }))
 }
 
 /// `GET /orgs/{org}/resources/defs/{def}/resources`: every environment's

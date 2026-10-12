@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use openporch_engine::planner::{Deployment, Executor, Planner};
+use openporch_engine::planner::{Deployment, Executor, NoPermits, PermitCheck, Planner};
 use openporch_store::{SqliteStore, Store};
 use serde_json::Value;
 
@@ -156,5 +156,29 @@ impl Runners {
                 .await;
             }
         });
+    }
+}
+
+/// Checks destructive-action permits presented to the API, such as for a
+/// detach. Refuses everything until permits can be issued.
+#[derive(Debug)]
+pub struct Permits(RwLock<Arc<dyn PermitCheck>>);
+
+impl Default for Permits {
+    fn default() -> Self {
+        Self(RwLock::new(Arc::new(NoPermits)))
+    }
+}
+
+impl Permits {
+    /// Replaces the check.
+    pub fn set(&self, check: Arc<dyn PermitCheck>) {
+        let mut current = self.0.write().unwrap_or_else(|e| e.into_inner());
+        *current = check;
+    }
+
+    /// The current check.
+    pub fn get(&self) -> Arc<dyn PermitCheck> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }

@@ -23,8 +23,9 @@ mod sqlite_values;
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
-    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, UncertainOperation,
+    DeploymentStatus, Detach, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
+    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
+    UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -326,6 +327,28 @@ pub trait Store: Send + Sync {
         descriptor: &str,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Detaches an active resource: removes it from management without calling
+    /// its driver and leaves a tombstone. Needs an administrator, and no
+    /// running deployment or open or uncertain operation on the resource. The
+    /// descriptor is not provisioned again until it is adopted. A resource
+    /// replaced since the caller checked its permit is refused.
+    fn detach_resource(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        detach: Detach<'_>,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Tombstone>> + Send;
+
+    /// Lists an environment's tombstones, oldest first.
+    fn tombstones(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+    ) -> impl Future<Output = Result<Vec<Tombstone>>> + Send;
 
     /// Finishes a deployment and records its correlated audit outcome. Success also
     /// sets the environment's last successful deployment and set.

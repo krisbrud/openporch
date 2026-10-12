@@ -12,6 +12,7 @@ use openporch_store::secrets::{
     BuiltinSecretStore, Keyring, MasterKey, SecretStore as _, SecretValue,
 };
 use openporch_store::{AuditIntent, DeploymentRequest, DeploymentStatus, Ownership, SqliteStore};
+use openporch_store::{Detach, Tombstone};
 use tokio::sync::Barrier;
 
 use super::*;
@@ -176,6 +177,7 @@ impl Executor for Fake {
             .cloned()
             .unwrap_or(Behavior::Succeed);
         let ty = job.descriptor.ty.to_string();
+        let guresid = job.guresid.clone();
         let mut refs = Vec::new();
         for input in [
             &job.inputs.secrets,
@@ -217,6 +219,13 @@ impl Executor for Fake {
             provisioned.target = Some("111122223333".into());
         }
         provisioned.recovery = json!({"state": format!("{ty}-state")});
+        provisioned.backend = Some(format!("s3://state/{guresid}"));
+        provisioned.external_ids = vec![format!("arn:aws:{ty}:{guresid}")];
+        provisioned.cookie = Some(Sealed {
+            key_id: "k1".into(),
+            nonce: vec![0; 12],
+            ciphertext: format!("{ty}-cookie").into_bytes(),
+        });
         let secret = match ty.as_str() {
             "dns" => Some(("token", "dns-token", TOKEN)),
             "postgres" => Some(("password", "pg-password", PASSWORD)),
@@ -294,7 +303,11 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let ownership = Ownership::acquire(dir.path()).unwrap();
         let store = SqliteStore::open(ownership, ORG).await.unwrap();
-        for (id, role) in [("alice", "manager"), ("ci", "member")] {
+        for (id, role) in [
+            ("alice", "manager"),
+            ("ci", "member"),
+            ("root", "administrator"),
+        ] {
             sqlx::query(
                 "INSERT INTO principals (org_id, id, type, name, org_role, created_at) \
                  VALUES (?, ?, 'user', ?, ?, 0)",
@@ -1489,4 +1502,207 @@ async fn deletion_keeps_the_drivers_recovery_metadata_and_ignores_lookalikes() {
             .await
             .unwrap();
     assert_eq!(serde_json::from_str::<Value>(&kept).unwrap(), recovery);
+}
+
+#[tokio::test]
+async fn a_detached_resource_is_not_provisioned_again() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let db = f.active(DB).await.unwrap();
+    let detach = |actor: &str| {
+        let store = f.store.clone();
+        let guresid = db.guresid.clone();
+        let audit = AuditIntent::accepted(ORG, actor, "POST", "/detach", "resource.detach");
+        async move {
+            store
+                .detach_resource(
+                    ORG,
+                    "shop",
+                    "development",
+                    Detach {
+                        descriptor: DB,
+                        guresid: &guresid,
+                        reason: "moved to a shared cluster",
+                    },
+                    audit,
+                )
+                .await
+        }
+    };
+    let refused = detach("ci").await;
+    assert!(
+        matches!(refused, Err(StoreError::Forbidden(_))),
+        "{refused:?}"
+    );
+
+    let tombstone = detach("root").await.unwrap();
+    assert_eq!(tombstone.descriptor, DB);
+    assert_eq!(tombstone.guresid, db.guresid);
+    assert_eq!(tombstone.reason, "detached");
+    assert_eq!(tombstone.actor.as_deref(), Some("root"));
+    assert_eq!(tombstone.body["reason"], "moved to a shared cluster");
+    assert_eq!(tombstone.body["driver_type"], "openporch/echo");
+    // It keeps what a later adoption needs: the objects, where their state
+    // is, the definition and the driver's recovery data and cookie.
+    assert_eq!(
+        tombstone.body["backend"],
+        format!("s3://state/{}", db.guresid)
+    );
+    assert_eq!(
+        tombstone.body["external_ids"],
+        json!([format!("arn:aws:postgres:{}", db.guresid)])
+    );
+    assert_eq!(tombstone.body["snapshot"], db.snapshot);
+    assert_eq!(
+        tombstone.body["recovery"],
+        json!({"state": "postgres-state"})
+    );
+    let (cookie,): (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT cookie FROM tombstones WHERE guresid = ? AND reason = 'detached'")
+            .bind(&db.guresid)
+            .fetch_one(f.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(cookie, Some(b"postgres-cookie".to_vec()));
+    assert!(f.active(DB).await.is_none());
+    assert!(fake.deletions().is_empty());
+
+    // The next deployment does not create a second database.
+    let next = f.accept().await;
+    let outcomes = planner(&f, &fake, fast()).run(next).await;
+    assert!(
+        matches!(&outcomes[&d(DB)], Outcome::Failed(e) if e.contains("detached")),
+        "{outcomes:?}"
+    );
+    assert_eq!(fake.attempts(DB), 1);
+    assert!(f.active(DB).await.is_none());
+}
+
+/// Detaches `descriptor` as the administrator.
+async fn detach_as_root(f: &Fixture, descriptor: &str) -> Result<Tombstone, StoreError> {
+    let guresid = f.active(descriptor).await.unwrap().guresid;
+    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
+    f.store
+        .detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor,
+                guresid: &guresid,
+                reason: "gone",
+            },
+            audit,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn what_a_detached_resource_uses_is_kept() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let workload = f.active(WORKLOAD).await.unwrap();
+    assert!(workload.dependencies.contains(&DB.to_owned()));
+    detach_as_root(&f, WORKLOAD).await.unwrap();
+
+    // The workload keeps running outside openporch, so its database stays even
+    // when scheduled for deletion.
+    f.schedule(DB).await;
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let checks = Arc::new(AllowAll::default());
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    assert_eq!(
+        outcomes[&d(DB)],
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{WORKLOAD} (detached)`"
+        ))
+    );
+    assert!(!fake.deletions().contains(&DB.to_owned()));
+    assert!(f.active(DB).await.is_some());
+}
+
+#[tokio::test]
+async fn detach_is_refused_while_anything_is_in_flight_or_changed() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("workload", Behavior::Permanent)]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+
+    // A resource that never provisioned has nothing to detach.
+    let refused = detach_as_root(&f, WORKLOAD).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("never provisioned")),
+        "{refused:?}"
+    );
+
+    // The permit was checked against another resource with the same descriptor.
+    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
+    let refused = f
+        .store
+        .detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor: DB,
+                guresid: "older-guresid",
+                reason: "gone",
+            },
+            audit,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("replaced")),
+        "{refused:?}"
+    );
+
+    // A deployment is running.
+    let running = f.accept().await;
+    let refused = detach_as_root(&f, DB).await;
+    assert!(matches!(refused, Err(StoreError::Busy(_))), "{refused:?}");
+
+    // An operation on the resource is still open after its deployment ended.
+    open_deletion(&f, &running, DB).await;
+    planner(&f, &fake, fast()).run(running).await;
+    let refused = detach_as_root(&f, DB).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("has not finished")),
+        "{refused:?}"
+    );
+    assert!(f.active(DB).await.is_some());
+}
+
+#[tokio::test]
+async fn a_deleted_resource_awaiting_cleanup_is_not_detached() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    sqlx::query(
+        "UPDATE active_resources SET cleanup_pending = 1, status = 'deletion_failed' \
+         WHERE descriptor = ?",
+    )
+    .bind(DB)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let refused = detach_as_root(&f, DB).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("already deleted")),
+        "{refused:?}"
+    );
+    assert!(f.active(DB).await.is_some());
+}
+
+#[tokio::test]
+async fn a_resource_with_an_uncertain_operation_is_not_detached() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("dns", Behavior::Panic)]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let refused = detach_as_root(&f, DNS).await;
+    assert!(
+        matches!(refused, Err(StoreError::RecoveryRequired(_))),
+        "{refused:?}"
+    );
+    assert!(f.active(DNS).await.is_some());
 }
