@@ -341,6 +341,20 @@ fn a_digest_follows_the_configuration() {
         *version = 2;
     }
     assert_ne!(first, run(&changed));
+    // So is a change to a shared value the resource references, but not to
+    // one it does not.
+    let value = |v: &str| openporch_core::placeholder::SharedValue::Value(serde_json::json!(v));
+    let mut uses = d.clone();
+    for n in uses.graph.nodes.values_mut() {
+        n.params = Some(serde_json::json!({"host": "${values.DB_HOST}"}));
+    }
+    uses.values.insert("DB_HOST".into(), value("a"));
+    uses.values.insert("OTHER".into(), value("x"));
+    let before = run(&uses);
+    uses.values.insert("OTHER".into(), value("y"));
+    assert_eq!(before, run(&uses));
+    uses.values.insert("DB_HOST".into(), value("b"));
+    assert_ne!(before, run(&uses));
     // A detach names its own action.
     let detached = detach(&db);
     assert_eq!(detached.action.permit_action(), Some("detach"));

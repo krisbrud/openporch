@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use openporch_core::canonical::to_canonical_string;
+use openporch_core::placeholder::SharedValue;
 use openporch_store::ActiveResource;
 use serde::Serialize;
 
@@ -96,6 +97,27 @@ pub struct Entry {
 }
 
 /// A digest of `value`'s canonical JSON.
+/// The shared values `node` may reference, secrets as their references: every
+/// value whose `values.KEY` appears in it.
+fn referenced_values(
+    deployment: &Deployment,
+    node: &openporch_core::graph::Node,
+) -> BTreeMap<String, serde_json::Value> {
+    let text = serde_json::to_string(node).unwrap_or_default();
+    deployment
+        .values
+        .iter()
+        .filter(|(key, _)| text.contains(&format!("values.{key}")))
+        .map(|(key, value)| {
+            let value = match value {
+                SharedValue::Value(v) => serde_json::json!({"value": v}),
+                SharedValue::Secret(r) => serde_json::json!({"secret_ref": r}),
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
 fn digest(value: &serde_json::Value) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(to_canonical_string(value).as_bytes())
@@ -123,11 +145,12 @@ pub fn preview(
         let current = by_descriptor.get(descriptor.as_str()).copied();
         let def = deployment.definitions.get(&node.definition).map(|(_, d)| d);
         let driver = facts(&node.driver_type);
-        // What the resource is provisioned from: its node and the definition
-        // version it matched.
+        // What the resource is provisioned from: its node, the definition
+        // version it matched and the shared values it may reference.
         let config = digest(&serde_json::json!({
             "node": node,
             "definition": deployment.definitions.get(&node.definition),
+            "values": referenced_values(deployment, node),
         }));
         let entry = |action, known, reason: &str, permit_required, plan| Entry {
             descriptor: descriptor.clone(),
