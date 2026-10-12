@@ -1152,10 +1152,11 @@ async fn deleting_an_application_needs_owner_and_deployer() {
         "{body}"
     );
     s.grant_deployer("development", "carol").await;
-    assert_eq!(
-        s.delete("/orgs/acme/apps/shop", &carol).await.0,
-        StatusCode::NO_CONTENT
-    );
+    let (status, body) = s.delete("/orgs/acme/apps/shop", &carol).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["removed"], true, "{body}");
+    assert_eq!(body["deletions"][0]["deployment"]["env"], "development");
+    assert_eq!(body["deletions"][0]["deployment"]["status"], "succeeded");
     assert_eq!(
         s.get("/orgs/acme/apps/shop", &s.admin).await.0,
         StatusCode::NOT_FOUND
@@ -1506,7 +1507,14 @@ async fn application_deletion_is_rechecked_with_the_change() {
     let e = s
         .state
         .store
-        .delete_app("acme", "shop", as_alice)
+        .accept_app_deletion(openporch_store::AppDeletionRequest {
+            org: "acme".into(),
+            app: "shop".into(),
+            actor: "alice".into(),
+            comment: String::new(),
+            snapshot: json!({}),
+            audit: as_alice,
+        })
         .await
         .unwrap_err();
     assert!(

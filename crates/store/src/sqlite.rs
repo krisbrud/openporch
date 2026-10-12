@@ -439,14 +439,20 @@ impl Store for SqliteStore {
                 "environment type `{env_type}`"
             )));
         }
-        let app_exists: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM apps WHERE org_id = ? AND id = ?")
+        let app_state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM apps WHERE org_id = ? AND id = ?")
                 .bind(org)
                 .bind(app)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if app_exists.is_none() {
-            return Err(StoreError::NotFound(format!("application `{app}`")));
+        match app_state.as_deref() {
+            None => return Err(StoreError::NotFound(format!("application `{app}`"))),
+            Some("active") => {}
+            Some(_) => {
+                return Err(StoreError::Conflict(format!(
+                    "application `{app}` is being deleted"
+                )));
+            }
         }
         check_env_authority(&mut tx, org, audit.actor.as_deref(), app, env_type).await?;
         let now = now_ms();
@@ -906,216 +912,103 @@ impl Store for SqliteStore {
 
     async fn accept_deployment(&self, req: DeploymentRequest) -> Result<Acceptance> {
         self.check_org(&req.org)?;
-        let (org, app, env) = (&req.org, &req.app, &req.env);
         let mut tx = self.begin().await?;
+        let acceptance = accept_in_tx(&mut tx, &req).await?;
+        tx.commit().await?;
+        Ok(acceptance)
+    }
 
-        if let Some(key) = &req.idempotency_key {
-            let prior: Option<(String, Option<String>)> = sqlx::query_as(
-                "SELECT id, request_fingerprint FROM deployments WHERE org_id = ? AND app_id = ? \
-                 AND env_id = ? AND actor_id = ? AND idempotency_key = ?",
-            )
-            .bind(org)
-            .bind(app)
-            .bind(env)
-            .bind(&req.actor)
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some((id, fingerprint)) = prior {
-                if fingerprint.as_deref() != Some(req.fingerprint.as_str()) {
-                    return Err(StoreError::IdempotencyMismatch(key.clone()));
-                }
-                let d = fetch_deployment(&mut tx, org, app, env, &id)
-                    .await?
-                    .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
-                return Ok(Acceptance::Replayed(d));
-            }
+    async fn accept_app_deletion(&self, req: AppDeletionRequest) -> Result<AppDeletion> {
+        self.check_org(&req.org)?;
+        let (org, app) = (&req.org, &req.app);
+        let mut tx = self.begin().await?;
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM apps WHERE org_id = ? AND id = ?")
+                .bind(org)
+                .bind(app)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(format!("application `{app}`")));
         }
-
-        let row: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT generation, state, type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+        // Owner, and deployer on every environment type it uses, checked with
+        // the deletion.
+        let actor = req.audit.actor.as_deref();
+        crate::identity::check_app_authority(&mut tx, org, actor, app).await?;
+        let envs: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, type, state, generation FROM envs WHERE org_id = ? AND app_id = ? \
+             ORDER BY id = 'development', id",
         )
         .bind(org)
         .bind(app)
-        .bind(env)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (generation, state, env_type) =
-            row.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
-        // The route checked the caller's roles; they may have changed since.
-        crate::identity::check_env_authority(
-            &mut tx,
-            org,
-            req.audit.actor.as_deref(),
-            app,
-            &env_type,
-        )
-        .await?;
-        match req.kind {
-            DeploymentKind::Deploy if state != "active" => {
-                return Err(StoreError::Conflict(format!(
-                    "environment `{app}/{env}` is {state}"
-                )));
-            }
-            // A deletion that failed can be retried; one that runs cannot.
-            DeploymentKind::DeleteEnv if state == "deleting" => {
-                return Err(StoreError::Conflict(format!(
-                    "environment `{app}/{env}` is already being deleted"
-                )));
-            }
-            DeploymentKind::DeleteEnv if env == "development" => {
-                return Err(StoreError::Conflict(
-                    "the `development` environment exists as long as its application".into(),
-                ));
-            }
-            _ => {}
-        }
-        if generation != req.expected_generation {
-            return Err(StoreError::StaleGeneration {
-                expected: req.expected_generation,
-                actual: generation,
-            });
-        }
-        let running: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
-             AND status = 'in_progress'",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(id) = running {
-            return Err(StoreError::Busy(id));
-        }
-        let uncertain: Vec<String> = sqlx::query_scalar(
-            "SELECT descriptor FROM active_resources WHERE org_id = ? AND app_id = ? AND env_id = ? \
-             AND status IN ('unknown', 'recovery_required') ORDER BY descriptor",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(env)
         .fetch_all(&mut *tx)
         .await?;
-        if !uncertain.is_empty() {
-            return Err(StoreError::RecoveryRequired(uncertain.join(", ")));
+        for (_, env_type, _, _) in &envs {
+            check_env_authority(&mut tx, org, actor, app, env_type).await?;
         }
-        match (req.kind, &req.set_id) {
-            (DeploymentKind::Deploy, None) => {
-                return Err(StoreError::Conflict("a deployment needs a set".into()));
-            }
-            (DeploymentKind::DeleteEnv, Some(_)) => {
-                return Err(StoreError::Conflict(
-                    "an environment deletion deploys no set".into(),
-                ));
-            }
-            (_, Some(set_id)) => {
-                let set_exists: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM sets WHERE org_id = ? AND app_id = ? AND id = ?",
+        sqlx::query("UPDATE apps SET state = 'deleting' WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(app)
+            .execute(&mut *tx)
+            .await?;
+        let mut deletions = Vec::with_capacity(envs.len());
+        for (env, _, state, generation) in &envs {
+            // A deletion that runs is part of this one.
+            if state == "deleting" {
+                let running: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+                     AND status = 'in_progress' AND kind = 'delete_env'",
                 )
                 .bind(org)
                 .bind(app)
-                .bind(set_id)
+                .bind(env)
                 .fetch_optional(&mut *tx)
                 .await?;
-                if set_exists.is_none() {
-                    return Err(StoreError::NotFound(format!("set `{set_id}`")));
-                }
+                let id = running.ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "environment `{app}/{env}` has no running deletion"
+                    ))
+                })?;
+                let d = fetch_deployment(&mut tx, org, app, env, &id)
+                    .await?
+                    .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
+                deletions.push(Acceptance::Replayed(d));
+                continue;
             }
-            (_, None) => {}
-        }
-        if let (Some(delta), Some(expected)) = (&req.delta_id, &req.delta_content) {
-            let stored: Option<String> = sqlx::query_scalar(
-                "SELECT content FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
+            let acceptance = accept_in_tx(
+                &mut tx,
+                &DeploymentRequest {
+                    org: org.clone(),
+                    app: app.clone(),
+                    env: env.clone(),
+                    actor: req.actor.clone(),
+                    expected_generation: *generation,
+                    idempotency_key: None,
+                    fingerprint: String::new(),
+                    kind: DeploymentKind::DeleteEnv,
+                    set_id: None,
+                    delta_id: None,
+                    delta_content: None,
+                    comment: req.comment.clone(),
+                    snapshot: req.snapshot.clone(),
+                    audit: AuditIntent {
+                        target: None,
+                        ..req.audit.clone()
+                    },
+                },
             )
-            .bind(org)
-            .bind(app)
-            .bind(delta)
-            .fetch_optional(&mut *tx)
             .await?;
-            let stored = stored.ok_or_else(|| StoreError::NotFound(format!("delta `{delta}`")))?;
-            let stored: serde_json::Value = serde_json::from_str(&stored)
-                .map_err(|e| StoreError::Corrupt(format!("delta `{delta}`: {e}")))?;
-            if &stored != expected {
-                return Err(StoreError::Conflict(format!(
-                    "delta `{delta}` changed while the deployment was being prepared"
-                )));
-            }
+            deletions.push(acceptance);
         }
-        if let Some(delta) = &req.delta_id {
-            let updated = sqlx::query(
-                "UPDATE deltas SET frozen_at = COALESCE(frozen_at, ?) \
-                 WHERE org_id = ? AND app_id = ? AND id = ?",
-            )
-            .bind(now_ms())
-            .bind(org)
-            .bind(app)
-            .bind(delta)
-            .execute(&mut *tx)
-            .await?;
-            if updated.rows_affected() == 0 {
-                return Err(StoreError::NotFound(format!("delta `{delta}`")));
-            }
-        }
-
-        let id = crate::random_hex(16);
-        let new_generation = generation + 1;
-        let seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM deployments \
-             WHERE org_id = ? AND app_id = ? AND env_id = ?",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO deployments (org_id, app_id, env_id, id, seq, kind, actor_id, set_id, \
-             delta_id, comment, generation, status, idempotency_key, request_fingerprint, \
-             snapshot, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .bind(&id)
-        .bind(seq)
-        .bind(req.kind.as_str())
-        .bind(&req.actor)
-        .bind(&req.set_id)
-        .bind(&req.delta_id)
-        .bind(&req.comment)
-        .bind(new_generation)
-        .bind(&req.idempotency_key)
-        .bind(&req.fingerprint)
-        .bind(serde_json::to_string(&req.snapshot)?)
-        .bind(now_ms())
-        .execute(&mut *tx)
-        .await?;
-        // A deletion keeps the desired set, which still describes what is
-        // deployed until its resources are gone.
-        sqlx::query(
-            "UPDATE envs SET generation = ?, desired_set_id = COALESCE(?, desired_set_id), \
-             state = CASE WHEN ? THEN 'deleting' ELSE state END \
-             WHERE org_id = ? AND app_id = ? AND id = ?",
-        )
-        .bind(new_generation)
-        .bind(&req.set_id)
-        .bind(req.kind == DeploymentKind::DeleteEnv)
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .execute(&mut *tx)
-        .await?;
         let mut intent = req.audit.clone();
-        intent.outcome = AuditOutcome::Accepted;
-        intent.target.get_or_insert_with(|| format!("{app}/{env}"));
-        audit::insert(&mut tx, &intent, Some(&id), None).await?;
-        let d = fetch_deployment(&mut tx, org, app, env, &id)
-            .await?
-            .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
+        intent.target.get_or_insert_with(|| app.clone());
+        audit::insert(&mut tx, &intent, None, None).await?;
+        let removed = envs.is_empty();
+        if removed {
+            remove_app(&mut tx, org, app).await?;
+        }
         tx.commit().await?;
-        Ok(Acceptance::Created(d))
+        Ok(AppDeletion { deletions, removed })
     }
 
     async fn deployment(
@@ -2104,6 +1997,256 @@ async fn log_in_tx(
     Ok(())
 }
 
+/// Accepts a deployment inside `conn`'s transaction; see
+/// [`Store::accept_deployment`].
+async fn accept_in_tx(conn: &mut SqliteConnection, req: &DeploymentRequest) -> Result<Acceptance> {
+    let (org, app, env) = (&req.org, &req.app, &req.env);
+
+    if let Some(key) = &req.idempotency_key {
+        let prior: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, request_fingerprint FROM deployments WHERE org_id = ? AND app_id = ? \
+                 AND env_id = ? AND actor_id = ? AND idempotency_key = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(&req.actor)
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some((id, fingerprint)) = prior {
+            if fingerprint.as_deref() != Some(req.fingerprint.as_str()) {
+                return Err(StoreError::IdempotencyMismatch(key.clone()));
+            }
+            let d = fetch_deployment(&mut *conn, org, app, env, &id)
+                .await?
+                .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
+            return Ok(Acceptance::Replayed(d));
+        }
+    }
+
+    let row: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT generation, state, type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let (generation, state, env_type) =
+        row.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
+    // The route checked the caller's roles; they may have changed since.
+    crate::identity::check_env_authority(
+        &mut *conn,
+        org,
+        req.audit.actor.as_deref(),
+        app,
+        &env_type,
+    )
+    .await?;
+    let app_state: String =
+        sqlx::query_scalar("SELECT state FROM apps WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(app)
+            .fetch_one(&mut *conn)
+            .await?;
+    match req.kind {
+        DeploymentKind::Deploy if app_state != "active" => {
+            return Err(StoreError::Conflict(format!(
+                "application `{app}` is being deleted"
+            )));
+        }
+        DeploymentKind::Deploy if state != "active" => {
+            return Err(StoreError::Conflict(format!(
+                "environment `{app}/{env}` is {state}"
+            )));
+        }
+        // A deletion that failed can be retried; one that runs cannot.
+        DeploymentKind::DeleteEnv if state == "deleting" => {
+            return Err(StoreError::Conflict(format!(
+                "environment `{app}/{env}` is already being deleted"
+            )));
+        }
+        DeploymentKind::DeleteEnv if env == "development" && app_state == "active" => {
+            return Err(StoreError::Conflict(
+                "the `development` environment exists as long as its application".into(),
+            ));
+        }
+        _ => {}
+    }
+    if generation != req.expected_generation {
+        return Err(StoreError::StaleGeneration {
+            expected: req.expected_generation,
+            actual: generation,
+        });
+    }
+    let running: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status = 'in_progress'",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(id) = running {
+        return Err(StoreError::Busy(id));
+    }
+    let uncertain: Vec<String> = sqlx::query_scalar(
+        "SELECT descriptor FROM active_resources WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status IN ('unknown', 'recovery_required') ORDER BY descriptor",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !uncertain.is_empty() {
+        return Err(StoreError::RecoveryRequired(uncertain.join(", ")));
+    }
+    match (req.kind, &req.set_id) {
+        (DeploymentKind::Deploy, None) => {
+            return Err(StoreError::Conflict("a deployment needs a set".into()));
+        }
+        (DeploymentKind::DeleteEnv, Some(_)) => {
+            return Err(StoreError::Conflict(
+                "an environment deletion deploys no set".into(),
+            ));
+        }
+        (_, Some(set_id)) => {
+            let set_exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM sets WHERE org_id = ? AND app_id = ? AND id = ?")
+                    .bind(org)
+                    .bind(app)
+                    .bind(set_id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            if set_exists.is_none() {
+                return Err(StoreError::NotFound(format!("set `{set_id}`")));
+            }
+        }
+        (_, None) => {}
+    }
+    if let (Some(delta), Some(expected)) = (&req.delta_id, &req.delta_content) {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(delta)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let stored = stored.ok_or_else(|| StoreError::NotFound(format!("delta `{delta}`")))?;
+        let stored: serde_json::Value = serde_json::from_str(&stored)
+            .map_err(|e| StoreError::Corrupt(format!("delta `{delta}`: {e}")))?;
+        if &stored != expected {
+            return Err(StoreError::Conflict(format!(
+                "delta `{delta}` changed while the deployment was being prepared"
+            )));
+        }
+    }
+    if let Some(delta) = &req.delta_id {
+        let updated = sqlx::query(
+            "UPDATE deltas SET frozen_at = COALESCE(frozen_at, ?) \
+                 WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(now_ms())
+        .bind(org)
+        .bind(app)
+        .bind(delta)
+        .execute(&mut *conn)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("delta `{delta}`")));
+        }
+    }
+
+    let id = crate::random_hex(16);
+    let new_generation = generation + 1;
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM deployments \
+             WHERE org_id = ? AND app_id = ? AND env_id = ?",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO deployments (org_id, app_id, env_id, id, seq, kind, actor_id, set_id, \
+             delta_id, comment, generation, status, idempotency_key, request_fingerprint, \
+             snapshot, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
+    )
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .bind(&id)
+    .bind(seq)
+    .bind(req.kind.as_str())
+    .bind(&req.actor)
+    .bind(&req.set_id)
+    .bind(&req.delta_id)
+    .bind(&req.comment)
+    .bind(new_generation)
+    .bind(&req.idempotency_key)
+    .bind(&req.fingerprint)
+    .bind(serde_json::to_string(&req.snapshot)?)
+    .bind(now_ms())
+    .execute(&mut *conn)
+    .await?;
+    // A deletion keeps the desired set, which still describes what is
+    // deployed until its resources are gone.
+    sqlx::query(
+        "UPDATE envs SET generation = ?, desired_set_id = COALESCE(?, desired_set_id), \
+             state = CASE WHEN ? THEN 'deleting' ELSE state END \
+             WHERE org_id = ? AND app_id = ? AND id = ?",
+    )
+    .bind(new_generation)
+    .bind(&req.set_id)
+    .bind(req.kind == DeploymentKind::DeleteEnv)
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .execute(&mut *conn)
+    .await?;
+    let mut intent = req.audit.clone();
+    intent.outcome = AuditOutcome::Accepted;
+    intent.target.get_or_insert_with(|| format!("{app}/{env}"));
+    audit::insert(&mut *conn, &intent, Some(&id), None).await?;
+    let d = fetch_deployment(&mut *conn, org, app, env, &id)
+        .await?
+        .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
+    Ok(Acceptance::Created(d))
+}
+
+/// Removes an application whose environments are all gone, with what is
+/// recorded about it, except the audit log and tombstones.
+async fn remove_app(conn: &mut SqliteConnection, org: &str, app: &str) -> Result<()> {
+    for table in [
+        "app_values",
+        "value_set_versions",
+        "deltas",
+        "sets",
+        "secret_grants",
+        "app_roles",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE org_id = ? AND app_id = ?"
+        ))
+        .bind(org)
+        .bind(app)
+        .execute(&mut *conn)
+        .await?;
+    }
+    sqlx::query("DELETE FROM apps WHERE org_id = ? AND id = ?")
+        .bind(org)
+        .bind(app)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Removes a deleted environment and everything recorded about it, except
 /// the audit log and tombstones. What it still lists but does not own, adopted
 /// and external resources, is released from management with a tombstone, so
@@ -2254,6 +2397,19 @@ async fn finish_in_tx(
         }
         (DeploymentKind::DeleteEnv, None) => {
             remove_env(&mut *conn, org, app, env).await?;
+            // The last environment of an application being deleted takes the
+            // application with it.
+            let (deleting, left): (bool, i64) = sqlx::query_as(
+                "SELECT state = 'deleting', (SELECT COUNT(*) FROM envs WHERE org_id = ?1 \
+                 AND app_id = ?2) FROM apps WHERE org_id = ?1 AND id = ?2",
+            )
+            .bind(org)
+            .bind(app)
+            .fetch_one(&mut *conn)
+            .await?;
+            if deleting && left == 0 {
+                remove_app(&mut *conn, org, app).await?;
+            }
         }
     }
     let accepted: Option<(String, Option<String>, String, String)> = sqlx::query_as(

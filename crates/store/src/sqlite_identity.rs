@@ -19,6 +19,8 @@ pub struct AppRecord {
     pub created_at: i64,
     /// The creating principal.
     pub created_by: Option<String>,
+    /// `active`, or `deleting` once its deletion was accepted.
+    pub state: String,
 }
 
 /// An environment type.
@@ -200,16 +202,6 @@ pub trait IdentityStore: Send + Sync {
         org: &str,
         app: &str,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
-
-    /// Deletes an application that has never been deployed, with its environments,
-    /// sets, deltas, values and roles. Applications with deployments or active
-    /// resources are rejected until deprovisioning on delete exists.
-    fn delete_app(
-        &self,
-        org: &str,
-        app: &str,
-        audit: AuditIntent,
-    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Lists environment types.
     fn env_types(&self, org: &str) -> impl Future<Output = Result<Vec<EnvTypeRecord>>> + Send;
@@ -944,8 +936,8 @@ impl IdentityStore for SqliteStore {
 
     async fn apps(&self, org: &str) -> Result<Vec<AppRecord>> {
         self.check_org(org)?;
-        let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT id, name, created_at, created_by FROM apps WHERE org_id = ? ORDER BY id",
+        let rows: Vec<(String, String, i64, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, name, created_at, created_by, state FROM apps WHERE org_id = ? ORDER BY id",
         )
         .bind(org)
         .fetch_all(self.pool())
@@ -957,6 +949,7 @@ impl IdentityStore for SqliteStore {
                 name: r.1,
                 created_at: r.2,
                 created_by: r.3,
+                state: r.4,
             })
             .collect())
     }
@@ -975,75 +968,6 @@ impl IdentityStore for SqliteStore {
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
-    }
-
-    async fn delete_app(&self, org: &str, app: &str, audit: AuditIntent) -> Result<()> {
-        self.check_org(org)?;
-        let mut tx = self.begin().await?;
-        let exists: Option<(i64,)> =
-            sqlx::query_as("SELECT 1 FROM apps WHERE org_id = ? AND id = ?")
-                .bind(org)
-                .bind(app)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if exists.is_none() {
-            return Err(not_found(format!("application `{app}`")));
-        }
-        // Owner plus deployer on every environment type the application uses,
-        // checked with the deletion.
-        if let Some(actor) = audit.actor.as_deref() {
-            let roles = roles_in(&mut tx, org, actor).await?;
-            if roles.org != Some(OrgRole::Administrator) {
-                check_app_authority(&mut tx, org, Some(actor), app).await?;
-                let types: Vec<String> = sqlx::query_scalar(
-                    "SELECT DISTINCT type FROM envs WHERE org_id = ? AND app_id = ?",
-                )
-                .bind(org)
-                .bind(app)
-                .fetch_all(&mut *tx)
-                .await?;
-                if let Some(t) = types.iter().find(|t| !roles.deployer.contains(*t)) {
-                    return Err(StoreError::Forbidden(format!(
-                        "requires the `deployer` role on environment type `{t}`"
-                    )));
-                }
-            }
-        }
-        let (deployed,): (i64,) = sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM deployments WHERE org_id = ?1 AND app_id = ?2) \
-                  + (SELECT COUNT(*) FROM active_resources WHERE org_id = ?1 AND app_id = ?2)",
-        )
-        .bind(org)
-        .bind(app)
-        .fetch_one(&mut *tx)
-        .await?;
-        if deployed > 0 {
-            return Err(StoreError::Conflict(format!(
-                "application `{app}` has deployments; deleting deployed applications is not \
-                 supported yet"
-            )));
-        }
-        for table in [
-            "app_values",
-            "value_set_versions",
-            "deltas",
-            "sets",
-            "secret_grants",
-            "envs",
-            "apps",
-        ] {
-            let column = if table == "apps" { "id" } else { "app_id" };
-            sqlx::query(&format!(
-                "DELETE FROM {table} WHERE org_id = ? AND {column} = ?"
-            ))
-            .bind(org)
-            .bind(app)
-            .execute(&mut *tx)
-            .await?;
-        }
-        audit_in(&mut tx, &audit).await?;
-        tx.commit().await?;
-        Ok(())
     }
 
     async fn env_types(&self, org: &str) -> Result<Vec<EnvTypeRecord>> {

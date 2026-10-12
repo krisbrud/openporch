@@ -1,12 +1,16 @@
 //! Applications, environment types and their role assignments.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use openporch_store::{AppRecord, AppRole, EnvTypeRecord, IdentityStore, Store};
+use openporch_store::{
+    AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, Store,
+};
 use serde::{Deserialize, Serialize};
 
 use super::check_id;
+use super::envs::{self, EnvDeletion};
 use crate::api::{Ctx, JsonBody};
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
@@ -78,14 +82,46 @@ pub async fn get(
     Ok(Json(app_or_404(&state, &app).await?))
 }
 
-/// Deletes an application. Requires `owner` and `deployer` on every environment
-/// type the application uses.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAppRequest {
+    /// Destructive-action permits for deleting the resources of every
+    /// environment.
+    #[serde(default)]
+    permits: Vec<String>,
+    #[serde(default)]
+    comment: String,
+}
+
+/// An accepted application deletion.
+#[derive(Debug, Serialize)]
+pub struct AppDeletion {
+    /// Each environment's deletion.
+    deletions: Vec<EnvDeletion>,
+    /// Whether the application is already gone.
+    removed: bool,
+}
+
+/// `DELETE /orgs/{org}/apps/{app}`, optionally with permits. Requires `owner`
+/// and `deployer` on every environment type the application uses. Every
+/// environment is deleted as by its own deletion, `development` included, and
+/// the application is removed once the last of them is gone. Until then it
+/// takes no new environments or deployments; a failed environment deletion
+/// keeps the environment, and repeating the request retries it.
 pub async fn delete(
     State(state): State<AppState>,
     ctx: Ctx,
     Path((_, app)): Path<(String, String)>,
-) -> ApiResult<StatusCode> {
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<AppDeletion>)> {
     let org = state.org();
+    let mut req: DeleteAppRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        DeleteAppRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(e.to_string()))?
+    };
+    req.permits.sort();
+    req.permits.dedup();
     app_or_404(&state, &app).await?;
     if !ctx.is_admin() {
         let types = state.store.app_env_types(org, &app).await?;
@@ -95,11 +131,36 @@ pub async fn delete(
             )));
         }
     }
-    state
+    let snapshot = envs::deletion_snapshot(&req.permits);
+    let accepted = state
         .store
-        .delete_app(org, &app, ctx.audit(org, "app.delete", &app))
+        .accept_app_deletion(AppDeletionRequest {
+            org: org.to_owned(),
+            app: app.clone(),
+            actor: ctx.principal.id.clone(),
+            comment: req.comment,
+            snapshot: snapshot.clone(),
+            audit: ctx.audit(org, "app.delete", &app),
+        })
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    // Every deletion is started before any of them is described, so an
+    // error describing one never leaves another unstarted.
+    let mut deletions = Vec::with_capacity(accepted.deletions.len());
+    let mut failure = None;
+    for acceptance in &accepted.deletions {
+        match envs::start_deletion(&state, acceptance, snapshot.clone()).await {
+            Ok(d) => deletions.push(d),
+            Err(e) => failure = failure.or(Some(e)),
+        }
+    }
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    let removed = accepted.removed || state.store.app(org, &app).await?.is_none();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AppDeletion { deletions, removed }),
+    ))
 }
 
 #[derive(Serialize)]

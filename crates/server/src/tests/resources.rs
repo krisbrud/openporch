@@ -879,6 +879,93 @@ async fn delete_a_deployed_environment() {
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 }
 
+#[tokio::test]
+async fn delete_a_deployed_application() {
+    const APP: &str = "/orgs/acme/apps/shop";
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let (status, b) = s
+        .post(
+            &format!("{APP}/envs"),
+            &s.admin,
+            json!({"id": "pr-42", "name": "PR 42", "type": "development"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let d = s.deploy_web_in("pr-42", "nginx:1", true, &[]).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    fake.undeletable.lock().unwrap().insert("postgres".into());
+
+    // Every environment is deleted; the empty `development` goes at once.
+    let delete = || {
+        s.call(
+            Method::DELETE,
+            APP,
+            Some(&s.admin),
+            Some(json!({"permits": ["permit-1"]})),
+        )
+    };
+    let (status, deletion) = delete().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deletion}");
+    assert_eq!(deletion["removed"], false, "{deletion}");
+    let envs: Vec<_> = deletion["deletions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["deployment"]["env"].as_str().unwrap())
+        .collect();
+    assert_eq!(envs, ["pr-42", "development"], "{deletion}");
+    assert_eq!(
+        deletion["deletions"][1]["deployment"]["status"],
+        "succeeded"
+    );
+    let (_, app) = s.get(APP, &s.admin).await;
+    assert_eq!(app["state"], "deleting", "{app}");
+    let (status, b) = s
+        .post(
+            &format!("{APP}/envs"),
+            &s.admin,
+            json!({"id": "pr-43", "name": "PR 43", "type": "development"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+
+    // The database cannot be deleted, so its environment and the application
+    // stay.
+    let id = deletion["deletions"][0]["deployment"]["id"]
+        .as_str()
+        .unwrap();
+    let d = s
+        .finished_at(&format!("{APP}/envs/pr-42/deploys/{id}"))
+        .await;
+    assert_eq!(d["status"], "failed", "{d}");
+    let (_, env) = s.get(&format!("{APP}/envs/pr-42"), &s.admin).await;
+    assert_eq!(env["state"], "deletion_failed", "{env}");
+    assert_eq!(
+        s.get(&format!("{APP}/envs/development"), &s.admin).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Repeating the request retries it, and then the application goes.
+    fake.undeletable.lock().unwrap().clear();
+    let (status, retry) = delete().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{retry}");
+    assert_eq!(retry["deletions"].as_array().unwrap().len(), 1, "{retry}");
+    let mut gone = false;
+    for _ in 0..500 {
+        if s.get(APP, &s.admin).await.0 == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the application was not deleted");
+    let deleted = fake.deleted.lock().unwrap().clone();
+    let at = |d: &str| deleted.iter().position(|x| x == d).unwrap();
+    assert!(at("workload.default#modules.web") < at(DB), "{deleted:?}");
+}
+
 impl Server {
     /// Starts deleting `env` with the permit `permit-1`.
     async fn delete_env(&self, env: &str, generation: i64) -> Value {
