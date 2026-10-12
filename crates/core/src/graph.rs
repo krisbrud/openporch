@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::catalog::{ClassRegistry, ResourceType, ResourceUse};
@@ -102,7 +102,7 @@ pub enum GraphError {
 }
 
 /// Why a node is in the graph.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Request {
     /// Where the request comes from, such as `modules.web.externals.db`.
     pub path: String,
@@ -112,7 +112,7 @@ pub struct Request {
 }
 
 /// A node of the resource graph.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     /// The resource.
     pub descriptor: Descriptor,
@@ -130,7 +130,7 @@ pub struct Node {
 }
 
 /// A resolved resource graph.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceGraph {
     /// Nodes by descriptor.
     pub nodes: BTreeMap<Descriptor, Node>,

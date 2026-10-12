@@ -1375,6 +1375,69 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn record_operation_inputs(
+        &self,
+        operation_id: &str,
+        recovery: serde_json::Value,
+    ) -> Result<()> {
+        let org: Option<(String,)> = sqlx::query_as("SELECT org_id FROM operations WHERE id = ?")
+            .bind(operation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let (org,) =
+            org.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        self.check_org(&org)?;
+        let updated =
+            sqlx::query("UPDATE operations SET recovery = ? WHERE id = ? AND state = 'started'")
+                .bind(recovery.to_string())
+                .bind(operation_id)
+                .execute(&self.pool)
+                .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::Conflict(format!(
+                "operation `{operation_id}` is no longer started"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn record_resource_status(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        descriptor: &str,
+        status: ResourceRunStatus,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        // A resource that never ran has a GUResID only if an earlier deployment
+        // provisioned it; otherwise the row's GUResID is empty. A status an
+        // operation recorded is kept.
+        sqlx::query(
+            "INSERT INTO deployment_resources (org_id, app_id, env_id, deployment_id, descriptor, \
+             guresid, status, error, observed_at) VALUES (?1, ?2, ?3, ?4, ?5, \
+             COALESCE((SELECT guresid FROM active_resources WHERE org_id = ?1 AND app_id = ?2 \
+             AND env_id = ?3 AND descriptor = ?5), ''), ?6, ?7, ?8) \
+             ON CONFLICT (org_id, app_id, env_id, deployment_id, descriptor) \
+             DO UPDATE SET status = excluded.status, error = excluded.error, \
+             observed_at = excluded.observed_at \
+             WHERE deployment_resources.status IN ('pending', 'skipped')",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(deployment_id)
+        .bind(descriptor)
+        .bind(status.as_str())
+        .bind(error)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn active_resource(
         &self,
         org: &str,

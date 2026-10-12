@@ -264,6 +264,30 @@ pub enum CheckpointResult {
     },
 }
 
+/// The status of a resource in a deployment that no operation decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRunStatus {
+    /// Not started, because a dependency did not provision or time ran out.
+    Pending,
+    /// Deliberately not visited.
+    Skipped,
+    /// Failed before an operation was recorded.
+    Failed,
+    /// Its outcome is unknown.
+    Unknown,
+}
+
+impl ResourceRunStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// An active resource.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveResource {
