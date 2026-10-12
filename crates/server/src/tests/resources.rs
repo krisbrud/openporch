@@ -20,6 +20,9 @@ struct Fake {
     guresids: Mutex<Vec<(String, String)>>,
     /// The descriptors deleted, in order.
     deleted: Mutex<Vec<String>>,
+    /// A secret value the executor resolves for postgres, and then leaks into
+    /// its output and error.
+    leak: Mutex<Option<String>>,
 }
 
 impl Executor for Fake {
@@ -29,6 +32,15 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push((job.descriptor.to_string(), job.guresid.to_string()));
+        let leak = self.leak.lock().unwrap().clone();
+        if let Some(secret) = leak.filter(|_| ty == "postgres") {
+            let mut log = job.log.redacting();
+            log.secret([&secret]);
+            log.info(&format!("psql --password={secret}"));
+            return Err(log.failure(ExecFailure::Permanent(format!(
+                "password authentication failed: {secret}"
+            ))));
+        }
         if self.failing.lock().unwrap().contains(&ty) {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
         }
@@ -645,5 +657,92 @@ async fn inspect_the_graph_after_a_failed_deployment() {
     // Someone who cannot see the application cannot see that it exists.
     let stranger = s.member("sam", "member").await;
     let (status, b) = s.get(&graph, &stranger).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+}
+
+#[tokio::test]
+async fn read_a_deployments_redacted_log() {
+    const SECRET: &str = "hunter2-leaked-91";
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    *fake.leak.lock().unwrap() = Some(SECRET.into());
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    let logs = format!("{DEPLOYS}/{}/logs", d["id"].as_str().unwrap());
+
+    let (status, page) = s.get(&logs, &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(!page.to_string().contains(SECRET), "{page}");
+    assert_eq!(page["finished"], true, "{page}");
+    let lines = page["lines"].as_array().unwrap();
+    let of_db: Vec<_> = lines.iter().filter(|l| l["descriptor"] == DB).collect();
+    let messages: Vec<_> = of_db
+        .iter()
+        .map(|l| l["message"].as_str().unwrap())
+        .collect();
+    assert!(messages.contains(&"psql --password=[REDACTED]"), "{page}");
+    assert!(
+        messages.contains(&"failed, nothing changed; fix the cause and deploy again: password authentication failed: [REDACTED]"),
+        "{page}"
+    );
+    assert!(
+        of_db
+            .iter()
+            .all(|l| l["guresid"].is_string() && l["operation_id"].is_string())
+    );
+    assert!(
+        lines.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("deployment failed"),
+        "{page}"
+    );
+    // The resource's error is redacted the same way.
+    let (_, g) = s.get(&format!("{RESOURCES}/graph"), &s.admin).await;
+    assert!(!g.to_string().contains(SECRET), "{g}");
+
+    // Pages follow each other through `next`.
+    let mut seen = Vec::new();
+    let mut after = 0;
+    loop {
+        let (status, page) = s
+            .get(&format!("{logs}?after={after}&limit=2"), &s.admin)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let got = page["lines"].as_array().unwrap();
+        assert!(got.len() <= 2);
+        seen.extend(got.iter().cloned());
+        after = page["next"].as_i64().unwrap();
+        if page["finished"] == true {
+            break;
+        }
+    }
+    assert_eq!(&seen, lines);
+    // Reading past the end returns nothing and keeps the position.
+    let (_, end) = s.get(&format!("{logs}?after={after}"), &s.admin).await;
+    assert_eq!(end, json!({"lines": [], "next": after, "finished": true}));
+
+    // The same log by relative reference.
+    let (status, latest) = s.get(&format!("{DEPLOYS}/+0/logs"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(latest["lines"], page["lines"]);
+
+    // A page that ends exactly at the last line is the final one.
+    let n = lines.len();
+    let (_, exact) = s.get(&format!("{logs}?after=0&limit={n}"), &s.admin).await;
+    assert_eq!(exact["finished"], true, "{exact}");
+    let (_, short) = s
+        .get(&format!("{logs}?after=0&limit={}", n - 1), &s.admin)
+        .await;
+    assert_eq!(short["finished"], false, "{short}");
+
+    let (status, b) = s.get(&format!("{logs}?limit=0"), &s.admin).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    let (status, b) = s.get(&format!("{DEPLOYS}/nope/logs"), &s.admin).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    // Someone who cannot see the application cannot see that it exists.
+    let stranger = s.member("sam", "member").await;
+    let (status, b) = s.get(&logs, &stranger).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
 }

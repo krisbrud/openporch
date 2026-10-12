@@ -109,6 +109,9 @@ enum Behavior {
     Panic,
     /// Waits until every resource sharing the barrier is provisioning at once.
     Meet(Arc<Barrier>),
+    /// Fails with the secret values it read in its error, as a careless driver
+    /// would.
+    Leak,
 }
 
 /// An executor that provisions nothing and records every job it is handed.
@@ -186,12 +189,22 @@ impl Executor for Fake {
         ] {
             secret_refs(input, &mut refs);
         }
+        let mut log = job.log.redacting();
         self.jobs.lock().unwrap().push(job);
+        let mut values = Vec::new();
         if let Some(store) = &self.secrets {
             for r in refs {
                 let value = store.read(&r).await.unwrap();
                 self.read.lock().unwrap().push(value.expose().to_owned());
+                values.push(value.expose().to_owned());
             }
+        }
+        // As a real executor does: register what it resolved, log, and hand
+        // failures back redacted.
+        log.secret(&values);
+        for v in &values {
+            log.info(&format!("connecting with {v}"));
+            log.info(&format!("{{\"password\": {}}}", json!(v)));
         }
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
@@ -208,9 +221,13 @@ impl Executor for Fake {
             Behavior::Permanent => Err(ExecFailure::Permanent("400: invalid zone".into())),
             Behavior::Hang => std::future::pending().await,
             Behavior::Panic => panic!("the driver crashed"),
+            Behavior::Leak => Err(ExecFailure::Permanent(format!(
+                "Error: authentication failed for {}",
+                values.join(", ")
+            ))),
         };
         self.running.fetch_sub(1, Ordering::SeqCst);
-        result?;
+        result.map_err(|f| log.failure(f))?;
         let mut provisioned = ProvisionResult::default();
         provisioned
             .outputs
@@ -264,7 +281,7 @@ impl Executor for Fake {
                 error: "503 from the database API".into(),
                 retry_after,
             }),
-            Behavior::Permanent => Err(ExecFailure::Permanent(
+            Behavior::Permanent | Behavior::Leak => Err(ExecFailure::Permanent(
                 "409: the database has deletion protection".into(),
             )),
             Behavior::Hang => std::future::pending().await,
@@ -1705,4 +1722,197 @@ async fn a_resource_with_an_uncertain_operation_is_not_detached() {
         "{refused:?}"
     );
     assert!(f.active(DNS).await.is_some());
+}
+
+/// Every log line of `deployment`, as `(descriptor, operation, guresid, message)`.
+async fn logs(f: &Fixture, deployment: &Deployment) -> Vec<openporch_store::LogLine> {
+    f.store
+        .deployment_logs(ORG, "shop", "development", &deployment.id, None, 10_000)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_driver_error_with_a_secret_is_redacted() {
+    // A value that JSON and HCL escape, so the escaped forms are covered too.
+    const LEAKED: &str = r#"pa"ss\word-73"#;
+    let f = Fixture::new().await;
+    let secrets = BuiltinSecretStore::new(
+        &f.store,
+        Arc::new(Keyring::new(MasterKey::from_bytes([7; 32]), [])),
+        ORG,
+    );
+    secrets
+        .write("pg-master", &SecretValue::new(LEAKED))
+        .await
+        .unwrap();
+    let fake = Arc::new(Fake {
+        secrets: Some(secrets),
+        ..Fake::default()
+    });
+    fake.behavior
+        .lock()
+        .unwrap()
+        .insert("postgres".into(), Behavior::Leak);
+    let deployment = f.accept().await;
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(
+        matches!(outcomes[&d(DB)], Outcome::Failed(_)),
+        "{outcomes:?}"
+    );
+
+    let lines = logs(&f, &deployment).await;
+    let (status, error) = f.status(&deployment).await;
+    assert_eq!(status, DeploymentStatus::Failed);
+    let (db_error,): (Option<String>,) = sqlx::query_as(
+        "SELECT error FROM deployment_resources WHERE deployment_id = ? AND descriptor = ?",
+    )
+    .bind(&deployment.id)
+    .bind(DB)
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap();
+    let db_error = db_error.unwrap();
+    assert_eq!(db_error, "Error: authentication failed for [REDACTED]");
+
+    // The secret, raw or escaped, is nowhere: not in the log, the resource's
+    // error or the deployment's.
+    let all = format!("{lines:?} {db_error} {error:?}");
+    let escaped = serde_json::to_string(LEAKED).unwrap();
+    for form in [
+        LEAKED,
+        &escaped[1..escaped.len() - 1],
+        "pa\\\"ss",
+        "ss\\\\word",
+    ] {
+        assert!(!all.contains(form), "{form} in {all}");
+    }
+
+    // What the executor logged is redacted, and the lines name the resource
+    // and its operation.
+    let db = fake.job(DB);
+    let of_db: Vec<_> = lines
+        .iter()
+        .filter(|l| l.descriptor.as_deref() == Some(DB))
+        .collect();
+    let messages: Vec<_> = of_db.iter().map(|l| l.message.as_str()).collect();
+    for expected in [
+        "connecting with [REDACTED]",
+        "{\"password\": \"[REDACTED]\"}",
+        "Error: authentication failed for [REDACTED]",
+    ] {
+        assert!(
+            messages.iter().any(|m| m.contains(expected)),
+            "{expected} in {messages:?}"
+        );
+    }
+    for line in &of_db {
+        assert_eq!(
+            line.guresid.as_deref(),
+            Some(db.guresid.to_string().as_str())
+        );
+        assert!(line.operation_id.is_some(), "{line:?}");
+    }
+    assert!(
+        messages.iter().any(|m| m.contains("(attempt 1)")),
+        "{messages:?}"
+    );
+
+    // Lines about the deployment as a whole name no resource.
+    let first = &lines[0];
+    assert_eq!(first.descriptor, None);
+    assert!(first.message.starts_with("deployment"), "{first:?}");
+    let last = lines.last().unwrap();
+    assert!(last.message.starts_with("deployment failed"), "{last:?}");
+    assert!(lines.windows(2).all(|w| w[0].seq < w[1].seq));
+}
+
+#[tokio::test]
+async fn the_log_stops_at_its_quota_but_keeps_the_outcome() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("dns", Behavior::Permanent)]);
+    let deployment = f.accept().await;
+    let limits = Limits {
+        log_bytes: 120,
+        ..fast()
+    };
+    planner(&f, &fake, limits).run(deployment.clone()).await;
+    let lines = logs(&f, &deployment).await;
+    let quota = lines
+        .iter()
+        .position(|l| l.message.contains("quota of 120 bytes"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    let warning = &lines[quota];
+    assert_eq!(warning.level, "warn");
+    assert_eq!((&warning.descriptor, &warning.operation_id), (&None, &None));
+    // Final status lines neither count against the quota nor are dropped.
+    let status =
+        |m: &str| m == "provisioned" || m.starts_with("failed, ") || m.starts_with("not attempted");
+    let kept: usize = lines[..quota]
+        .iter()
+        .filter(|l| !status(&l.message))
+        .map(|l| l.message.len())
+        .sum();
+    assert!(kept <= 120, "{lines:?}");
+    let messages: Vec<_> = lines.iter().map(|l| l.message.as_str()).collect();
+    assert!(
+        messages.contains(
+            &"failed, nothing changed; fix the cause and deploy again: 400: invalid zone"
+        ),
+        "{messages:?}"
+    );
+    assert!(
+        messages.last().unwrap().starts_with("deployment failed"),
+        "{messages:?}"
+    );
+    // Only those follow the warning.
+    assert!(
+        messages[quota + 1..]
+            .iter()
+            .all(|m| status(m) || m.starts_with("deployment failed")),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_logged_after_the_log_closes() {
+    let f = Fixture::new().await;
+    let deployment = f.accept().await;
+    let log = DeploymentLog::start(f.store.clone(), &deployment, 1 << 20);
+    let db = log.resource(&d(DB));
+    db.info("before");
+    log.close().await;
+    db.info("after");
+    log.deployment().status("info", "after");
+    tokio::task::yield_now().await;
+    let messages: Vec<_> = logs(&f, &deployment)
+        .await
+        .into_iter()
+        .map(|l| l.message)
+        .collect();
+    assert_eq!(messages, ["before"]);
+}
+
+#[tokio::test]
+async fn lost_log_lines_fail_the_deployment() {
+    let f = Fixture::new().await;
+    let fake = Arc::new(Fake::default());
+    let deployment = f.accept().await;
+    // Every line but the outcome fails to be stored.
+    sqlx::query(
+        "CREATE TRIGGER logs_full BEFORE INSERT ON logs \
+         WHEN NEW.message NOT LIKE 'deployment failed%' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    let (status, error) = f.status(&deployment).await;
+    assert_eq!(status, DeploymentStatus::Failed);
+    let error = error.unwrap();
+    assert!(error.ends_with("log lines could not be stored"), "{error}");
+    let lines = logs(&f, &deployment).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].message, format!("deployment failed: {error}"));
 }

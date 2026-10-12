@@ -700,6 +700,71 @@ impl Store for SqliteStore {
         .await?)
     }
 
+    async fn append_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        lines: Vec<LogLine>,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin().await?;
+        for line in lines {
+            // A finished deployment's log is complete: later lines, from a
+            // task that outlived it, are dropped.
+            sqlx::query(
+                "INSERT INTO logs (org_id, app_id, env_id, deployment_id, operation_id, \
+                 descriptor, guresid, at, level, message) \
+                 SELECT org_id, app_id, env_id, id, ?, ?, ?, ?, ?, ? FROM deployments \
+                 WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ? \
+                 AND status = 'in_progress'",
+            )
+            .bind(&line.operation_id)
+            .bind(&line.descriptor)
+            .bind(&line.guresid)
+            .bind(line.at)
+            .bind(&line.level)
+            .bind(&line.message)
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .bind(deployment_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn deployment_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<LogLine>> {
+        self.check_org(org)?;
+        Ok(sqlx::query_as(
+            "SELECT seq, operation_id, descriptor, guresid, at, level, message FROM logs \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? AND seq > ? \
+             ORDER BY seq LIMIT ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(deployment_id)
+        .bind(after.unwrap_or(0))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn deployment_snapshot(
         &self,
         org: &str,
@@ -1923,6 +1988,17 @@ impl Store for SqliteStore {
             .bind(guresid)
             .execute(&mut *tx)
             .await?;
+            let line = "deleted, but removing its record was interrupted by a restart; deploy \
+                        again to finish the cleanup";
+            log_in_tx(
+                &mut tx,
+                &self.org,
+                deployment,
+                Some((op, guresid)),
+                "warn",
+                line,
+            )
+            .await?;
         }
         let uncertain: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? AND state = 'started' \
@@ -1954,17 +2030,40 @@ impl Store for SqliteStore {
             .bind(guresid)
             .execute(&mut *tx)
             .await?;
-        }
-        for (app, env, id) in &running {
-            finish_in_tx(
+            let line = "outcome unknown: interrupted by a restart; the resource needs recovery \
+                        before it is deployed again";
+            log_in_tx(
                 &mut tx,
                 &self.org,
-                app,
-                env,
-                id,
-                Some("interrupted by a server restart"),
+                deployment,
+                Some((op, guresid)),
+                "error",
+                line,
             )
             .await?;
+        }
+        for (app, env, id) in &running {
+            // Cleanups were closed before, so count them separately.
+            let open = uncertain.iter().filter(|(_, d, _)| d == id).count();
+            let cleanup = cleanups.iter().filter(|(_, d, _)| d == id).count();
+            let mut parts = vec!["interrupted by a server restart".to_owned()];
+            if open > 0 {
+                parts.push(format!(
+                    "{open} resource(s) may have changed and need recovery before the \
+                     environment is deployed again"
+                ));
+            }
+            if cleanup > 0 {
+                parts.push(format!(
+                    "{cleanup} deleted resource(s) keep their records until the next \
+                     deployment finishes the cleanup"
+                ));
+            }
+            if open == 0 && cleanup == 0 {
+                parts.push("no operation was in flight, so deploy again to continue".to_owned());
+            }
+            let error = parts.join("; ");
+            finish_in_tx(&mut tx, &self.org, app, env, id, Some(&error)).await?;
         }
         tx.commit().await?;
         Ok(RecoveryReport {
@@ -1991,6 +2090,38 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await?)
     }
+}
+
+/// Appends a line to deployment `deployment_id`'s log, about operation `op` on
+/// the resource with the given GUResID if there is one. A finished
+/// deployment's log ends with its outcome, so nothing is added to it.
+async fn log_in_tx(
+    conn: &mut SqliteConnection,
+    org: &str,
+    deployment_id: &str,
+    op: Option<(&String, &String)>,
+    level: &str,
+    message: &str,
+) -> Result<()> {
+    let (op, guresid) = op.unzip();
+    sqlx::query(
+        "INSERT INTO logs (org_id, app_id, env_id, deployment_id, operation_id, descriptor, \
+         guresid, at, level, message) \
+         SELECT org_id, app_id, env_id, id, ?, \
+         (SELECT descriptor FROM active_resources WHERE guresid = ?), ?, ?, ?, ? \
+         FROM deployments WHERE org_id = ? AND id = ? AND status = 'in_progress'",
+    )
+    .bind(op)
+    .bind(guresid)
+    .bind(guresid)
+    .bind(now_ms())
+    .bind(level)
+    .bind(message)
+    .bind(org)
+    .bind(deployment_id)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Marks a running deployment finished and records the correlated audit outcome.
@@ -2023,6 +2154,13 @@ async fn finish_in_tx(
     } else {
         "succeeded"
     };
+    // The log ends with the outcome, written with it so that no other line
+    // can follow.
+    let (level, line) = match error {
+        None => ("info", "deployment succeeded".to_owned()),
+        Some(e) => ("error", format!("deployment failed: {e}")),
+    };
+    log_in_tx(&mut *conn, org, id, None, level, &line).await?;
     sqlx::query(
         "UPDATE deployments SET status = ?, error = ?, finished_at = ? \
          WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",

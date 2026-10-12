@@ -45,7 +45,11 @@ impl Runner for Unimplemented {
             finish(
                 &state,
                 &job,
-                Some("provisioning resources is not implemented yet".into()),
+                Some(
+                    "provisioning resources is not implemented yet; nothing changed; \
+                     deploy again once the server runs with an executor"
+                        .into(),
+                ),
             )
             .await;
         })
@@ -76,7 +80,10 @@ impl<E: Executor> Runner for PlannerRunner<E> {
                 Ok(deployment) => {
                     planner.run(deployment).await;
                 }
-                Err(error) => finish(&state, &job, Some(error)).await,
+                Err(error) => {
+                    let error = format!("{error}; nothing changed; fix the cause and deploy again");
+                    finish(&state, &job, Some(error)).await;
+                }
             }
         })
     }
@@ -112,8 +119,9 @@ async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
     )
 }
 
-/// Finishes `job`'s deployment; a failure to record it leaves the deployment
-/// running until restart recovery fails it.
+/// Finishes `job`'s deployment, which ends its log with the outcome; a
+/// failure to record it leaves the deployment running until restart recovery
+/// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
     if let Err(e) = state
         .store
@@ -151,7 +159,11 @@ impl Runners {
                 finish(
                     &state,
                     &job,
-                    Some("the deployment stopped unexpectedly".into()),
+                    Some(
+                        "the deployment stopped unexpectedly; resources it was changing may have \
+                         changed and need recovery before the environment is deployed again"
+                            .into(),
+                    ),
                 )
                 .await;
             }

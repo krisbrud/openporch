@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use openporch_core::redact::Redactor;
 use reqwest::header::{AUTHORIZATION, HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
@@ -42,9 +43,6 @@ const MAX_MESSAGE_CHARS: usize = 1000;
 /// How long to wait for a connection; a driver that cannot be reached in this
 /// time was not called, so the call may be retried.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Secret values shorter than this are not redacted from driver messages, since
-/// replacing them would garble the text.
-const MIN_REDACTED_CHARS: usize = 4;
 
 /// Checks an external driver's target URL: `http` or `https` with a host, and no
 /// credentials, query or fragment, since the GUResID is appended to its path.
@@ -292,21 +290,23 @@ impl HttpDriver {
     fn failure(&self, req: &DriverRequest, reply: &Reply) -> DriverError {
         let status = reply.status.as_u16();
         let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap_or_default();
-        let secrets = secret_strings(req);
+        // Redacted before truncating, so a cut cannot leave part of a secret.
+        let secrets = secret_redactor(req);
         let message = body
             .message
             .map(|m| {
-                redact(
-                    &m.chars().take(MAX_MESSAGE_CHARS).collect::<String>(),
-                    &secrets,
-                )
+                secrets
+                    .redact(&m)
+                    .chars()
+                    .take(MAX_MESSAGE_CHARS)
+                    .collect::<String>()
             })
             .unwrap_or_else(|| format!("the driver answered {status}"));
         match status {
             400 | 422 => DriverError::Invalid {
                 code: body
                     .error
-                    .map(|c| redact(&c.chars().take(64).collect::<String>(), &secrets)),
+                    .map(|c| secrets.redact(&c).chars().take(64).collect::<String>()),
                 message,
             },
             401 | 403 => DriverError::Invalid {
@@ -361,11 +361,11 @@ impl HttpDriver {
 const NOT_A_DRIVER_404: &str = "the target answered 404 without `Openporch-Protocol`, so it \
      may not be the driver; check the driver's target";
 
-/// The string secret values of a request, at any depth.
-fn secret_strings(req: &DriverRequest) -> Vec<String> {
+/// A redactor for the string secret values of a request, at any depth.
+fn secret_redactor(req: &DriverRequest) -> Redactor {
     fn walk(v: &Value, out: &mut Vec<String>) {
         match v {
-            Value::String(s) if s.chars().count() >= MIN_REDACTED_CHARS => out.push(s.clone()),
+            Value::String(s) => out.push(s.clone()),
             Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
             Value::Object(m) => m.values().for_each(|v| walk(v, out)),
             _ => {}
@@ -378,15 +378,7 @@ fn secret_strings(req: &DriverRequest) -> Vec<String> {
     {
         map.expose().values().for_each(|v| walk(v, &mut out));
     }
-    // Longest first, so a secret containing another is replaced whole.
-    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    out
-}
-
-fn redact(text: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
-        .fold(text.to_owned(), |t, s| t.replace(s.as_str(), "[REDACTED]"))
+    Redactor::new(out)
 }
 
 /// The request body: `{type, resource, driver: {values, secrets}}`. Resource

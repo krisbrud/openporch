@@ -119,7 +119,7 @@ async fn inputs_are_checked_before_anything_runs() {
         ),
         (
             json!({"script": ""}),
-            json!({"tokens": {"bad host": "t"}}),
+            json!({"tokens": {"bad host": "token-1"}}),
             "is not a host name",
         ),
         (

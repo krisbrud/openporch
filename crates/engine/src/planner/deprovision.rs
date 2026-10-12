@@ -23,9 +23,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use super::log::DeploymentLog;
 use super::{
-    Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, Limits, Outcome, Planner,
-    ProvisionJob, backoff,
+    Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, JobLog, Limits, Outcome, Planner,
+    ProvisionJob, backoff, log_retry,
 };
 
 /// A destructive action that needs a permit.
@@ -106,6 +107,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         deadline: Instant,
         converged: bool,
         outcomes: &mut BTreeMap<Descriptor, Outcome>,
+        log: &DeploymentLog,
     ) -> Result<(), String> {
         let d = deployment;
         let active = match self
@@ -247,6 +249,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     resource: r.clone(),
                     descriptor: descriptor.clone(),
                     deadline,
+                    log: log.resource(descriptor),
                 };
                 let id = running
                     .spawn(async move { (run.descriptor.clone(), run.run().await) })
@@ -261,7 +264,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Err(e) => {
                     // The deletion may have started: only an observation can
                     // tell, and a restart marks its open operation unknown.
-                    tracing::error!(error = %e, "a deletion task stopped unexpectedly");
+                    // A panic message could hold a secret, so it is not logged.
+                    tracing::error!(
+                        panicked = e.is_panic(),
+                        "a deletion task stopped unexpectedly"
+                    );
                     let Some(descriptor) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
@@ -346,6 +353,7 @@ struct DeleteRun<S, E> {
     resource: ActiveResource,
     descriptor: Descriptor,
     deadline: Instant,
+    log: JobLog,
 }
 
 impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
@@ -442,6 +450,16 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                     other => failed(format!("the deletion was not recorded: {other}")),
                 })?;
             let guresid: Guresid = started.guresid.clone();
+            let log = self
+                .log
+                .operation(&started.operation_id, started.guresid.as_str());
+            if r.cleanup_pending {
+                log.info("removing the record of a deletion the driver already confirmed");
+            } else {
+                log.info(&format!(
+                    "deleting with `{driver_type}` (attempt {attempt})"
+                ));
+            }
             let job = ProvisionJob {
                 operation_id: started.operation_id.clone(),
                 attempt: started.attempt,
@@ -456,6 +474,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 cookie: r.cookie.clone(),
                 target: r.target.clone(),
                 deadline: self.deadline,
+                log: log.clone(),
             };
             // The driver deletes against what was retained, not the current
             // definition.
@@ -471,9 +490,16 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             };
             drop(permit);
             let failure = match result {
-                Ok(()) => return self.record_deletion(&started.operation_id).await,
+                Ok(()) => {
+                    let recorded = self.record_deletion(&started.operation_id).await;
+                    if recorded.is_ok() {
+                        log.status("info", "deleted");
+                    }
+                    return recorded;
+                }
                 Err(f) => f,
             };
+            log_retry(&failure, &log);
             match failure {
                 ExecFailure::Permanent(error) => {
                     self.checkpoint(
@@ -569,7 +595,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             )
             .await
         {
-            return Err(Outcome::Failed(format!("cleanup pending: {error}")));
+            return Err(Outcome::CleanupPending(error.into()));
         }
         self.checkpoint(
             operation_id,
@@ -590,7 +616,8 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                tracing::error!(error = %e, "the executor stopped unexpectedly");
+                // A panic message could hold a secret, so it is not logged.
+                tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
                 Err(ExecFailure::Uncertain(
                     "the executor stopped unexpectedly while the resource was being deleted".into(),
                 ))

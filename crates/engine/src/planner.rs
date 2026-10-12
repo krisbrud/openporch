@@ -36,10 +36,13 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 mod deprovision;
+mod log;
 #[cfg(test)]
 mod tests;
 
 pub use deprovision::{DestructiveAction, NoPermits, PermitCheck, PermitRequest};
+use log::DeploymentLog;
+pub use log::{JobLog, RedactingLog};
 
 /// A deployment as the planner runs it: the accepted configuration, never the
 /// current one.
@@ -143,6 +146,10 @@ pub struct ProvisionJob {
     pub target: Option<String>,
     /// When the deployment's time runs out.
     pub deadline: Instant,
+    /// Where the executor writes the resource's log. Before writing, it
+    /// registers every secret value it resolves with [`JobLog::secret`], so
+    /// that no line or error carries one.
+    pub log: JobLog,
 }
 
 /// Everything the executor needs to delete one resource: the job it was
@@ -211,6 +218,10 @@ pub enum ExecFailure {
 }
 
 /// Provisions resources: resolves secrets, obtains credentials and calls drivers.
+///
+/// Secret values stay in the executor. It writes a job's log through
+/// [`JobLog::redacting`], registers every value it resolves there, and passes
+/// every failure it returns through [`RedactingLog::failure`].
 pub trait Executor: Send + Sync + 'static {
     /// Provisions one resource.
     fn provision(
@@ -240,6 +251,9 @@ pub struct Limits {
     pub max_backoff: Duration,
     /// How long one deployment may run.
     pub deadline: Duration,
+    /// The most log text kept per deployment, in bytes; later lines are
+    /// dropped after a line saying so.
+    pub log_bytes: usize,
 }
 
 impl Default for Limits {
@@ -250,6 +264,7 @@ impl Default for Limits {
             backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             deadline: Duration::from_secs(30 * 60),
+            log_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -267,6 +282,10 @@ pub enum Outcome {
     Pending(String),
     /// Deleted, because the deployment no longer includes it.
     Deleted,
+    /// The driver confirmed the deletion, but the resource's record could not
+    /// be removed; the next deployment finishes the cleanup. This fails the
+    /// deployment.
+    CleanupPending(String),
     /// Scheduled for deletion but kept, because a resource that stays still
     /// uses it. This does not fail the deployment.
     Kept(String),
@@ -320,6 +339,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     pub async fn run(&self, deployment: Deployment) -> BTreeMap<Descriptor, Outcome> {
         let deadline = Instant::now() + self.limits.deadline;
         let deployment = Arc::new(deployment);
+        let log = DeploymentLog::start(self.store.clone(), &deployment, self.limits.log_bytes);
+        log.deployment().info(&format!(
+            "deployment `{}` started with {} resources",
+            deployment.id,
+            deployment.graph.nodes.len()
+        ));
         let mut outcomes: BTreeMap<Descriptor, Outcome> = BTreeMap::new();
         let mut done: BTreeMap<Descriptor, Done> = BTreeMap::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
@@ -350,6 +375,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         .filter_map(|d| done.get(d).map(|x| (d.clone(), x.outputs.clone())))
                         .collect(),
                     deadline,
+                    log: log.resource(&node.descriptor),
                 };
                 let d = node.descriptor.clone();
                 let task = running.spawn({
@@ -367,7 +393,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // The executor's own panics are caught; this is the planner's.
                     // Its operation, if one started, stays open for restart
                     // recovery, and the resource may have changed.
-                    tracing::error!(error = %e, "a provisioning task stopped unexpectedly");
+                    // A panic message could hold a secret, so it is not logged.
+                    tracing::error!(
+                        panicked = e.is_panic(),
+                        "a provisioning task stopped unexpectedly"
+                    );
                     let Some(d) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
@@ -410,19 +440,54 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // it includes provisioned.
         let converged = outcomes.values().all(|o| *o == Outcome::Provisioned);
         let listed = self
-            .deprovision(&deployment, deadline, converged, &mut outcomes)
+            .deprovision(&deployment, deadline, converged, &mut outcomes, &log)
             .await;
 
         // Every resource gets a record, also those that ended before an
         // operation was recorded; the store keeps any status an operation set.
         for (d, outcome) in &outcomes {
-            let (status, reason) = match outcome {
+            // Terminal lines say what is known about the effects and what to
+            // do next.
+            let (status, reason, level, line) = match outcome {
                 Outcome::Provisioned | Outcome::Deleted => continue,
-                Outcome::Pending(r) => (ResourceRunStatus::Pending, r),
-                Outcome::Kept(r) => (ResourceRunStatus::Skipped, r),
-                Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
-                Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
+                Outcome::Pending(r) => (
+                    ResourceRunStatus::Pending,
+                    r.clone(),
+                    "warn",
+                    format!("not attempted: {r}"),
+                ),
+                Outcome::Kept(r) => (
+                    ResourceRunStatus::Skipped,
+                    r.clone(),
+                    "info",
+                    format!("kept: {r}"),
+                ),
+                Outcome::Failed(r) => (
+                    ResourceRunStatus::Failed,
+                    r.clone(),
+                    "error",
+                    format!("failed, nothing changed; fix the cause and deploy again: {r}"),
+                ),
+                Outcome::CleanupPending(r) => (
+                    ResourceRunStatus::Failed,
+                    format!("cleanup pending: {r}"),
+                    "error",
+                    format!(
+                        "deleted, but its record remains; the next deployment finishes the \
+                         cleanup: {r}"
+                    ),
+                ),
+                Outcome::Unknown(r) => (
+                    ResourceRunStatus::Unknown,
+                    r.clone(),
+                    "error",
+                    format!(
+                        "outcome unknown, the resource may have changed; recover it before \
+                         deploying again: {r}"
+                    ),
+                ),
             };
+            log.resource(d).status(level, &line);
             if let Err(e) = self
                 .store
                 .record_resource_status(
@@ -445,6 +510,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             (None, Err(e)) => Some(e),
             (Some(error), Err(e)) => Some(format!("{error}; {e}")),
         };
+        // Every line is written before the deployment finishes, which adds
+        // its outcome as the last line. A log with lines missing is reported,
+        // not presented as complete.
+        let error = with_lost_lines(error, log.close().await);
         if let Err(e) = self
             .store
             .finish_deployment(
@@ -462,6 +531,24 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 }
 
+/// `error`, noting that `lost` log lines could not be stored.
+fn with_lost_lines(error: Option<String>, lost: usize) -> Option<String> {
+    match (error, lost) {
+        (error, 0) => error,
+        (None, n) => Some(format!("{n} log lines could not be stored")),
+        (Some(e), n) => Some(format!("{e}; {n} log lines could not be stored")),
+    }
+}
+
+/// Logs a failure the executor returned, already redacted, when another
+/// attempt may follow; a final failure is logged with the resource's status at
+/// the end of the run, or when its deletion ends.
+fn log_retry(failure: &ExecFailure, log: &JobLog) {
+    if let ExecFailure::Retryable { error, .. } = failure {
+        log.warn(&format!("failed, retryable: {error}"));
+    }
+}
+
 /// The deployment's error, or `None` when every resource provisioned.
 fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
     let mut failed = Vec::new();
@@ -471,6 +558,9 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
         match o {
             Outcome::Provisioned | Outcome::Deleted | Outcome::Kept(_) => {}
             Outcome::Failed(e) => failed.push(format!("`{d}` failed: {e}")),
+            Outcome::CleanupPending(e) => {
+                failed.push(format!("`{d}` failed: cleanup pending: {e}"));
+            }
             Outcome::Unknown(e) => unknown.push(format!(
                 "`{d}` has an unknown outcome and needs recovery: {e}"
             )),
@@ -561,6 +651,7 @@ struct NodeRun<S, E> {
     scope: MapScope,
     dependencies: BTreeMap<Descriptor, ResourceOutputs>,
     deadline: Instant,
+    log: JobLog,
 }
 
 impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
@@ -631,9 +722,17 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             self.scope
                 .context
                 .insert(ContextKey::ResGuresid, json!(started.guresid.as_str()));
-            let job = match self.job(node, *version, def, &fingerprint, &started) {
+            let log = self
+                .log
+                .operation(&started.operation_id, started.guresid.as_str());
+            log.info(&format!(
+                "provisioning with `{}` (attempt {attempt})",
+                def.driver_type
+            ));
+            let job = match self.job(node, *version, def, &fingerprint, &started, &log) {
                 Ok(job) => job,
                 Err(error) => {
+                    log.error(&error);
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Failed {
@@ -708,9 +807,11 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         )
                         .await;
                     if recorded {
+                        log.status("info", "provisioned");
                         return Ok(outputs);
                     }
                     let error = "the resource provisioned, but its result could not be recorded";
+                    log.error(error);
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Unknown {
@@ -722,6 +823,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 }
                 Err(f) => f,
             };
+            log_retry(&failure, &log);
             match failure {
                 ExecFailure::Permanent(error) => {
                     self.checkpoint(
@@ -776,6 +878,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         def: &ResourceDefinition,
         fingerprint: &str,
         started: &openporch_store::OperationStarted,
+        log: &JobLog,
     ) -> Result<ProvisionJob, String> {
         let at = |what: &str| format!("definition `{}`: {what}", def.id);
         let scope = &self.scope;
@@ -853,6 +956,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             cookie: None,
             target: None,
             deadline: self.deadline,
+            log: log.clone(),
         })
     }
 
@@ -865,7 +969,8 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                tracing::error!(error = %e, "the executor stopped unexpectedly");
+                // A panic message could hold a secret, so it is not logged.
+                tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
                 Err(ExecFailure::Uncertain(
                     "the executor stopped unexpectedly while the resource was provisioning".into(),
                 ))

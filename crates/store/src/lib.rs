@@ -23,9 +23,9 @@ mod sqlite_values;
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord, NewEnv, OperationKind,
-    OperationStart, OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
-    UncertainOperation,
+    DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord, LogLine, NewEnv,
+    OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
+    ResourceRunStatus, Tombstone, UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -260,6 +260,28 @@ pub trait Store: Send + Sync {
         env: &str,
         id: &str,
     ) -> impl Future<Output = Result<Vec<DeploymentResource>>> + Send;
+
+    /// Appends redacted lines to a deployment's log.
+    fn append_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        lines: Vec<LogLine>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// A deployment's log lines in order: at most `limit`, each after line
+    /// `after` when given.
+    fn deployment_logs(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<LogLine>>> + Send;
 
     /// Persists a driver operation, allocating the resource's GUResID if it has
     /// none, before the driver is called.

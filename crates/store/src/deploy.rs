@@ -328,6 +328,26 @@ pub struct DeploymentResource {
     pub observed_at: Option<i64>,
 }
 
+/// One line of a deployment's log, already redacted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct LogLine {
+    /// Its position in the log; later lines have higher numbers. Ignored when
+    /// appending.
+    pub seq: i64,
+    /// The operation it belongs to, if any.
+    pub operation_id: Option<String>,
+    /// The resource it is about, if any.
+    pub descriptor: Option<String>,
+    /// That resource's permanent identity, once it has one.
+    pub guresid: Option<String>,
+    /// When it was written, in milliseconds since the epoch.
+    pub at: i64,
+    /// `info`, `warn` or `error`.
+    pub level: String,
+    /// The text.
+    pub message: String,
+}
+
 /// A request to detach a resource.
 #[derive(Debug, Clone, Copy)]
 pub struct Detach<'a> {
