@@ -223,28 +223,52 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             }
             outcomes.insert(descriptor, outcome);
         }
-        for (descriptor, r) in candidates {
-            if outcomes.contains_key(&descriptor) {
-                continue;
-            }
-            let blocker = users
+        // A candidate stays when something that is kept uses it, directly or
+        // through other candidates: kept rather than failed, so that scheduling
+        // something a retained resource uses does not fail every later
+        // deployment. Repeat until no more candidates turn out to be kept.
+        let undecided: Vec<(Descriptor, ActiveResource)> = candidates
+            .into_iter()
+            .filter(|(d, _)| !outcomes.contains_key(d))
+            .collect();
+        let blockers = |r: &ActiveResource| -> Vec<String> {
+            users
                 .get(&r.descriptor)
                 .into_iter()
                 .flatten()
-                .find(|u| !deleted.contains(*u));
-            let reason = match blocker {
-                Some(u) if candidate_names.contains(u) => {
-                    format!("waiting for `{u}` to be deleted")
-                }
-                // Kept rather than failed, so that scheduling something a
-                // retained resource uses does not fail every later deployment.
-                Some(u) => {
-                    outcomes.insert(
-                        descriptor,
-                        Outcome::Kept(format!("scheduled for deletion, but still used by `{u}`")),
-                    );
+                .filter(|u| !deleted.contains(*u))
+                .cloned()
+                .collect()
+        };
+        let mut kept: BTreeMap<String, String> = BTreeMap::new();
+        loop {
+            let mut changed = false;
+            for (_, r) in &undecided {
+                if kept.contains_key(&r.descriptor) {
                     continue;
                 }
+                let keeper = blockers(r)
+                    .into_iter()
+                    .find(|u| !candidate_names.contains(u) || kept.contains_key(u));
+                if let Some(u) = keeper {
+                    kept.insert(r.descriptor.clone(), u);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (descriptor, r) in undecided {
+            if let Some(u) = kept.get(&r.descriptor) {
+                outcomes.insert(
+                    descriptor,
+                    Outcome::Kept(format!("scheduled for deletion, but still used by `{u}`")),
+                );
+                continue;
+            }
+            let reason = match blockers(&r).first() {
+                Some(u) => format!("waiting for `{u}` to be deleted"),
                 None if Instant::now() >= deadline => "the deployment ran out of time".into(),
                 None => "deletion stopped unexpectedly".into(),
             };

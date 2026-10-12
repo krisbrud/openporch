@@ -213,16 +213,19 @@ pub async fn schedule_deletion(
             ),
         )
         .await?;
-    let resource = state
+    // A deployment that started right after may already have deleted it; the
+    // request was still accepted.
+    let resource = match state
         .store
         .active_resource(org, &env.app, &env.id, &resource.descriptor)
         .await?
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "resource `{ty}/{res_id}` not found in `{}/{}`",
-                env.app, env.id
-            ))
-        })?;
+    {
+        Some(current) => current,
+        None => ActiveResource {
+            scheduled_deletion: true,
+            ..resource
+        },
+    };
     let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
     Ok((StatusCode::ACCEPTED, Json(usage.view(resource))))
 }

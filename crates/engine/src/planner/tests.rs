@@ -1275,3 +1275,40 @@ async fn a_workload_that_never_provisioned_is_deleted_by_its_identity() {
     assert_eq!(deleted[0].guresid.as_str(), workload.guresid);
     assert_eq!(deleted[0].inputs.values, Value::Null);
 }
+
+#[tokio::test]
+async fn a_chain_under_a_kept_resource_is_kept() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // The removed workload is adopted and not scheduled, so it stays, and with
+    // it the scheduled route it uses and the scheduled DNS the route uses.
+    sqlx::query("UPDATE active_resources SET ownership = 'adopted' WHERE descriptor = ?")
+        .bind(WORKLOAD)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    f.schedule(ROUTE).await;
+    f.schedule(DNS).await;
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert!(!outcomes.contains_key(&d(WORKLOAD)));
+    assert_eq!(
+        outcomes[&d(ROUTE)],
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{WORKLOAD}`"
+        ))
+    );
+    assert_eq!(
+        outcomes[&d(DNS)],
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{ROUTE}`"
+        ))
+    );
+    assert!(fake.deletions().is_empty());
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+}
