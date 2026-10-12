@@ -39,6 +39,8 @@ pub struct Inner {
     pub login_limit: RateLimiter,
     /// Token creation per principal.
     pub token_limit: RateLimiter,
+    /// Runs accepted deployments.
+    pub runners: crate::deploy::Runners,
 }
 
 impl std::ops::Deref for AppState {
@@ -204,6 +206,7 @@ pub async fn start_with(
         cloud: CredentialResolver::new(sts),
         login_limit,
         token_limit,
+        runners: crate::deploy::Runners::default(),
     }));
     prune_sessions(&state);
     Ok(state)

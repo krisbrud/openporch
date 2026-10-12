@@ -626,6 +626,87 @@ impl Store for SqliteStore {
         row.map(DeploymentRow::into_record).transpose()
     }
 
+    async fn deployments(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        limit: i64,
+        before_seq: Option<i64>,
+    ) -> Result<Vec<DeploymentRecord>> {
+        self.check_org(org)?;
+        let rows: Vec<DeploymentRow> = sqlx::query_as(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS} FROM deployments \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND seq < ? \
+             ORDER BY seq DESC LIMIT ?"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(before_seq.unwrap_or(i64::MAX))
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(DeploymentRow::into_record).collect()
+    }
+
+    async fn idempotent_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        actor: &str,
+        key: &str,
+    ) -> Result<Option<(DeploymentRecord, String)>> {
+        self.check_org(org)?;
+        let mut conn = self.pool.acquire().await?;
+        let prior: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, request_fingerprint FROM deployments WHERE org_id = ? AND app_id = ? \
+             AND env_id = ? AND actor_id = ? AND idempotency_key = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(actor)
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((id, fingerprint)) = prior else {
+            return Ok(None);
+        };
+        let d = fetch_deployment(&mut conn, org, app, env, &id)
+            .await?
+            .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
+        Ok(Some((d, fingerprint.unwrap_or_default())))
+    }
+
+    async fn deployment_snapshot(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        self.check_org(org)?;
+        let snapshot: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT snapshot FROM deployments \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        snapshot
+            .flatten()
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map_err(|e| StoreError::Corrupt(format!("snapshot of deployment `{id}`: {e}")))
+            })
+            .transpose()
+    }
+
     async fn app_deployment(
         &self,
         org: &str,

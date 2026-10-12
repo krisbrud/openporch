@@ -1412,6 +1412,198 @@ Authorization: Bearer $ADMIN_TOKEN
 [{"id": "$GRANT", "ref": "shop/stripe-key"}]
 ```
 
+## Deployments
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/deploys` | app read |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/deploys` | app deploy |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}` | app read |
+
+A deployment converges an environment to a set. The request names exactly one
+of:
+
+- `delta_id`: a delta, applied to the environment's desired set (the empty set
+  before the first deployment). The delta becomes frozen.
+- `set_id`: a stored set, or `0` for the empty set.
+- `deploy_id`: an earlier deployment's set. This can be a deployment ID from any
+  environment of the application, `+0` for the latest attempt in this environment,
+  `+1` for the one before it, and so on, or `last-successful`. By default
+  (`"replay": "snapshot"`) the deployment reuses the configuration recorded by
+  the earlier one, which only works in the same environment.
+  `"replay": "current"` matches definitions again as they are now.
+
+`expected_generation` must be the environment's current `generation`. If it is
+stale, or another deployment is still running in the environment, the request
+fails with `409` and changes nothing. With an `Idempotency-Key` header, the same
+caller retrying the same request gets the original deployment back, even after
+the generation moved on. The same key with a different request gets `409`.
+`mode` is `full`; `incremental` is not supported and returns `400`. `permits`
+holds destructive-action permits, and `comment` is free text.
+
+Acceptance builds the set's resource graph and rejects a set that cannot be
+deployed, such as one with a resource that no definition matches, with `400`.
+The graph and the definitions it matched are recorded with the deployment, so
+later edits do not affect it. The deployment is returned at once with status
+`in_progress`. It then becomes `succeeded` or `failed`, and only success changes
+the environment's last successful deployment and set.
+
+Provisioning resources is not implemented yet, so for now every deployment
+fails once accepted.
+
+```http
+POST /orgs/acme/apps
+Authorization: Bearer $ADMIN_TOKEN
+
+{"id": "blog"}
+```
+
+```http-response
+201 Created
+
+{"id": "blog"}
+```
+
+Every graph has a `base-env` node, and every workload is a `workload` node, so
+both need a matching definition:
+
+```http
+POST /orgs/acme/resources/defs
+Authorization: Bearer $ADMIN_TOKEN
+
+{"id": "blog-env", "type": "base-env", "driver_type": "openporch/none", "criteria": [{"app_id": "blog"}]}
+```
+
+```http-response
+201 Created
+
+{"id": "blog-env"}
+```
+
+```http
+POST /orgs/acme/resources/defs
+Authorization: Bearer $ADMIN_TOKEN
+
+{"id": "blog-workloads", "type": "workload", "driver_type": "openporch/none", "criteria": [{"app_id": "blog"}]}
+```
+
+```http-response
+201 Created
+
+{"id": "blog-workloads"}
+```
+
+```http
+POST /orgs/acme/apps/blog/deltas
+Authorization: Bearer $ADMIN_TOKEN
+
+{"modules": {"add": {"web": {"spec": {"containers": {"web": {"image": "registry.acme.example/blog/web:1"}}}}}}}
+```
+
+```http-response
+201 Created
+
+{"id": "$BLOG_DELTA"}
+```
+
+```http
+POST /orgs/acme/apps/blog/envs/development/deploys
+Authorization: Bearer $ADMIN_TOKEN
+Idempotency-Key: release-2026-10-12
+
+{"delta_id": "$BLOG_DELTA", "expected_generation": 0, "comment": "First release"}
+```
+
+```http-response
+202 Accepted
+
+{
+  "id": "$DEPLOY",
+  "app": "blog",
+  "env": "development",
+  "seq": 1,
+  "actor": "bootstrap",
+  "set_id": "$BLOG_SET",
+  "delta_id": "$BLOG_DELTA",
+  "comment": "First release",
+  "generation": 1,
+  "status": "in_progress",
+  "error": null,
+  "created_at": "…",
+  "finished_at": null
+}
+```
+
+Sending the same request with the same key again returns the same deployment:
+
+```http
+POST /orgs/acme/apps/blog/envs/development/deploys
+Authorization: Bearer $ADMIN_TOKEN
+Idempotency-Key: release-2026-10-12
+
+{"delta_id": "$BLOG_DELTA", "expected_generation": 0, "comment": "First release"}
+```
+
+```http-response
+202 Accepted
+
+{"id": "$DEPLOY"}
+```
+
+Without the key, the generation has moved on:
+
+```http
+POST /orgs/acme/apps/blog/envs/development/deploys
+Authorization: Bearer $ADMIN_TOKEN
+
+{"delta_id": "$BLOG_DELTA", "expected_generation": 0}
+```
+
+```http-response
+409 Conflict
+
+{"error": "API-004", "message": "…"}
+```
+
+```http
+POST /orgs/acme/apps/blog/envs/development/deploys
+Authorization: Bearer $ADMIN_TOKEN
+
+{"set_id": "0", "expected_generation": 1, "mode": "incremental"}
+```
+
+```http-response
+400 Bad Request
+
+{"error": "API-003", "message": "mode `incremental` is not supported; use `full`"}
+```
+
+History is newest first. `limit` defaults to 50, and `next`, when present, is
+passed as `before` for the next page. A single deployment can be read by ID,
+`+n` or `last-successful`:
+
+```http
+GET /orgs/acme/apps/blog/envs/development/deploys
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"deployments": [{"id": "$DEPLOY", "seq": 1, "status": "…"}]}
+```
+
+```http
+GET /orgs/acme/apps/blog/envs/development/deploys/+0
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"id": "$DEPLOY", "set_id": "$BLOG_SET"}
+```
+
 ## Audit log
 
 | Method | Path | Permission |

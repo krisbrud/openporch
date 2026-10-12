@@ -136,6 +136,37 @@ pub trait Store: Send + Sync {
         env: &str,
     ) -> impl Future<Output = Result<Option<DeploymentRecord>>> + Send;
 
+    /// An environment's deployments, newest first: at most `limit`, each older
+    /// than attempt `before_seq` when given.
+    fn deployments(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        limit: i64,
+        before_seq: Option<i64>,
+    ) -> impl Future<Output = Result<Vec<DeploymentRecord>>> + Send;
+
+    /// The deployment `actor` submitted with idempotency key `key`, and the
+    /// fingerprint of that request.
+    fn idempotent_deployment(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        actor: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<(DeploymentRecord, String)>>> + Send;
+
+    /// A deployment's execution snapshot.
+    fn deployment_snapshot(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<serde_json::Value>>> + Send;
+
     /// Finds a deployment by ID in any environment of an application.
     fn app_deployment(
         &self,
