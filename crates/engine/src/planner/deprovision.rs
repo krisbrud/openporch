@@ -119,6 +119,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             }
         };
         let mut candidates: BTreeMap<Descriptor, ActiveResource> = BTreeMap::new();
+        // Removals the deployment must complete to succeed: removed workloads
+        // and what they own.
+        let mut mandatory: BTreeSet<String> = BTreeSet::new();
+        let mut left_out: Vec<(Descriptor, &ActiveResource)> = Vec::new();
         for r in &active {
             let Ok(descriptor) = Descriptor::parse(&r.descriptor) else {
                 tracing::error!(resource = %r.descriptor, "an active resource has an invalid descriptor");
@@ -133,10 +137,34 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             };
             // One whose deletion the driver already confirmed only needs its
             // record removed.
-            if d.graph.nodes.contains_key(&descriptor) || !(deletable || r.cleanup_pending) {
+            if d.graph.nodes.contains_key(&descriptor) {
                 continue;
             }
+            if !(deletable || r.cleanup_pending) {
+                left_out.push((descriptor, r));
+                continue;
+            }
+            if removed_workload {
+                mandatory.insert(r.descriptor.clone());
+            }
             candidates.insert(descriptor, r.clone());
+        }
+        // A removed workload loses the owned resources provisioned with it,
+        // such as its triggers: they depend on it and are left out with it.
+        loop {
+            let before = mandatory.len();
+            left_out.retain(|(descriptor, r)| {
+                let owned_by_removed = r.ownership == "owned"
+                    && r.dependencies.iter().any(|dep| mandatory.contains(dep));
+                if owned_by_removed {
+                    mandatory.insert(r.descriptor.clone());
+                    candidates.insert(descriptor.clone(), (*r).clone());
+                }
+                !owned_by_removed
+            });
+            if mandatory.len() == before {
+                break;
+            }
         }
         if candidates.is_empty() {
             return Ok(());
@@ -244,7 +272,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         loop {
             let mut changed = false;
             for (_, r) in &undecided {
-                if kept.contains_key(&r.descriptor) {
+                // Removing a workload is not optional, so it is never kept.
+                if kept.contains_key(&r.descriptor) || mandatory.contains(&r.descriptor) {
                     continue;
                 }
                 let keeper = blockers(r)
@@ -268,6 +297,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 continue;
             }
             let reason = match blockers(&r).first() {
+                Some(u) if !candidate_names.contains(u) || kept.contains_key(u) => {
+                    format!("still used by `{u}`, which stays; schedule it for deletion too")
+                }
                 Some(u) => format!("waiting for `{u}` to be deleted"),
                 None if Instant::now() >= deadline => "the deployment ran out of time".into(),
                 None => "deletion stopped unexpectedly".into(),

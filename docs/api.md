@@ -1645,7 +1645,10 @@ resource, now with `scheduled_deletion: true`. Nothing is deleted yet: the next
 deployment that leaves the resource out deletes it with the driver and state it
 was provisioned with, and the record disappears, leaving a tombstone in the
 audit trail. A deployment that removes a workload deletes the workload the same
-way; its dependencies stay unless they are scheduled too. Deletion runs only
+way, together with the owned resources provisioned with it that depend on it,
+such as its triggers; its dependencies stay unless they are scheduled too. A
+removed workload that something kept still uses is not deleted, and the
+deployment fails until that resource is scheduled too. Deletion runs only
 after everything the deployment includes has provisioned, in reverse dependency
 order: a resource is deleted only once nothing that uses it remains. A scheduled
 resource that a kept resource still uses stays, with status `skipped` in the

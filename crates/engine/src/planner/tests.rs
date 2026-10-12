@@ -1312,3 +1312,68 @@ async fn a_chain_under_a_kept_resource_is_kept() {
         (DeploymentStatus::Succeeded, None)
     );
 }
+
+#[tokio::test]
+async fn a_removed_workload_takes_what_it_owns_with_it() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // Pretend the database was provisioned with the workload and depends on it,
+    // as a co-provisioned trigger would.
+    let redo = |descriptor: &str, deps: Value| {
+        let pool = f.store.pool().clone();
+        let descriptor = descriptor.to_owned();
+        async move {
+            sqlx::query("UPDATE active_resources SET dependencies = ? WHERE descriptor = ?")
+                .bind(deps.to_string())
+                .bind(descriptor)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    redo(WORKLOAD, json!([ROUTE])).await;
+    redo(DB, json!([WORKLOAD])).await;
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(DB)], Outcome::Deleted);
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert_eq!(fake.deletions(), vec![DB.to_owned(), WORKLOAD.to_owned()]);
+    assert!(f.active(ROUTE).await.is_some());
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+}
+
+#[tokio::test]
+async fn a_removed_workload_that_something_kept_uses_fails_the_deployment() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    sqlx::query(
+        "UPDATE active_resources SET dependencies = ?, ownership = 'adopted' WHERE descriptor = ?",
+    )
+    .bind(json!([WORKLOAD]).to_string())
+    .bind(DB)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE active_resources SET dependencies = '[]' WHERE descriptor = ?")
+        .bind(WORKLOAD)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(
+        outcomes[&d(WORKLOAD)],
+        Outcome::Pending(format!(
+            "still used by `{DB}`, which stays; schedule it for deletion too"
+        ))
+    );
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
