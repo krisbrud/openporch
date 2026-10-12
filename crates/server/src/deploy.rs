@@ -12,11 +12,13 @@ use std::sync::{Arc, RwLock};
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::planner::{
-    Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, Planner,
+    Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, Planner, RecoverError,
+    Recovered,
 };
 use openporch_engine::preview::DriverFacts;
 use openporch_store::{
-    ApprovalRequest, DeploymentKind, PermitStore, PermitUse, SqliteStore, Store, StoreError,
+    ApprovalRequest, AuditIntent, DeploymentKind, PermitStore, PermitUse, SqliteStore, Store,
+    StoreError,
 };
 use serde_json::Value;
 
@@ -35,10 +37,38 @@ pub struct Job {
     pub snapshot: Value,
 }
 
+/// A resource to recover.
+#[derive(Debug, Clone)]
+pub struct Recovery {
+    /// Application.
+    pub app: String,
+    /// Environment.
+    pub env: String,
+    /// The resource.
+    pub descriptor: String,
+    /// The audit intent of the recovery.
+    pub audit: AuditIntent,
+}
+
+/// What recovering a resource returns.
+pub type RecoverFuture = Pin<Box<dyn Future<Output = Result<Recovered, RecoverError>> + Send>>;
+
 /// Runs accepted deployments to completion.
 pub trait Runner: Send + Sync + std::fmt::Debug {
     /// Runs `job` and finishes its deployment.
     fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// Observes a resource whose last operation has an unknown outcome and
+    /// records what the observation establishes. A runner without an
+    /// executor cannot.
+    fn recover(&self, recovery: Recovery) -> RecoverFuture {
+        let _ = recovery;
+        Box::pin(async {
+            Err(RecoverError::Observation(
+                "resources cannot be observed until the server runs with an executor".into(),
+            ))
+        })
+    }
 }
 
 /// The runner without an executor: nothing is provisioned, so every
@@ -92,6 +122,15 @@ impl<E: Executor> Runner for PlannerRunner<E> {
                     finish(&state, &job, Some(error)).await;
                 }
             }
+        })
+    }
+
+    fn recover(&self, r: Recovery) -> RecoverFuture {
+        let planner = self.0.clone();
+        Box::pin(async move {
+            planner
+                .recover(&r.audit.org, &r.app, &r.env, &r.descriptor, r.audit.clone())
+                .await
         })
     }
 }
@@ -183,6 +222,12 @@ impl Runners {
     pub fn set(&self, runner: Arc<dyn Runner>) {
         let mut current = self.0.write().unwrap_or_else(|e| e.into_inner());
         *current = runner;
+    }
+
+    /// Recovers a resource with the current runner.
+    pub fn recover(&self, recovery: Recovery) -> RecoverFuture {
+        let runner = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
+        runner.recover(recovery)
     }
 
     /// Starts `job` in the background.

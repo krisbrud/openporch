@@ -64,6 +64,8 @@ Authorization: Bearer $ADMIN_TOKEN
 | `DPL-001` | 409 | `approval_required`: a destructive or unknown-impact change has no permit. Preview and request one. |
 | `DPL-002` | 409 | `migration_required`: the change moves a resource to another driver, cloud account or state backend. |
 | `DPL-003` | 409 | A presented permit is unknown, expired, stale or already used. Preview again. |
+| `DPL-004` | 409 | `recovery_required`: a resource's last operation has an unknown outcome. Recover the resource first. |
+| `DPL-005` | 503 | A resource could not be observed. Nothing changed; recover it again. |
 | `CLD-001` | 422 | The cloud refused a request, such as an account check. |
 | `CLD-002` | 502 | The cloud could not be reached. |
 
@@ -1872,6 +1874,8 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | app read |
 | DELETE | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | deploy to the environment |
 | POST | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/detach` | administrator |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/recover` | deploy to the environment |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/resolve` | administrator |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/tombstones` | app read |
 | GET | `/orgs/{org}/resources/defs/{def}/resources` | org read all |
 
@@ -1948,6 +1952,68 @@ detach keeps it; without one the request fails with `409` `DPL-001`.
 
 `GET .../tombstones` lists what remains of the environment's deleted and
 detached resources, oldest first.
+
+### Unknown outcomes
+
+Every driver operation is recorded, with the resource's `guresid` and the
+inputs it runs with, before the driver is called. When the server stops during
+an operation, or a driver times out or cannot say what it did, the resource's
+`status` is `unknown`: it may have changed in the cloud. An operation the
+server stopped before its driver was called is known to have changed nothing;
+it fails, and the next deployment repeats it with the same `guresid`.
+
+A resource with an unknown outcome blocks every deployment and deletion of its
+environment that would touch it, with `409` `DPL-004`, until the outcome is
+known. Nothing repeats the operation automatically.
+
+After a restart the server observes each resource whose operation the
+restart interrupted with its driver's read-only `get`, using the identity,
+driver, cloud account and inputs the operation recorded, and the definition's
+own secrets even if the definition no longer matches the resource, as a
+deletion does. One that cannot be settled then, for example because a
+deployment started first, and one left unknown by a timeout, waits for an
+explicit recovery. `POST .../recover` does the same on request and returns
+what the observation established as `outcome`, with the resource as it is now
+(absent once deleted) and the observation's `reason`:
+
+- `provisioned`: the creation took effect. The resource is `provisioned`
+  with what the driver reports. A resource that existed before the operation
+  proves nothing about an update by existing, so an interrupted update is
+  `repeatable` instead and keeps its last successful result.
+- `deleted`: the deletion took effect. The record is replaced by a tombstone,
+  and the next deletion of the environment does not delete it again.
+- `repeatable`: the operation can safely be repeated with the same `guresid`,
+  because a creation left nothing behind, a deletion left the resource in
+  place, an update's outcome is unknown, or the driver reports a failure, and
+  the driver has the `recover` capability: repeating with the same identity
+  converges instead of duplicating. The
+  resource is `failed` or `deletion_failed`, and the next deployment repeats
+  the operation.
+- `in_progress`: the operation is still running. Nothing changed; recover
+  again later.
+- `recovery_required`: the driver cannot tell, as for a driver without the
+  `observe` capability, or the outcome would be `repeatable` but the driver
+  lacks the `recover` capability. The resource stays blocked with status
+  `recovery_required`.
+
+`POST .../recover` returns `409` when the resource has no unknown outcome or a
+deployment is running in the environment, and `503` `DPL-005` when the driver
+could not be reached; nothing changed then, so recover again.
+
+When observation cannot settle an outcome, an administrator checks the cloud
+and states that repeating the operation with the same `guresid` is safe:
+
+```text
+POST /orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db/resolve
+{"reason": "no database with this GUResID exists in the console"}
+```
+
+The resource becomes `failed` (or `deletion_failed` for a deletion) and the
+response is the resource; the next deployment repeats the operation. The reason
+is recorded with the operation and in the audit log. Resolving needs an
+administrator and a `reason`, and is refused with `409` when there is no unknown
+outcome or a deployment is running. If the object exists but should no longer be
+managed, resolve the outcome first and then detach the resource.
 
 `GET .../resources/graph` returns the graph of the environment's latest
 attempt, or `404` before the first one. After an environment deletion, the

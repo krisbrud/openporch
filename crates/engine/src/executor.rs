@@ -15,8 +15,9 @@ use openporch_core::criteria::definition_weight;
 use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
-    Action, Cookie, Driver, DriverContext, DriverError, DriverRegistry, DriverRequest, Operation,
-    Plan, SecretMap, call_timeout, converge, remove, with_timeout,
+    Action, Cookie, Driver, DriverContext, DriverError, DriverOutputs, DriverRegistry,
+    DriverRequest, Observation, Operation, Plan, SecretMap, call_timeout, converge, remove,
+    with_timeout,
 };
 use openporch_store::secrets::{Keyring, Sealed, SecretError, SecretStore, SecretValue};
 use openporch_store::{AccountStore, CatalogStore, SecretOwner, SecretUseStore, StoreError};
@@ -25,7 +26,7 @@ use tokio::time::Instant;
 
 use crate::cloud::{CloudError, CredentialResolver};
 use crate::planner::{
-    DeprovisionJob, DestructiveAction, ExecFailure, Executor, PermitCheck, PermitRequest,
+    DeprovisionJob, DestructiveAction, ExecFailure, Executor, Observed, PermitCheck, PermitRequest,
     ProvisionJob, ProvisionResult, RedactingLog, SecretSource,
 };
 
@@ -504,6 +505,20 @@ where
         let settled = converge(driver.as_ref(), &req, timeout).await;
         let accepted = settled.cookie != req.cookie;
         let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
+        self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
+            .await
+    }
+
+    /// What a resource that provisioned returns: its outputs, with secret
+    /// outputs written to the secret store and the cookie sealed.
+    async fn provisioned(
+        &self,
+        job: &ProvisionJob,
+        outputs: DriverOutputs,
+        cookie: Option<&Cookie>,
+        target: Option<String>,
+        log: &mut RedactingLog,
+    ) -> Result<ProvisionResult, ExecFailure> {
         let mut result = ProvisionResult {
             outputs: outputs.values,
             target,
@@ -531,10 +546,74 @@ where
                 })?;
             result.secret_outputs.insert(key.clone(), reference);
         }
-        if let Some(cookie) = &settled.cookie {
+        if let Some(cookie) = cookie {
             result.cookie = Some(self.seal_cookie(job, cookie)?);
         }
         Ok(result)
+    }
+
+    async fn run_observe(
+        &self,
+        job: &ProvisionJob,
+        deleting: bool,
+        log: &mut RedactingLog,
+    ) -> Result<Observed, ExecFailure> {
+        if let Some(driver) = self.drivers.get(&job.driver_type)
+            && !driver.info().capabilities.observe
+        {
+            return Ok(Observed::Unknown(format!(
+                "driver `{}` cannot observe resources",
+                job.driver_type
+            )));
+        }
+        let sources = if job.inputs.sources.is_empty() {
+            inferred_sources(job)
+        } else {
+            job.inputs.sources.clone()
+        };
+        // The operation being recovered was started with this definition, so
+        // its secrets are read whether or not it still matches, as for a
+        // deletion.
+        let Call {
+            driver,
+            req,
+            timeout,
+            target,
+        } = self.request(job, &sources, false, log).await?;
+        let observation =
+            with_timeout(timeout, driver.get(&req))
+                .await
+                .map_err(|e| ExecFailure::Retryable {
+                    error: format!("the resource could not be observed: {e}"),
+                    retry_after: None,
+                })?;
+        let repeatable = driver.info().capabilities.recover;
+        Ok(match observation {
+            Observation::Absent => Observed::Absent { repeatable },
+            Observation::InProgress { .. } => Observed::InProgress,
+            Observation::Failed { error } => Observed::Failed {
+                error: error.to_string(),
+                repeatable,
+            },
+            Observation::Unknown { reason } => Observed::Unknown(reason),
+            // Only a creation's result is kept: for a resource that existed
+            // before, nothing is stored.
+            Observation::Ready { .. } if deleting || job.existing => Observed::Ready {
+                result: Box::default(),
+                repeatable,
+            },
+            Observation::Ready { outputs, cookie } => {
+                // A driver that returns no cookie leaves the last one in place.
+                let cookie = cookie.or(req.cookie.clone());
+                Observed::Ready {
+                    result: Box::new(
+                        self.provisioned(job, outputs, cookie.as_ref(), target, log)
+                            .await?,
+                    ),
+                    repeatable,
+                }
+            }
+        })
     }
 
     async fn run_deprovision(
@@ -615,6 +694,23 @@ where
         self.run_deprovision(&job, &mut log)
             .await
             .map_err(|f| log.failure(f))
+    }
+
+    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Result<Observed, ExecFailure> {
+        let mut log = job.log.redacting();
+        let observed = self
+            .run_observe(&job, deleting, &mut log)
+            .await
+            .map_err(|f| log.failure(f))?;
+        // What the driver said goes into records, so it is redacted too.
+        Ok(match observed {
+            Observed::Failed { error, repeatable } => Observed::Failed {
+                error: log.redact(&error),
+                repeatable,
+            },
+            Observed::Unknown(reason) => Observed::Unknown(log.redact(&reason)),
+            other => other,
+        })
     }
 }
 

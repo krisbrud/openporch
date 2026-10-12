@@ -11,7 +11,7 @@ use openporch_store::Store;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
-use super::{Server, assert_error, server};
+use super::{Server, assert_error, server, server_in};
 use crate::deploy::{self, Job, Runner};
 use crate::state::AppState;
 
@@ -796,4 +796,77 @@ async fn a_started_server_provisions_deployments() {
             "postgres.default#modules.web.externals.db"
         ]
     );
+}
+
+#[tokio::test]
+async fn a_restart_observes_resources_left_with_an_unknown_outcome() {
+    let s = server().await;
+    s.app("shop").await;
+    for (id, ty, driver) in [
+        ("env", "base-env", "openporch/none"),
+        ("workloads", "workload", "openporch/none"),
+        ("pg", "postgres", "openporch/echo"),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver,
+                       "driver_inputs": {"values": {"host": "db.internal"}}, "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let db_path =
+        "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db";
+    let (_, db) = s.get(db_path, &s.admin).await;
+
+    // The server stops while the database's operation is open.
+    sqlx::query("UPDATE operations SET state = 'started', finished_at = NULL WHERE guresid = ?")
+        .bind(db["guresid"].as_str().unwrap())
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let Server {
+        dir, state, router, ..
+    } = s;
+    state.store.pool().close().await;
+    drop((state, router));
+
+    // The restart marks it unknown, then observes it. It exists, which says
+    // nothing about whether the update applied, and its driver can repeat
+    // it safely, so the next deployment does.
+    let s = server_in(dir).await;
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        let (st, db) = s.get(db_path, &s.admin).await;
+        assert_eq!(st, StatusCode::OK, "{db}");
+        status = db["status"].clone();
+        if status == "failed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(status, "failed");
+    let (_, audit) = s.get("/orgs/acme/audit-logs", &s.admin).await;
+    assert!(audit.to_string().contains("resource.recover"), "{audit}");
 }

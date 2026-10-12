@@ -131,7 +131,8 @@ impl Fixture {
                 driver_type: Some("openporch/echo".into()),
                 kind: OperationKind::Put,
                 input_fingerprint: "inputs-1".into(),
-                recovery: json!({"backend": "local"}),
+                // Recorded inputs mark an operation whose driver may have run.
+                recovery: json!({"backend": "local", "inputs": {}}),
             })
             .await
     }
@@ -676,6 +677,9 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
             operation_id: op.operation_id.clone(),
             deployment_id: d1.id.clone(),
             guresid: op.guresid.to_string(),
+            app: "shop".into(),
+            env: "development".into(),
+            descriptor: DB.into(),
         }]
     );
     let d1 = f
