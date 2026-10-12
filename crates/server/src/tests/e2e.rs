@@ -6,6 +6,7 @@
 use axum::http::StatusCode;
 use openporch_core::catalog::builtin_types;
 use openporch_core::workload::Workload;
+use openporch_store::Store;
 use serde_json::{Value, json};
 
 use super::{Server, server};
@@ -124,6 +125,14 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     }
     let (st, b) = s
         .post(
+            &format!("{APP}/values"),
+            &s.admin,
+            json!({"key": "TOKEN", "description": "", "secret_ref": {"value": "hunter2-token"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let (st, b) = s
+        .post(
             &format!("{APP}/envs"),
             &s.admin,
             json!({"id": "staging", "name": "Staging", "type": "development"}),
@@ -167,6 +176,26 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
         )
         .await;
     assert_eq!(frozen["frozen"], true);
+    // The snapshot records every value it resolved, a secret as a reference
+    // only.
+    let snapshot = s
+        .state
+        .store
+        .deployment_snapshot("acme", "shop", "development", first["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let values = &snapshot["values"];
+    assert!(values["versions"]["app"].is_string(), "{values}");
+    assert_eq!(
+        values["resolved"]["API_HOST"],
+        json!({"value": "api.shared"})
+    );
+    assert!(
+        values["resolved"]["TOKEN"]["secret_ref"]["ref"].is_string(),
+        "{values}"
+    );
+    assert!(!snapshot.to_string().contains("hunter2"), "{snapshot}");
     let dev = s.active("development").await;
     assert_eq!(
         dev.keys().map(String::as_str).collect::<Vec<_>>(),
