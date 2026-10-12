@@ -1225,3 +1225,72 @@ async fn an_unknown_outcome_is_recovered_or_resolved() {
     assert_eq!(d["status"], "succeeded", "{d}");
     assert_eq!(s.resource(DB).await["guresid"], db["guresid"]);
 }
+
+#[tokio::test]
+async fn conflicting_shared_parameters_provision_nothing() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let (st, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "ddb", "type": "dynamodb-table", "driver_type": "openporch/echo",
+                   "criteria": [{}]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let module = |key: &str| {
+        json!({"externals": {"orders": {"type": "dynamodb-table", "id": "orders",
+                "params": {"hash_key": key}}},
+               "spec": {"containers": {"web": {"image": "nginx"}}}})
+    };
+    let s = &s;
+    let deploy = |alpha: &str, beta: &str| {
+        let body = json!({"modules": {"add": {"alpha": module(alpha), "beta": module(beta)}}});
+        async move {
+            let (st, delta) = s.post("/orgs/acme/apps/shop/deltas", &s.admin, body).await;
+            assert_eq!(st, StatusCode::CREATED, "{delta}");
+            let (_, env) = s.get(ENV_DEV, &s.admin).await;
+            s.post(
+                DEPLOYS,
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": env["generation"]}),
+            )
+            .await
+        }
+    };
+
+    // Two workloads that disagree on the shared table's key are refused,
+    // naming both, before anything is provisioned.
+    let (st, b) = deploy("id", "order_id").await;
+    assert_error(st, &b, StatusCode::BAD_REQUEST, "API-003");
+    let message = b["message"].as_str().unwrap();
+    for path in [
+        "dynamodb-table.default#shared.orders",
+        "modules.alpha.externals.orders",
+        "modules.beta.externals.orders",
+    ] {
+        assert!(message.contains(path), "{message}");
+    }
+    assert!(fake.guresids.lock().unwrap().is_empty());
+    let (_, list) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(list["deployments"], json!([]), "{list}");
+
+    // Agreeing on it, they share one table.
+    let (st, d) = deploy("id", "id").await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s
+        .finished_at(&format!("{DEPLOYS}/{}", d["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let tables: Vec<String> = fake
+        .guresids
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(d, _)| d == "dynamodb-table.default#shared.orders")
+        .map(|(_, g)| g.clone())
+        .collect();
+    assert_eq!(tables.len(), 1, "{tables:?}");
+}
