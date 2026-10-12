@@ -1647,11 +1647,14 @@ was provisioned with, and the record disappears, leaving a tombstone in the
 audit trail. A deployment that removes a workload deletes the workload the same
 way; its dependencies stay unless they are scheduled too. Deletion runs only
 after everything the deployment includes has provisioned, in reverse dependency
-order: a resource is deleted only once nothing that uses it remains. A resource
+order: a resource is deleted only once nothing that uses it remains. A scheduled
+resource that a kept resource still uses stays, with status `skipped` in the
+deployment, without failing it. A resource
 whose deletion fails keeps its record with status `deletion_failed`, and the
 resources it uses stay too; the next deployment retries it with the same
 `guresid`. External resources are never deleted and cannot be scheduled
-(`409`); adopted resources are deleted only when scheduled.
+(`409`); adopted resources are deleted only when scheduled. Scheduling advances
+the environment's `generation` and returns `409` while a deployment is running.
 
 Every deletion needs a destructive-action permit in the deployment's `permits`.
 Without one the resource fails with `approval_required` and the deployment

@@ -246,6 +246,9 @@ pub enum Outcome {
     Pending(String),
     /// Deleted, because the deployment no longer includes it.
     Deleted,
+    /// Scheduled for deletion but kept, because a resource that stays still
+    /// uses it. This does not fail the deployment.
+    Kept(String),
 }
 
 /// The planner, shared by all deployments of a server.
@@ -394,6 +397,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             let (status, reason) = match outcome {
                 Outcome::Provisioned | Outcome::Deleted => continue,
                 Outcome::Pending(r) => (ResourceRunStatus::Pending, r),
+                Outcome::Kept(r) => (ResourceRunStatus::Skipped, r),
                 Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
                 Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
             };
@@ -439,7 +443,7 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
     let mut pending = 0;
     for (d, o) in outcomes {
         match o {
-            Outcome::Provisioned | Outcome::Deleted => {}
+            Outcome::Provisioned | Outcome::Deleted | Outcome::Kept(_) => {}
             Outcome::Failed(e) => failed.push(format!("`{d}` failed: {e}")),
             Outcome::Unknown(e) => unknown.push(format!(
                 "`{d}` has an unknown outcome and needs recovery: {e}"

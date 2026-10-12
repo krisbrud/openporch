@@ -315,8 +315,9 @@ pub trait Store: Send + Sync {
     ) -> impl Future<Output = Result<Vec<ActiveResource>>> + Send;
 
     /// Schedules an active resource for deletion by the next deployment that
-    /// leaves it out. Scheduling twice is harmless; external resources are
-    /// never deleted and cannot be scheduled.
+    /// leaves it out, and advances the environment's generation. Scheduling
+    /// twice is harmless; external resources are never deleted and cannot be
+    /// scheduled, and nothing is scheduled while a deployment runs.
     fn schedule_deletion(
         &self,
         org: &str,

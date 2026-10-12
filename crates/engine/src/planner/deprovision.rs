@@ -163,6 +163,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut deleted: BTreeSet<String> = BTreeSet::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
+        let mut tasks = BTreeMap::new();
         loop {
             for (descriptor, r) in &candidates {
                 let ready = users
@@ -186,15 +187,28 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     descriptor: descriptor.clone(),
                     deadline,
                 };
-                running.spawn(async move { (run.descriptor.clone(), run.run().await) });
+                let id = running
+                    .spawn(async move { (run.descriptor.clone(), run.run().await) })
+                    .id();
+                tasks.insert(id, descriptor.clone());
             }
-            let Some(joined) = running.join_next().await else {
+            let Some(joined) = running.join_next_with_id().await else {
                 break;
             };
-            let Ok((descriptor, outcome)) = joined else {
-                // The task's resource stays undecided and is reported below.
-                tracing::error!("a deletion task stopped unexpectedly");
-                continue;
+            let (descriptor, outcome) = match joined {
+                Ok((_, result)) => result,
+                Err(e) => {
+                    // The deletion may have started: only an observation can
+                    // tell, and a restart marks its open operation unknown.
+                    tracing::error!(error = %e, "a deletion task stopped unexpectedly");
+                    let Some(descriptor) = tasks.get(&e.id()).cloned() else {
+                        continue;
+                    };
+                    (
+                        descriptor,
+                        Outcome::Unknown("the deletion stopped unexpectedly".into()),
+                    )
+                }
             };
             if outcome == Outcome::Deleted {
                 deleted.insert(descriptor.to_string());
@@ -214,7 +228,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Some(u) if candidate_names.contains(u) => {
                     format!("waiting for `{u}` to be deleted")
                 }
-                Some(u) => format!("still used by `{u}`"),
+                // Kept rather than failed, so that scheduling something a
+                // retained resource uses does not fail every later deployment.
+                Some(u) => {
+                    outcomes.insert(
+                        descriptor,
+                        Outcome::Kept(format!("scheduled for deletion, but still used by `{u}`")),
+                    );
+                    continue;
+                }
                 None if Instant::now() >= deadline => "the deployment ran out of time".into(),
                 None => "deletion stopped unexpectedly".into(),
             };
@@ -248,17 +270,19 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         let d = &self.deployment;
         let r = &self.resource;
         let failed = |e: String| Outcome::Failed(e);
-        self.checks
-            .check(PermitRequest {
-                org: d.org.as_str(),
-                app: d.app.as_str(),
-                env: d.env.as_str(),
-                descriptor: &r.descriptor,
-                action: DestructiveAction::Delete,
-                permits: &d.permits,
-            })
-            .await
-            .map_err(|e| failed(format!("approval_required: {e}")))?;
+        let check = self.checks.check(PermitRequest {
+            org: d.org.as_str(),
+            app: d.app.as_str(),
+            env: d.env.as_str(),
+            descriptor: &r.descriptor,
+            action: DestructiveAction::Delete,
+            permits: &d.permits,
+        });
+        match tokio::time::timeout_at(self.deadline, check).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(failed(format!("approval_required: {e}"))),
+            Err(_) => return Err(Outcome::Pending("the deployment ran out of time".into())),
+        }
         let driver_type = r
             .driver_type
             .clone()
@@ -296,11 +320,14 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             attempt += 1;
             let permit =
                 tokio::time::timeout_at(self.deadline, self.permits.clone().acquire_owned()).await;
-            let _permit = match permit {
+            let permit = match permit {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_)) => return Err(failed("the planner is shutting down".into())),
                 Err(_) => return Err(Outcome::Pending("the deployment ran out of time".into())),
             };
+            if Instant::now() >= self.deadline {
+                return Err(Outcome::Pending("the deployment ran out of time".into()));
+            }
             let started = self
                 .store
                 .begin_operation(OperationStart {
@@ -345,7 +372,9 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 target: r.target.clone(),
                 deadline: self.deadline,
             };
-            let failure = match self.execute(job).await {
+            let result = self.execute(job).await;
+            drop(permit);
+            let failure = match result {
                 Ok(()) => {
                     return if self
                         .checkpoint(&started.operation_id, CheckpointResult::Deleted)

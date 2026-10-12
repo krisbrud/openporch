@@ -951,7 +951,9 @@ async fn a_removed_workload_keeps_its_unscheduled_dependencies() {
     assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
     assert_eq!(
         outcomes[&d(DNS)],
-        Outcome::Pending(format!("still used by `{ROUTE}`"))
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{ROUTE}`"
+        ))
     );
     assert!(!outcomes.contains_key(&d(DB)));
     assert!(!outcomes.contains_key(&d(ROUTE)));
@@ -959,7 +961,12 @@ async fn a_removed_workload_keeps_its_unscheduled_dependencies() {
     for descriptor in [DB, ROUTE, DNS] {
         assert!(f.active(descriptor).await.is_some(), "{descriptor}");
     }
-    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+    // Keeping it does not fail the deployment.
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+    assert_eq!(f.resources(&deployment).await[DNS], "skipped");
 }
 
 #[tokio::test]
@@ -1073,8 +1080,13 @@ async fn adopted_and_external_resources_are_not_deleted() {
     assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
     assert!(!outcomes.contains_key(&d(DB)));
     assert!(!outcomes.contains_key(&d(ROUTE)));
-    // The scheduled adopted DNS waits for the route that still uses it.
-    assert!(matches!(outcomes[&d(DNS)], Outcome::Pending(_)));
+    // The scheduled adopted DNS stays while the kept route uses it.
+    assert_eq!(
+        outcomes[&d(DNS)],
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{ROUTE}`"
+        ))
+    );
     assert_eq!(fake.deletions(), vec![WORKLOAD.to_owned()]);
     for descriptor in [DB, ROUTE, DNS] {
         assert!(f.active(descriptor).await.is_some(), "{descriptor}");
@@ -1101,4 +1113,63 @@ async fn nothing_is_deleted_while_the_deployment_has_not_converged() {
     assert!(fake.deletions().is_empty());
     assert!(checks.asked.lock().unwrap().is_empty());
     assert!(f.active(DB).await.is_some());
+}
+
+#[tokio::test]
+async fn an_uncertain_deletion_needs_recovery() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    fake.deletions
+        .lock()
+        .unwrap()
+        .insert("postgres".into(), Behavior::Panic);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    f.schedule(DB).await;
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert!(
+        matches!(outcomes[&d(DB)], Outcome::Unknown(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(f.active(DB).await.unwrap().status, "unknown");
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+    let next = f.accept_set(Some(WEB_NO_DB), definitions()).await;
+    assert!(
+        matches!(next, Err(StoreError::RecoveryRequired(_))),
+        "{next:?}"
+    );
+}
+
+#[tokio::test]
+async fn scheduling_advances_the_generation_and_waits_for_a_running_deployment() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let generation = |f: &Fixture| {
+        let store = f.store.clone();
+        async move {
+            store
+                .env(ORG, "shop", "development")
+                .await
+                .unwrap()
+                .unwrap()
+                .generation
+        }
+    };
+    let before = generation(&f).await;
+    f.schedule(DB).await;
+    assert_eq!(generation(&f).await, before + 1);
+
+    // Accepted but not yet run: the deployment is in progress.
+    let running = f.accept().await;
+    let refused = f
+        .store
+        .schedule_deletion(ORG, "shop", "development", ROUTE, audit("DELETE", "/"))
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::Busy(ref id)) if *id == running.id),
+        "{refused:?}"
+    );
+    assert!(!f.active(ROUTE).await.unwrap().scheduled_deletion);
 }

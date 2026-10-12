@@ -1574,6 +1574,28 @@ impl Store for SqliteStore {
             }
             Some(_) => {}
         }
+        // A running deployment was accepted without this change; it must not
+        // act on it.
+        let running: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status = 'in_progress'",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = running {
+            return Err(StoreError::Busy(id));
+        }
+        // What the next deployment does changes, so plans and permits made
+        // against the current generation no longer apply.
+        sqlx::query("UPDATE envs SET generation = generation + 1 WHERE org_id = ? AND app_id = ? AND id = ?")
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE active_resources SET scheduled_deletion = 1, updated_at = ? \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
