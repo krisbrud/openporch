@@ -26,6 +26,7 @@ impl Server {
         let path = format!("/orgs/acme/apps/{app}/envs/{env}/deploys");
         let d = store
             .accept_deployment(DeploymentRequest {
+                permits: Default::default(),
                 org: "acme".into(),
                 app: app.into(),
                 env: env.into(),

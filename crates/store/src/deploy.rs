@@ -103,6 +103,9 @@ pub struct DeploymentRequest {
     pub snapshot: Value,
     /// The audit intent of the request.
     pub audit: AuditIntent,
+    /// The destructive-action permits presented, checked and bound on
+    /// acceptance.
+    pub permits: crate::PermitBinding,
 }
 
 /// What a deployment does.
@@ -228,6 +231,8 @@ pub struct AppDeletionRequest {
     pub snapshot: Value,
     /// The audit intent of the request.
     pub audit: AuditIntent,
+    /// The permits presented for each environment's deletion, by environment.
+    pub permits: std::collections::BTreeMap<String, crate::PermitBinding>,
 }
 
 /// An accepted application deletion.

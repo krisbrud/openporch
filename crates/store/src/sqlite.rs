@@ -995,6 +995,8 @@ impl Store for SqliteStore {
                         target: None,
                         ..req.audit.clone()
                     },
+
+                    permits: req.permits.get(env).cloned().unwrap_or_default(),
                 },
             )
             .await?;
@@ -2167,6 +2169,7 @@ async fn accept_in_tx(conn: &mut SqliteConnection, req: &DeploymentRequest) -> R
 
     let id = crate::random_hex(16);
     let new_generation = generation + 1;
+    crate::sqlite_permits::bind_permits(conn, org, app, env, generation, &id, &req.permits).await?;
     let seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM deployments \
              WHERE org_id = ? AND app_id = ? AND env_id = ?",

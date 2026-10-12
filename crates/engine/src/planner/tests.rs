@@ -520,6 +520,7 @@ impl Fixture {
         let accepted = self
             .store
             .accept_deployment(DeploymentRequest {
+                permits: Default::default(),
                 org: ORG.into(),
                 app: "shop".into(),
                 env: self.env.into(),

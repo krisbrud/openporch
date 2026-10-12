@@ -40,6 +40,7 @@ impl Fixture {
         let accepted = self
             .store
             .accept_deployment(DeploymentRequest {
+                permits: Default::default(),
                 org: ORG.into(),
                 app: "shop".into(),
                 env: self.env.into(),
@@ -65,6 +66,7 @@ impl Fixture {
         let deletion = self
             .store
             .accept_app_deletion(AppDeletionRequest {
+                permits: Default::default(),
                 org: ORG.into(),
                 app: "shop".into(),
                 actor: "root".into(),

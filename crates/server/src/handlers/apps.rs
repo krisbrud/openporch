@@ -135,6 +135,7 @@ pub async fn delete(
     let accepted = state
         .store
         .accept_app_deletion(AppDeletionRequest {
+            permits: Default::default(),
             org: org.to_owned(),
             app: app.clone(),
             actor: ctx.principal.id.clone(),

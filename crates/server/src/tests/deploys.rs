@@ -663,6 +663,7 @@ async fn a_delta_changed_after_it_was_read_is_not_frozen() {
         .state
         .store
         .accept_deployment(openporch_store::DeploymentRequest {
+            permits: Default::default(),
             org: "acme".into(),
             app: "shop".into(),
             env: "development".into(),

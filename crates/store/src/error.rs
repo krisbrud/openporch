@@ -59,6 +59,12 @@ pub enum StoreError {
         /// The definition's driver.
         to: String,
     },
+    /// A presented permit is unknown, expired, stale or used elsewhere.
+    #[error("{0}")]
+    PermitInvalid(String),
+    /// A destructive action has no permit that covers it.
+    #[error("{0}")]
+    ApprovalRequired(String),
     /// The idempotency key was used before with different content.
     #[error("idempotency key `{0}` was already used for a different request")]
     IdempotencyMismatch(String),
