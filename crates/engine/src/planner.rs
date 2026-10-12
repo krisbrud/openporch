@@ -68,6 +68,10 @@ pub struct Deployment {
     pub values: BTreeMap<String, SharedValue>,
     /// The destructive-action permits the deployment was submitted with.
     pub permits: Vec<String>,
+    /// Whether this deletes the environment: the graph is empty, and every
+    /// owned resource is deleted rather than only removed workloads and those
+    /// scheduled for deletion.
+    pub teardown: bool,
 }
 
 impl Deployment {
@@ -108,6 +112,7 @@ impl Deployment {
                 .flatten()
                 .filter_map(|p| p.as_str().map(str::to_owned))
                 .collect(),
+            teardown: false,
         })
     }
 }

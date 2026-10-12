@@ -121,6 +121,14 @@ impl Server {
         self.call(Method::DELETE, path, Some(token), None).await
     }
 
+    /// Deletes the environment at `path` with its current generation.
+    async fn remove_env(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        let (_, env) = self.get(path, &self.admin).await;
+        let body = json!({"expected_generation": env["generation"]});
+        self.call(Method::DELETE, path, Some(token), Some(body))
+            .await
+    }
+
     /// Creates service user `id` with `role` and returns a token for it.
     async fn member(&self, id: &str, role: &str) -> String {
         let (s, b) = self

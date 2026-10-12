@@ -22,9 +22,9 @@ mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
-    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord, LogLine, NewEnv,
-    OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
+    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentKind, DeploymentRecord,
+    DeploymentRequest, DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord,
+    LogLine, NewEnv, OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
     ResourceRunStatus, Tombstone, UncertainOperation,
 };
 pub use error::StoreError;
@@ -109,17 +109,6 @@ pub trait Store: Send + Sync {
 
     /// Lists an application's environments.
     fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
-
-    /// Deletes an environment that has never been deployed, with its drafts and
-    /// values. `development` stays while its application exists, and deployed
-    /// environments are rejected until deprovisioning on delete exists.
-    fn delete_env(
-        &self,
-        org: &str,
-        app: &str,
-        env: &str,
-        audit: AuditIntent,
-    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Deletes an environment type no environment uses.
     fn delete_env_type(

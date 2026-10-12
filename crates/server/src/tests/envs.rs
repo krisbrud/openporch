@@ -1,7 +1,7 @@
 //! HTTP tests for `applications-and-environments`, with a forbidden-role case per
 //! endpoint.
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_store::{AuditIntent, DeploymentRecord, DeploymentRequest, NewEnv, Store};
 use serde_json::json;
@@ -33,7 +33,8 @@ impl Server {
                 expected_generation: generation,
                 idempotency_key: None,
                 fingerprint: format!("body-{set_id}"),
-                set_id,
+                kind: openporch_store::DeploymentKind::Deploy,
+                set_id: Some(set_id),
                 delta_id: None,
                 delta_content: None,
                 comment: String::new(),
@@ -148,11 +149,29 @@ async fn environments_need_developer_and_deployer() {
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     // `development` stays while the application exists, even for administrators.
     let (status, b) = s
-        .delete("/orgs/acme/apps/shop/envs/development", &s.admin)
+        .remove_env("/orgs/acme/apps/shop/envs/development", &s.admin)
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
-    let (status, _) = s.delete("/orgs/acme/apps/shop/envs/staging", &dev).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    // The request needs the generation the client read.
+    let (status, b) = s.delete("/orgs/acme/apps/shop/envs/staging", &dev).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = s
+        .call(
+            Method::DELETE,
+            "/orgs/acme/apps/shop/envs/staging",
+            Some(&dev),
+            Some(json!({"expected_generation": 7})),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    // Without resources, it is deleted at once.
+    let (status, b) = s
+        .remove_env("/orgs/acme/apps/shop/envs/staging", &dev)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{b}");
+    assert_eq!(b["deployment"]["kind"], "delete_env");
+    assert_eq!(b["deployment"]["status"], "succeeded", "{b}");
+    assert_eq!(b["retained"], json!([]));
     let (status, b) = s.get("/orgs/acme/apps/shop/envs/staging", &dev).await;
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 
@@ -266,14 +285,20 @@ async fn clone_an_environment_from_a_deployment() {
     let (status, _) = s.get("/orgs/acme/apps/billing/envs/copy", &s.admin).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Deployed environments are kept until deprovisioning on delete exists.
+    // Deleting a deployed environment needs the generation the client read.
     s.deployed("shop", "pr-42", "web:2", false).await;
     let (_, pr) = s.get("/orgs/acme/apps/shop/envs/pr-42", &s.admin).await;
     assert_eq!(pr["latest_deployment"]["status"], "failed");
     assert_eq!(pr["convergence"], "partial");
     assert!(pr["last_successful_deploy_id"].is_null());
     let (status, b) = s.delete("/orgs/acme/apps/shop/envs/pr-42", &s.admin).await;
-    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected_generation")
+    );
 }
 
 #[tokio::test]
@@ -306,7 +331,7 @@ async fn environment_types_in_use_are_kept() {
         StatusCode::OK
     );
 
-    s.delete("/orgs/acme/apps/shop/envs/staging", &s.admin)
+    s.remove_env("/orgs/acme/apps/shop/envs/staging", &s.admin)
         .await;
     let (status, _) = s.delete("/orgs/acme/env-types/staging", &s.admin).await;
     assert_eq!(status, StatusCode::NO_CONTENT);

@@ -548,8 +548,30 @@ the latest deployment attempt, and `convergence`, which is `never_deployed`,
 `converged`, `partial` or `unknown`. With `from_deploy_id`, creation clones a
 deployment of the same application into a draft delta and returns its `delta_id`.
 Nothing is deployed. The default `development` environment cannot be deleted while
-its application exists (`409`), and environments that have been deployed cannot be
-deleted yet.
+its application exists (`409`).
+
+Deleting an environment runs like a deployment, so the request needs a body
+like a deployment's: `expected_generation`, the `permits` for deleting its
+resources and an optional `comment`, with an optional `Idempotency-Key` header
+that returns the same deletion to a retry while the environment exists.
+Without the body the request is `400`, and a stale generation, a running
+deployment or a resource that needs recovery is `409`. It returns `202` with
+the deletion's `deployment`, whose `kind` is `delete_env`, and the resources it
+leaves in place as `retained`: external ones, and adopted ones not scheduled
+for deletion. An environment without resources is deleted at once, and the
+deployment is already `succeeded`. Otherwise the environment is `deleting`
+while the deletion deletes every resource it owns, and every adopted one
+scheduled for deletion, in reverse dependency order, each behind its permit,
+and then the environment with its deployments, values and deltas; the audit
+log and tombstones remain, and retained resources get a `released` tombstone.
+Once the environment is gone, the request is `404`. If a resource cannot be
+deleted, the environment stays in state `deletion_failed` with what is left:
+the failed resource has its error in `GET .../resources/graph`, the deletion's
+error names it, and nothing can be deployed there. Fixing the cause, scheduling
+an adopted resource for deletion or detaching a resource, and sending the
+request again with the new generation retries the deletion with the same
+resource identities. Deployments do not run yet, so until they do every
+deletion of a deployed environment fails and leaves it `deletion_failed`.
 
 ```http
 POST /orgs/acme/apps/shop/envs
@@ -1529,6 +1551,7 @@ Idempotency-Key: release-2026-10-12
   "app": "blog",
   "env": "development",
   "seq": 1,
+  "kind": "deploy",
   "actor": "bootstrap",
   "set_id": "$BLOG_SET",
   "delta_id": "$BLOG_DELTA",
@@ -1585,7 +1608,10 @@ Authorization: Bearer $ADMIN_TOKEN
 {"error": "API-003", "message": "mode `incremental` is not supported; use `full`"}
 ```
 
-History is newest first. `limit` defaults to 50, and `next`, when present, is
+History is newest first and holds deployments only; an environment
+deletion (`"kind": "delete_env"`) is read by its ID and shows as the
+environment's latest attempt; `+n` skips it, and `deploy_id` cannot redeploy it.
+`limit` defaults to 50, and `next`, when present, is
 an attempt number to pass as `before` for the next page. A single deployment can
 be read by ID, `+n` or `last-successful`; the ID of a deployment in another
 environment is `404` here:
@@ -1729,7 +1755,9 @@ so it is refused until permits can be issued.
 detached resources, oldest first.
 
 `GET .../resources/graph` returns the graph of the environment's latest
-deployment, or `404` before the first one. Each node has its descriptor,
+attempt, or `404` before the first one. After an environment deletion, the
+graph is empty and its nodes are the resources the deletion deleted, kept or
+failed to delete. Each node has its descriptor,
 definition, driver, GUResID, status and error; a resource the deployment has
 not reached yet is `pending`. Resources the deployment deleted or kept while
 removing them are listed too, without a definition. Each edge says that `from`
@@ -1915,13 +1943,30 @@ Authorization: Bearer $CI_TOKEN
 204 No Content
 ```
 
+Deleting an environment sends the generation the client read:
+
 ```http
-DELETE /orgs/acme/apps/shop/envs/production
+GET /orgs/acme/apps/shop/envs/production
 Authorization: Bearer $CI_TOKEN
 ```
 
 ```http-response
-204 No Content
+200 OK
+
+{"id": "production", "generation": "$PRODUCTION_GENERATION"}
+```
+
+```http
+DELETE /orgs/acme/apps/shop/envs/production
+Authorization: Bearer $CI_TOKEN
+
+{"expected_generation": $PRODUCTION_GENERATION}
+```
+
+```http-response
+202 Accepted
+
+{"deployment": {"kind": "delete_env", "status": "succeeded"}, "retained": []}
 ```
 
 ```http

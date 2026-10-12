@@ -1,19 +1,25 @@
 //! Environments: creation (empty or cloned from a deployment), listing, the runtime
 //! summary and deletion.
 
+use std::collections::BTreeMap;
+
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use openporch_core::graph::ResourceGraph;
 use openporch_core::sets::{DeploymentSet, diff_sets};
 use openporch_store::{
-    DeploymentRecord, DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, NewEnv, OrgRole,
-    Store,
+    Acceptance, ActiveResource, DeploymentKind, DeploymentRecord, DeploymentRequest,
+    DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, NewEnv, OrgRole, Store, now_ms,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use super::check_id;
+use super::{check_id, deploys};
 use crate::api::{Ctx, JsonBody};
 use crate::auth;
+use crate::deploy::Job;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -21,6 +27,8 @@ use crate::state::AppState;
 #[derive(Serialize)]
 pub struct Attempt {
     id: String,
+    /// `deploy`, or `delete_env` for an environment deletion.
+    kind: DeploymentKind,
     status: DeploymentStatus,
     created_at: i64,
     finished_at: Option<i64>,
@@ -72,6 +80,7 @@ async fn view(state: &AppState, env: EnvRecord) -> ApiResult<EnvView> {
         convergence: convergence(&env, latest.as_ref()),
         latest_deployment: latest.map(|d| Attempt {
             id: d.id,
+            kind: d.kind,
             status: d.status,
             created_at: d.created_at,
             finished_at: d.finished_at,
@@ -197,23 +206,203 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Deletes an environment that has never been deployed. The route requires the
-/// deployer gate on the environment's type; `development` stays while its
-/// application exists.
+/// The body of `DELETE .../envs/{env}`, required once the environment has
+/// been deployed.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteEnvRequest {
+    /// The environment generation the client read.
+    expected_generation: i64,
+    /// Destructive-action permits for deleting its resources.
+    #[serde(default)]
+    permits: Vec<String>,
+    #[serde(default)]
+    comment: String,
+}
+
+/// A resource the deletion leaves in place: external, or adopted and not
+/// scheduled for deletion. It is released from management when the
+/// environment is removed.
+#[derive(Debug, Serialize)]
+pub struct Retained {
+    descriptor: String,
+    guresid: String,
+    ownership: String,
+}
+
+/// An accepted environment deletion.
+#[derive(Debug, Serialize)]
+pub struct EnvDeletion {
+    /// The deployment that deletes the environment's resources and then the
+    /// environment.
+    deployment: DeploymentRecord,
+    /// What it leaves in place.
+    retained: Vec<Retained>,
+}
+
+/// `DELETE /orgs/{org}/apps/{app}/envs/{env}`, with the generation the
+/// client read. A deployment deletes the environment's owned resources in
+/// reverse dependency order and then the environment; one without resources
+/// is deleted at once. If a deletion fails, the environment stays in
+/// `deletion_failed` with what is left, and the request can be repeated. The
+/// route requires the deployer gate on the environment's type; `development`
+/// stays while its application exists.
 pub async fn delete(
     State(state): State<AppState>,
     ctx: Ctx,
     Path((_, app, env)): Path<(String, String, String)>,
-) -> ApiResult<StatusCode> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<EnvDeletion>)> {
     let org = state.org();
-    state
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiError::invalid(
+            "deleting an environment needs a body with `expected_generation` and the \
+             permits for deleting its resources",
+        ));
+    }
+    let mut req: DeleteEnvRequest =
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(e.to_string()))?;
+    // Permits are a set; their order does not make a different request.
+    req.permits.sort();
+    req.permits.dedup();
+    let key = deploys::idempotency_key(&headers)?;
+    let fingerprint = {
+        let mut body = serde_json::to_value(&req).map_err(ApiError::internal)?;
+        body["kind"] = json!("delete_env");
+        deploys::fingerprint(&body)
+    };
+    // A retry returns the original deletion while the environment exists;
+    // once it is gone, the environment is `404`.
+    if let Some(key) = &key
+        && let Some((prior, prior_fingerprint)) = state
+            .store
+            .idempotent_deployment(org, &app, &env, &ctx.principal.id, key)
+            .await?
+    {
+        if prior_fingerprint != fingerprint {
+            return Err(ApiError::conflict(format!(
+                "idempotency key `{key}` was used for a different request"
+            )));
+        }
+        let retained = retained(&state, &prior).await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(EnvDeletion {
+                deployment: prior,
+                retained,
+            }),
+        ));
+    }
+
+    env_or_404(&state, &app, &env).await?;
+    let snapshot = json!({
+        "version": deploys::SNAPSHOT_VERSION,
+        "kind": "delete_env",
+        "permits": req.permits,
+        "graph": ResourceGraph { nodes: BTreeMap::new(), layers: Vec::new() },
+        "definitions": {},
+    });
+    let acceptance = state
         .store
-        .delete_env(
-            org,
-            &app,
-            &env,
-            ctx.audit(org, "env.delete", format!("{app}/{env}")),
-        )
+        .accept_deployment(DeploymentRequest {
+            org: org.to_owned(),
+            app: app.clone(),
+            env: env.clone(),
+            actor: ctx.principal.id.clone(),
+            expected_generation: req.expected_generation,
+            idempotency_key: key,
+            fingerprint,
+            kind: DeploymentKind::DeleteEnv,
+            set_id: None,
+            delta_id: None,
+            delta_content: None,
+            comment: req.comment,
+            snapshot: snapshot.clone(),
+            audit: ctx.audit(org, "env.delete", format!("{app}/{env}")),
+        })
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    let mut deployment = acceptance.deployment().clone();
+    let Acceptance::Created(d) = &acceptance else {
+        let retained = retained(&state, &deployment).await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(EnvDeletion {
+                deployment,
+                retained,
+            }),
+        ));
+    };
+    // Accepting the deletion stopped anything else from running in the
+    // environment, so what it holds now is what the deletion works on. One
+    // without resources has nothing to delete: it is finished here, which
+    // removes it, and finishing checks again that nothing it must delete is
+    // left. Otherwise, or if that cannot be done, the runner does the
+    // deletion, so a store error never leaves it unstarted.
+    let resources = state.store.active_resources(org, &app, &env).await;
+    let finished = match &resources {
+        Ok(resources) if resources.is_empty() => state
+            .store
+            .finish_deployment(org, &app, &env, &d.id, None)
+            .await
+            .is_ok(),
+        _ => false,
+    };
+    if !finished {
+        state.runners.spawn(
+            state.clone(),
+            Job {
+                app: app.clone(),
+                env: env.clone(),
+                id: d.id.clone(),
+                snapshot,
+            },
+        );
+    }
+    let retained = retained_of(resources?);
+    if finished {
+        match state.store.deployment(org, &app, &env, &d.id).await? {
+            // Something was left to delete after all.
+            Some(failed) => deployment = failed,
+            // The environment is gone with its deployments.
+            None => {
+                deployment.status = DeploymentStatus::Succeeded;
+                deployment.finished_at = Some(now_ms());
+            }
+        }
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EnvDeletion {
+            deployment,
+            retained,
+        }),
+    ))
+}
+
+/// The resources `deletion` leaves in place: those of its environment it does
+/// not delete.
+async fn retained(state: &AppState, deletion: &DeploymentRecord) -> ApiResult<Vec<Retained>> {
+    let resources = state
+        .store
+        .active_resources(state.org(), &deletion.app, &deletion.env)
+        .await?;
+    Ok(retained_of(resources))
+}
+
+/// What a deletion of an environment holding `resources` leaves in place.
+fn retained_of(resources: Vec<ActiveResource>) -> Vec<Retained> {
+    resources
+        .into_iter()
+        .filter(|r| match r.ownership.as_str() {
+            "owned" => false,
+            "adopted" => !r.scheduled_deletion,
+            _ => true,
+        })
+        .map(|r| Retained {
+            descriptor: r.descriptor,
+            guresid: r.guresid,
+            ownership: r.ownership,
+        })
+        .collect()
 }

@@ -17,6 +17,11 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # unsafe-libyaml, under serde_yaml_ng, is unmaintained. No vulnerability
+    # is reported; revisit when moving to a maintained YAML parser.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no known vulnerability" },
+]
 
 [licenses]
 version = 2
