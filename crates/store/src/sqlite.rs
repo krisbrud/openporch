@@ -1131,9 +1131,66 @@ impl Store for SqliteStore {
                 .fetch_optional(&mut *tx)
                 .await?;
                 if let Some(op) = open {
-                    return Err(StoreError::Conflict(format!(
-                        "operation `{op}` on `{descriptor}` has not finished"
-                    )));
+                    let (deployment, op_kind, deployment_status, cleanup_pending): (
+                        String,
+                        String,
+                        String,
+                        bool,
+                    ) = sqlx::query_as(
+                        "SELECT o.deployment_id, o.kind, d.status, r.cleanup_pending \
+                         FROM operations o JOIN deployments d ON d.id = o.deployment_id \
+                         JOIN active_resources r ON r.guresid = o.guresid WHERE o.id = ?",
+                    )
+                    .bind(&op)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if deployment_status == "in_progress" {
+                        return Err(StoreError::Conflict(format!(
+                            "operation `{op}` on `{descriptor}` has not finished"
+                        )));
+                    }
+                    // Its deployment finished without recording the result, as
+                    // after a failed checkpoint. Close it the way a restart
+                    // would: removing a record whose deletion the driver
+                    // confirmed is retried, and anything else needs recovery.
+                    let now = now_ms();
+                    let (op_state, resource_status, error) =
+                        if op_kind == "delete" && cleanup_pending {
+                            ("failed", "deletion_failed", "abandoned; cleanup pending")
+                        } else {
+                            ("unknown", "unknown", "abandoned without a recorded result")
+                        };
+                    sqlx::query(
+                        "UPDATE operations SET state = ?, error = ?, finished_at = ? WHERE id = ?",
+                    )
+                    .bind(op_state)
+                    .bind(error)
+                    .bind(now)
+                    .bind(&op)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE active_resources SET status = ?, updated_at = ? WHERE guresid = ?",
+                    )
+                    .bind(resource_status)
+                    .bind(now)
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE deployment_resources SET status = ?, error = ? \
+                         WHERE deployment_id = ? AND guresid = ?",
+                    )
+                    .bind(op_state)
+                    .bind(error)
+                    .bind(&deployment)
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
+                    if op_state == "unknown" {
+                        tx.commit().await?;
+                        return Err(StoreError::RecoveryRequired(descriptor));
+                    }
                 }
                 sqlx::query(
                     // The definition columns describe the last success; a

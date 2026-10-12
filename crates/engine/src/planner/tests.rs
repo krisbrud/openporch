@@ -1266,6 +1266,71 @@ async fn a_confirmed_deletion_is_finished_without_the_driver() {
     );
 }
 
+/// Opens a deletion of `descriptor` in `deployment` and leaves it open, as when
+/// its result could not be checkpointed.
+async fn open_deletion(f: &Fixture, deployment: &Deployment, descriptor: &str) {
+    f.store
+        .begin_operation(OperationStart {
+            org: ORG.into(),
+            app: "shop".into(),
+            env: "development".into(),
+            deployment_id: deployment.id.clone(),
+            descriptor: d(descriptor),
+            definition_id: None,
+            definition_version: None,
+            driver_type: None,
+            kind: OperationKind::Delete,
+            input_fingerprint: "delete".into(),
+            recovery: json!({}),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_operation_left_open_by_a_finished_deployment_is_closed() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    f.schedule(DB).await;
+    // The deletion's result was never recorded, so its deployment ends with
+    // the operation still open.
+    let first = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    open_deletion(&f, &first, DB).await;
+    deleting(&f, &fake, &checks).run(first.clone()).await;
+    assert_eq!(f.status(&first).await.0, DeploymentStatus::Failed);
+
+    // The next deployment does not wait for a restart: the outcome is unknown,
+    // and the resource needs recovery.
+    let next = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(next).await;
+    let Outcome::Failed(error) = &outcomes[&d(DB)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(error.contains("recover the resource first"), "{error}");
+    assert_eq!(f.active(DB).await.unwrap().status, "unknown");
+    assert!(fake.deletions().is_empty());
+
+    // Removing a record whose deletion the driver confirmed is retried instead.
+    let f = Fixture::new().await;
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let first = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    open_deletion(&f, &first, DB).await;
+    sqlx::query("UPDATE active_resources SET cleanup_pending = 1 WHERE descriptor = ?")
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    deleting(&f, &fake, &checks).run(first).await;
+    let next = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(next.clone()).await;
+    assert_eq!(outcomes[&d(DB)], Outcome::Deleted);
+    assert!(f.active(DB).await.is_none());
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.status(&next).await, (DeploymentStatus::Succeeded, None));
+}
+
 #[tokio::test]
 async fn a_workload_that_never_provisioned_is_deleted_by_its_identity() {
     let f = Fixture::new().await;
