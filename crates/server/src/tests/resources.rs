@@ -108,6 +108,7 @@ impl Server {
         };
         let planner = Planner::new(Arc::new(self.state.store.clone()), fake, limits)
             .with_permit_check(Arc::new(OnePermit));
+        self.state.permits.set(Arc::new(OnePermit));
         self.state
             .runners
             .set(Arc::new(PlannerRunner::new(Arc::new(planner))));
@@ -492,4 +493,93 @@ async fn scheduled_deletion() {
         audit.to_string().contains("resource.schedule_deletion"),
         "{audit}"
     );
+}
+
+#[tokio::test]
+async fn detach() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    s.deploy_web("nginx:1", true).await;
+    let db = s.resource(DB).await;
+    let path = format!("{RESOURCES}/postgres/modules.web.externals.db");
+    let detach = format!("{path}/detach");
+    let body = |reason: &str, permits: &[&str]| json!({"reason": reason, "permits": permits});
+
+    // Only administrators detach.
+    let developer = s.member("dev", "member").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/users",
+            &s.admin,
+            json!({"id": "dev", "role": "developer"}),
+        )
+        .await;
+    assert!(status.is_success(), "{b}");
+    let (status, b) = s
+        .post(&detach, &developer, body("moving it", &["permit-1"]))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{b}");
+    // A reason and a matching permit are required.
+    let (status, b) = s.post(&detach, &s.admin, body("  ", &["permit-1"])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    let (status, b) = s.post(&detach, &s.admin, body("moving it", &[])).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("approval_required"),
+        "{b}"
+    );
+    assert_eq!(s.resource(DB).await["guresid"], db["guresid"]);
+
+    let (status, tombstone) = s
+        .post(
+            &detach,
+            &s.admin,
+            body("moving it to the shared cluster", &["permit-1"]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{tombstone}");
+    assert_eq!(tombstone["descriptor"], DB);
+    assert_eq!(tombstone["guresid"], db["guresid"]);
+    assert_eq!(tombstone["reason"], "detached");
+    assert_eq!(
+        tombstone["body"]["reason"],
+        "moving it to the shared cluster"
+    );
+    assert_eq!(tombstone["body"]["outputs"]["host"], "db.internal");
+    assert!(
+        !tombstone.to_string().contains("resources/db/password"),
+        "{tombstone}"
+    );
+
+    // The record is gone and the driver was never asked to delete anything.
+    let (status, b) = s.get(&path, &s.admin).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    assert!(fake.deleted.lock().unwrap().is_empty());
+    let (status, list) = s
+        .get("/orgs/acme/apps/shop/envs/development/tombstones", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["tombstones"][0]["guresid"], db["guresid"]);
+    let (_, audit) = s.get("/orgs/acme/audit-logs?method=POST", &s.admin).await;
+    assert!(
+        audit
+            .to_string()
+            .contains("moving it to the shared cluster"),
+        "{audit}"
+    );
+
+    // A deployment that still includes it does not silently recreate it.
+    let d = s.deploy_web("nginx:2", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    assert!(d["error"].as_str().unwrap().contains("detached"), "{d}");
+    let created: Vec<String> = fake
+        .guresids
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(d, _)| d == DB)
+        .map(|(_, g)| g.clone())
+        .collect();
+    assert_eq!(created.len(), 1);
 }

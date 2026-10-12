@@ -306,6 +306,28 @@ impl ResourceRunStatus {
     }
 }
 
+/// What remains of a resource that was deleted or detached.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Tombstone {
+    /// Application.
+    pub app: String,
+    /// Environment.
+    pub env: String,
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: String,
+    /// The resource's permanent identity.
+    pub guresid: String,
+    /// `deleted` or `detached`.
+    pub reason: String,
+    /// Who detached it.
+    pub actor: Option<String>,
+    /// Definition, driver, cloud account, object IDs and state location, plus
+    /// the operator's reason for a detach. Never secrets.
+    pub body: serde_json::Value,
+    /// When.
+    pub at: i64,
+}
+
 /// An active resource. It holds secret references and the encrypted cookie,
 /// so it is not serialized directly into responses.
 #[derive(Debug, Clone, PartialEq)]

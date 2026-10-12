@@ -618,7 +618,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     StoreError::RecoveryRequired(_) => Outcome::Failed(format!(
                         "an earlier operation's outcome is unknown; recover the resource first ({e})"
                     )),
-                    StoreError::MigrationRequired { .. } => Outcome::Failed(e.to_string()),
+                    StoreError::MigrationRequired { .. } | StoreError::Detached(_) => {
+                        Outcome::Failed(e.to_string())
+                    }
                     other => Outcome::Failed(format!("the operation was not recorded: {other}")),
                 })?;
             self.scope

@@ -294,7 +294,11 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let ownership = Ownership::acquire(dir.path()).unwrap();
         let store = SqliteStore::open(ownership, ORG).await.unwrap();
-        for (id, role) in [("alice", "manager"), ("ci", "member")] {
+        for (id, role) in [
+            ("alice", "manager"),
+            ("ci", "member"),
+            ("root", "administrator"),
+        ] {
             sqlx::query(
                 "INSERT INTO principals (org_id, id, type, name, org_role, created_at) \
                  VALUES (?, ?, 'user', ?, ?, 0)",
@@ -1489,4 +1493,70 @@ async fn deletion_keeps_the_drivers_recovery_metadata_and_ignores_lookalikes() {
             .await
             .unwrap();
     assert_eq!(serde_json::from_str::<Value>(&kept).unwrap(), recovery);
+}
+
+#[tokio::test]
+async fn a_detached_resource_is_not_provisioned_again() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let db = f.active(DB).await.unwrap();
+    let detach = |actor: &str| {
+        let store = f.store.clone();
+        let audit = AuditIntent::accepted(ORG, actor, "POST", "/detach", "resource.detach");
+        async move {
+            store
+                .detach_resource(
+                    ORG,
+                    "shop",
+                    "development",
+                    DB,
+                    "moved to a shared cluster",
+                    audit,
+                )
+                .await
+        }
+    };
+    let refused = detach("ci").await;
+    assert!(
+        matches!(refused, Err(StoreError::Forbidden(_))),
+        "{refused:?}"
+    );
+
+    let tombstone = detach("root").await.unwrap();
+    assert_eq!(tombstone.descriptor, DB);
+    assert_eq!(tombstone.guresid, db.guresid);
+    assert_eq!(tombstone.reason, "detached");
+    assert_eq!(tombstone.actor.as_deref(), Some("root"));
+    assert_eq!(tombstone.body["reason"], "moved to a shared cluster");
+    assert_eq!(tombstone.body["driver_type"], "openporch/echo");
+    assert!(f.active(DB).await.is_none());
+    assert!(fake.deletions().is_empty());
+
+    // The next deployment does not create a second database.
+    let next = f.accept().await;
+    let outcomes = planner(&f, &fake, fast()).run(next).await;
+    assert!(
+        matches!(&outcomes[&d(DB)], Outcome::Failed(e) if e.contains("detached")),
+        "{outcomes:?}"
+    );
+    assert_eq!(fake.attempts(DB), 1);
+    assert!(f.active(DB).await.is_none());
+}
+
+#[tokio::test]
+async fn a_resource_with_an_uncertain_operation_is_not_detached() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("dns", Behavior::Panic)]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
+    let refused = f
+        .store
+        .detach_resource(ORG, "shop", "development", DNS, "gone", audit)
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::RecoveryRequired(_))),
+        "{refused:?}"
+    );
+    assert!(f.active(DNS).await.is_some());
 }

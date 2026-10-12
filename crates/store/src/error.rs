@@ -35,6 +35,13 @@ pub enum StoreError {
     /// Another deployment or deletion is running in the environment.
     #[error("deployment {0} is already running in this environment")]
     Busy(String),
+    /// The resource was detached from management; provisioning it again would
+    /// create a second object.
+    #[error(
+        "`{0}` was detached from management; adopt the existing object explicitly \
+         instead of provisioning a new one"
+    )]
+    Detached(String),
     /// Resources with uncertain outcomes must be resolved first.
     #[error("resources need recovery before new changes: {0}")]
     RecoveryRequired(String),

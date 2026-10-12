@@ -1618,6 +1618,8 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources` | app read |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | app read |
 | DELETE | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | deploy to the environment |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/detach` | administrator |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/tombstones` | app read |
 | GET | `/orgs/{org}/resources/defs/{def}/resources` | org read all |
 
 An active resource is something a deployment provisioned in an environment. It
@@ -1665,8 +1667,22 @@ and returns `409` while a deployment is running.
 Every deletion needs a destructive-action permit in the deployment's `permits`.
 Without one the resource fails with `approval_required` and the deployment
 fails. Permits are issued from deployment plans, which are not implemented yet,
-so until then deployments that delete resources fail. Detaching resources is not
-implemented yet.
+so until then deployments that delete resources fail.
+
+Detaching stops openporch from managing a resource without calling its driver,
+so the real object keeps running. It needs an administrator, a `reason` and a
+matching permit in `permits`, and is refused with `409` while a deployment runs
+or while an operation on the resource is open or has an unknown outcome. The
+response is the resource's tombstone. Its `body` holds the definition, driver,
+cloud account, target, object IDs, state backend and outputs, which are enough
+to adopt the object elsewhere, plus the reason, which the audit log records
+too. A deployment that still includes a detached resource fails for it rather
+than creating a second object; bringing it back under management is an explicit
+adoption, which is not implemented yet. Like deletion, detaching needs a permit,
+so it is refused until permits can be issued.
+
+`GET .../tombstones` lists what remains of the environment's deleted and
+detached resources, oldest first.
 
 Resources are listed by descriptor. The single-resource path takes the type and
 resource ID, such as `postgres/modules.web.externals.db`, and returns `409` if
@@ -1693,6 +1709,17 @@ Authorization: Bearer $ADMIN_TOKEN
 404 Not Found
 
 {"error": "…", "message": "resource `postgres/modules.api.externals.db` not found in `blog/development`"}
+```
+
+```http
+GET /orgs/acme/apps/blog/envs/development/tombstones
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"tombstones": []}
 ```
 
 ## Audit log
