@@ -186,6 +186,11 @@ pub struct ProvisionResult {
     pub recovery: Value,
     /// What the cloud account resolved to, such as an AWS account number.
     pub target: Option<String>,
+    /// Where the driver keeps the resource's state, such as an S3 location. A
+    /// detached resource's tombstone keeps it for a later adoption.
+    pub backend: Option<String>,
+    /// The cloud objects the resource consists of, such as ARNs.
+    pub external_ids: Vec<String>,
 }
 
 /// Why provisioning failed. Messages are already redacted.
@@ -692,6 +697,8 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                     .collect(),
                                 account: account.as_ref().map(ToString::to_string),
                                 target: provisioned.target,
+                                backend: provisioned.backend,
+                                external_ids: provisioned.external_ids,
                                 snapshot: json!({
                                     "deployment_id": deployment.id,
                                     "definition_version": version,

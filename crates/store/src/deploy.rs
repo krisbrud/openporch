@@ -254,6 +254,10 @@ pub struct Provisioned {
     pub account: Option<String>,
     /// What the account resolved to, such as an AWS account number.
     pub target: Option<String>,
+    /// Where the driver keeps the resource's state, such as an S3 location.
+    pub backend: Option<String>,
+    /// The cloud objects the resource consists of, such as ARNs.
+    pub external_ids: Vec<String>,
 }
 
 /// The outcome of a driver operation.
