@@ -995,6 +995,8 @@ impl Store for SqliteStore {
                         target: None,
                         ..req.audit.clone()
                     },
+
+                    permits: req.permits.get(env).cloned().unwrap_or_default(),
                 },
             )
             .await?;
@@ -1593,6 +1595,7 @@ impl Store for SqliteStore {
             descriptor,
             guresid: expected,
             reason,
+            permits,
         } = detach;
         self.check_org(org)?;
         let mut tx = self.begin().await?;
@@ -1653,6 +1656,24 @@ impl Store for SqliteStore {
             return Err(StoreError::Conflict(format!(
                 "operation `{op}` on `{descriptor}` has not finished"
             )));
+        }
+        // The permit is used with the detach, so a refused detach keeps it.
+        if let Some(presented) = permits {
+            crate::sqlite_permits::consume_permit(
+                &mut tx,
+                &crate::PermitUse {
+                    org,
+                    app,
+                    env,
+                    deployment: None,
+                    presented,
+                    descriptor,
+                    guresid: Some(&guresid),
+                    action: "detach",
+                    fingerprint: None,
+                },
+            )
+            .await?;
         }
         let now = now_ms();
         sqlx::query(
@@ -2167,6 +2188,7 @@ async fn accept_in_tx(conn: &mut SqliteConnection, req: &DeploymentRequest) -> R
 
     let id = crate::random_hex(16);
     let new_generation = generation + 1;
+    crate::sqlite_permits::bind_permits(conn, org, app, env, generation, &id, &req.permits).await?;
     let seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM deployments \
              WHERE org_id = ? AND app_id = ? AND env_id = ?",
@@ -2271,6 +2293,9 @@ async fn remove_env(conn: &mut SqliteConnection, org: &str, app: &str, env: &str
     .execute(&mut *conn)
     .await?;
     for table in [
+        "permits",
+        "plans",
+        "approval_requests",
         "active_resources",
         "operations",
         "logs",

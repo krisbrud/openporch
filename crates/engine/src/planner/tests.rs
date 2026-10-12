@@ -520,6 +520,7 @@ impl Fixture {
         let accepted = self
             .store
             .accept_deployment(DeploymentRequest {
+                permits: Default::default(),
                 org: ORG.into(),
                 app: "shop".into(),
                 env: self.env.into(),
@@ -1641,6 +1642,7 @@ async fn a_detached_resource_is_not_provisioned_again() {
                     "shop",
                     "development",
                     Detach {
+                        permits: None,
                         descriptor: DB,
                         guresid: &guresid,
                         reason: "moved to a shared cluster",
@@ -1709,6 +1711,7 @@ async fn detach_as_root(f: &Fixture, descriptor: &str) -> Result<Tombstone, Stor
             "shop",
             "development",
             Detach {
+                permits: None,
                 descriptor,
                 guresid: &guresid,
                 reason: "gone",
@@ -1765,6 +1768,7 @@ async fn detach_is_refused_while_anything_is_in_flight_or_changed() {
             "shop",
             "development",
             Detach {
+                permits: None,
                 descriptor: DB,
                 guresid: "older-guresid",
                 reason: "gone",

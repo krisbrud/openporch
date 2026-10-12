@@ -163,6 +163,7 @@ pub async fn trigger(
     let acceptance = state
         .store
         .accept_deployment(DeploymentRequest {
+            permits: Default::default(),
             org: org.to_owned(),
             app: app.clone(),
             env: env.clone(),

@@ -162,6 +162,8 @@ impl From<StoreError> for ApiError {
             | StoreError::RecoveryRequired(_)
             | StoreError::MigrationRequired { .. }
             | StoreError::Detached(_)
+            | StoreError::PermitInvalid(_)
+            | StoreError::ApprovalRequired(_)
             | StoreError::IdempotencyMismatch(_) => Self::conflict(e.to_string()),
             StoreError::Forbidden(_) => Self::forbidden(e.to_string()),
             StoreError::Invalid(_) => Self::invalid(e.to_string()),

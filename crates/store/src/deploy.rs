@@ -103,6 +103,9 @@ pub struct DeploymentRequest {
     pub snapshot: Value,
     /// The audit intent of the request.
     pub audit: AuditIntent,
+    /// The destructive-action permits presented, checked and bound on
+    /// acceptance.
+    pub permits: crate::PermitBinding,
 }
 
 /// What a deployment does.
@@ -228,6 +231,8 @@ pub struct AppDeletionRequest {
     pub snapshot: Value,
     /// The audit intent of the request.
     pub audit: AuditIntent,
+    /// The permits presented for each environment's deletion, by environment.
+    pub permits: std::collections::BTreeMap<String, crate::PermitBinding>,
 }
 
 /// An accepted application deletion.
@@ -421,6 +426,9 @@ pub struct Detach<'a> {
     pub guresid: &'a str,
     /// Why; recorded in the tombstone and the audit log.
     pub reason: &'a str,
+    /// The detach permits presented, one of which is used with the detach;
+    /// `None` while the caller checks the permit itself.
+    pub permits: Option<&'a [String]>,
 }
 
 /// What remains of a resource that was deleted or detached.

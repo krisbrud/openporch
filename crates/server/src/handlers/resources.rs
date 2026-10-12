@@ -416,6 +416,7 @@ pub async fn detach(
             &env.app,
             &env.id,
             Detach {
+                permits: None,
                 descriptor: &resource.descriptor,
                 guresid: &resource.guresid,
                 reason,

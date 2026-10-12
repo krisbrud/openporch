@@ -248,6 +248,7 @@ async fn deltas_are_mutable_until_deployed() {
         .await;
     store
         .accept_deployment(DeploymentRequest {
+            permits: Default::default(),
             org: "acme".into(),
             app: "shop".into(),
             env: "development".into(),

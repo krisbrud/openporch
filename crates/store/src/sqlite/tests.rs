@@ -89,6 +89,7 @@ impl Fixture {
 
     fn request(&self, generation: i64, set_id: &str, key: Option<&str>) -> DeploymentRequest {
         DeploymentRequest {
+            permits: Default::default(),
             org: ORG.into(),
             app: "shop".into(),
             env: "development".into(),

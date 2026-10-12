@@ -18,6 +18,7 @@ mod sqlite;
 mod sqlite_accounts;
 mod sqlite_catalog;
 mod sqlite_identity;
+mod sqlite_permits;
 mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
@@ -39,6 +40,10 @@ pub use sqlite::SqliteStore;
 pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
+pub use sqlite_permits::{
+    ApprovalRequest, NewPermit, NewPlan, PERMIT_TTL_MS, PermitBinding, PermitRecord, PermitStore,
+    PermitUse, PlanRecord,
+};
 pub use sqlite_values::{
     PutValue, ValueContent, ValueRecord, ValueSetVersion, ValueStore, value_secret_prefix,
 };
