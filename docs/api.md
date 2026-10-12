@@ -1476,9 +1476,13 @@ of:
   `+1` for the one before it, and so on up to `+499`, or `last-successful`; one
   that does not exist is `404`. By default (`"replay": "snapshot"`) the
   deployment reuses the configuration recorded by the earlier one: the
-  definitions it matched and the shared values it resolved, at their value set
-  versions. This only works in the same environment and while the definitions
-  it used still exist. `"replay": "current"` matches definitions and reads
+  definitions it matched, the shared values it resolved at their value set
+  versions, and the version of every built-in secret it read, since acceptance
+  pins a reference that names no version to the version it has then. This only
+  works in the same environment and while what it used still exists: the
+  definitions, the drivers at the same protocol version, and the pinned secret
+  versions; otherwise the request is `400`, naming what is missing, before
+  anything runs. `"replay": "current"` matches definitions and reads
   values again as they are now. `replay` is
   only valid with `deploy_id`.
 
@@ -1655,7 +1659,9 @@ environment's latest attempt; `+n` skips it, and `deploy_id` cannot redeploy it.
 `limit` defaults to 50, and `next`, when present, is
 an attempt number to pass as `before` for the next page. A single deployment can
 be read by ID, `+n` or `last-successful`; the ID of a deployment in another
-environment is `404` here:
+environment is `404` here. A single deployment also shows `value_versions`, the
+value set versions of the application and the environment it resolved (`null`
+for a scope without values), which stay as they were when values change later:
 
 ```http
 GET /orgs/acme/apps/blog/envs/development/deploys
@@ -1676,7 +1682,7 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 200 OK
 
-{"id": "$DEPLOY", "set_id": "$BLOG_SET"}
+{"id": "$DEPLOY", "set_id": "$BLOG_SET", "value_versions": {"app": null, "env": null}}
 ```
 
 A deployment's log is read oldest first, by the same references. Each line has

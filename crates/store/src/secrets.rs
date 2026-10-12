@@ -557,3 +557,47 @@ impl SecretStore for BuiltinSecretStore {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::SqliteStore {
+    /// The version each built-in secret name in `names` has now, the latest;
+    /// names without any version are left out. Reads no secret values.
+    pub async fn latest_secret_versions(
+        &self,
+        org: &str,
+        names: &[String],
+    ) -> Result<std::collections::BTreeMap<String, i64>, SecretError> {
+        let mut found = std::collections::BTreeMap::new();
+        for name in names {
+            let latest: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(version) FROM secret_versions WHERE org_id = ? AND ref = ?",
+            )
+            .bind(org)
+            .bind(name)
+            .fetch_one(self.pool())
+            .await?;
+            if let Some(version) = latest {
+                found.insert(name.clone(), version);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether the built-in secret `name` still has `version`. Reads no
+    /// secret value.
+    pub async fn has_secret_version(
+        &self,
+        org: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<bool, SecretError> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM secret_versions WHERE org_id = ? AND ref = ? AND version = ?",
+        )
+        .bind(org)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(found.is_some())
+    }
+}

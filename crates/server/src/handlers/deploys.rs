@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use openporch_store::secrets::BUILTIN_STORE;
+
 use super::plans;
 use super::sets::{delta_or_404, set_or_404};
 use crate::api::{Ctx, JsonBody, QueryParams};
@@ -360,6 +362,7 @@ pub(super) async fn resolve(
                 )));
             }
             let mut snapshot = recorded;
+            check_replay(state, &source.id, &mut snapshot).await?;
             snapshot["permits"] = json!(req.permits);
             snapshot["replayed_from"] = json!(source.id);
             snapshot
@@ -417,14 +420,157 @@ async fn snapshot(
             )
         })
         .collect();
-    Ok(json!({
+    let drivers: BTreeMap<String, Option<String>> = graph
+        .nodes
+        .values()
+        .map(|n| {
+            (
+                n.driver_type.clone(),
+                state.drivers.protocol(&n.driver_type),
+            )
+        })
+        .collect();
+    let mut snapshot = json!({
         "version": SNAPSHOT_VERSION,
         "mode": req.mode,
         "permits": req.permits,
         "graph": graph,
         "definitions": used,
+        "drivers": drivers,
         "values": values(state, env).await?,
-    }))
+    });
+    pin_secrets(state, &mut snapshot).await?;
+    Ok(snapshot)
+}
+
+/// The built-in secret references a snapshot reads: those of the definitions'
+/// `secret_refs` and of secret shared values.
+fn snapshot_secrets(snapshot: &mut Value) -> Vec<&mut Value> {
+    let mut refs = Vec::new();
+    let Some(object) = snapshot.as_object_mut() else {
+        return refs;
+    };
+    for (key, section) in object.iter_mut() {
+        match key.as_str() {
+            "definitions" => {
+                for entry in section
+                    .as_object_mut()
+                    .into_iter()
+                    .flat_map(|d| d.values_mut())
+                {
+                    // `get_mut`, since indexing would add missing fields.
+                    let secret_refs = entry
+                        .get_mut("definition")
+                        .and_then(|d| d.get_mut("driver_inputs"))
+                        .and_then(|i| i.get_mut("secret_refs"))
+                        .and_then(Value::as_object_mut);
+                    for nested in secret_refs.into_iter().flat_map(|r| r.values_mut()) {
+                        references(nested, &mut refs);
+                    }
+                }
+            }
+            "values" => {
+                for value in section
+                    .get_mut("resolved")
+                    .and_then(Value::as_object_mut)
+                    .into_iter()
+                    .flat_map(|v| v.values_mut())
+                {
+                    if let Some(reference) = value.get_mut("secret_ref") {
+                        refs.push(reference);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refs.retain(|r| r["store"] == BUILTIN_STORE && r["ref"].is_string());
+    refs
+}
+
+/// The secret references in `value`: objects with a `store` and a `ref`,
+/// possibly nested in maps.
+fn references<'a>(value: &'a mut Value, out: &mut Vec<&'a mut Value>) {
+    let is_reference = value.get("store").is_some_and(Value::is_string)
+        && value.get("ref").is_some_and(Value::is_string);
+    if is_reference {
+        out.push(value);
+    } else if let Some(fields) = value.as_object_mut() {
+        for field in fields.values_mut() {
+            references(field, out);
+        }
+    }
+}
+
+/// Pins every built-in secret reference without a version to the version it
+/// has now, so a replay reads what this deployment read. A reference to a
+/// secret that does not exist is `400`.
+async fn pin_secrets(state: &AppState, snapshot: &mut Value) -> ApiResult<()> {
+    let mut refs = snapshot_secrets(snapshot);
+    let names: Vec<String> = refs
+        .iter()
+        .filter(|r| r["version"].is_null())
+        .filter_map(|r| r["ref"].as_str().map(str::to_owned))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let latest = state
+        .store
+        .latest_secret_versions(state.org(), &names)
+        .await
+        .map_err(|e| ApiError::internal(format!("secret versions could not be read: {e}")))?;
+    for reference in refs.iter_mut().filter(|r| r["version"].is_null()) {
+        let name = reference["ref"].as_str().unwrap_or_default().to_owned();
+        let version = latest.get(&name).ok_or_else(|| {
+            ApiError::invalid(format!("secret `{BUILTIN_STORE}/{name}` does not exist"))
+        })?;
+        reference["version"] = json!(version.to_string());
+    }
+    Ok(())
+}
+
+/// Checks that what a recorded snapshot needs still exists: its drivers at
+/// the protocol version it ran with, and the secret versions it pinned.
+async fn check_replay(state: &AppState, source: &str, snapshot: &mut Value) -> ApiResult<()> {
+    for (driver, protocol) in snapshot["drivers"].as_object().into_iter().flatten() {
+        let now = state.drivers.protocol(driver);
+        if now.is_none() || now.as_deref() != protocol.as_str() {
+            return Err(ApiError::invalid(format!(
+                "deployment `{source}` used driver `{driver}` at protocol {}, which this server \
+                 {}; use `\"replay\": \"current\"`",
+                protocol.as_str().unwrap_or("unknown"),
+                match now {
+                    Some(now) => format!("now runs at protocol {now}"),
+                    None => "no longer runs".to_owned(),
+                }
+            )));
+        }
+    }
+    for reference in snapshot_secrets(snapshot) {
+        let name = reference["ref"].as_str().unwrap_or_default();
+        let version = reference["version"]
+            .as_str()
+            .and_then(|v| v.parse::<i64>().ok());
+        let exists = match version {
+            Some(version) => state
+                .store
+                .has_secret_version(state.org(), name, version)
+                .await
+                .map_err(|e| {
+                    ApiError::internal(format!("secret versions could not be read: {e}"))
+                })?,
+            None => false,
+        };
+        if !exists {
+            return Err(ApiError::invalid(format!(
+                "deployment `{source}` used secret `{BUILTIN_STORE}/{name}` version {}, which no \
+                 longer exists; use `\"replay\": \"current\"`",
+                reference["version"].as_str().unwrap_or("unknown")
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The shared values a deployment to `env` resolves: the latest value set
@@ -548,11 +694,22 @@ pub async fn list(
     Ok(Json(Page { deployments, next }))
 }
 
+/// One deployment, with the configuration versions it resolved.
+#[derive(Serialize)]
+pub struct DeploymentView {
+    #[serde(flatten)]
+    record: DeploymentRecord,
+    /// The value set versions of the application and the environment
+    /// (`null` for a scope without values, or for a deployment recorded
+    /// before versions were).
+    value_versions: Value,
+}
+
 /// `GET .../deploys/{deploy}`, by ID, `+n` or `last-successful`.
 pub async fn get(
     State(state): State<AppState>,
     Path((_, app, env, reference)): Path<(String, String, String, String)>,
-) -> ApiResult<Json<DeploymentRecord>> {
+) -> ApiResult<Json<DeploymentView>> {
     let env = env_or_404(&state, &app, &env).await?;
     let d = deployment_by_ref(&state, &env, &reference).await?;
     if d.env != env.id {
@@ -561,7 +718,18 @@ pub async fn get(
             env.app, env.id
         )));
     }
-    Ok(Json(d))
+    let snapshot = state
+        .store
+        .deployment_snapshot(state.org(), &app, &env.id, &d.id)
+        .await?;
+    let versions = snapshot
+        .map(|s| s["values"]["versions"].clone())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"app": null, "env": null}));
+    Ok(Json(DeploymentView {
+        record: d,
+        value_versions: versions,
+    }))
 }
 
 /// Log lines returned by default, and at most.

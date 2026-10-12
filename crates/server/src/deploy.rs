@@ -228,6 +228,13 @@ impl Drivers {
         *current = (registry, backend);
     }
 
+    /// The protocol version of driver `id`; `None` for a driver this server
+    /// cannot run.
+    pub fn protocol(&self, id: &str) -> Option<String> {
+        let current = self.0.read().unwrap_or_else(|e| e.into_inner());
+        Some(current.0.get(id)?.info().protocol_version.clone())
+    }
+
     /// What a preview knows about driver `id`; `None` for a driver this
     /// server cannot run.
     pub fn facts(&self, id: &str) -> Option<DriverFacts> {
