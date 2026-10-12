@@ -189,7 +189,7 @@ impl Executor for Fake {
         ] {
             secret_refs(input, &mut refs);
         }
-        let log = job.log.clone();
+        let mut log = job.log.redacting();
         self.jobs.lock().unwrap().push(job);
         let mut values = Vec::new();
         if let Some(store) = &self.secrets {
@@ -199,7 +199,8 @@ impl Executor for Fake {
                 values.push(value.expose().to_owned());
             }
         }
-        // As a real executor does: register what it resolved, then log.
+        // As a real executor does: register what it resolved, log, and hand
+        // failures back redacted.
         log.secret(&values);
         for v in &values {
             log.info(&format!("connecting with {v}"));
@@ -226,7 +227,7 @@ impl Executor for Fake {
             ))),
         };
         self.running.fetch_sub(1, Ordering::SeqCst);
-        result?;
+        result.map_err(|f| log.failure(f))?;
         let mut provisioned = ProvisionResult::default();
         provisioned
             .outputs

@@ -2,15 +2,11 @@
 //! logged, streamed, persisted or returned in an error.
 //!
 //! A secret is matched as written and in the escaped forms that JSON and HCL
-//! output print it in. Values shorter than [`MIN_CHARS`] are not redacted,
-//! since replacing every occurrence of a short string would garble the text
-//! without protecting anything guessable.
+//! output print it in. Every non-empty value is redacted, however short: a
+//! short secret garbles the text it appears in, which is the safer failure.
 
 /// What a redacted value is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
-
-/// The shortest value that is redacted.
-pub const MIN_CHARS: usize = 4;
 
 /// Known secret values and how to recognize them in text.
 #[derive(Clone, Default)]
@@ -31,7 +27,7 @@ impl Redactor {
     pub fn add(&mut self, values: impl IntoIterator<Item = impl AsRef<str>>) {
         for v in values {
             let v = v.as_ref();
-            if v.chars().count() < MIN_CHARS {
+            if v.is_empty() {
                 continue;
             }
             self.forms.extend(escaped_forms(v));
@@ -143,9 +139,10 @@ mod tests {
     }
 
     #[test]
-    fn ignores_short_values_and_hides_values_in_debug() {
-        let r = Redactor::new(["ab", "secret-value"]);
-        assert_eq!(r.redact("ab"), "ab");
+    fn redacts_short_values_and_hides_values_in_debug() {
+        let r = Redactor::new(["", "ab", "secret-value"]);
+        assert_eq!(r.redact("ab xyz"), "[REDACTED] xyz");
+        assert_eq!(r.redact("xyz"), "xyz");
         assert!(!format!("{r:?}").contains("secret"));
     }
 }

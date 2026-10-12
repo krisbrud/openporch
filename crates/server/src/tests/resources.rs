@@ -34,11 +34,12 @@ impl Executor for Fake {
             .push((job.descriptor.to_string(), job.guresid.to_string()));
         let leak = self.leak.lock().unwrap().clone();
         if let Some(secret) = leak.filter(|_| ty == "postgres") {
-            job.log.secret([&secret]);
-            job.log.info(&format!("psql --password={secret}"));
-            return Err(ExecFailure::Permanent(format!(
+            let mut log = job.log.redacting();
+            log.secret([&secret]);
+            log.info(&format!("psql --password={secret}"));
+            return Err(log.failure(ExecFailure::Permanent(format!(
                 "password authentication failed: {secret}"
-            )));
+            ))));
         }
         if self.failing.lock().unwrap().contains(&ty) {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));

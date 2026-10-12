@@ -42,7 +42,7 @@ mod tests;
 
 pub use deprovision::{DestructiveAction, NoPermits, PermitCheck, PermitRequest};
 use log::DeploymentLog;
-pub use log::JobLog;
+pub use log::{JobLog, RedactingLog};
 
 /// A deployment as the planner runs it: the accepted configuration, never the
 /// current one.
@@ -218,6 +218,10 @@ pub enum ExecFailure {
 }
 
 /// Provisions resources: resolves secrets, obtains credentials and calls drivers.
+///
+/// Secret values stay in the executor. It writes a job's log through
+/// [`JobLog::redacting`], registers every value it resolves there, and passes
+/// every failure it returns through [`RedactingLog::failure`].
 pub trait Executor: Send + Sync + 'static {
     /// Provisions one resource.
     fn provision(
@@ -507,22 +511,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 }
 
-/// `failure` with every secret value registered with `log` replaced.
-fn redacted(failure: ExecFailure, log: &JobLog) -> ExecFailure {
-    let failure = match failure {
-        ExecFailure::Permanent(e) => ExecFailure::Permanent(log.redact(&e)),
-        ExecFailure::Uncertain(e) => ExecFailure::Uncertain(log.redact(&e)),
-        ExecFailure::Retryable { error, retry_after } => ExecFailure::Retryable {
-            error: log.redact(&error),
-            retry_after,
-        },
-    };
-    // A final failure is logged with the resource's status at the end of the
-    // run, or when its deletion ends; a retryable one only here.
-    if let ExecFailure::Retryable { error, .. } = &failure {
+/// Logs a failure the executor returned, already redacted, when another
+/// attempt may follow; a final failure is logged with the resource's status at
+/// the end of the run, or when its deletion ends.
+fn log_retry(failure: &ExecFailure, log: &JobLog) {
+    if let ExecFailure::Retryable { error, .. } = failure {
         log.warn(&format!("failed, retryable: {error}"));
     }
-    failure
 }
 
 /// The deployment's error, or `None` when every resource provisioned.
@@ -796,7 +791,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 }
                 Err(f) => f,
             };
-            let failure = redacted(failure, &log);
+            log_retry(&failure, &log);
             match failure {
                 ExecFailure::Permanent(error) => {
                     self.checkpoint(

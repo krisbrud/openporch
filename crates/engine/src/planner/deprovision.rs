@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use super::log::DeploymentLog;
 use super::{
     Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, JobLog, Limits, Outcome, Planner,
-    ProvisionJob, backoff, redacted,
+    ProvisionJob, backoff, log_retry,
 };
 
 /// A destructive action that needs a permit.
@@ -499,7 +499,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 }
                 Err(f) => f,
             };
-            let failure = redacted(failure, &log);
+            log_retry(&failure, &log);
             match failure {
                 ExecFailure::Permanent(error) => {
                     self.checkpoint(

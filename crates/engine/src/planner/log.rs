@@ -1,13 +1,13 @@
-//! Deployment logs: the single redaction layer every log line passes through
-//! before it is persisted or streamed.
+//! Deployment logs, and the redaction layer every line an executor writes
+//! passes through before it is persisted or streamed.
 //!
-//! Each resource gets a [`JobLog`]. The executor registers every secret value
-//! it resolves for the resource with [`JobLog::secret`], and every line written
-//! afterwards, by the executor or the planner, has those values replaced with
-//! `[REDACTED]`. The planner also passes driver errors through the same log
-//! before recording them. Lines go to one writer per deployment, which
-//! persists them in order and stops at the deployment's log quota with an
-//! explicit truncation line; only the final status lines are written past it.
+//! Each resource gets a [`JobLog`], which holds no secret values. The executor
+//! writes to it through a [`RedactingLog`] it owns: it registers every secret
+//! value it resolves there, and every line it writes, and every failure it
+//! returns to the planner, has those values replaced with `[REDACTED]`. Lines
+//! go to one writer per deployment, which persists them in order and stops at
+//! the deployment's log quota with an explicit truncation line; only the
+//! final status lines are written past it.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +19,7 @@ use openporch_core::redact::Redactor;
 use openporch_store::{LogLine, Store, now_ms};
 use tokio::sync::{mpsc, oneshot};
 
-use super::Deployment;
+use super::{Deployment, ExecFailure};
 
 /// Lines written at once.
 const BATCH: usize = 256;
@@ -198,7 +198,6 @@ async fn write<S: Store>(store: &S, [org, app, env, id]: [&str; 4], lines: Vec<L
 }
 
 struct Shared {
-    redactor: Mutex<Redactor>,
     /// The resource's latest operation and GUResID, which later lines about
     /// the resource name.
     latest: Mutex<Option<(String, String)>>,
@@ -208,15 +207,14 @@ struct Shared {
 impl Shared {
     fn new(writer: Arc<Writer>) -> Self {
         Self {
-            redactor: Mutex::new(Redactor::default()),
             latest: Mutex::default(),
             writer,
         }
     }
 }
 
-/// Where the log lines about one resource go. Clones share the values to
-/// redact.
+/// Where the log lines about one resource go. It holds no secret values: an
+/// executor writes to it only through a [`RedactingLog`], which it owns.
 #[derive(Clone)]
 pub struct JobLog {
     shared: Arc<Shared>,
@@ -256,15 +254,98 @@ impl JobLog {
         }
     }
 
-    /// Registers secret values: from now on they never appear in this
-    /// resource's log lines or in the errors the planner records for it.
-    pub fn secret(&self, values: impl IntoIterator<Item = impl AsRef<str>>) {
-        self.redactor().add(values);
+    /// The executor's side of this log, which redacts the secret values the
+    /// executor registers with it.
+    pub fn redacting(&self) -> RedactingLog {
+        RedactingLog {
+            log: self.clone(),
+            redactor: Redactor::default(),
+        }
     }
 
-    /// `text` with every registered secret value replaced.
+    /// Writes an informational line.
+    pub(super) fn info(&self, message: &str) {
+        self.write("info", message);
+    }
+
+    /// Writes a warning.
+    pub(super) fn warn(&self, message: &str) {
+        self.write("warn", message);
+    }
+
+    /// Writes an error.
+    pub(super) fn error(&self, message: &str) {
+        self.write("error", message);
+    }
+
+    /// Writes the resource's or the deployment's final status, which the
+    /// quota does not drop.
+    pub(super) fn status(&self, level: &str, message: &str) {
+        self.send(level, message, true);
+    }
+
+    fn write(&self, level: &str, message: &str) {
+        self.send(level, message, false);
+    }
+
+    fn send(&self, level: &str, message: &str, exempt: bool) {
+        let writer = &self.shared.writer;
+        if writer.full() && !exempt {
+            return;
+        }
+        let line = LogLine {
+            seq: 0,
+            operation_id: self.operation_id.clone(),
+            descriptor: Some(self.descriptor.clone()).filter(|d| !d.is_empty()),
+            guresid: self.guresid.clone(),
+            at: now_ms(),
+            level: level.to_owned(),
+            message: message.to_owned(),
+        };
+        writer.send(line, exempt);
+    }
+}
+
+impl std::fmt::Debug for JobLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobLog")
+            .field("descriptor", &self.descriptor)
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The executor's view of a job's log. It keeps the secret values the
+/// executor resolved, which never leave the executor: every line it writes,
+/// and every failure it hands back to the planner, has them replaced with
+/// `[REDACTED]` first.
+pub struct RedactingLog {
+    log: JobLog,
+    redactor: Redactor,
+}
+
+impl RedactingLog {
+    /// Registers secret values to redact from now on.
+    pub fn secret(&mut self, values: impl IntoIterator<Item = impl AsRef<str>>) {
+        self.redactor.add(values);
+    }
+
+    /// `text` with every registered value replaced.
     pub fn redact(&self, text: &str) -> String {
-        self.redactor().redact(text)
+        self.redactor.redact(text)
+    }
+
+    /// `failure` with every registered value replaced, for returning to the
+    /// planner.
+    pub fn failure(&self, failure: ExecFailure) -> ExecFailure {
+        match failure {
+            ExecFailure::Permanent(e) => ExecFailure::Permanent(self.redact(&e)),
+            ExecFailure::Uncertain(e) => ExecFailure::Uncertain(self.redact(&e)),
+            ExecFailure::Retryable { error, retry_after } => ExecFailure::Retryable {
+                error: self.redact(&error),
+                retry_after,
+            },
+        }
     }
 
     /// Writes an informational line.
@@ -282,48 +363,21 @@ impl JobLog {
         self.write("error", message);
     }
 
-    /// Writes the resource's or the deployment's final status, which the
-    /// quota does not drop.
-    pub(super) fn status(&self, level: &str, message: &str) {
-        self.send(level, message, true);
-    }
-
     fn write(&self, level: &str, message: &str) {
-        self.send(level, message, false);
-    }
-
-    fn send(&self, level: &str, message: &str, exempt: bool) {
-        let writer = &self.shared.writer;
         // A line that would be dropped is not redacted first.
-        if writer.full() && !exempt {
+        if self.log.shared.writer.full() {
             return;
         }
-        let line = LogLine {
-            seq: 0,
-            operation_id: self.operation_id.clone(),
-            descriptor: Some(self.descriptor.clone()).filter(|d| !d.is_empty()),
-            guresid: self.guresid.clone(),
-            at: now_ms(),
-            level: level.to_owned(),
-            message: self.redact(message),
-        };
-        writer.send(line, exempt);
-    }
-
-    fn redactor(&self) -> std::sync::MutexGuard<'_, Redactor> {
-        self.shared
-            .redactor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.log.send(level, &self.redact(message), false);
     }
 }
 
 /// Registered values are never shown.
-impl std::fmt::Debug for JobLog {
+impl std::fmt::Debug for RedactingLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobLog")
-            .field("descriptor", &self.descriptor)
-            .field("operation_id", &self.operation_id)
-            .finish_non_exhaustive()
+        f.debug_struct("RedactingLog")
+            .field("log", &self.log)
+            .field("redactor", &self.redactor)
+            .finish()
     }
 }
