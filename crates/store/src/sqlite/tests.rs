@@ -577,6 +577,29 @@ async fn checkpoints_survive_partial_failure() {
 }
 
 #[tokio::test]
+async fn restart_recovery_leaves_a_finished_log_alone() {
+    let f = Fixture::new().await;
+    let d1 = f.deploy("nginx:1").await;
+    f.start(&d1.id, DB).await.unwrap();
+    // The deployment finished, as after a planner panic, with its operation
+    // still open.
+    f.store
+        .finish_deployment(ORG, "shop", "development", &d1.id, Some("stopped".into()))
+        .await
+        .unwrap();
+    let f = f.restart().await;
+    let report = f.store.recover_interrupted().await.unwrap();
+    assert_eq!(report.uncertain.len(), 1);
+    let lines = f
+        .store
+        .deployment_logs(ORG, "shop", "development", &d1.id, None, 100)
+        .await
+        .unwrap();
+    let messages: Vec<_> = lines.iter().map(|l| l.message.as_str()).collect();
+    assert_eq!(messages, ["deployment failed: stopped"]);
+}
+
+#[tokio::test]
 async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
     let f = Fixture::new().await;
     let d1 = f.deploy("nginx:1").await;

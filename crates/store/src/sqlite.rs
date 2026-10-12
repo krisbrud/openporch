@@ -2089,7 +2089,8 @@ impl Store for SqliteStore {
 }
 
 /// Appends a line to deployment `deployment_id`'s log, about operation `op` on
-/// the resource with the given GUResID if there is one.
+/// the resource with the given GUResID if there is one. A finished
+/// deployment's log ends with its outcome, so nothing is added to it.
 async fn log_in_tx(
     conn: &mut SqliteConnection,
     org: &str,
@@ -2104,7 +2105,7 @@ async fn log_in_tx(
          guresid, at, level, message) \
          SELECT org_id, app_id, env_id, id, ?, \
          (SELECT descriptor FROM active_resources WHERE guresid = ?), ?, ?, ?, ? \
-         FROM deployments WHERE org_id = ? AND id = ?",
+         FROM deployments WHERE org_id = ? AND id = ? AND status = 'in_progress'",
     )
     .bind(op)
     .bind(guresid)
