@@ -450,18 +450,25 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
             };
             let resource_log = log.resource(d);
+            // Terminal lines say what is known about the effects and what to
+            // do next.
             match status {
-                ResourceRunStatus::Failed => {
-                    resource_log.status("error", &format!("failed: {reason}"))
-                }
-                ResourceRunStatus::Unknown => {
-                    resource_log.status("error", &format!("outcome unknown: {reason}"));
-                }
+                ResourceRunStatus::Failed => resource_log.status(
+                    "error",
+                    &format!("failed, nothing changed; fix the cause and deploy again: {reason}"),
+                ),
+                ResourceRunStatus::Unknown => resource_log.status(
+                    "error",
+                    &format!(
+                        "outcome unknown, the resource may have changed; recover it before \
+                         deploying again: {reason}"
+                    ),
+                ),
                 ResourceRunStatus::Pending => {
-                    resource_log.status("warn", &format!("pending: {reason}"))
+                    resource_log.status("warn", &format!("not attempted: {reason}"));
                 }
                 ResourceRunStatus::Skipped => {
-                    resource_log.status("info", &format!("kept: {reason}"))
+                    resource_log.status("info", &format!("kept: {reason}"));
                 }
             }
             if let Err(e) = self

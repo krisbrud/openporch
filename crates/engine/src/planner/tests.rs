@@ -1852,12 +1852,17 @@ async fn the_log_stops_at_its_quota_but_keeps_the_outcome() {
         .iter()
         .map(|l| l.message.as_str())
         .collect();
-    assert!(after.contains(&"failed: 400: invalid zone"), "{after:?}");
+    assert!(
+        after.contains(
+            &"failed, nothing changed; fix the cause and deploy again: 400: invalid zone"
+        ),
+        "{after:?}"
+    );
     assert!(
         after.last().unwrap().starts_with("deployment failed"),
         "{after:?}"
     );
-    assert!(after.iter().all(|m| !m.contains("attempt")), "{after:?}");
+    assert!(after.iter().all(|m| !m.contains("(attempt")), "{after:?}");
 }
 
 #[tokio::test]

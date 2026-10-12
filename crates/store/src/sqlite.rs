@@ -714,20 +714,25 @@ impl Store for SqliteStore {
         }
         let mut tx = self.begin().await?;
         for line in lines {
+            // A finished deployment's log is complete: later lines, from a
+            // task that outlived it, are dropped.
             sqlx::query(
                 "INSERT INTO logs (org_id, app_id, env_id, deployment_id, operation_id, \
-                 descriptor, guresid, at, level, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 descriptor, guresid, at, level, message) \
+                 SELECT org_id, app_id, env_id, id, ?, ?, ?, ?, ?, ? FROM deployments \
+                 WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ? \
+                 AND status = 'in_progress'",
             )
-            .bind(org)
-            .bind(app)
-            .bind(env)
-            .bind(deployment_id)
             .bind(&line.operation_id)
             .bind(&line.descriptor)
             .bind(&line.guresid)
             .bind(line.at)
             .bind(&line.level)
             .bind(&line.message)
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .bind(deployment_id)
             .execute(&mut *tx)
             .await?;
         }

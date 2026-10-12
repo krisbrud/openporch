@@ -683,7 +683,7 @@ async fn read_a_deployments_redacted_log() {
         .collect();
     assert!(messages.contains(&"psql --password=[REDACTED]"), "{page}");
     assert!(
-        messages.contains(&"failed: password authentication failed: [REDACTED]"),
+        messages.contains(&"failed, nothing changed; fix the cause and deploy again: password authentication failed: [REDACTED]"),
         "{page}"
     );
     assert!(

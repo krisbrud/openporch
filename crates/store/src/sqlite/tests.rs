@@ -631,6 +631,26 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
         lines[1].message,
         "deployment failed: interrupted by a server restart"
     );
+    // A finished deployment's log takes no more lines.
+    let late = LogLine {
+        seq: 0,
+        operation_id: None,
+        descriptor: None,
+        guresid: None,
+        at: 0,
+        level: "info".into(),
+        message: "late".into(),
+    };
+    f.store
+        .append_logs(ORG, "shop", "development", &d1.id, vec![late])
+        .await
+        .unwrap();
+    let after = f
+        .store
+        .deployment_logs(ORG, "shop", "development", &d1.id, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(after, lines);
 
     // New deployments are refused until the outcome is resolved.
     let set = f.set("nginx:2").await;
