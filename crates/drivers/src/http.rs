@@ -281,6 +281,7 @@ impl HttpDriver {
             values: body.resource.values,
             secrets: SecretMap::new(body.resource.secrets),
             manifests: body.manifests,
+            footprint: Default::default(),
         })
     }
 

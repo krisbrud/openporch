@@ -32,6 +32,7 @@ impl Echo {
             values: req.values.clone(),
             secrets: req.secrets.clone(),
             manifests: Vec::new(),
+            footprint: Default::default(),
         }
     }
 }

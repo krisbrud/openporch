@@ -252,6 +252,18 @@ pub struct DriverOutputs {
     pub values: Map<String, Value>,
     pub secrets: SecretMap,
     pub manifests: Vec<Manifest>,
+    /// Where the resource lives, kept so a detached resource can be adopted.
+    pub footprint: Footprint,
+}
+
+/// Where a resource lives outside openporch: what a detached resource's
+/// tombstone keeps for a later adoption.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Footprint {
+    /// Where the driver keeps the resource's state, such as an S3 location.
+    pub backend: Option<String>,
+    /// The cloud objects the resource consists of, such as ARNs.
+    pub external_ids: Vec<String>,
 }
 
 /// The result of `put`.

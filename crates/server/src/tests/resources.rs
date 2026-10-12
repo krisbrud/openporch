@@ -966,6 +966,63 @@ async fn delete_a_deployed_application() {
     assert!(at("workload.default#modules.web") < at(DB), "{deleted:?}");
 }
 
+#[tokio::test]
+async fn a_resource_secret_output_is_used_only_in_its_environment() {
+    use openporch_store::{SecretOwner, SecretUseStore, StoreError};
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let d = s.deploy_web_in("development", "nginx:1", true, &[]).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "pr-42", "name": "PR 42", "type": "development"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let (_, resources) = s
+        .get("/orgs/acme/apps/shop/envs/development/resources", &s.admin)
+        .await;
+    let guresid = resources["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["descriptor"] == DB)
+        .unwrap()["guresid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let output = |reference: String| SecretRef {
+        store: "openporch".into(),
+        reference,
+        version: None,
+    };
+    let own = output(format!("resources/{guresid}/outputs/password"));
+    let authorize = |env: &'static str, r: SecretRef| {
+        let store = s.state.store.clone();
+        let guresid = guresid.clone();
+        async move {
+            store
+                .authorize_secret_use("acme", "shop", env, SecretOwner::Resource(&guresid), &r)
+                .await
+        }
+    };
+    authorize("development", own.clone()).await.unwrap();
+    // Not in another environment, and not another resource's secret.
+    for (env, r) in [
+        ("pr-42", own),
+        (
+            "development",
+            output("resources/0000/outputs/password".into()),
+        ),
+    ] {
+        let e = authorize(env, r).await.unwrap_err();
+        assert!(matches!(e, StoreError::Forbidden(_)), "{e}");
+    }
+}
+
 impl Server {
     /// Starts deleting `env` with the permit `permit-1`.
     async fn delete_env(&self, env: &str, generation: i64) -> Value {

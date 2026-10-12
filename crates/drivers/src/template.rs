@@ -147,6 +147,7 @@ impl Template {
                 values,
                 secrets: crate::SecretMap::new(secrets),
                 manifests,
+                footprint: Default::default(),
             },
             cookie,
         ))

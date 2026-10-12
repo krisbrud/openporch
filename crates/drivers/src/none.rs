@@ -32,6 +32,7 @@ impl NoneDriver {
             values: req.resource.clone(),
             secrets: req.resource_secrets.clone(),
             manifests: Vec::new(),
+            footprint: Default::default(),
         }
     }
 }

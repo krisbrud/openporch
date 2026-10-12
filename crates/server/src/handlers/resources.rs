@@ -397,6 +397,7 @@ pub async fn detach(
             descriptor: &resource.descriptor,
             action: DestructiveAction::Detach,
             permits: &req.permits,
+            plan: None,
         })
         .await
         .map_err(|e| ApiError::conflict(format!("approval_required: {e}")))?;

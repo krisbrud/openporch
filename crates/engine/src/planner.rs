@@ -20,8 +20,8 @@ use openporch_core::ids::{
 };
 use openporch_core::model::{ResourceDefinition, SecretRef};
 use openporch_core::placeholder::{
-    ContextKey, Dialect, MapScope, Resolved, ResourceOutputs, SecretExpr, SharedValue, Sink,
-    resolve_value,
+    ContextKey, Dialect, Expr, Lookup, MapScope, Resolved, ResourceOutputs, Scope, SecretExpr,
+    SharedValue, Sink, resolve_value,
 };
 use openporch_store::secrets::Sealed;
 use openporch_store::{
@@ -130,6 +130,8 @@ pub struct ProvisionJob {
     pub descriptor: Descriptor,
     /// Its permanent identity.
     pub guresid: Guresid,
+    /// The deployment the job belongs to.
+    pub context: JobContext,
     /// The matched definition.
     pub definition_id: DefinitionId,
     /// The definition's version in the snapshot.
@@ -155,6 +157,52 @@ pub struct ProvisionJob {
     /// registers every secret value it resolves with [`JobLog::secret`], so
     /// that no line or error carries one.
     pub log: JobLog,
+}
+
+/// The deployment a job belongs to: the scope its secret references are
+/// authorized for, and the permits it was submitted with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobContext {
+    /// Organization.
+    pub org: OrgId,
+    /// Application.
+    pub app: AppId,
+    /// Environment.
+    pub env: EnvId,
+    /// Environment type.
+    pub env_type: EnvTypeId,
+    /// Deployment ID.
+    pub deployment_id: String,
+    /// The destructive-action permits the deployment was submitted with.
+    pub permits: Vec<String>,
+}
+
+impl JobContext {
+    /// The context of a job in `deployment`.
+    pub fn of(deployment: &Deployment) -> Self {
+        Self {
+            org: deployment.org.clone(),
+            app: deployment.app.clone(),
+            env: deployment.env.clone(),
+            env_type: deployment.env_type.clone(),
+            deployment_id: deployment.id.clone(),
+            permits: deployment.permits.clone(),
+        }
+    }
+}
+
+/// Where a secret reference in a job's inputs came from, which decides whose
+/// use of it the executor authorizes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum SecretSource {
+    /// A shared value of the application or environment.
+    Values,
+    /// A secret output of the resource with this GUResID.
+    Output {
+        /// The resource.
+        guresid: Guresid,
+    },
 }
 
 /// Everything the executor needs to delete one resource: the job it was
@@ -183,6 +231,11 @@ pub struct JobInputs {
     pub secret_refs: Resolved,
     /// The resource inputs (`params`), which may contain secrets.
     pub resource: Resolved,
+    /// Where each secret reference in `secrets` and `resource` came from. The
+    /// executor refuses a reference it finds none for; those in `secret_refs`
+    /// belong to the definition.
+    #[serde(default)]
+    pub sources: Vec<(SecretRef, SecretSource)>,
 }
 
 /// What a successful provisioning returns: non-secret outputs and references.
@@ -646,6 +699,59 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
     scope
 }
 
+/// A scope that records where each secret reference it hands out came from.
+struct Recording<'a> {
+    scope: &'a MapScope,
+    seen: std::sync::Mutex<BTreeSet<(SecretRef, SecretSource)>>,
+}
+
+impl Recording<'_> {
+    fn into_sources(self) -> Vec<(SecretRef, SecretSource)> {
+        self.seen
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .into_iter()
+            .collect()
+    }
+
+    /// The resource whose outputs `expr` reads.
+    fn output_of(&self, expr: &Expr) -> Option<Guresid> {
+        let outputs = match expr {
+            Expr::Resource { target, .. } => {
+                let d = self.scope.descriptor_for(target).ok()?;
+                self.scope.resources.get(&d)
+            }
+            Expr::Externals { key, .. } => self.scope.externals.get(key),
+            Expr::Shared { id, .. } => self.scope.shared.get(id),
+            _ => None,
+        };
+        outputs.and_then(|o| o.guresid.clone())
+    }
+}
+
+impl Scope for Recording<'_> {
+    fn lookup(&self, expr: &Expr) -> Result<Lookup, String> {
+        let found = self.scope.lookup(expr)?;
+        if let Lookup::Secret(r) = &found {
+            // A reference whose source is unknown is left out, and the
+            // executor refuses it.
+            let source = match expr {
+                Expr::Values { .. } => Some(SecretSource::Values),
+                _ => self
+                    .output_of(expr)
+                    .map(|guresid| SecretSource::Output { guresid }),
+            };
+            if let Some(source) = source {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert((r.clone(), source));
+            }
+        }
+        Ok(found)
+    }
+}
+
 /// One node's provisioning, with retries.
 struct NodeRun<S, E> {
     store: Arc<S>,
@@ -887,6 +993,11 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
     ) -> Result<ProvisionJob, String> {
         let at = |what: &str| format!("definition `{}`: {what}", def.id);
         let scope = &self.scope;
+        // Secret inputs record where each reference came from.
+        let recording = Recording {
+            scope,
+            seen: std::sync::Mutex::new(BTreeSet::new()),
+        };
         let values = resolve_value(
             &Value::Object(def.driver_inputs.values.clone()),
             Dialect::Definition,
@@ -901,7 +1012,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         let secrets = resolve_value(
             &Value::Object(def.driver_inputs.secrets.clone()),
             Dialect::Definition,
-            scope,
+            &recording,
             Sink::Secret,
             "driver_inputs.secrets",
         )
@@ -951,7 +1062,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     .collect();
             }
         }
-        let mut resource = resolve_value(&params, dialect, scope, Sink::Secret, "params")
+        let mut resource = resolve_value(&params, dialect, &recording, Sink::Secret, "params")
             .map_err(|e| format!("`{}`: {e}", node.descriptor))?;
         for (path, content) in literal {
             put(&mut resource, &path, content);
@@ -961,6 +1072,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             attempt: started.attempt,
             descriptor: node.descriptor.clone(),
             guresid: started.guresid.clone(),
+            context: JobContext::of(&self.deployment),
             definition_id: def.id.clone(),
             definition_version: version,
             driver_type: def.driver_type.clone(),
@@ -970,6 +1082,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 secrets,
                 secret_refs,
                 resource,
+                sources: recording.into_sources(),
             },
             input_fingerprint: fingerprint.to_owned(),
             cookie: None,

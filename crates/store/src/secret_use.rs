@@ -26,6 +26,8 @@ pub enum SecretOwner<'a> {
     Account(&'a str),
     /// An external driver's token.
     Driver(&'a str),
+    /// The secret outputs of the resource with this GUResID.
+    Resource(&'a str),
 }
 
 impl SecretOwner<'_> {
@@ -37,6 +39,7 @@ impl SecretOwner<'_> {
             Self::Definition(id) => Some(format!("defs/{id}/")),
             Self::Account(id) => Some(format!("accounts/{id}/")),
             Self::Driver(id) => Some(format!("drivers/{id}/")),
+            Self::Resource(guresid) => Some(format!("resources/{guresid}/")),
         }
     }
 
@@ -46,6 +49,7 @@ impl SecretOwner<'_> {
             Self::Definition(id) => format!("definition `{id}`"),
             Self::Account(id) => format!("cloud account `{id}`"),
             Self::Driver(id) => format!("driver `{id}`"),
+            Self::Resource(guresid) => format!("resource `{guresid}`"),
         }
     }
 
@@ -101,6 +105,25 @@ pub(crate) async fn check_use(
 ) -> Result<()> {
     if owner == SecretOwner::Values {
         return check_secret_use(conn, org, app, Some(env), r).await;
+    }
+    // A resource's outputs are used only within its own environment.
+    if let SecretOwner::Resource(guresid) = owner {
+        let active: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM active_resources WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND guresid = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(guresid)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if active.is_none() {
+            return Err(StoreError::Forbidden(format!(
+                "resource `{guresid}` is not in `{app}/{env}`, so its secret outputs cannot be \
+                 used there"
+            )));
+        }
     }
     let mut refs = Map::new();
     refs.insert("ref".into(), serde_json::to_value(r)?);

@@ -1271,7 +1271,9 @@ impl OpenTofu {
             .await?;
         let outputs: Map<String, Value> = serde_json::from_str(&out.stdout)
             .map_err(|_| Failure::Io("`tofu output -json` printed no outputs".into()))?;
-        Ok(split_outputs(outputs, &mut run.log))
+        let mut outputs = split_outputs(outputs, &mut run.log);
+        outputs.footprint.backend = run.retained.backend.as_ref().map(ToString::to_string);
+        Ok(outputs)
     }
 
     /// Keeps what later calls need: the lock file, the script and the source
@@ -1522,6 +1524,7 @@ fn split_outputs(outputs: Map<String, Value>, log: &mut RunLog) -> DriverOutputs
         values,
         secrets: SecretMap::new(secrets),
         manifests: Vec::new(),
+        footprint: Default::default(),
     }
 }
 
@@ -1581,8 +1584,10 @@ impl Driver for OpenTofu {
                 }
             };
             let outputs = state["outputs"].as_object().cloned().unwrap_or_default();
+            let mut outputs = split_outputs(outputs, &mut RunLog::default());
+            outputs.footprint.backend = Some(self.config.state.id().to_string());
             Ok(Observation::Ready {
-                outputs: split_outputs(outputs, &mut RunLog::default()),
+                outputs,
                 cookie: None,
             })
         })
