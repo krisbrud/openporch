@@ -1053,8 +1053,12 @@ impl Store for SqliteStore {
                 )));
             }
         }
-        let existing: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT guresid, status, driver_type, last_deploy_id FROM active_resources \
+        // A resource counts as provisioned once a deployment succeeded or a
+        // driver left a cookie or target behind, as the preview judges it.
+        let existing: Option<(String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT guresid, status, driver_type, \
+             (last_deploy_id IS NOT NULL OR cookie IS NOT NULL OR target IS NOT NULL) \
+             FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1073,7 +1077,7 @@ impl Store for SqliteStore {
             }
             // A different driver cannot take over a resource another driver
             // provisioned: that is a migration, which only an operator starts.
-            Some((_, _, Some(current), Some(_)))
+            Some((_, _, Some(current), true))
                 if start.kind == OperationKind::Put
                     && start.driver_type.as_ref().is_some_and(|d| *d != current) =>
             {

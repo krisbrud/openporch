@@ -266,3 +266,56 @@ fn moving_a_resource_is_refused_as_a_migration() {
     db.driver_account = Some("aws-dev".into());
     assert!(preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).is_ok());
 }
+
+#[test]
+fn a_failed_first_attempt_and_a_cookie_only_resource() {
+    let d = deployment(&[(
+        node(DB, "pg", "openporch/opentofu"),
+        def("pg", "openporch/opentofu", None),
+    )]);
+    // The first attempt failed and left nothing the orchestrator recorded,
+    // but its driver may still find state when it plans.
+    let mut db = active(DB, "openporch/template");
+    db.last_deploy_id = None;
+    db.status = "failed".into();
+    let entries = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap();
+    assert_eq!(entries[0].action, Change::Create);
+    assert!(!entries[0].known && !entries[0].permit_required);
+    assert!(
+        entries[0]
+            .reason
+            .starts_with("an earlier attempt did not finish")
+    );
+
+    // A cookie from that attempt makes the resource its driver's.
+    db.cookie = Some(openporch_store::secrets::Sealed {
+        key_id: "k".into(),
+        nonce: Vec::new(),
+        ciphertext: Vec::new(),
+    });
+    let migrations = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap_err();
+    assert!(migrations[0].contains("driver `openporch/template`"));
+}
+
+#[test]
+fn cleanup_and_drivers_without_facts() {
+    let d = deployment(&[(node(QUEUE, "qu", "test/gone"), def("qu", "test/gone", None))]);
+    let mut bucket = active(BUCKET, "openporch/opentofu");
+    bucket.scheduled_deletion = true;
+    bucket.cleanup_pending = true;
+    let entries = preview(
+        &d,
+        &[active(QUEUE, "test/gone"), bucket],
+        |driver| (driver != "test/gone").then(DriverFacts::default),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let e = by_descriptor(&entries);
+    // A driver nothing is known about is treated as one that cannot preview.
+    assert_eq!(e[QUEUE].action, Change::Unknown);
+    assert!(e[QUEUE].permit_required);
+    // Removing only a record needs no permit.
+    assert_eq!(e[BUCKET].action, Change::Delete);
+    assert!(!e[BUCKET].permit_required);
+    assert!(e[BUCKET].reason.contains("only its record is removed"));
+}

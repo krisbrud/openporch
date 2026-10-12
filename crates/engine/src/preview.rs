@@ -106,13 +106,19 @@ pub fn preview(
         let existing = current
             .filter(|r| r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some());
         let Some(r) = existing else {
-            entries.push(entry(
-                Change::Create,
-                true,
-                "not provisioned yet",
-                false,
-                None,
-            ));
+            // A failed first attempt may have left state the driver finds when
+            // it plans, so only a resource with no record is known to be new.
+            let (known, reason) = if current.is_some() && driver.as_ref().is_some_and(|f| f.preview)
+            {
+                (
+                    false,
+                    "an earlier attempt did not finish; the driver plans the change when the \
+                     deployment runs",
+                )
+            } else {
+                (true, "not provisioned yet")
+            };
+            entries.push(entry(Change::Create, known, reason, false, None));
             continue;
         };
         if let Some(from) = &r.driver_type
