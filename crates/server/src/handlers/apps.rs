@@ -5,12 +5,13 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_store::{
-    AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, Store,
+    AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, PermitStore, Store,
+    StoreError,
 };
 use serde::{Deserialize, Serialize};
 
-use super::check_id;
 use super::envs::{self, EnvDeletion};
+use super::{check_id, plans};
 use crate::api::{Ctx, JsonBody};
 use crate::error::{ApiError, ApiResult};
 use crate::rbac;
@@ -132,10 +133,29 @@ pub async fn delete(
         }
     }
     let snapshot = envs::deletion_snapshot(&req.permits);
+    // Each environment's deletion runs the preflight of its own deletion and
+    // binds the permits issued for it.
+    let issued = state.store.permit_envs(org, &app, &req.permits).await?;
+    if let Some(unknown) = req.permits.iter().find(|p| !issued.contains_key(*p)) {
+        return Err(StoreError::PermitInvalid(format!(
+            "permit `{unknown}` was not issued for `{app}`"
+        ))
+        .into());
+    }
+    let mut permits = std::collections::BTreeMap::new();
+    for env in state.store.envs(org, &app).await? {
+        let entries = plans::preflight(&state, &env, String::new(), &snapshot, true).await?;
+        let presented: Vec<String> = issued
+            .iter()
+            .filter(|(_, for_env)| **for_env == env.id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        permits.insert(env.id.clone(), plans::binding(&entries, &presented));
+    }
     let accepted = state
         .store
         .accept_app_deletion(AppDeletionRequest {
-            permits: Default::default(),
+            permits,
             org: org.to_owned(),
             app: app.clone(),
             actor: ctx.principal.id.clone(),

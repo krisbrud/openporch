@@ -10,7 +10,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::Descriptor;
-use openporch_engine::planner::{DestructiveAction, PermitRequest};
 use openporch_store::{ActiveResource, DeploymentStatus, Detach, EnvRecord, Store, Tombstone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -387,22 +386,6 @@ pub async fn detach(
     let env = env_or_404(&state, &app, &env).await?;
     let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
     let org = state.org();
-    state
-        .permits
-        .get()
-        .check(PermitRequest {
-            org,
-            app: &env.app,
-            env: &env.id,
-            descriptor: &resource.descriptor,
-            guresid: Some(&resource.guresid),
-            deployment: None,
-            action: DestructiveAction::Detach,
-            permits: &req.permits,
-            plan: None,
-        })
-        .await
-        .map_err(|e| ApiError::conflict(format!("approval_required: {e}")))?;
     let mut audit = ctx.audit(
         org,
         "resource.detach",
@@ -416,7 +399,7 @@ pub async fn detach(
             &env.app,
             &env.id,
             Detach {
-                permits: None,
+                permits: Some(&req.permits),
                 descriptor: &resource.descriptor,
                 guresid: &resource.guresid,
                 reason,

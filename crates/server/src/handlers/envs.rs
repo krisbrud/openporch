@@ -16,7 +16,7 @@ use openporch_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{check_id, deploys};
+use super::{check_id, deploys, plans};
 use crate::api::{Ctx, JsonBody};
 use crate::auth;
 use crate::deploy::Job;
@@ -295,12 +295,13 @@ pub async fn delete(
         ));
     }
 
-    env_or_404(&state, &app, &env).await?;
+    let env_record = env_or_404(&state, &app, &env).await?;
     let snapshot = deletion_snapshot(&req.permits);
+    let entries = plans::preflight(&state, &env_record, String::new(), &snapshot, true).await?;
     let acceptance = state
         .store
         .accept_deployment(DeploymentRequest {
-            permits: Default::default(),
+            permits: plans::binding(&entries, &req.permits),
             org: org.to_owned(),
             app: app.clone(),
             env: env.clone(),

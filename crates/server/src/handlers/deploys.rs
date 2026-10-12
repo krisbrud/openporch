@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use super::plans;
 use super::sets::{delta_or_404, set_or_404};
 use crate::api::{Ctx, JsonBody, QueryParams};
 use crate::deploy::Job;
@@ -81,26 +82,31 @@ pub struct TriggerRequest {
     expected_generation: i64,
 }
 
-/// The set a request deploys, with the snapshot to run it from.
-struct Resolved {
-    set: DeploymentSet,
-    delta_id: Option<String>,
-    delta_content: Option<Value>,
-    snapshot: Value,
+impl TriggerRequest {
+    /// The sources of a deployment to preview, with no permits.
+    pub(super) fn preview(
+        delta_id: Option<String>,
+        set_id: Option<String>,
+        deploy_id: Option<String>,
+        replay: Option<Replay>,
+        mode: Mode,
+        expected_generation: i64,
+    ) -> Self {
+        Self {
+            delta_id,
+            set_id,
+            deploy_id,
+            replay,
+            mode,
+            comment: String::new(),
+            permits: Vec::new(),
+            expected_generation,
+        }
+    }
 }
 
-/// `POST /orgs/{org}/apps/{app}/envs/{env}/deploys`.
-pub async fn trigger(
-    State(state): State<AppState>,
-    ctx: Ctx,
-    Path((_, app, env)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    JsonBody(mut req): JsonBody<TriggerRequest>,
-) -> ApiResult<(StatusCode, Json<DeploymentRecord>)> {
-    let org = state.org();
-    // Permits are a set; their order does not make a different request.
-    req.permits.sort();
-    req.permits.dedup();
+/// Checks the shape of a request's sources.
+pub(super) fn check_trigger(req: &TriggerRequest) -> ApiResult<()> {
     if req.mode == Mode::Incremental {
         return Err(ApiError::invalid(
             "mode `incremental` is not supported; use `full`",
@@ -118,6 +124,30 @@ pub async fn trigger(
     if req.replay.is_some() && req.deploy_id.is_none() {
         return Err(ApiError::invalid("`replay` applies only to `deploy_id`"));
     }
+    Ok(())
+}
+
+/// The set a request deploys, with the snapshot to run it from.
+pub(super) struct Resolved {
+    pub(super) set: DeploymentSet,
+    delta_id: Option<String>,
+    delta_content: Option<Value>,
+    pub(super) snapshot: Value,
+}
+
+/// `POST /orgs/{org}/apps/{app}/envs/{env}/deploys`.
+pub async fn trigger(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    JsonBody(mut req): JsonBody<TriggerRequest>,
+) -> ApiResult<(StatusCode, Json<DeploymentRecord>)> {
+    let org = state.org();
+    // Permits are a set; their order does not make a different request.
+    req.permits.sort();
+    req.permits.dedup();
+    check_trigger(&req)?;
     let key = idempotency_key(&headers)?;
     let fingerprint = fingerprint(&serde_json::to_value(&req).map_err(ApiError::internal)?);
     // A retry returns the original deployment without deriving anything again:
@@ -160,10 +190,20 @@ pub async fn trigger(
     }
     let resolved = resolve(&state, &env_record, &req).await?;
     let set_id = state.store.put_set(org, &app, &resolved.set).await?;
+    // The same preflight as a preview: migrations are refused, and every
+    // destructive change it knows of needs a presented permit.
+    let entries = plans::preflight(
+        &state,
+        &env_record,
+        set_id.clone(),
+        &resolved.snapshot,
+        false,
+    )
+    .await?;
     let acceptance = state
         .store
         .accept_deployment(DeploymentRequest {
-            permits: Default::default(),
+            permits: plans::binding(&entries, &req.permits),
             org: org.to_owned(),
             app: app.clone(),
             env: env.clone(),
@@ -218,7 +258,7 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>> 
     Ok(Some(key.to_owned()))
 }
 
-async fn env_or_404(state: &AppState, app: &str, env: &str) -> ApiResult<EnvRecord> {
+pub(super) async fn env_or_404(state: &AppState, app: &str, env: &str) -> ApiResult<EnvRecord> {
     state
         .store
         .env(state.org(), app, env)
@@ -227,7 +267,11 @@ async fn env_or_404(state: &AppState, app: &str, env: &str) -> ApiResult<EnvReco
 }
 
 /// Resolves the request into the set to deploy and its snapshot.
-async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> ApiResult<Resolved> {
+pub(super) async fn resolve(
+    state: &AppState,
+    env: &EnvRecord,
+    req: &TriggerRequest,
+) -> ApiResult<Resolved> {
     let app = &env.app;
     if let Some(id) = &req.delta_id {
         let record = delta_or_404(state, app, id).await?;

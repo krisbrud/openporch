@@ -9,6 +9,7 @@ mod envs;
 mod health;
 mod login;
 mod members;
+mod plans;
 mod resources;
 mod sets;
 mod values;
@@ -219,6 +220,25 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}/logs",
             App(AppPerm::Read),
             deploys::logs,
+        )
+        // Previews and permits.
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/plans",
+            App(AppPerm::Deploy),
+            plans::create,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}",
+            App(AppPerm::Read),
+            plans::get,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits",
+            App(AppPerm::Deploy),
+            plans::permits,
         )
         // Active resources.
         .route(

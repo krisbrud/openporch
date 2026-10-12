@@ -4,22 +4,21 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use openporch_core::model::SecretRef;
 use openporch_engine::planner::{
-    DeprovisionJob, ExecFailure, Executor, Limits, PermitCheck, PermitRequest, Planner,
-    ProvisionJob, ProvisionResult,
+    DeprovisionJob, ExecFailure, Executor, Limits, Planner, ProvisionJob, ProvisionResult,
 };
 use serde_json::{Value, json};
 
 use super::*;
-use crate::deploy::PlannerRunner;
+use crate::deploy::{PlannerRunner, StorePermits};
 
 /// Provisions every resource except those of the failing types.
 #[derive(Debug, Default)]
-struct Fake {
+pub(super) struct Fake {
     failing: Mutex<BTreeSet<String>>,
     /// The GUResID each job was handed, by descriptor.
     guresids: Mutex<Vec<(String, String)>>,
     /// The descriptors deleted, in order.
-    deleted: Mutex<Vec<String>>,
+    pub(super) deleted: Mutex<Vec<String>>,
     /// Types whose deletion fails.
     undeletable: Mutex<BTreeSet<String>>,
     /// A secret value the executor resolves for postgres, and then leaks into
@@ -78,34 +77,15 @@ impl Executor for Fake {
     }
 }
 
-/// Accepts the permit `permit-1` for any destructive action.
-#[derive(Debug)]
-struct OnePermit;
-
-impl PermitCheck for OnePermit {
-    fn check<'a>(
-        &'a self,
-        req: PermitRequest<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        let ok = req.permits.iter().any(|p| p == "permit-1");
-        Box::pin(async move {
-            if ok {
-                Ok(())
-            } else {
-                Err("no matching permit".into())
-            }
-        })
-    }
-}
-
 const RESOURCES: &str = "/orgs/acme/apps/shop/envs/development/resources";
 const DEPLOYS: &str = "/orgs/acme/apps/shop/envs/development/deploys";
-const DB: &str = "postgres.default#modules.web.externals.db";
+pub(super) const DB: &str = "postgres.default#modules.web.externals.db";
+pub(super) const ENV_DEV: &str = "/orgs/acme/apps/shop/envs/development";
 
 impl Server {
     /// `shop` with definitions for its environment, workloads and postgres, and
     /// deployments run by the planner over `fake`.
-    async fn provisioning(&self, fake: Arc<Fake>) {
+    pub(super) async fn provisioning(&self, fake: Arc<Fake>) {
         self.app("shop").await;
         for (id, ty, driver) in [
             ("env", "base-env", "openporch/none"),
@@ -127,8 +107,7 @@ impl Server {
             ..Limits::default()
         };
         let planner = Planner::new(Arc::new(self.state.store.clone()), fake, limits)
-            .with_permit_check(Arc::new(OnePermit));
-        self.state.permits.set(Arc::new(OnePermit));
+            .with_permit_check(Arc::new(StorePermits(self.state.store.clone())));
         self.state
             .runners
             .set(Arc::new(PlannerRunner::new(Arc::new(planner))));
@@ -136,19 +115,42 @@ impl Server {
 
     /// Deploys `web` with image `image` and, when `db`, its database, and
     /// waits for the outcome.
-    async fn deploy_web(&self, image: &str, db: bool) -> Value {
-        self.deploy_web_with(image, db, &[]).await
+    pub(super) async fn deploy_web(&self, image: &str, db: bool) -> Value {
+        self.deploy_web_with(image, db, false).await
     }
 
-    /// [`Self::deploy_web`] with destructive-action permits.
-    async fn deploy_web_with(&self, image: &str, db: bool, permits: &[&str]) -> Value {
-        self.deploy_web_in("development", image, db, permits).await
+    /// [`Self::deploy_web`] with a permit for every change that needs one.
+    pub(super) async fn deploy_web_with(&self, image: &str, db: bool, permitted: bool) -> Value {
+        self.deploy_web_in("development", image, db, permitted)
+            .await
     }
 
     /// [`Self::deploy_web_with`] to environment `env`.
-    async fn deploy_web_in(&self, env: &str, image: &str, db: bool, permits: &[&str]) -> Value {
+    pub(super) async fn deploy_web_in(
+        &self,
+        env: &str,
+        image: &str,
+        db: bool,
+        permitted: bool,
+    ) -> Value {
+        let (s, d) = self.try_deploy_web(env, image, db, permitted).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{d}");
+        let id = d["id"].as_str().unwrap().to_owned();
+        self.finished_at(&format!("/orgs/acme/apps/shop/envs/{env}/deploys/{id}"))
+            .await
+    }
+
+    /// Triggers deploying `web` with image `image` and, when `db`, its
+    /// database to `env`, with a permit for every change that needs one when
+    /// `permitted`.
+    pub(super) async fn try_deploy_web(
+        &self,
+        env: &str,
+        image: &str,
+        db: bool,
+        permitted: bool,
+    ) -> (StatusCode, Value) {
         let env_path = format!("/orgs/acme/apps/shop/envs/{env}");
-        let deploys = format!("{env_path}/deploys");
         let externals = if db {
             json!({"db": {"type": "postgres"}})
         } else {
@@ -171,28 +173,58 @@ impl Server {
             )
             .await;
         assert_eq!(s, StatusCode::CREATED, "{delta}");
-        let (s, d) = self
-            .post(
-                &deploys,
-                &self.admin,
-                json!({"delta_id": delta["id"], "expected_generation": env["generation"],
-                    "permits": permits}),
-            )
-            .await;
-        assert_eq!(s, StatusCode::ACCEPTED, "{d}");
-        let id = d["id"].as_str().unwrap().to_owned();
-        for _ in 0..500 {
-            let (s, d) = self.get(&format!("{deploys}/{id}"), &self.admin).await;
-            assert_eq!(s, StatusCode::OK, "{d}");
-            if d["status"] != "in_progress" {
-                return d;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("deployment {id} did not finish");
+        let permits = if permitted {
+            self.permits_for(&env_path, json!({"delta_id": delta["id"]}))
+                .await
+        } else {
+            Vec::new()
+        };
+        self.post(
+            &format!("{env_path}/deploys"),
+            &self.admin,
+            json!({"delta_id": delta["id"], "expected_generation": env["generation"],
+                "permits": permits}),
+        )
+        .await
     }
 
-    async fn resource(&self, descriptor: &str) -> Value {
+    /// Previews `body` in the environment at `env_path` and issues a permit,
+    /// as an administrator, for every change the preview says needs one.
+    pub(super) async fn permits_for(&self, env_path: &str, mut body: Value) -> Vec<String> {
+        let (s, env) = self.get(env_path, &self.admin).await;
+        assert_eq!(s, StatusCode::OK, "{env}");
+        body["expected_generation"] = env["generation"].clone();
+        let (s, plan) = self
+            .post(&format!("{env_path}/plans"), &self.admin, body)
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{plan}");
+        let asks: Vec<Value> = plan["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["permit_required"] == true)
+            .map(|r| json!({"descriptor": r["descriptor"], "action": r["action"]}))
+            .collect();
+        if asks.is_empty() {
+            return Vec::new();
+        }
+        let (s, issued) = self
+            .post(
+                &format!("{env_path}/plans/{}/permits", plan["id"].as_str().unwrap()),
+                &self.admin,
+                json!({"permits": asks}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{issued}");
+        issued["permits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    pub(super) async fn resource(&self, descriptor: &str) -> Value {
         let (s, b) = self.get(RESOURCES, &self.admin).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         b["resources"]
@@ -347,10 +379,25 @@ async fn definition_switches_driver() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{b}");
-    let d = s.deploy_web("nginx:2", true).await;
-    assert_eq!(d["status"], "failed", "{d}");
-    let error = d["error"].as_str().unwrap();
+    // Moving it is a migration, refused before anything is accepted.
+    let generation = s.get(ENV_DEV, &s.admin).await.1["generation"].clone();
+    let (status, b) = s
+        .try_deploy_web("development", "nginx:2", true, false)
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-002");
+    let error = b["message"].as_str().unwrap();
     assert!(error.contains("migrate or replace the resource"), "{error}");
+    assert_eq!(s.get(ENV_DEV, &s.admin).await.1["generation"], generation);
+    // A preview says the same.
+    let (status, b) = s
+        .post(
+            &format!("{ENV_DEV}/plans"),
+            &s.admin,
+            json!({"set_id": s.get(ENV_DEV, &s.admin).await.1["desired_set_id"],
+                   "expected_generation": generation}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-002");
 
     // The resource keeps its driver and identity.
     let after = s.resource(DB).await;
@@ -495,18 +542,17 @@ async fn scheduled_deletion() {
     assert_eq!(d["status"], "succeeded", "{d}");
     assert_eq!(s.resource(DB).await["scheduled_deletion"], true);
 
-    // Leaving it out without a permit fails, and the database stays.
-    let d = s.deploy_web("nginx:3", false).await;
-    assert_eq!(d["status"], "failed", "{d}");
-    assert!(
-        d["error"].as_str().unwrap().contains("approval_required"),
-        "{d}"
-    );
+    // Leaving it out without a permit is refused, and the database stays.
+    let (status, b) = s
+        .try_deploy_web("development", "nginx:3", false, false)
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-001");
+    assert!(b["message"].as_str().unwrap().contains(DB), "{b}");
     assert_eq!(s.resource(DB).await["status"], "provisioned");
     assert!(fake.deleted.lock().unwrap().is_empty());
 
     // With a permit, the driver deletes it and the record disappears.
-    let d = s.deploy_web_with("nginx:4", false, &["permit-1"]).await;
+    let d = s.deploy_web_with("nginx:4", false, true).await;
     assert_eq!(d["status"], "succeeded", "{d}");
     assert_eq!(*fake.deleted.lock().unwrap(), vec![DB.to_owned()]);
     let (status, b) = s.get(&path, &s.admin).await;
@@ -529,7 +575,11 @@ async fn detach() {
     let db = s.resource(DB).await;
     let path = format!("{RESOURCES}/postgres/modules.web.externals.db");
     let detach = format!("{path}/detach");
-    let body = |reason: &str, permits: &[&str]| json!({"reason": reason, "permits": permits});
+    let body = |reason: &str, permits: &[String]| json!({"reason": reason, "permits": permits});
+    let permits = s
+        .permits_for(ENV_DEV, json!({"kind": "detach", "descriptor": DB}))
+        .await;
+    assert_eq!(permits.len(), 1);
 
     // Only administrators detach.
     let developer = s.member("dev", "member").await;
@@ -542,25 +592,21 @@ async fn detach() {
         .await;
     assert!(status.is_success(), "{b}");
     let (status, b) = s
-        .post(&detach, &developer, body("moving it", &["permit-1"]))
+        .post(&detach, &developer, body("moving it", &permits))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{b}");
     // A reason and a matching permit are required.
-    let (status, b) = s.post(&detach, &s.admin, body("  ", &["permit-1"])).await;
+    let (status, b) = s.post(&detach, &s.admin, body("  ", &permits)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
     let (status, b) = s.post(&detach, &s.admin, body("moving it", &[])).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{b}");
-    assert!(
-        b["message"].as_str().unwrap().contains("approval_required"),
-        "{b}"
-    );
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-001");
     assert_eq!(s.resource(DB).await["guresid"], db["guresid"]);
 
     let (status, tombstone) = s
         .post(
             &detach,
             &s.admin,
-            body("moving it to the shared cluster", &["permit-1"]),
+            body("moving it to the shared cluster", &permits),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{tombstone}");
@@ -774,7 +820,7 @@ async fn delete_a_deployed_environment() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{b}");
-    let d = s.deploy_web_in("pr-42", "nginx:1", true, &[]).await;
+    let d = s.deploy_web_in("pr-42", "nginx:1", true, false).await;
     assert_eq!(d["status"], "succeeded", "{d}");
     fake.undeletable.lock().unwrap().insert("postgres".into());
 
@@ -843,7 +889,8 @@ async fn delete_a_deployed_environment() {
 
     // The retry deletes the rest and then the environment.
     fake.undeletable.lock().unwrap().clear();
-    let body = json!({"expected_generation": env["generation"], "permits": ["permit-1"]});
+    let permits = s.permits_for(ENV, json!({"kind": "delete_env"})).await;
+    let body = json!({"expected_generation": env["generation"], "permits": permits});
     let retry = || {
         s.call_with(
             Method::DELETE,
@@ -893,18 +940,20 @@ async fn delete_a_deployed_application() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{b}");
-    let d = s.deploy_web_in("pr-42", "nginx:1", true, &[]).await;
+    let d = s.deploy_web_in("pr-42", "nginx:1", true, false).await;
     assert_eq!(d["status"], "succeeded", "{d}");
     fake.undeletable.lock().unwrap().insert("postgres".into());
 
     // Every environment is deleted; the empty `development` goes at once.
-    let delete = || {
+    let delete = || async {
+        let permits = s.app_deletion_permits(APP).await;
         s.call(
             Method::DELETE,
             APP,
             Some(&s.admin),
-            Some(json!({"permits": ["permit-1"]})),
+            Some(json!({"permits": permits})),
         )
+        .await
     };
     let (status, deletion) = delete().await;
     assert_eq!(status, StatusCode::ACCEPTED, "{deletion}");
@@ -972,7 +1021,7 @@ async fn a_resource_secret_output_is_used_only_in_its_environment() {
     let s = server().await;
     let fake = Arc::new(Fake::default());
     s.provisioning(fake.clone()).await;
-    let d = s.deploy_web_in("development", "nginx:1", true, &[]).await;
+    let d = s.deploy_web_in("development", "nginx:1", true, false).await;
     assert_eq!(d["status"], "succeeded", "{d}");
     let (status, b) = s
         .post(
@@ -1024,14 +1073,27 @@ async fn a_resource_secret_output_is_used_only_in_its_environment() {
 }
 
 impl Server {
-    /// Starts deleting `env` with the permit `permit-1`.
+    /// Permits for deleting every environment of the application at `app`.
+    async fn app_deletion_permits(&self, app: &str) -> Vec<String> {
+        let (status, envs) = self.get(&format!("{app}/envs"), &self.admin).await;
+        assert_eq!(status, StatusCode::OK, "{envs}");
+        let mut permits = Vec::new();
+        for env in envs.as_array().unwrap() {
+            let path = format!("{app}/envs/{}", env["id"].as_str().unwrap());
+            permits.extend(self.permits_for(&path, json!({"kind": "delete_env"})).await);
+        }
+        permits
+    }
+
+    /// Starts deleting `env` with permits for everything it deletes.
     async fn delete_env(&self, env: &str, generation: i64) -> Value {
+        let permits = self.permits_for(env, json!({"kind": "delete_env"})).await;
         let (status, b) = self
             .call(
                 Method::DELETE,
                 env,
                 Some(&self.admin),
-                Some(json!({"expected_generation": generation, "permits": ["permit-1"]})),
+                Some(json!({"expected_generation": generation, "permits": permits})),
             )
             .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{b}");
@@ -1039,7 +1101,7 @@ impl Server {
     }
 
     /// The deployment at `path` once it finished.
-    async fn finished_at(&self, path: &str) -> Value {
+    pub(super) async fn finished_at(&self, path: &str) -> Value {
         for _ in 0..500 {
             let (status, d) = self.get(path, &self.admin).await;
             assert_eq!(status, StatusCode::OK, "{d}");

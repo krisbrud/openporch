@@ -41,8 +41,8 @@ pub struct Inner {
     pub token_limit: RateLimiter,
     /// Runs accepted deployments.
     pub runners: crate::deploy::Runners,
-    /// Checks destructive-action permits.
-    pub permits: crate::deploy::Permits,
+    /// What previews know about the drivers.
+    pub drivers: crate::deploy::Drivers,
 }
 
 impl std::ops::Deref for AppState {
@@ -209,7 +209,7 @@ pub async fn start_with(
         login_limit,
         token_limit,
         runners: crate::deploy::Runners::default(),
-        permits: crate::deploy::Permits::default(),
+        drivers: crate::deploy::Drivers::default(),
     }));
     prune_sessions(&state);
     Ok(state)

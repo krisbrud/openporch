@@ -996,7 +996,12 @@ impl Store for SqliteStore {
                         ..req.audit.clone()
                     },
 
-                    permits: req.permits.get(env).cloned().unwrap_or_default(),
+                    permits: req.permits.get(env).cloned().ok_or_else(|| {
+                        StoreError::Conflict(format!(
+                            "environment `{app}/{env}` was added while the application's \
+                             deletion was prepared; try again"
+                        ))
+                    })?,
                 },
             )
             .await?;

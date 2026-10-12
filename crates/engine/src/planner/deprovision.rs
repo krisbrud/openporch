@@ -79,6 +79,9 @@ pub struct PermitRequest<'a> {
     /// Fingerprint of the driver's plan, when the action comes from one. A
     /// permit issued for one plan does not cover a different plan.
     pub plan: Option<&'a str>,
+    /// The plan's actions on named objects, as `(action, address)`, so a
+    /// refused plan can be shown in the next preview.
+    pub planned: &'a [(String, String)],
 }
 
 /// Decides whether presented permits allow a destructive action. A permit
@@ -543,6 +546,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             action: DestructiveAction::Delete,
             permits: &d.permits,
             plan: None,
+            planned: &[],
         });
         match tokio::time::timeout_at(self.deadline, check).await {
             Ok(Ok(())) => Ok(()),

@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use openporch_core::canonical::to_canonical_string;
 use openporch_store::ActiveResource;
 use serde::Serialize;
 
@@ -38,11 +39,29 @@ pub enum Change {
     Unknown,
     /// Replaced, as a driver's plan from an earlier attempt showed.
     Replace,
+    /// No longer managed; the object stays.
+    Detach,
+}
+
+impl Change {
+    /// The destructive action a permit for this change names, if it needs one.
+    pub fn permit_action(self) -> Option<&'static str> {
+        match self {
+            Self::Delete => Some("delete"),
+            Self::Unknown => Some("unknown"),
+            Self::Replace => Some("replace"),
+            Self::Detach => Some("detach"),
+            Self::Create | Self::Update => None,
+        }
+    }
 }
 
 /// A driver's plan from an earlier attempt that needed a permit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DriverPlan {
+    /// The permit action it needs: `replace`, `delete`, or `unknown` when the
+    /// driver could not tell, which has no fingerprint.
+    pub action: String,
     /// The plan's fingerprint, which a permit for it names.
     pub fingerprint: String,
     /// The planned actions on named objects.
@@ -71,6 +90,18 @@ pub struct Entry {
     pub permit_required: bool,
     /// The driver's plan from an earlier attempt, when one needed a permit.
     pub driver_plan: Option<DriverPlan>,
+    /// A digest of the resource's configuration as previewed; a permit for
+    /// the change binds only while the deployment's digest is the same.
+    pub digest: String,
+}
+
+/// A digest of `value`'s canonical JSON.
+fn digest(value: &serde_json::Value) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(to_canonical_string(value).as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Previews `deployment` against the environment's `active` resources.
@@ -92,6 +123,12 @@ pub fn preview(
         let current = by_descriptor.get(descriptor.as_str()).copied();
         let def = deployment.definitions.get(&node.definition).map(|(_, d)| d);
         let driver = facts(&node.driver_type);
+        // What the resource is provisioned from: its node and the definition
+        // version it matched.
+        let config = digest(&serde_json::json!({
+            "node": node,
+            "definition": deployment.definitions.get(&node.definition),
+        }));
         let entry = |action, known, reason: &str, permit_required, plan| Entry {
             descriptor: descriptor.clone(),
             guresid: current.map(|r| r.guresid.clone()),
@@ -102,9 +139,40 @@ pub fn preview(
             reason: reason.to_owned(),
             permit_required,
             driver_plan: plan,
+            digest: config.clone(),
         };
         let existing = current
             .filter(|r| r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some());
+        // A driver plan an earlier attempt could not run without a permit:
+        // the change needs a permit for that action, whatever else is true.
+        if let Some(plan) = current.and_then(|r| plans.get(&r.guresid)) {
+            let refused = match plan.action.as_str() {
+                "delete" => Some((
+                    Change::Delete,
+                    "an earlier attempt's driver plan deletes objects",
+                )),
+                "replace" => Some((
+                    Change::Replace,
+                    "an earlier attempt's driver plan destroys or replaces objects",
+                )),
+                "unknown" => Some((
+                    Change::Unknown,
+                    "an earlier attempt's driver could not tell what the change does",
+                )),
+                _ => None,
+            };
+            if let Some((action, reason)) = refused {
+                let fingerprinted = action != Change::Unknown;
+                entries.push(entry(
+                    action,
+                    fingerprinted,
+                    reason,
+                    true,
+                    fingerprinted.then(|| plan.clone()),
+                ));
+                continue;
+            }
+        }
         let Some(r) = existing else {
             // A failed first attempt may have left state the driver finds when
             // it plans, so only a resource with no record is known to be new.
@@ -158,15 +226,7 @@ pub fn preview(
             ));
             continue;
         }
-        if let Some(plan) = plans.get(&r.guresid) {
-            entries.push(entry(
-                Change::Replace,
-                true,
-                "an earlier attempt's driver plan destroys or replaces objects",
-                true,
-                Some(plan.clone()),
-            ));
-        } else if driver.is_some_and(|f| f.preview) {
+        if driver.is_some_and(|f| f.preview) {
             entries.push(entry(
                 Change::Update,
                 false,
@@ -209,6 +269,12 @@ pub fn preview(
             reason: reason.to_owned(),
             permit_required: !r.cleanup_pending,
             driver_plan: None,
+            digest: digest(&serde_json::json!({
+                "delete": r.guresid,
+                "last_deploy_id": r.last_deploy_id,
+                "definition": r.definition_id,
+                "version": r.definition_version,
+            })),
         });
     }
     entries.sort_by(|a, b| a.descriptor.cmp(&b.descriptor));
@@ -216,6 +282,28 @@ pub fn preview(
         Ok(entries)
     } else {
         Err(migrations)
+    }
+}
+
+/// The preview of detaching `r`: the orchestrator stops managing it and the
+/// object stays.
+pub fn detach(r: &ActiveResource) -> Entry {
+    Entry {
+        descriptor: r.descriptor.clone(),
+        guresid: Some(r.guresid.clone()),
+        definition: r.definition_id.clone(),
+        driver_type: r.driver_type.clone(),
+        action: Change::Detach,
+        known: true,
+        reason: "detached: no longer managed, and the object stays".to_owned(),
+        permit_required: true,
+        driver_plan: None,
+        digest: digest(&serde_json::json!({
+            "detach": r.guresid,
+            "last_deploy_id": r.last_deploy_id,
+            "definition": r.definition_id,
+            "version": r.definition_version,
+        })),
     }
 }
 

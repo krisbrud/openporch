@@ -399,8 +399,13 @@ where
         &self,
         job: &ProvisionJob,
         action: DestructiveAction,
-        plan: Option<&str>,
+        plan: Option<(&str, &[(Action, String)])>,
     ) -> Result<(), ExecFailure> {
+        let planned: Vec<(String, String)> = plan
+            .into_iter()
+            .flat_map(|(_, actions)| actions)
+            .map(|(a, address)| (action_name(a).to_owned(), address.clone()))
+            .collect();
         let c = &job.context;
         let descriptor = job.descriptor.to_string();
         let check = self.checks.check(PermitRequest {
@@ -412,7 +417,8 @@ where
             deployment: Some(&c.deployment_id),
             action,
             permits: &c.permits,
-            plan,
+            plan: plan.map(|(fingerprint, _)| fingerprint),
+            planned: &planned,
         });
         match tokio::time::timeout_at(job.deadline, check).await {
             Ok(Ok(())) => Ok(()),
@@ -479,7 +485,8 @@ where
                     None
                 };
                 if let Some(action) = destructive {
-                    self.permit(job, action, Some(&fingerprint)).await?;
+                    self.permit(job, action, Some((&fingerprint, &actions)))
+                        .await?;
                     req.permit = Some(fingerprint);
                 }
             }
@@ -552,9 +559,16 @@ where
             ..
         } = self.request(job, &sources, false, log).await?;
         match self.plan(driver.as_ref(), &req, timeout, true).await? {
-            Plan::Actions { fingerprint, .. } => {
-                self.permit(job, DestructiveAction::Delete, Some(&fingerprint))
-                    .await?;
+            Plan::Actions {
+                fingerprint,
+                actions,
+            } => {
+                self.permit(
+                    job,
+                    DestructiveAction::Delete,
+                    Some((&fingerprint, &actions)),
+                )
+                .await?;
                 req.permit = Some(fingerprint);
             }
             Plan::NoEffects | Plan::Unknown => {}
@@ -606,6 +620,16 @@ where
 
 fn cookie_aad(job: &ProvisionJob) -> String {
     format!("{COOKIE_AAD}:{}:{}", job.context.org, job.guresid)
+}
+
+/// An action's name, as previews and approval requests show it.
+fn action_name(action: &Action) -> &'static str {
+    match action {
+        Action::Create => "create",
+        Action::Update => "update",
+        Action::Replace => "replace",
+        Action::Delete => "delete",
+    }
 }
 
 fn describe(actions: &[(Action, String)]) -> String {
