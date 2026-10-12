@@ -227,6 +227,12 @@ pub fn api(state: AppState) -> Api {
             App(AppPerm::Read),
             resources::get,
         )
+        .route(
+            delete(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}",
+            App(AppPerm::Deploy),
+            resources::schedule_deletion,
+        )
         // Sets and deltas.
         .route(
             get(),

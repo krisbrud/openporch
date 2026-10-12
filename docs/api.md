@@ -1617,6 +1617,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | --- | --- | --- |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources` | app read |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | app read |
+| DELETE | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | deploy to the environment |
 | GET | `/orgs/{org}/resources/defs/{def}/resources` | org read all |
 
 An active resource is something a deployment provisioned in an environment. It
@@ -1637,8 +1638,35 @@ again reuses it with its data. If a definition switches a provisioned resource t
 a different driver or cloud account, the deployment fails with a conflict and the
 resource keeps its driver, account and state, since moving it is an explicit
 migration. A resource that has never provisioned can still switch. The
-definition and version shown are those of the last successful provisioning. Scheduling
-deletion and detaching resources are not implemented yet.
+definition and version shown are those of the last successful provisioning.
+
+`DELETE` on a resource schedules it for deletion and returns `202` with the
+resource, now with `scheduled_deletion: true`. Nothing is deleted yet: the next
+deployment that leaves the resource out deletes it with the driver and state it
+was provisioned with, and the record disappears, leaving a tombstone in the
+audit trail. A deployment that removes a workload deletes the workload the same
+way, together with the owned resources provisioned with it that depend on it,
+such as its triggers; its dependencies stay unless they are scheduled too. A
+removed workload that something kept still uses is not deleted, and the
+deployment fails until that resource is scheduled too. Deletion runs only
+after everything the deployment includes has provisioned, in reverse dependency
+order: a resource is deleted only once nothing that uses it remains. A scheduled
+resource that a kept resource still uses stays, with status `skipped` in the
+deployment, without failing it. A resource
+whose deletion fails keeps its record with status `deletion_failed`, and the
+resources it uses stay too; the next deployment retries it with the same
+`guresid`. If the driver confirmed a deletion but the record could not be
+removed, the resource stays `deletion_failed` and the next deployment that
+leaves it out removes the record without deleting in the cloud again. External resources are never deleted and cannot be scheduled
+(`409`); adopted resources are deleted only when scheduled. Scheduling advances
+the environment's `generation`, except when the resource is already scheduled,
+and returns `409` while a deployment is running.
+
+Every deletion needs a destructive-action permit in the deployment's `permits`.
+Without one the resource fails with `approval_required` and the deployment
+fails. Permits are issued from deployment plans, which are not implemented yet,
+so until then deployments that delete resources fail. Detaching resources is not
+implemented yet.
 
 Resources are listed by descriptor. The single-resource path takes the type and
 resource ID, such as `postgres/modules.web.externals.db`, and returns `409` if
@@ -1654,6 +1682,17 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"resources": []}
+```
+
+```http
+DELETE /orgs/acme/apps/blog/envs/development/resources/postgres/modules.api.externals.db
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+404 Not Found
+
+{"error": "…", "message": "resource `postgres/modules.api.externals.db` not found in `blog/development`"}
 ```
 
 ## Audit log

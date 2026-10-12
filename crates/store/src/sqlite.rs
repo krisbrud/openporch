@@ -1131,9 +1131,66 @@ impl Store for SqliteStore {
                 .fetch_optional(&mut *tx)
                 .await?;
                 if let Some(op) = open {
-                    return Err(StoreError::Conflict(format!(
-                        "operation `{op}` on `{descriptor}` has not finished"
-                    )));
+                    let (deployment, op_kind, deployment_status, cleanup_pending): (
+                        String,
+                        String,
+                        String,
+                        bool,
+                    ) = sqlx::query_as(
+                        "SELECT o.deployment_id, o.kind, d.status, r.cleanup_pending \
+                         FROM operations o JOIN deployments d ON d.id = o.deployment_id \
+                         JOIN active_resources r ON r.guresid = o.guresid WHERE o.id = ?",
+                    )
+                    .bind(&op)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if deployment_status == "in_progress" {
+                        return Err(StoreError::Conflict(format!(
+                            "operation `{op}` on `{descriptor}` has not finished"
+                        )));
+                    }
+                    // Its deployment finished without recording the result, as
+                    // after a failed checkpoint. Close it the way a restart
+                    // would: removing a record whose deletion the driver
+                    // confirmed is retried, and anything else needs recovery.
+                    let now = now_ms();
+                    let (op_state, resource_status, error) =
+                        if op_kind == "delete" && cleanup_pending {
+                            ("failed", "deletion_failed", "abandoned; cleanup pending")
+                        } else {
+                            ("unknown", "unknown", "abandoned without a recorded result")
+                        };
+                    sqlx::query(
+                        "UPDATE operations SET state = ?, error = ?, finished_at = ? WHERE id = ?",
+                    )
+                    .bind(op_state)
+                    .bind(error)
+                    .bind(now)
+                    .bind(&op)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE active_resources SET status = ?, updated_at = ? WHERE guresid = ?",
+                    )
+                    .bind(resource_status)
+                    .bind(now)
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE deployment_resources SET status = ?, error = ? \
+                         WHERE deployment_id = ? AND guresid = ?",
+                    )
+                    .bind(op_state)
+                    .bind(error)
+                    .bind(&deployment)
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
+                    if op_state == "unknown" {
+                        tx.commit().await?;
+                        return Err(StoreError::RecoveryRequired(descriptor));
+                    }
                 }
                 sqlx::query(
                     // The definition columns describe the last success; a
@@ -1145,13 +1202,16 @@ impl Store for SqliteStore {
                      THEN COALESCE(?3, definition_version) ELSE definition_version END, \
                      driver_type = CASE WHEN last_deploy_id IS NULL \
                      THEN COALESCE(?4, driver_type) ELSE driver_type END, \
-                     recovery = ?5, updated_at = ?6 WHERE guresid = ?7",
+                     cleanup_pending = CASE WHEN ?5 = 'put' THEN 0 ELSE cleanup_pending END, \
+                     updated_at = ?6 WHERE guresid = ?7",
                 )
+                // The resource keeps the recovery metadata of its last
+                // provisioning; the operation records its own.
                 .bind(resource_status)
                 .bind(&start.definition_id)
                 .bind(start.definition_version)
                 .bind(&start.driver_type)
-                .bind(serde_json::to_string(&start.recovery)?)
+                .bind(start.kind.as_str())
                 .bind(now)
                 .bind(&guresid)
                 .execute(&mut *tx)
@@ -1264,7 +1324,13 @@ impl Store for SqliteStore {
         }
         match (&result, kind.as_str()) {
             (CheckpointResult::Provisioned(_), "put") | (CheckpointResult::Deleted, "delete") => {}
-            (CheckpointResult::Provisioned(_) | CheckpointResult::Deleted, _) => {
+            (CheckpointResult::CleanupPending { .. }, "delete") if state == "started" => {}
+            (
+                CheckpointResult::Provisioned(_)
+                | CheckpointResult::Deleted
+                | CheckpointResult::CleanupPending { .. },
+                _,
+            ) => {
                 return Err(StoreError::Conflict(format!(
                     "operation `{operation_id}` is a {kind}; the result does not match it"
                 )));
@@ -1366,6 +1432,19 @@ impl Store for SqliteStore {
                 Some(error.clone()),
                 None,
             ),
+            CheckpointResult::CleanupPending { error } => {
+                sqlx::query("UPDATE active_resources SET cleanup_pending = 1 WHERE guresid = ?")
+                    .bind(&guresid)
+                    .execute(&mut *tx)
+                    .await?;
+                (
+                    "failed",
+                    Some("deletion_failed"),
+                    "failed",
+                    Some(format!("cleanup pending: {error}")),
+                    None,
+                )
+            }
             CheckpointResult::Unknown { error } => (
                 "unknown",
                 Some("unknown"),
@@ -1530,6 +1609,96 @@ impl Store for SqliteStore {
         rows.into_iter().map(ResourceRow::into_resource).collect()
     }
 
+    async fn schedule_deletion(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let env_type: Option<String> =
+            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
+                .bind(org)
+                .bind(app)
+                .bind(env)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let env_type =
+            env_type.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
+        // The route checked the caller's roles; they may have changed since.
+        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT ownership, scheduled_deletion FROM active_resources \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(descriptor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let scheduled = row.as_ref().is_some_and(|(_, s)| *s);
+        match row.as_ref().map(|(o, _)| o.as_str()) {
+            None => {
+                return Err(StoreError::NotFound(format!(
+                    "active resource `{descriptor}`"
+                )));
+            }
+            Some("external") => {
+                return Err(StoreError::Conflict(format!(
+                    "`{descriptor}` is external; openporch never deletes it"
+                )));
+            }
+            Some(_) => {}
+        }
+        // Scheduling again changes nothing, so a retried request does not
+        // advance the generation.
+        if scheduled {
+            audit::insert(&mut tx, &audit, None, None).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        // A running deployment was accepted without this change; it must not
+        // act on it.
+        let running: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM deployments WHERE org_id = ? AND app_id = ? AND env_id = ? \
+             AND status = 'in_progress'",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = running {
+            return Err(StoreError::Busy(id));
+        }
+        // What the next deployment does changes, so plans and permits made
+        // against the current generation no longer apply.
+        sqlx::query("UPDATE envs SET generation = generation + 1 WHERE org_id = ? AND app_id = ? AND id = ?")
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE active_resources SET scheduled_deletion = 1, updated_at = ? \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
+        )
+        .bind(now_ms())
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(descriptor)
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn finish_deployment(
         &self,
         org: &str,
@@ -1554,6 +1723,46 @@ impl Store for SqliteStore {
         .bind(&self.org)
         .fetch_all(&mut *tx)
         .await?;
+        let now = now_ms();
+        // Removing the record of a deletion the driver already confirmed has a
+        // known outcome: the record stays, still marked for cleanup.
+        let cleanups: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT o.id, o.deployment_id, o.guresid FROM operations o \
+             JOIN active_resources r ON r.guresid = o.guresid \
+             WHERE o.org_id = ? AND o.state = 'started' AND o.kind = 'delete' \
+             AND r.cleanup_pending = 1",
+        )
+        .bind(&self.org)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (op, deployment, guresid) in &cleanups {
+            let error = "interrupted by a restart; cleanup pending";
+            sqlx::query(
+                "UPDATE operations SET state = 'failed', error = ?, finished_at = ? WHERE id = ?",
+            )
+            .bind(error)
+            .bind(now)
+            .bind(op)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE active_resources SET status = 'deletion_failed', updated_at = ? \
+                 WHERE guresid = ?",
+            )
+            .bind(now)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE deployment_resources SET status = 'failed', error = ? \
+                 WHERE deployment_id = ? AND guresid = ?",
+            )
+            .bind(error)
+            .bind(deployment)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+        }
         let uncertain: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? AND state = 'started' \
              ORDER BY started_at",
@@ -1561,7 +1770,6 @@ impl Store for SqliteStore {
         .bind(&self.org)
         .fetch_all(&mut *tx)
         .await?;
-        let now = now_ms();
         for (op, deployment, guresid) in &uncertain {
             sqlx::query(
                 "UPDATE operations SET state = 'unknown', error = 'interrupted by a restart' \
@@ -1719,7 +1927,8 @@ async fn finish_in_tx(
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
      definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
-     cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
+     cookie_nonce, cookie, snapshot, recovery, ownership, dependencies, last_deploy_id, scheduled_deletion, \
+     cleanup_pending, \
      observed_at, created_at FROM active_resources";
 
 /// An `active_resources` row.
@@ -1742,10 +1951,12 @@ struct ResourceRow {
     cookie_nonce: Option<Vec<u8>>,
     cookie: Option<Vec<u8>>,
     snapshot: String,
+    recovery: String,
     ownership: String,
     dependencies: String,
     last_deploy_id: Option<String>,
     scheduled_deletion: bool,
+    cleanup_pending: bool,
     observed_at: Option<i64>,
     created_at: i64,
 }
@@ -1776,10 +1987,12 @@ impl ResourceRow {
             secret_outputs: serde_json::from_str(&self.secret_outputs)?,
             cookie,
             snapshot: serde_json::from_str(&self.snapshot)?,
+            recovery: serde_json::from_str(&self.recovery)?,
             ownership: self.ownership,
             dependencies: serde_json::from_str(&self.dependencies)?,
             last_deploy_id: self.last_deploy_id,
             scheduled_deletion: self.scheduled_deletion,
+            cleanup_pending: self.cleanup_pending,
             observed_at: self.observed_at,
             created_at: self.created_at,
         })
