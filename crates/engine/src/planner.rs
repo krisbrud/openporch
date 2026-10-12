@@ -594,13 +594,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     error,
                     retry_after: None,
                 }),
-                Ok(()) => match self.with_cookie(job, node).await {
+                Ok(()) => match self.with_prior_state(job, node).await {
                     Ok(job) => self.provision(job).await,
-                    // Without the cookie the driver might create a duplicate.
-                    Err(error) => Err(ExecFailure::Retryable {
-                        error,
-                        retry_after: None,
-                    }),
+                    Err(failure) => Err(failure),
                 },
             };
             drop(permit);
@@ -610,7 +606,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         values: provisioned.outputs.clone(),
                         secrets: provisioned.secret_outputs.clone(),
                         guresid: Some(started.guresid.clone()),
-                        account,
+                        account: account.clone(),
                     };
                     let recorded = self
                         .checkpoint(
@@ -626,6 +622,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                     .iter()
                                     .map(ToString::to_string)
                                     .collect(),
+                                account: account.as_ref().map(ToString::to_string),
                                 snapshot: json!({
                                     "deployment_id": deployment.id,
                                     "definition_version": version,
@@ -805,12 +802,13 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         }
     }
 
-    /// Adds the cookie of the resource's last successful operation.
-    async fn with_cookie(
+    /// Adds the cookie of the resource's last successful operation, and refuses
+    /// to move a provisioned resource to another cloud account.
+    async fn with_prior_state(
         &self,
         mut job: ProvisionJob,
         node: &Node,
-    ) -> Result<ProvisionJob, String> {
+    ) -> Result<ProvisionJob, ExecFailure> {
         let d = &self.deployment;
         let resource = self
             .store
@@ -821,8 +819,29 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 &node.descriptor.to_string(),
             )
             .await
-            .map_err(|e| format!("the resource's driver state could not be read: {e}"))?;
-        job.cookie = resource.and_then(|r| r.cookie);
+            // Without the cookie the driver might create a duplicate.
+            .map_err(|e| ExecFailure::Retryable {
+                error: format!("the resource's driver state could not be read: {e}"),
+                retry_after: None,
+            })?;
+        let Some(resource) = resource else {
+            return Ok(job);
+        };
+        let account = job.driver_account.as_ref().map(ToString::to_string);
+        if resource.last_deploy_id.is_some() && resource.driver_account != account {
+            let name = |a: &Option<String>| match a {
+                Some(a) => format!("cloud account `{a}`"),
+                None => "no cloud account".to_owned(),
+            };
+            return Err(ExecFailure::Permanent(format!(
+                "`{}` was provisioned in {}, but its definition now uses {}; migrate or \
+                 replace the resource explicitly",
+                node.descriptor,
+                name(&resource.driver_account),
+                name(&account),
+            )));
+        }
+        job.cookie = resource.cookie;
         Ok(job)
     }
 

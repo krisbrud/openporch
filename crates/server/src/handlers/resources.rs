@@ -34,6 +34,8 @@ pub struct ResourceView {
     pub definition_version: Option<i64>,
     /// The driver.
     pub driver_type: Option<String>,
+    /// The cloud account it was provisioned in.
+    pub driver_account: Option<String>,
     /// Status.
     pub status: String,
     /// `owned`, `adopted` or `external`.
@@ -144,6 +146,7 @@ impl EnvUsage {
             definition_id: r.definition_id,
             definition_version: r.definition_version,
             driver_type: r.driver_type,
+            driver_account: r.driver_account,
             status: r.status,
             ownership: r.ownership,
             outputs: r.outputs,

@@ -1093,8 +1093,8 @@ impl Store for SqliteStore {
                 )));
             }
         }
-        let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT guresid, status, driver_type FROM active_resources \
+        let existing: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT guresid, status, driver_type, last_deploy_id FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1108,12 +1108,12 @@ impl Store for SqliteStore {
             OperationKind::Delete => "deleting",
         };
         let guresid = match existing {
-            Some((_, status, _)) if status == "unknown" || status == "recovery_required" => {
+            Some((_, status, _, _)) if status == "unknown" || status == "recovery_required" => {
                 return Err(StoreError::RecoveryRequired(descriptor));
             }
             // A different driver cannot take over a resource another driver
-            // manages: that is a migration, which only an operator starts.
-            Some((_, _, Some(current)))
+            // provisioned: that is a migration, which only an operator starts.
+            Some((_, _, Some(current), Some(_)))
                 if start.kind == OperationKind::Put
                     && start.driver_type.as_ref().is_some_and(|d| *d != current) =>
             {
@@ -1123,7 +1123,7 @@ impl Store for SqliteStore {
                     to: start.driver_type.clone().unwrap_or_default(),
                 });
             }
-            Some((guresid, _, _)) => {
+            Some((guresid, _, _, _)) => {
                 let open: Option<String> = sqlx::query_scalar(
                     "SELECT id FROM operations WHERE guresid = ? AND state = 'started'",
                 )
@@ -1136,10 +1136,16 @@ impl Store for SqliteStore {
                     )));
                 }
                 sqlx::query(
-                    "UPDATE active_resources SET status = ?, definition_id = COALESCE(?, definition_id), \
-                     definition_version = COALESCE(?, definition_version), \
-                     driver_type = COALESCE(?, driver_type), recovery = ?, updated_at = ? \
-                     WHERE guresid = ?",
+                    // The definition columns describe the last success; a
+                    // resource that never provisioned shows its latest attempt.
+                    "UPDATE active_resources SET status = ?1, \
+                     definition_id = CASE WHEN last_deploy_id IS NULL \
+                     THEN COALESCE(?2, definition_id) ELSE definition_id END, \
+                     definition_version = CASE WHEN last_deploy_id IS NULL \
+                     THEN COALESCE(?3, definition_version) ELSE definition_version END, \
+                     driver_type = CASE WHEN last_deploy_id IS NULL \
+                     THEN COALESCE(?4, driver_type) ELSE driver_type END, \
+                     recovery = ?5, updated_at = ?6 WHERE guresid = ?7",
                 )
                 .bind(resource_status)
                 .bind(&start.definition_id)
@@ -1190,8 +1196,9 @@ impl Store for SqliteStore {
         let operation_id = crate::random_hex(16);
         sqlx::query(
             "INSERT INTO operations (id, org_id, app_id, env_id, deployment_id, guresid, kind, \
-             input_fingerprint, state, attempt, recovery, started_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?)",
+             input_fingerprint, state, attempt, recovery, started_at, definition_id, \
+             definition_version, driver_type) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?, ?)",
         )
         .bind(&operation_id)
         .bind(org)
@@ -1204,6 +1211,9 @@ impl Store for SqliteStore {
         .bind(attempt)
         .bind(serde_json::to_string(&start.recovery)?)
         .bind(now)
+        .bind(&start.definition_id)
+        .bind(start.definition_version)
+        .bind(&start.driver_type)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -1286,12 +1296,19 @@ impl Store for SqliteStore {
                     inputs,
                     dependencies,
                     snapshot,
+                    account,
                 } = &**p;
                 sqlx::query(
                     "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
                      secret_outputs = ?, cookie_key_id = ?, cookie_nonce = ?, cookie = ?, \
-                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, \
-                     last_deploy_id = ?, observed_at = ?, updated_at = ? WHERE guresid = ?",
+                     recovery = ?, inputs = ?, dependencies = ?, snapshot = ?, driver_account = ?, \
+                     definition_id = COALESCE(o.definition_id, active_resources.definition_id), \
+                     definition_version = COALESCE(o.definition_version, \
+                     active_resources.definition_version), \
+                     driver_type = COALESCE(o.driver_type, active_resources.driver_type), \
+                     last_deploy_id = ?, observed_at = ?, updated_at = ? \
+                     FROM (SELECT definition_id, definition_version, driver_type FROM operations \
+                     WHERE id = ?) AS o WHERE guresid = ?",
                 )
                 .bind(serde_json::to_string(outputs)?)
                 .bind(serde_json::to_string(secret_outputs)?)
@@ -1302,9 +1319,11 @@ impl Store for SqliteStore {
                 .bind(serde_json::to_string(inputs)?)
                 .bind(serde_json::to_string(dependencies)?)
                 .bind(serde_json::to_string(snapshot)?)
+                .bind(account)
                 .bind(&deployment_id)
                 .bind(now)
                 .bind(now)
+                .bind(operation_id)
                 .bind(&guresid)
                 .execute(&mut *tx)
                 .await?;
@@ -1697,7 +1716,7 @@ async fn finish_in_tx(
 }
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
-     definition_version, driver_type, status, inputs, outputs, secret_outputs, cookie_key_id, \
+     definition_version, driver_type, driver_account, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
      observed_at, created_at FROM active_resources";
 
@@ -1711,6 +1730,7 @@ struct ResourceRow {
     definition_id: Option<String>,
     definition_version: Option<i64>,
     driver_type: Option<String>,
+    driver_account: Option<String>,
     status: String,
     inputs: String,
     outputs: String,
@@ -1745,6 +1765,7 @@ impl ResourceRow {
             definition_id: self.definition_id,
             definition_version: self.definition_version,
             driver_type: self.driver_type,
+            driver_account: self.driver_account,
             status: self.status,
             inputs: serde_json::from_str(&self.inputs)?,
             outputs: serde_json::from_str(&self.outputs)?,

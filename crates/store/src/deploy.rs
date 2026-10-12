@@ -250,6 +250,8 @@ pub struct Provisioned {
     /// The configuration it was provisioned from, such as its definition and
     /// version.
     pub snapshot: Value,
+    /// The cloud account it was provisioned in.
+    pub account: Option<String>,
 }
 
 /// The outcome of a driver operation.
@@ -295,8 +297,9 @@ impl ResourceRunStatus {
     }
 }
 
-/// An active resource.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// An active resource. It holds secret references and the encrypted cookie,
+/// so it is not serialized directly into responses.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveResource {
     /// Application.
     pub app: String,
@@ -312,6 +315,8 @@ pub struct ActiveResource {
     pub definition_version: Option<i64>,
     /// The driver.
     pub driver_type: Option<String>,
+    /// The cloud account it was provisioned in.
+    pub driver_account: Option<String>,
     /// Status.
     pub status: String,
     /// The inputs of the last successful operation, secrets as references.
@@ -321,7 +326,6 @@ pub struct ActiveResource {
     /// Secret outputs as references.
     pub secret_outputs: BTreeMap<String, SecretRef>,
     /// The encrypted cookie.
-    #[serde(skip)]
     pub cookie: Option<Sealed>,
     /// The configuration of the last successful operation.
     pub snapshot: Value,

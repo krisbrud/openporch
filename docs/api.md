@@ -1631,13 +1631,16 @@ their values or references), the resources it depends on, and its `usage`:
 
 A resource that a later deployment no longer includes stays tracked, with
 `referenced: false`, because it still exists and may cost money. Including it
-again reuses it with its data. If a definition switches an existing resource to
-a different driver, the deployment fails with a conflict and the resource keeps
-its driver and state, since moving it is an explicit migration. Scheduling
+again reuses it with its data. If a definition switches a provisioned resource to
+a different driver or cloud account, the deployment fails with a conflict and the
+resource keeps its driver, account and state, since moving it is an explicit
+migration. A resource that has never provisioned can still switch. The
+definition and version shown are those of the last successful provisioning. Scheduling
 deletion and detaching resources are not implemented yet.
 
 Resources are listed by descriptor. The single-resource path takes the type and
-resource ID, such as `postgres/modules.web.externals.db`. Listing a definition's
+resource ID, such as `postgres/modules.web.externals.db`, and returns `409` if
+resources of several classes share them. Listing a definition's
 resources across every application needs organization-wide read access.
 
 ```http

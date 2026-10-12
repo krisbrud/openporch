@@ -15,11 +15,17 @@ use crate::deploy::PlannerRunner;
 #[derive(Debug, Default)]
 struct Fake {
     failing: Mutex<BTreeSet<String>>,
+    /// The GUResID each job was handed, by descriptor.
+    guresids: Mutex<Vec<(String, String)>>,
 }
 
 impl Executor for Fake {
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let ty = job.descriptor.ty.to_string();
+        self.guresids
+            .lock()
+            .unwrap()
+            .push((job.descriptor.to_string(), job.guresid.to_string()));
         if self.failing.lock().unwrap().contains(&ty) {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
         }
@@ -182,7 +188,8 @@ async fn read_outputs() {
 #[tokio::test]
 async fn stable_across_deployments() {
     let s = server().await;
-    s.provisioning(Arc::default()).await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
     s.deploy_web("nginx:1", true).await;
     let first = s.resource(DB).await;
     let d = s.deploy_web("nginx:2", true).await;
@@ -190,6 +197,17 @@ async fn stable_across_deployments() {
     let second = s.resource(DB).await;
     assert_eq!(first["guresid"], second["guresid"]);
     assert_eq!(second["usage"]["last_deploy_id"], d["id"]);
+    // The driver got the same identity both times.
+    let handed: Vec<String> = fake
+        .guresids
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(d, _)| d == DB)
+        .map(|(_, g)| g.clone())
+        .collect();
+    assert_eq!(handed.len(), 2);
+    assert!(handed.iter().all(|g| *g == first["guresid"]));
 }
 
 #[tokio::test]
@@ -199,12 +217,24 @@ async fn usage_after_a_partial_failure() {
     s.provisioning(fake.clone()).await;
     let good = s.deploy_web("nginx:1", true).await;
     assert_eq!(good["status"], "succeeded", "{good}");
+    // A new definition version fails to provision.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(json!({"name": "Postgres v2", "driver_type": "openporch/echo"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
     fake.failing.lock().unwrap().insert("postgres".into());
     let bad = s.deploy_web("nginx:2", true).await;
     assert_eq!(bad["status"], "failed", "{bad}");
 
     let db = s.resource(DB).await;
     assert_eq!(db["status"], "failed");
+    // It still describes the last success.
+    assert_eq!(db["definition_version"], 1);
     assert_eq!(db["usage"]["last_deploy_id"], good["id"]);
     assert_eq!(db["usage"]["deploys_ago"], 1);
     assert_eq!(db["usage"]["referenced"], true);
@@ -263,6 +293,35 @@ async fn definition_switches_driver() {
     assert_eq!(after["guresid"], before["guresid"]);
     assert_eq!(after["driver_type"], "openporch/echo");
     assert_eq!(after["status"], "provisioned");
+}
+
+#[tokio::test]
+async fn a_resource_that_never_provisioned_can_switch_driver() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    fake.failing.lock().unwrap().insert("postgres".into());
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    let failed = s.resource(DB).await;
+
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(json!({"driver_type": "openporch/template",
+                        "driver_inputs": {"values": {"template": "outputs: {}"}}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    fake.failing.lock().unwrap().clear();
+    let d = s.deploy_web("nginx:2", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let db = s.resource(DB).await;
+    assert_eq!(db["guresid"], failed["guresid"]);
+    assert_eq!(db["driver_type"], "openporch/template");
+    assert_eq!(db["definition_version"], 2);
 }
 
 #[tokio::test]
