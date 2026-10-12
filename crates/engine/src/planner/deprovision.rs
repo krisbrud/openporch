@@ -466,13 +466,21 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                     return Err(Outcome::Unknown(error));
                 }
                 ExecFailure::Retryable { error, retry_after } => {
-                    self.checkpoint(
-                        &started.operation_id,
-                        CheckpointResult::Failed {
-                            error: error.clone(),
-                        },
-                    )
-                    .await;
+                    let recorded = self
+                        .checkpoint(
+                            &started.operation_id,
+                            CheckpointResult::Failed {
+                                error: error.clone(),
+                            },
+                        )
+                        .await;
+                    // The operation is still open, so another attempt would be
+                    // refused; stop, and a restart leaves it for recovery.
+                    if !recorded {
+                        return Err(failed(format!(
+                            "{error} (the failure could not be recorded, so it is not retried)"
+                        )));
+                    }
                     if attempt >= self.limits.attempts {
                         return Err(failed(format!("{error} (after {attempt} attempts)")));
                     }
