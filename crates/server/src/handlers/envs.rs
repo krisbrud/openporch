@@ -14,7 +14,7 @@ use openporch_store::{
     DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, NewEnv, OrgRole, Store, now_ms,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{check_id, deploys};
 use crate::api::{Ctx, JsonBody};
@@ -296,13 +296,7 @@ pub async fn delete(
     }
 
     env_or_404(&state, &app, &env).await?;
-    let snapshot = json!({
-        "version": deploys::SNAPSHOT_VERSION,
-        "kind": "delete_env",
-        "permits": req.permits,
-        "graph": ResourceGraph { nodes: BTreeMap::new(), layers: Vec::new() },
-        "definitions": {},
-    });
+    let snapshot = deletion_snapshot(&req.permits);
     let acceptance = state
         .store
         .accept_deployment(DeploymentRequest {
@@ -322,28 +316,49 @@ pub async fn delete(
             audit: ctx.audit(org, "env.delete", format!("{app}/{env}")),
         })
         .await?;
+    let deletion = start_deletion(&state, &acceptance, snapshot).await?;
+    Ok((StatusCode::ACCEPTED, Json(deletion)))
+}
+
+/// The snapshot of an environment deletion: no graph, only the permits.
+pub(super) fn deletion_snapshot(permits: &[String]) -> Value {
+    json!({
+        "version": deploys::SNAPSHOT_VERSION,
+        "kind": "delete_env",
+        "permits": permits,
+        "graph": ResourceGraph { nodes: BTreeMap::new(), layers: Vec::new() },
+        "definitions": {},
+    })
+}
+
+/// Starts an accepted environment deletion and describes it. A replayed one
+/// already runs, or has finished.
+pub(super) async fn start_deletion(
+    state: &AppState,
+    acceptance: &Acceptance,
+    snapshot: Value,
+) -> ApiResult<EnvDeletion> {
+    let org = state.org();
     let mut deployment = acceptance.deployment().clone();
-    let Acceptance::Created(d) = &acceptance else {
-        let retained = retained(&state, &deployment).await?;
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(EnvDeletion {
-                deployment,
-                retained,
-            }),
-        ));
+    let Acceptance::Created(d) = acceptance else {
+        let retained = retained(state, &deployment).await?;
+        return Ok(EnvDeletion {
+            deployment,
+            retained,
+        });
     };
+    let (app, env) = (&d.app, &d.env);
     // Accepting the deletion stopped anything else from running in the
     // environment, so what it holds now is what the deletion works on. One
     // without resources has nothing to delete: it is finished here, which
     // removes it, and finishing checks again that nothing it must delete is
     // left. Otherwise, or if that cannot be done, the runner does the
     // deletion, so a store error never leaves it unstarted.
-    let resources = state.store.active_resources(org, &app, &env).await;
+    let resources = state.store.active_resources(org, app, env).await;
     let finished = match &resources {
         Ok(resources) if resources.is_empty() => state
             .store
-            .finish_deployment(org, &app, &env, &d.id, None)
+            .finish_deployment(org, app, env, &d.id, None)
             .await
             .is_ok(),
         _ => false,
@@ -361,7 +376,7 @@ pub async fn delete(
     }
     let retained = retained_of(resources?);
     if finished {
-        match state.store.deployment(org, &app, &env, &d.id).await? {
+        match state.store.deployment(org, app, env, &d.id).await? {
             // Something was left to delete after all.
             Some(failed) => deployment = failed,
             // The environment is gone with its deployments.
@@ -371,13 +386,10 @@ pub async fn delete(
             }
         }
     }
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(EnvDeletion {
-            deployment,
-            retained,
-        }),
-    ))
+    Ok(EnvDeletion {
+        deployment,
+        retained,
+    })
 }
 
 /// The resources `deletion` leaves in place: those of its environment it does

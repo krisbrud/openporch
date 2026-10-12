@@ -22,10 +22,11 @@ mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
-    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentKind, DeploymentRecord,
-    DeploymentRequest, DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord,
-    LogLine, NewEnv, OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
-    ResourceRunStatus, Tombstone, UncertainOperation,
+    Acceptance, ActiveResource, AppDeletion, AppDeletionRequest, CheckpointResult, DeltaRecord,
+    DeploymentKind, DeploymentRecord, DeploymentRequest, DeploymentResource, DeploymentStatus,
+    Detach, DraftDelta, EnvRecord, LogLine, NewEnv, OperationKind, OperationStart,
+    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
+    UncertainOperation,
 };
 pub use error::StoreError;
 pub use identity::{
@@ -230,6 +231,16 @@ pub trait Store: Send + Sync {
         &self,
         req: DeploymentRequest,
     ) -> impl Future<Output = Result<Acceptance>> + Send;
+
+    /// Atomically accepts the deletion of an application: marks it deleting, so
+    /// it takes no new environments, and accepts the deletion of each of its
+    /// environments not already being deleted, under the same checks as
+    /// [`Store::accept_deployment`]. The application is removed when the last
+    /// of them finishes, or at once if it has none.
+    fn accept_app_deletion(
+        &self,
+        req: AppDeletionRequest,
+    ) -> impl Future<Output = Result<AppDeletion>> + Send;
 
     /// Reads a deployment.
     fn deployment(

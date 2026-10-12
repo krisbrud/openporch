@@ -212,6 +212,34 @@ impl Acceptance {
     }
 }
 
+/// A request to delete an application: every environment is deleted, then
+/// the application.
+#[derive(Debug, Clone)]
+pub struct AppDeletionRequest {
+    /// Organization.
+    pub org: String,
+    /// Application.
+    pub app: String,
+    /// The requesting principal.
+    pub actor: String,
+    /// Free-text comment.
+    pub comment: String,
+    /// The execution snapshot of each environment's deletion.
+    pub snapshot: Value,
+    /// The audit intent of the request.
+    pub audit: AuditIntent,
+}
+
+/// An accepted application deletion.
+#[derive(Debug, Clone)]
+pub struct AppDeletion {
+    /// Each environment's deletion, newly accepted or, for one already being
+    /// deleted, the deletion that runs.
+    pub deletions: Vec<Acceptance>,
+    /// Whether the application is already gone: it had no environments left.
+    pub removed: bool,
+}
+
 /// The kind of driver operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {

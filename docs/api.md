@@ -462,6 +462,21 @@ A new application gets a `development` environment, and its creator becomes its
 `owner`. Application roles are `viewer`, `developer` and `owner`. The list shows
 only the applications the caller can see.
 
+Deleting an application needs `owner` on it and `deployer` on every
+environment type it uses. The optional body is `{"permits": [...], "comment":
+"..."}`, with the destructive-action permits for deleting the resources of
+every environment. Each environment, `development` included, is then deleted
+as by its own deletion (see [Environments](#environments)), and the response
+is `202 Accepted` with each environment's deletion and what it leaves in
+place. The application's `state` becomes `deleting`: it takes no new
+environments or deployments, and it is removed with its sets, deltas, values
+and roles once the last environment is gone. `removed` says whether that has
+already happened, which it does at once for environments without resources.
+If an environment's deletion fails, that environment stays in
+`deletion_failed` and the application stays; repeating the request, with the
+missing permits if that was the cause, retries every environment that is not
+already being deleted.
+
 ```http
 POST /orgs/acme/apps
 Authorization: Bearer $ADMIN_TOKEN
@@ -2002,7 +2017,9 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 ```http-response
-204 No Content
+202 Accepted
+
+{"deletions": [{"deployment": {"env": "development", "kind": "delete_env", "status": "succeeded"}, "retained": []}], "removed": true}
 ```
 
 ```http
