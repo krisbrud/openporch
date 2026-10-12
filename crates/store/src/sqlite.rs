@@ -2460,7 +2460,7 @@ async fn finish_in_tx(
 }
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
-     definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
+     definition_version, driver_type, driver_account, target, backend, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, recovery, ownership, dependencies, last_deploy_id, scheduled_deletion, \
      cleanup_pending, \
      observed_at, created_at FROM active_resources";
@@ -2477,6 +2477,7 @@ struct ResourceRow {
     driver_type: Option<String>,
     driver_account: Option<String>,
     target: Option<String>,
+    backend: Option<String>,
     status: String,
     inputs: String,
     outputs: String,
@@ -2515,6 +2516,7 @@ impl ResourceRow {
             driver_type: self.driver_type,
             driver_account: self.driver_account,
             target: self.target,
+            backend: self.backend,
             status: self.status,
             inputs: serde_json::from_str(&self.inputs)?,
             outputs: serde_json::from_str(&self.outputs)?,

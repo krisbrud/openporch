@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_core::placeholder::Resolved;
 use openporch_store::{
@@ -66,6 +67,11 @@ pub struct PermitRequest<'a> {
     pub env: &'a str,
     /// The resource.
     pub descriptor: &'a str,
+    /// Its permanent identity, once it has one.
+    pub guresid: Option<&'a str>,
+    /// The deployment the action runs in; `None` outside a deployment, as
+    /// for a detach.
+    pub deployment: Option<&'a str>,
     /// The action.
     pub action: DestructiveAction,
     /// The permits presented.
@@ -133,60 +139,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 return Err(format!("the resources to delete could not be listed: {e}"));
             }
         };
-        let mut candidates: BTreeMap<Descriptor, ActiveResource> = BTreeMap::new();
-        // Removals the deployment must complete to succeed: removed workloads
-        // and what they own, or everything owned when the environment goes.
-        let mut mandatory: BTreeSet<String> = BTreeSet::new();
-        let mut left_out: Vec<(Descriptor, &ActiveResource)> = Vec::new();
-        for r in &active {
-            let Ok(descriptor) = Descriptor::parse(&r.descriptor) else {
-                tracing::error!(resource = %r.descriptor, "an active resource has an invalid descriptor");
-                continue;
-            };
-            // External resources are never deleted, and adopted ones only when
-            // explicitly scheduled. Removed workloads go, and when the
-            // environment is deleted, everything it owns and every adopted
-            // resource scheduled for deletion.
-            let must_go = match r.ownership.as_str() {
-                "owned" => d.teardown || descriptor.ty.as_str() == "workload",
-                "adopted" => d.teardown && r.scheduled_deletion,
-                _ => false,
-            };
-            let deletable = match r.ownership.as_str() {
-                "owned" | "adopted" => r.scheduled_deletion || must_go,
-                _ => false,
-            };
-            // One whose deletion the driver already confirmed only needs its
-            // record removed.
-            if d.graph.nodes.contains_key(&descriptor) {
-                continue;
-            }
-            if !(deletable || r.cleanup_pending) {
-                left_out.push((descriptor, r));
-                continue;
-            }
-            if must_go {
-                mandatory.insert(r.descriptor.clone());
-            }
-            candidates.insert(descriptor, r.clone());
-        }
-        // A removed workload loses the owned resources provisioned with it,
-        // such as its triggers: they depend on it and are left out with it.
-        loop {
-            let before = mandatory.len();
-            left_out.retain(|(descriptor, r)| {
-                let owned_by_removed = r.ownership == "owned"
-                    && r.dependencies.iter().any(|dep| mandatory.contains(dep));
-                if owned_by_removed {
-                    mandatory.insert(r.descriptor.clone());
-                    candidates.insert(descriptor.clone(), (*r).clone());
-                }
-                !owned_by_removed
-            });
-            if mandatory.len() == before {
-                break;
-            }
-        }
+        let (candidates, mandatory) = deletion_candidates(&d.graph, d.teardown, &active);
         if candidates.is_empty() {
             return Ok(());
         }
@@ -585,6 +538,8 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             app: d.app.as_str(),
             env: d.env.as_str(),
             descriptor: &self.resource.descriptor,
+            guresid: Some(&self.resource.guresid),
+            deployment: Some(&d.id),
             action: DestructiveAction::Delete,
             permits: &d.permits,
             plan: None,
@@ -666,4 +621,71 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             }
         }
     }
+}
+
+/// The resources a deployment of `graph` deletes among `active`, if it
+/// converges: owned resources it leaves out that are workloads or scheduled
+/// for deletion (everything owned in a `teardown`), and what removed
+/// workloads own. Also returns the removals the deployment must complete to
+/// succeed; the others are kept while something kept uses them.
+pub fn deletion_candidates(
+    graph: &ResourceGraph,
+    teardown: bool,
+    active: &[ActiveResource],
+) -> (BTreeMap<Descriptor, ActiveResource>, BTreeSet<String>) {
+    let mut candidates: BTreeMap<Descriptor, ActiveResource> = BTreeMap::new();
+    // Removals the deployment must complete to succeed: removed workloads
+    // and what they own, or everything owned when the environment goes.
+    let mut mandatory: BTreeSet<String> = BTreeSet::new();
+    let mut left_out: Vec<(Descriptor, &ActiveResource)> = Vec::new();
+    for r in active {
+        let Ok(descriptor) = Descriptor::parse(&r.descriptor) else {
+            tracing::error!(resource = %r.descriptor, "an active resource has an invalid descriptor");
+            continue;
+        };
+        // External resources are never deleted, and adopted ones only when
+        // explicitly scheduled. Removed workloads go, and when the
+        // environment is deleted, everything it owns and every adopted
+        // resource scheduled for deletion.
+        let must_go = match r.ownership.as_str() {
+            "owned" => teardown || descriptor.ty.as_str() == "workload",
+            "adopted" => teardown && r.scheduled_deletion,
+            _ => false,
+        };
+        let deletable = match r.ownership.as_str() {
+            "owned" | "adopted" => r.scheduled_deletion || must_go,
+            _ => false,
+        };
+        // One whose deletion the driver already confirmed only needs its
+        // record removed.
+        if graph.nodes.contains_key(&descriptor) {
+            continue;
+        }
+        if !(deletable || r.cleanup_pending) {
+            left_out.push((descriptor, r));
+            continue;
+        }
+        if must_go {
+            mandatory.insert(r.descriptor.clone());
+        }
+        candidates.insert(descriptor, r.clone());
+    }
+    // A removed workload loses the owned resources provisioned with it,
+    // such as its triggers: they depend on it and are left out with it.
+    loop {
+        let before = mandatory.len();
+        left_out.retain(|(descriptor, r)| {
+            let owned_by_removed =
+                r.ownership == "owned" && r.dependencies.iter().any(|dep| mandatory.contains(dep));
+            if owned_by_removed {
+                mandatory.insert(r.descriptor.clone());
+                candidates.insert(descriptor.clone(), (*r).clone());
+            }
+            !owned_by_removed
+        });
+        if mandatory.len() == before {
+            break;
+        }
+    }
+    (candidates, mandatory)
 }

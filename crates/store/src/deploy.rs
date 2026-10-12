@@ -467,6 +467,8 @@ pub struct ActiveResource {
     pub driver_account: Option<String>,
     /// What that account resolved to, such as an AWS account number.
     pub target: Option<String>,
+    /// Where the driver keeps its state, such as an S3 location.
+    pub backend: Option<String>,
     /// Status.
     pub status: String,
     /// The inputs of the last successful operation, secrets as references.
