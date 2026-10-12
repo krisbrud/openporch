@@ -934,14 +934,28 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         } else {
             Dialect::Definition
         };
-        let resource = resolve_value(
-            node.params.as_ref().unwrap_or(&Value::Null),
-            dialect,
-            scope,
-            Sink::Secret,
-            "params",
-        )
-        .map_err(|e| format!("`{}`: {e}", node.descriptor))?;
+        let mut params = node.params.clone().unwrap_or(Value::Null);
+        let mut literal: Vec<(Vec<String>, Value)> = Vec::new();
+        if node.descriptor.ty.as_str() == "workload" {
+            add_dependency_outputs(&mut params, scope);
+            if let Some(spec) = params.get_mut("spec") {
+                add_trigger_outputs(spec, scope);
+                literal = set_aside_no_expand(spec)
+                    .into_iter()
+                    .map(|(path, content)| {
+                        (
+                            std::iter::once("spec".to_owned()).chain(path).collect(),
+                            content,
+                        )
+                    })
+                    .collect();
+            }
+        }
+        let mut resource = resolve_value(&params, dialect, scope, Sink::Secret, "params")
+            .map_err(|e| format!("`{}`: {e}", node.descriptor))?;
+        for (path, content) in literal {
+            put(&mut resource, &path, content);
+        }
         Ok(ProvisionJob {
             operation_id: started.operation_id.clone(),
             attempt: started.attempt,
@@ -1082,6 +1096,106 @@ fn references(value: &Value) -> Resolved {
             }
         }
         other => Resolved::Value(other.clone()),
+    }
+}
+
+/// Placeholders for the outputs of the workload dependency `key`, by name,
+/// resolved with the rest of the inputs so secret outputs stay references.
+/// Only names a placeholder path holds plainly are passed.
+fn output_placeholders(key: &str, outputs: &ResourceOutputs) -> Value {
+    outputs
+        .values
+        .keys()
+        .chain(outputs.secrets.keys())
+        .filter(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .map(|name| (name.clone(), json!(format!("${{externals.{key}.{name}}}"))))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// Gives a workload's inputs its direct dependencies' outputs by key.
+fn add_dependency_outputs(params: &mut Value, scope: &MapScope) {
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    let dependencies = scope
+        .externals
+        .iter()
+        .map(|(key, outputs)| (key.clone(), output_placeholders(key, outputs)))
+        .collect::<serde_json::Map<_, _>>();
+    params.insert("dependencies".into(), dependencies.into());
+}
+
+/// Gives each trigger of a workload spec that names one of its resources
+/// that resource's outputs under `outputs`.
+fn add_trigger_outputs(spec: &mut Value, scope: &MapScope) {
+    let Some(triggers) = spec.get_mut("triggers").and_then(Value::as_object_mut) else {
+        return;
+    };
+    // Each trigger is `{<kind>: {...}}`.
+    for trigger in triggers.values_mut().filter_map(Value::as_object_mut) {
+        for body in trigger.values_mut().filter_map(Value::as_object_mut) {
+            let Some(key) = body.get("resource").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(outputs) = scope.externals.get(key) else {
+                continue;
+            };
+            let outputs = output_placeholders(key, outputs);
+            body.insert("outputs".into(), outputs);
+        }
+    }
+}
+
+/// Takes the content of files marked `noExpand` out of a workload spec, so
+/// that it is passed on literally rather than resolved, with the path of each.
+fn set_aside_no_expand(spec: &mut Value) -> Vec<(Vec<String>, Value)> {
+    let mut out = Vec::new();
+    let Some(containers) = spec.get_mut("containers").and_then(Value::as_object_mut) else {
+        return out;
+    };
+    for (id, container) in containers.iter_mut() {
+        let Some(files) = container.get_mut("files").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (target, file) in files.iter_mut() {
+            let Some(file) = file.as_object_mut() else {
+                continue;
+            };
+            if file.get("noExpand") != Some(&Value::Bool(true)) {
+                continue;
+            }
+            if let Some(content) = file.get_mut("content") {
+                let path = ["containers", id, "files", target, "content"].map(str::to_owned);
+                out.push((path.to_vec(), content.take()));
+            }
+        }
+    }
+    out
+}
+
+/// Puts `value` back at `path` in `resolved`, where it was set aside.
+fn put(resolved: &mut Resolved, path: &[String], value: Value) {
+    let Some((first, rest)) = path.split_first() else {
+        *resolved = Resolved::Value(value);
+        return;
+    };
+    match resolved {
+        Resolved::Value(v) => {
+            if let Some(at) = path.iter().try_fold(v, |at, key| at.get_mut(key.as_str())) {
+                *at = value;
+            }
+        }
+        Resolved::Object(fields) => {
+            if let Some((_, r)) = fields.iter_mut().find(|(k, _)| k == first) {
+                put(r, rest, value);
+            }
+        }
+        Resolved::Array(_) | Resolved::Secret(_) => {}
     }
 }
 

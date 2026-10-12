@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use openporch_core::catalog::{ClassRegistry, builtin_types};
+use openporch_core::catalog::{ClassRegistry, ResourceClass, builtin_types};
 use openporch_core::graph::{GraphInput, build_graph};
 use openporch_core::placeholder::SecretPart;
 use openporch_core::sets::DeploymentSet;
@@ -62,6 +62,15 @@ const BASE: &str = "base-env.default#base-env";
 
 fn d(s: &str) -> Descriptor {
     Descriptor::parse(s).unwrap()
+}
+
+/// The classes defined besides `default`.
+fn classes() -> ClassRegistry {
+    ClassRegistry::new([ResourceClass {
+        id: "aws-lambda".parse().unwrap(),
+        resource_type: "workload".parse().unwrap(),
+        description: String::new(),
+    }])
 }
 
 fn definitions() -> Vec<ResourceDefinition> {
@@ -172,6 +181,48 @@ impl Fake {
     }
 }
 
+/// The plain part of `resolved`, collecting each secret inside under its
+/// dotted path. A secret made of one reference keeps it.
+fn none_outputs(
+    resolved: &Resolved,
+    path: &str,
+    secrets: &mut BTreeMap<String, SecretRef>,
+) -> Value {
+    let at = |key: &str| {
+        if path.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{path}.{key}")
+        }
+    };
+    match resolved {
+        Resolved::Value(v) => v.clone(),
+        Resolved::Secret(e) => {
+            if let [SecretPart::Secret(r)] = &e.parts[..] {
+                secrets.insert(path.to_owned(), r.clone());
+            }
+            Value::Null
+        }
+        Resolved::Array(items) => Value::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, r)| none_outputs(r, &at(&i.to_string()), secrets))
+                .collect(),
+        ),
+        Resolved::Object(fields) => {
+            let mut values = serde_json::Map::new();
+            for (k, r) in fields {
+                let value = none_outputs(r, &at(k), secrets);
+                if !matches!(r, Resolved::Secret(_)) {
+                    values.insert(k.clone(), value);
+                }
+            }
+            Value::Object(values)
+        }
+    }
+}
+
 impl Executor for Fake {
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let behavior = self
@@ -183,6 +234,8 @@ impl Executor for Fake {
             .unwrap_or(Behavior::Succeed);
         let ty = job.descriptor.ty.to_string();
         let guresid = job.guresid.clone();
+        let driver_type = job.driver_type.to_string();
+        let resource = job.inputs.resource.clone();
         let mut refs = Vec::new();
         for input in [
             &job.inputs.secrets,
@@ -231,6 +284,16 @@ impl Executor for Fake {
         self.running.fetch_sub(1, Ordering::SeqCst);
         result.map_err(|f| log.failure(f))?;
         let mut provisioned = ProvisionResult::default();
+        // As `openporch/none` does through the executor: the resolved inputs
+        // are the outputs, with what resolved from secrets kept as references.
+        if driver_type == "openporch/none" {
+            let mut secrets = BTreeMap::new();
+            if let Value::Object(values) = none_outputs(&resource, "", &mut secrets) {
+                provisioned.outputs = values;
+            }
+            provisioned.secret_outputs = secrets;
+            return Ok(provisioned);
+        }
         provisioned
             .outputs
             .insert("host".into(), json!(format!("{ty}.internal")));
@@ -433,7 +496,7 @@ impl Fixture {
             set: &set,
             definitions: &defs,
             types: &builtin_types(),
-            classes: &ClassRegistry::new([]),
+            classes: &classes(),
         })
         .unwrap();
         let snapshot = json!({
@@ -759,9 +822,11 @@ async fn no_secret_value_reaches_the_planner() {
         matches!(&secrets[0].1, Resolved::Secret(e) if matches!(&e.parts[..],
         [SecretPart::Literal(l), SecretPart::Secret(r)] if l == "Bearer " && r.reference == "dns-token"))
     );
+    // The workload gets the database password with its dependencies'
+    // outputs and in its variables.
     let mut read = fake.read.lock().unwrap().clone();
     read.sort();
-    assert_eq!(read, [MASTER, TOKEN]);
+    assert_eq!(read, [MASTER, PASSWORD, PASSWORD, TOKEN]);
 
     // The plaintexts are in no job, outcome or deployment record.
     let jobs = fake.jobs.lock().unwrap().clone();
@@ -1946,3 +2011,4 @@ async fn lost_log_lines_fail_the_deployment() {
 }
 
 mod teardown;
+mod workloads;

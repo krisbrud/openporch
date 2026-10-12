@@ -187,7 +187,14 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
     for (wid, module) in &input.set.modules {
         let w = Descriptor::new(ty("workload"), module.class.clone(), ResId::workload(wid));
         let wpath = format!("modules.{wid}");
-        b.request(&w, &wpath, None)?;
+        // The workload's inputs are its ID, class and spec, resolved at deploy
+        // time; the planner adds its dependencies' outputs.
+        let params = serde_json::json!({
+            "id": wid.as_str(),
+            "class": module.class.as_str(),
+            "spec": module.spec,
+        });
+        b.request(&w, &wpath, Some(params))?;
         for (key, ext) in &module.externals {
             let res_id = match &ext.id {
                 Some(id) => ResId::shared(id),
