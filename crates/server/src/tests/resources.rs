@@ -728,6 +728,15 @@ async fn read_a_deployments_redacted_log() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(latest["lines"], page["lines"]);
 
+    // A page that ends exactly at the last line is the final one.
+    let n = lines.len();
+    let (_, exact) = s.get(&format!("{logs}?after=0&limit={n}"), &s.admin).await;
+    assert_eq!(exact["finished"], true, "{exact}");
+    let (_, short) = s
+        .get(&format!("{logs}?after=0&limit={}", n - 1), &s.admin)
+        .await;
+    assert_eq!(short["finished"], false, "{short}");
+
     let (status, b) = s.get(&format!("{logs}?limit=0"), &s.admin).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
     let (status, b) = s.get(&format!("{DEPLOYS}/nope/logs"), &s.admin).await;

@@ -528,12 +528,22 @@ pub async fn logs(
     // The log is complete before the deployment finishes, so a deployment
     // read as finished before its lines has no lines still to come.
     let done = d.status != DeploymentStatus::InProgress;
-    let lines = state
+    // One more line than asked for tells whether any follow.
+    let mut lines = state
         .store
-        .deployment_logs(state.org(), &env.app, &env.id, &d.id, Some(after), limit)
+        .deployment_logs(
+            state.org(),
+            &env.app,
+            &env.id,
+            &d.id,
+            Some(after),
+            limit + 1,
+        )
         .await?;
+    let more = lines.len() > limit as usize;
+    lines.truncate(limit as usize);
     let next = lines.last().map_or(after, |l| l.seq);
-    let finished = done && lines.len() < limit as usize;
+    let finished = done && !more;
     Ok(Json(LogPage {
         lines,
         next,

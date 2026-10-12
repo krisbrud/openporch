@@ -1638,7 +1638,7 @@ Authorization: Bearer $ADMIN_TOKEN
     {"seq": "…", "operation_id": null, "descriptor": null, "guresid": null, "at": "…", "level": "…", "message": "…"}
   ],
   "next": "…",
-  "finished": false
+  "finished": true
 }
 ```
 
