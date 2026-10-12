@@ -26,8 +26,8 @@ use tokio::time::Instant;
 
 use super::log::DeploymentLog;
 use super::{
-    Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, JobLog, Limits, Outcome, Planner,
-    ProvisionJob, backoff, log_retry,
+    Deployment, DeprovisionJob, ExecFailure, Executor, JobContext, JobInputs, JobLog, Limits,
+    Outcome, Planner, ProvisionJob, backoff, log_retry,
 };
 
 /// A destructive action that needs a permit.
@@ -37,6 +37,10 @@ pub enum DestructiveAction {
     Delete,
     /// Detaching a resource from management.
     Detach,
+    /// Replacing a resource: the driver's plan destroys and recreates it.
+    Replace,
+    /// A change whose impact the driver could not determine.
+    Unknown,
 }
 
 impl DestructiveAction {
@@ -45,6 +49,8 @@ impl DestructiveAction {
         match self {
             Self::Delete => "delete",
             Self::Detach => "detach",
+            Self::Replace => "replace",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -64,6 +70,9 @@ pub struct PermitRequest<'a> {
     pub action: DestructiveAction,
     /// The permits presented.
     pub permits: &'a [String],
+    /// Fingerprint of the driver's plan, when the action comes from one. A
+    /// permit issued for one plan does not cover a different plan.
+    pub plan: Option<&'a str>,
 }
 
 /// Decides whether presented permits allow a destructive action. A permit
@@ -400,6 +409,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 secrets: Resolved::Value(Value::Null),
                 secret_refs: Resolved::Value(Value::Null),
                 resource: Resolved::Value(Value::Null),
+                sources: Vec::new(),
             }
         } else {
             serde_json::from_value(r.inputs.clone()).map_err(|e| {
@@ -478,6 +488,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 attempt: started.attempt,
                 descriptor: self.descriptor.clone(),
                 guresid,
+                context: JobContext::of(d),
                 definition_id: definition_id.clone(),
                 definition_version: r.definition_version.unwrap_or_default(),
                 driver_type: driver_type.clone(),
@@ -575,6 +586,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             descriptor: &self.resource.descriptor,
             action: DestructiveAction::Delete,
             permits: &d.permits,
+            plan: None,
         });
         match tokio::time::timeout_at(self.deadline, check).await {
             Ok(Ok(())) => Ok(()),

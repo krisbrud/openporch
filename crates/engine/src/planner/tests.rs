@@ -822,6 +822,16 @@ async fn no_secret_value_reaches_the_planner() {
         matches!(&secrets[0].1, Resolved::Secret(e) if matches!(&e.parts[..],
         [SecretPart::Literal(l), SecretPart::Secret(r)] if l == "Bearer " && r.reference == "dns-token"))
     );
+    // The executor learns that the reference is the DNS record's output, so
+    // it authorizes the read as that resource's, and in which deployment.
+    let dns = fake.job(DNS).guresid;
+    assert!(
+        matches!(&route.inputs.sources[..], [(r, SecretSource::Output { guresid })]
+            if r.reference == "dns-token" && *guresid == dns),
+        "{:?}",
+        route.inputs.sources
+    );
+    assert_eq!(route.context, JobContext::of(&deployment));
     // The workload gets the database password with its dependencies'
     // outputs and in its variables.
     let mut read = fake.read.lock().unwrap().clone();
