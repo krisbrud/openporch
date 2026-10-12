@@ -678,6 +678,28 @@ impl Store for SqliteStore {
         Ok(Some((d, fingerprint.unwrap_or_default())))
     }
 
+    async fn deployment_resources(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        id: &str,
+    ) -> Result<Vec<DeploymentResource>> {
+        self.check_org(org)?;
+        Ok(sqlx::query_as(
+            "SELECT descriptor, guresid, status, attempts, error, observed_at \
+             FROM deployment_resources \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? \
+             ORDER BY descriptor",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn deployment_snapshot(
         &self,
         org: &str,

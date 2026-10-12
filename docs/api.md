@@ -1616,6 +1616,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | Method | Path | Permission |
 | --- | --- | --- |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources` | app read |
+| GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/graph` | app read |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | app read |
 | DELETE | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}` | deploy to the environment |
 | POST | `/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}/detach` | administrator |
@@ -1696,6 +1697,13 @@ so it is refused until permits can be issued.
 `GET .../tombstones` lists what remains of the environment's deleted and
 detached resources, oldest first.
 
+`GET .../resources/graph` returns the graph of the environment's latest
+deployment, or `404` before the first one. Each node has its descriptor,
+definition, driver, GUResID, status and error; a resource the deployment has
+not reached yet is `pending`. Resources the deployment deleted or kept while
+removing them are listed too, without a definition. Each edge says that `from`
+depends on `to`.
+
 Resources are listed by descriptor. The single-resource path takes the type and
 resource ID, such as `postgres/modules.web.externals.db`, and returns `409` if
 resources of several classes share them. Listing a definition's
@@ -1721,6 +1729,17 @@ Authorization: Bearer $ADMIN_TOKEN
 404 Not Found
 
 {"error": "…", "message": "resource `postgres/modules.api.externals.db` not found in `blog/development`"}
+```
+
+```http
+GET /orgs/acme/apps/blog/envs/development/resources/graph
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"deployment_id": "…", "status": "…", "nodes": "…", "edges": "…"}
 ```
 
 ```http

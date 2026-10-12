@@ -583,3 +583,55 @@ async fn detach() {
         .collect();
     assert_eq!(created.len(), 1);
 }
+
+#[tokio::test]
+async fn inspect_the_graph_after_a_failed_deployment() {
+    let s = server().await;
+    let graph = format!("{RESOURCES}/graph");
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let (status, b) = s.get(&graph, &s.admin).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+
+    fake.failing.lock().unwrap().insert("postgres".into());
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+
+    let (status, g) = s.get(&graph, &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{g}");
+    assert_eq!(g["deployment_id"], d["id"]);
+    assert_eq!(g["status"], "failed");
+    let nodes: std::collections::BTreeMap<String, Value> = g["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| (n["descriptor"].as_str().unwrap().to_owned(), n.clone()))
+        .collect();
+    // Every node shows its status, and the failed one its error.
+    assert!(nodes.values().all(|n| n["status"].is_string()), "{g}");
+    assert_eq!(nodes[DB]["status"], "failed", "{g}");
+    assert_eq!(nodes[DB]["definition_id"], "pg");
+    assert!(
+        nodes[DB]["error"]
+            .as_str()
+            .unwrap()
+            .contains("postgres is unavailable"),
+        "{g}"
+    );
+    assert_eq!(
+        nodes["workload.default#modules.web"]["status"], "pending",
+        "{g}"
+    );
+    assert!(
+        g["edges"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"from": "workload.default#modules.web", "to": DB})),
+        "{g}"
+    );
+
+    // Someone who cannot see the application cannot see that it exists.
+    let stranger = s.member("sam", "member").await;
+    let (status, b) = s.get(&graph, &stranger).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+}
