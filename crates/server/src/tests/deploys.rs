@@ -482,7 +482,8 @@ async fn redeploys_replay_the_recorded_snapshot_unless_asked_for_current() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{current}");
     assert_eq!(current["set_id"], first["set_id"]);
-    let current = snapshot(current["id"].as_str().unwrap().to_owned()).await;
+    let current_id = current["id"].as_str().unwrap().to_owned();
+    let current = snapshot(current_id.clone()).await;
     assert_eq!(
         current["definitions"]["workloads"]["definition"]["driver_type"],
         "openporch/echo"
@@ -516,6 +517,25 @@ async fn redeploys_replay_the_recorded_snapshot_unless_asked_for_current() {
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{b}");
     assert_eq!(b["set_id"], first["set_id"]);
+
+    // A snapshot whose definition was deleted is not replayed.
+    let (status, b) = s
+        .delete("/orgs/acme/resources/defs/workloads", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+    s.finished(&current_id).await;
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"deploy_id": first_id, "expected_generation": 3}),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("no longer exists"),
+        "{b}"
+    );
 }
 
 #[tokio::test]
@@ -542,4 +562,133 @@ async fn without_the_engine_deployments_fail_and_free_the_environment() {
         .await;
     assert_eq!(env["convergence"], "partial");
     assert_eq!(env["last_successful_set_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn concurrent_requests_accept_one() {
+    let s = server().await;
+    let _gate = s.deployable().await;
+    let a = s.delta("web:1").await;
+    let b = s.delta("web:2").await;
+    let (x, y) = tokio::join!(
+        s.deploy(
+            &s.admin,
+            json!({"delta_id": a, "expected_generation": 0}),
+            None
+        ),
+        s.deploy(
+            &s.admin,
+            json!({"delta_id": b, "expected_generation": 0}),
+            None
+        ),
+    );
+    let mut statuses = [x.0, y.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::ACCEPTED, StatusCode::CONFLICT],
+        "{x:?} {y:?}"
+    );
+    let (_, page) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(page["deployments"].as_array().unwrap().len(), 1);
+    // Only the accepted delta is frozen.
+    let mut frozen = Vec::new();
+    for id in [a, b] {
+        let (_, d) = s
+            .get(&format!("/orgs/acme/apps/shop/deltas/{id}"), &s.admin)
+            .await;
+        frozen.push(d["frozen"].clone());
+    }
+    let (fa, fb) = (&frozen[0], &frozen[1]);
+    assert_ne!(fa, fb);
+}
+
+#[tokio::test]
+async fn retries_and_references_respect_access() {
+    let s = server().await;
+    let _gate = s.deployable().await;
+    let dev = s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "developer").await;
+    s.grant_deployer("development", "dev").await;
+    let body = json!({"set_id": "0", "expected_generation": 0});
+    let (status, d) = s.deploy(&dev, body.clone(), Some("k1")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    // Another principal's key is its own.
+    let (status, b) = s.deploy(&s.admin, body.clone(), Some("k1")).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+
+    // A retry after the deployer role is gone does not reveal the deployment.
+    let (status, b) = s
+        .delete("/orgs/acme/env-types/development/users/dev", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+    let (status, b) = s.deploy(&dev, body, Some("k1")).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+
+    // Deployments of another application are not found.
+    s.app("blog").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/blog/envs/development/deploys",
+            &s.admin,
+            json!({"deploy_id": d["id"], "replay": "current", "expected_generation": 0}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let (status, b) = s
+        .get(
+            &format!(
+                "/orgs/acme/apps/blog/envs/development/deploys/{}",
+                d["id"].as_str().unwrap()
+            ),
+            &s.admin,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+}
+
+#[tokio::test]
+async fn a_delta_changed_after_it_was_read_is_not_frozen() {
+    let s = server().await;
+    let _gate = s.deployable().await;
+    let delta = s.delta("web:1").await;
+    let set = s
+        .state
+        .store
+        .put_set("acme", "shop", &Default::default())
+        .await
+        .unwrap();
+    let path = "/orgs/acme/apps/shop/envs/development/deploys";
+    let err = s
+        .state
+        .store
+        .accept_deployment(openporch_store::DeploymentRequest {
+            org: "acme".into(),
+            app: "shop".into(),
+            env: "development".into(),
+            actor: "bootstrap".into(),
+            expected_generation: 0,
+            idempotency_key: None,
+            fingerprint: "body".into(),
+            set_id: set,
+            delta_id: Some(delta.clone()),
+            delta_content: Some(json!({"modules": {"remove": ["web"]}})),
+            comment: String::new(),
+            snapshot: json!({}),
+            audit: openporch_store::AuditIntent::accepted(
+                "acme",
+                "bootstrap",
+                "POST",
+                path,
+                "deploy",
+            ),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("changed"), "{err}");
+    let (_, d) = s
+        .get(&format!("/orgs/acme/apps/shop/deltas/{delta}"), &s.admin)
+        .await;
+    assert_eq!(d["frozen"], false);
+    assert_eq!(s.generation("development").await, 0);
 }

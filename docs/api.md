@@ -1424,18 +1424,22 @@ A deployment converges an environment to a set. The request names exactly one
 of:
 
 - `delta_id`: a delta, applied to the environment's desired set (the empty set
-  before the first deployment). The delta becomes frozen.
+  before the first deployment). The delta becomes frozen. A draft delta created
+  for one environment cannot be deployed to another.
 - `set_id`: a stored set, or `0` for the empty set.
 - `deploy_id`: an earlier deployment's set. This can be a deployment ID from any
   environment of the application, `+0` for the latest attempt in this environment,
-  `+1` for the one before it, and so on, or `last-successful`. By default
-  (`"replay": "snapshot"`) the deployment reuses the configuration recorded by
-  the earlier one, which only works in the same environment.
-  `"replay": "current"` matches definitions again as they are now.
+  `+1` for the one before it, and so on up to `+499`, or `last-successful`; one
+  that does not exist is `404`. By default (`"replay": "snapshot"`) the
+  deployment reuses the configuration recorded by the earlier one, which only
+  works in the same environment and while the definitions it used still exist.
+  `"replay": "current"` matches definitions again as they are now. `replay` is
+  only valid with `deploy_id`.
 
 `expected_generation` must be the environment's current `generation`. If it is
-stale, or another deployment is still running in the environment, the request
-fails with `409` and changes nothing. With an `Idempotency-Key` header, the same
+stale, another deployment is still running, the environment is being deleted, or
+a resource in it needs recovery, the request fails with `409` and the
+environment, its desired set and the delta are unchanged. With an `Idempotency-Key` header, the same
 caller retrying the same request gets the original deployment back, even after
 the generation moved on. The same key with a different request gets `409`.
 `mode` is `full`; `incremental` is not supported and returns `400`. `permits`
@@ -1579,8 +1583,9 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 History is newest first. `limit` defaults to 50, and `next`, when present, is
-passed as `before` for the next page. A single deployment can be read by ID,
-`+n` or `last-successful`:
+an attempt number to pass as `before` for the next page. A single deployment can
+be read by ID, `+n` or `last-successful`; the ID of a deployment in another
+environment is `404` here:
 
 ```http
 GET /orgs/acme/apps/blog/envs/development/deploys

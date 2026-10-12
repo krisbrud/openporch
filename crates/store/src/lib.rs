@@ -136,8 +136,8 @@ pub trait Store: Send + Sync {
         env: &str,
     ) -> impl Future<Output = Result<Option<DeploymentRecord>>> + Send;
 
-    /// An environment's deployments, newest first: at most `limit`, each older
-    /// than attempt `before_seq` when given.
+    /// An environment's deployments, newest first and without environment
+    /// deletions: at most `limit`, each older than attempt `before_seq` when given.
     fn deployments(
         &self,
         org: &str,

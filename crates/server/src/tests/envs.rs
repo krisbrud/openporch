@@ -35,6 +35,7 @@ impl Server {
                 fingerprint: format!("body-{set_id}"),
                 set_id,
                 delta_id: None,
+                delta_content: None,
                 comment: String::new(),
                 snapshot: json!({}),
                 audit: AuditIntent::accepted("acme", "bootstrap", "POST", &path, "deploy"),

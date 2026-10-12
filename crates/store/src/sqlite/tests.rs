@@ -41,6 +41,15 @@ impl Fixture {
             )
             .await
             .unwrap();
+        // `ci` deploys to `shop/development`.
+        for query in [
+            "INSERT INTO app_roles (org_id, app_id, principal_id, role) \
+             VALUES ('acme', 'shop', 'ci', 'developer')",
+            "INSERT INTO env_type_roles (org_id, env_type_id, principal_id, role) \
+             VALUES ('acme', 'development', 'ci', 'deployer')",
+        ] {
+            sqlx::query(query).execute(store.pool()).await.unwrap();
+        }
         Self { dir, store }
     }
 
@@ -88,6 +97,7 @@ impl Fixture {
             fingerprint: format!("body-{set_id}"),
             set_id: set_id.into(),
             delta_id: None,
+            delta_content: None,
             comment: String::new(),
             snapshot: json!({"definitions": {}}),
             audit: audit("POST", "/orgs/acme/apps/shop/envs/development/deploys"),

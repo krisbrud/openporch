@@ -85,6 +85,7 @@ pub struct TriggerRequest {
 struct Resolved {
     set: DeploymentSet,
     delta_id: Option<String>,
+    delta_content: Option<Value>,
     snapshot: Value,
 }
 
@@ -94,9 +95,12 @@ pub async fn trigger(
     ctx: Ctx,
     Path((_, app, env)): Path<(String, String, String)>,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<TriggerRequest>,
+    JsonBody(mut req): JsonBody<TriggerRequest>,
 ) -> ApiResult<(StatusCode, Json<DeploymentRecord>)> {
     let org = state.org();
+    // Permits are a set; their order does not make a different request.
+    req.permits.sort();
+    req.permits.dedup();
     if req.mode == Mode::Incremental {
         return Err(ApiError::invalid(
             "mode `incremental` is not supported; use `full`",
@@ -143,6 +147,12 @@ pub async fn trigger(
     // Conflicts are reported before the request is resolved, so a delta that no
     // longer applies to the moved-on desired set still reads as stale. Acceptance
     // checks again atomically.
+    if env_record.state != "active" {
+        return Err(ApiError::conflict(format!(
+            "environment `{app}/{env}` is {}",
+            env_record.state
+        )));
+    }
     if env_record.generation != req.expected_generation {
         return Err(StoreError::StaleGeneration {
             expected: req.expected_generation,
@@ -169,6 +179,7 @@ pub async fn trigger(
             fingerprint,
             set_id,
             delta_id: resolved.delta_id,
+            delta_content: resolved.delta_content,
             comment: req.comment,
             snapshot: resolved.snapshot.clone(),
             audit: ctx.audit(org, "deployment.create", format!("{app}/{env}")),
@@ -216,7 +227,15 @@ async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> Api
     let app = &env.app;
     if let Some(id) = &req.delta_id {
         let record = delta_or_404(state, app, id).await?;
-        let delta: Delta = serde_json::from_value(record.content)
+        if let Some(for_env) = &record.env
+            && for_env != &env.id
+        {
+            return Err(ApiError::invalid(format!(
+                "delta `{id}` was drafted for `{for_env}`, not `{}`",
+                env.id
+            )));
+        }
+        let delta: Delta = serde_json::from_value(record.content.clone())
             .map_err(|e| ApiError::internal(format!("stored delta `{id}`: {e}")))?;
         // Deltas apply to the desired set, which starts empty.
         let base = match &env.desired_set_id {
@@ -229,6 +248,7 @@ async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> Api
         return Ok(Resolved {
             set,
             delta_id: Some(id.clone()),
+            delta_content: Some(record.content),
             snapshot,
         });
     }
@@ -238,15 +258,19 @@ async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> Api
         return Ok(Resolved {
             set,
             delta_id: None,
+            delta_content: None,
             snapshot,
         });
     }
     let reference = req.deploy_id.as_deref().unwrap_or_default();
     let source = deployment_by_ref(state, env, reference).await?;
-    let set = match &source.set_id {
-        Some(id) => set_or_404(state, app, id).await?,
-        None => DeploymentSet::default(),
+    let Some(source_set) = &source.set_id else {
+        return Err(ApiError::invalid(format!(
+            "deployment `{}` has no set to deploy",
+            source.id
+        )));
     };
+    let set = set_or_404(state, app, source_set).await?;
     let snapshot = match req.replay.unwrap_or_default() {
         Replay::Current => snapshot(state, env, &set, req).await?,
         Replay::Snapshot => {
@@ -269,6 +293,24 @@ async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> Api
                         source.id
                     ))
                 })?;
+            // Replay uses the recorded content, but only of definitions that
+            // still exist.
+            let current = state.store.definitions(state.org()).await?;
+            if let Some(gone) = recorded["definitions"]
+                .as_object()
+                .into_iter()
+                .flat_map(|d| d.keys())
+                .find(|id| {
+                    !current
+                        .iter()
+                        .any(|r| r.definition.id.as_str() == id.as_str())
+                })
+            {
+                return Err(ApiError::invalid(format!(
+                    "deployment `{}` used definition `{gone}`, which no longer exists",
+                    source.id
+                )));
+            }
             let mut snapshot = recorded;
             snapshot["permits"] = json!(req.permits);
             snapshot["replayed_from"] = json!(source.id);
@@ -278,6 +320,7 @@ async fn resolve(state: &AppState, env: &EnvRecord, req: &TriggerRequest) -> Api
     Ok(Resolved {
         set,
         delta_id: None,
+        delta_content: None,
         snapshot,
     })
 }

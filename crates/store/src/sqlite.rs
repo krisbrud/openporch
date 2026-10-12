@@ -637,7 +637,7 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let rows: Vec<DeploymentRow> = sqlx::query_as(&format!(
             "SELECT {DEPLOYMENT_COLUMNS} FROM deployments \
-             WHERE org_id = ? AND app_id = ? AND env_id = ? AND seq < ? \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND kind = 'deploy' AND seq < ? \
              ORDER BY seq DESC LIMIT ?"
         ))
         .bind(org)
@@ -901,16 +901,25 @@ impl Store for SqliteStore {
             }
         }
 
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT generation, state FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT generation, state, type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
         )
         .bind(org)
         .bind(app)
         .bind(env)
         .fetch_optional(&mut *tx)
         .await?;
-        let (generation, state) =
+        let (generation, state, env_type) =
             row.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
+        // The route checked the caller's roles; they may have changed since.
+        crate::identity::check_env_authority(
+            &mut tx,
+            org,
+            req.audit.actor.as_deref(),
+            app,
+            &env_type,
+        )
+        .await?;
         if state != "active" {
             return Err(StoreError::Conflict(format!(
                 "environment `{app}/{env}` is {state}"
@@ -955,6 +964,24 @@ impl Store for SqliteStore {
                 .await?;
         if set_exists.is_none() {
             return Err(StoreError::NotFound(format!("set `{}`", req.set_id)));
+        }
+        if let (Some(delta), Some(expected)) = (&req.delta_id, &req.delta_content) {
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT content FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(delta)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let stored = stored.ok_or_else(|| StoreError::NotFound(format!("delta `{delta}`")))?;
+            let stored: serde_json::Value = serde_json::from_str(&stored)
+                .map_err(|e| StoreError::Corrupt(format!("delta `{delta}`: {e}")))?;
+            if &stored != expected {
+                return Err(StoreError::Conflict(format!(
+                    "delta `{delta}` changed while the deployment was being prepared"
+                )));
+            }
         }
         if let Some(delta) = &req.delta_id {
             let updated = sqlx::query(

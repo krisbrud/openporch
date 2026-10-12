@@ -83,6 +83,17 @@ impl Runners {
     /// Starts `job` in the background.
     pub fn spawn(&self, state: AppState, job: Job) {
         let runner = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
-        tokio::spawn(runner.run(state, job));
+        let run = tokio::spawn(runner.run(state.clone(), job.clone()));
+        // A runner that panics must not leave the environment blocked.
+        tokio::spawn(async move {
+            if run.await.is_err() {
+                finish(
+                    &state,
+                    &job,
+                    Some("the deployment stopped unexpectedly".into()),
+                )
+                .await;
+            }
+        });
     }
 }
