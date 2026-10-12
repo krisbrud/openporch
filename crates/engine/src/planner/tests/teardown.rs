@@ -325,3 +325,16 @@ async fn a_scheduled_adopted_resource_must_be_deleted_before_the_environment_goe
     assert_eq!(f.env_state().await.as_deref(), Some("deletion_failed"));
     assert!(f.active(BASE).await.is_some());
 }
+
+#[tokio::test]
+async fn the_runner_deletes_an_environment_without_resources() {
+    // The server finishes such a deletion itself, and leaves it to the
+    // runner when it cannot.
+    let f = Fixture::in_env(ENV).await;
+    let fake = Fake::with(&[]);
+    let teardown = f.accept_teardown().await.unwrap();
+    let outcomes = deleting(&f, &fake, &Arc::default()).run(teardown).await;
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.env_state().await, None);
+}

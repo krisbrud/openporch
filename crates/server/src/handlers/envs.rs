@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, StatusCode};
 use openporch_core::graph::ResourceGraph;
 use openporch_core::sets::{DeploymentSet, diff_sets};
 use openporch_store::{
-    Acceptance, DeploymentKind, DeploymentRecord, DeploymentRequest, DeploymentStatus, DraftDelta,
-    EnvRecord, IdentityStore, NewEnv, OrgRole, Store, now_ms,
+    Acceptance, ActiveResource, DeploymentKind, DeploymentRecord, DeploymentRequest,
+    DeploymentStatus, DraftDelta, EnvRecord, IdentityStore, NewEnv, OrgRole, Store, now_ms,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -323,37 +323,52 @@ pub async fn delete(
         })
         .await?;
     let mut deployment = acceptance.deployment().clone();
-    let retained = retained(&state, &deployment).await?;
-    if let Acceptance::Created(d) = &acceptance {
-        // Accepting the deletion stopped anything else from running in the
-        // environment, so one without resources has nothing to delete: it is
-        // finished here, which removes it. Finishing checks again that
-        // nothing it must delete is left.
-        let resources = state.store.active_resources(org, &app, &env).await?;
-        if resources.is_empty() {
-            state
-                .store
-                .finish_deployment(org, &app, &env, &d.id, None)
-                .await?;
-            match state.store.deployment(org, &app, &env, &d.id).await? {
-                // Something was left to delete after all.
-                Some(failed) => deployment = failed,
-                // The environment is gone with its deployments.
-                None => {
-                    deployment.status = DeploymentStatus::Succeeded;
-                    deployment.finished_at = Some(now_ms());
-                }
+    let Acceptance::Created(d) = &acceptance else {
+        let retained = retained(&state, &deployment).await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(EnvDeletion {
+                deployment,
+                retained,
+            }),
+        ));
+    };
+    // Accepting the deletion stopped anything else from running in the
+    // environment, so what it holds now is what the deletion works on. One
+    // without resources has nothing to delete: it is finished here, which
+    // removes it, and finishing checks again that nothing it must delete is
+    // left. Otherwise, or if that cannot be done, the runner does the
+    // deletion, so a store error never leaves it unstarted.
+    let resources = state.store.active_resources(org, &app, &env).await;
+    let finished = match &resources {
+        Ok(resources) if resources.is_empty() => state
+            .store
+            .finish_deployment(org, &app, &env, &d.id, None)
+            .await
+            .is_ok(),
+        _ => false,
+    };
+    if !finished {
+        state.runners.spawn(
+            state.clone(),
+            Job {
+                app: app.clone(),
+                env: env.clone(),
+                id: d.id.clone(),
+                snapshot,
+            },
+        );
+    }
+    let retained = retained_of(resources?);
+    if finished {
+        match state.store.deployment(org, &app, &env, &d.id).await? {
+            // Something was left to delete after all.
+            Some(failed) => deployment = failed,
+            // The environment is gone with its deployments.
+            None => {
+                deployment.status = DeploymentStatus::Succeeded;
+                deployment.finished_at = Some(now_ms());
             }
-        } else {
-            state.runners.spawn(
-                state.clone(),
-                Job {
-                    app,
-                    env,
-                    id: d.id.clone(),
-                    snapshot,
-                },
-            );
         }
     }
     Ok((
@@ -368,10 +383,16 @@ pub async fn delete(
 /// The resources `deletion` leaves in place: those of its environment it does
 /// not delete.
 async fn retained(state: &AppState, deletion: &DeploymentRecord) -> ApiResult<Vec<Retained>> {
-    Ok(state
+    let resources = state
         .store
         .active_resources(state.org(), &deletion.app, &deletion.env)
-        .await?
+        .await?;
+    Ok(retained_of(resources))
+}
+
+/// What a deletion of an environment holding `resources` leaves in place.
+fn retained_of(resources: Vec<ActiveResource>) -> Vec<Retained> {
+    resources
         .into_iter()
         .filter(|r| match r.ownership.as_str() {
             "owned" => false,
@@ -383,5 +404,5 @@ async fn retained(state: &AppState, deletion: &DeploymentRecord) -> ApiResult<Ve
             guresid: r.guresid,
             ownership: r.ownership,
         })
-        .collect())
+        .collect()
 }
