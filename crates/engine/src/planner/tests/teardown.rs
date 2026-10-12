@@ -526,11 +526,37 @@ async fn what_a_detached_resource_uses_blocks_the_deletion() {
         let outcomes = deleting(&f, &fake, &checks).run(teardown).await;
         assert!(
             matches!(&outcomes[&d(DB)], Outcome::Pending(r)
-                if r.contains("no longer manages") && r.contains(WORKLOAD)),
+                if r.contains("no longer manages") && r.contains("detach this resource")),
             "{outcomes:?}"
         );
     }
     assert_eq!(f.env_state().await.as_deref(), Some("deletion_failed"));
     assert_eq!(f.app_state().await.as_deref(), Some("deleting"));
     assert!(f.active(DB).await.is_some());
+
+    // Detaching what each message names leaves it in place, and the retries
+    // remove the rest and then the application.
+    detach_as_root(&f, DB).await.unwrap();
+    for _ in 0..5 {
+        if f.app_state().await.is_none() {
+            break;
+        }
+        for (_, teardown) in f.accept_app_teardown().await.unwrap() {
+            let outcomes = deleting(&f, &fake, &checks).run(teardown).await;
+            for (descriptor, outcome) in outcomes {
+                if matches!(&outcome, Outcome::Pending(r) if r.contains("detach this resource")) {
+                    detach_as_root(&f, &descriptor.to_string()).await.unwrap();
+                }
+            }
+        }
+    }
+    assert!(!fake.deletions().contains(&DB.to_owned()));
+    assert_eq!(f.app_state().await, None);
+    let (removed,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'app.delete' AND outcome = 'succeeded'",
+    )
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(removed, 1);
 }

@@ -2369,6 +2369,7 @@ async fn finish_in_tx(
     .bind(id)
     .execute(&mut *conn)
     .await?;
+    let mut app_removed = false;
     match (kind, error) {
         (DeploymentKind::Deploy, None) => {
             sqlx::query(
@@ -2409,6 +2410,7 @@ async fn finish_in_tx(
             .await?;
             if deleting && left == 0 {
                 remove_app(&mut *conn, org, app).await?;
+                app_removed = true;
             }
         }
     }
@@ -2445,7 +2447,15 @@ async fn finish_in_tx(
         status_code: None,
         reason: error.map(|_| "deployment_failed".to_owned()),
     };
-    audit::insert(conn, &intent, Some(id), correlates.as_deref()).await?;
+    audit::insert(&mut *conn, &intent, Some(id), correlates.as_deref()).await?;
+    if app_removed {
+        let removed = AuditIntent {
+            action: "app.delete".to_owned(),
+            target: Some(app.to_owned()),
+            ..intent
+        };
+        audit::insert(conn, &removed, Some(id), correlates.as_deref()).await?;
+    }
     Ok(())
 }
 

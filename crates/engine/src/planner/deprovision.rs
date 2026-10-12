@@ -336,11 +336,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 continue;
             }
             let reason = match blockers(&r).first() {
-                // A detached object is no longer managed, so it can only be
-                // removed outside openporch.
+                // A detached object is no longer managed, so nothing tells
+                // openporch it is gone: what it uses can only be detached too.
                 Some(u) if u.ends_with(" (detached)") => format!(
-                    "still used by `{u}`, which openporch no longer manages; remove that \
-                     object outside openporch, then retry"
+                    "still used by `{u}`, which openporch no longer manages; detach this \
+                     resource too to leave it in place, then retry"
                 ),
                 Some(u) if !candidate_names.contains(u) || kept.contains_key(u) => {
                     format!("still used by `{u}`, which stays; schedule it for deletion too")
