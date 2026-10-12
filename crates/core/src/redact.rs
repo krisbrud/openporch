@@ -92,9 +92,8 @@ impl std::fmt::Debug for Redactor {
 }
 
 /// The forms a secret takes in JSON and HCL output: escaped quotes, backslashes
-/// and control characters, Go's HTML-safe `<`, `>` and `&`, and
-/// HCL's `$${` and `%%{`. Not covered: Go's escaping of U+2028 and U+2029, and
-/// HTML-safe and HCL escaping applied together.
+/// and control characters; Go's escaping of `<`, `>`, `&`, U+2028 and U+2029;
+/// HCL's `$${` and `%%{`; and Go's and HCL's escaping together.
 fn escaped_forms(v: &str) -> Vec<String> {
     let json = serde_json::to_string(v).unwrap_or_default();
     let json = json
@@ -102,12 +101,15 @@ fn escaped_forms(v: &str) -> Vec<String> {
         .and_then(|j| j.strip_suffix('"'))
         .unwrap_or_default()
         .to_owned();
-    let html = json
+    let go = json
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
-        .replace('&', "\\u0026");
-    let hcl = json.replace("${", "$${").replace("%{", "%%{");
-    [json, html, hcl].into_iter().filter(|f| f != v).collect()
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    let hcl = |s: &str| s.replace("${", "$${").replace("%{", "%%{");
+    let forms = [hcl(&json), hcl(&go), json, go];
+    forms.into_iter().filter(|f| f != v).collect()
 }
 
 #[cfg(test)]
@@ -122,6 +124,13 @@ mod tests {
         }
         let r = Redactor::new(["x${y}%{z}"]);
         assert_eq!(r.redact("x$${y}%%{z}"), REDACTED);
+        let r = Redactor::new(["a\u{2028}b\u{2029}<${c}"]);
+        for text in [
+            r#"a\u2028b\u2029\u003c${c}"#,
+            r#"a\u2028b\u2029\u003c$${c}"#,
+        ] {
+            assert_eq!(r.redact(text), REDACTED, "{text}");
+        }
     }
 
     #[test]

@@ -1983,6 +1983,16 @@ impl Store for SqliteStore {
             .bind(guresid)
             .execute(&mut *tx)
             .await?;
+            let line = format!("failed: {error}");
+            log_in_tx(
+                &mut tx,
+                &self.org,
+                deployment,
+                Some((op, guresid)),
+                "error",
+                &line,
+            )
+            .await?;
         }
         let uncertain: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? AND state = 'started' \
@@ -2014,8 +2024,21 @@ impl Store for SqliteStore {
             .bind(guresid)
             .execute(&mut *tx)
             .await?;
+            let line = "outcome unknown: interrupted by a restart; the resource needs recovery \
+                        before it is deployed again";
+            log_in_tx(
+                &mut tx,
+                &self.org,
+                deployment,
+                Some((op, guresid)),
+                "error",
+                line,
+            )
+            .await?;
         }
         for (app, env, id) in &running {
+            let line = "deployment failed: interrupted by a server restart";
+            log_in_tx(&mut tx, &self.org, id, None, "error", line).await?;
             finish_in_tx(
                 &mut tx,
                 &self.org,
@@ -2051,6 +2074,37 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await?)
     }
+}
+
+/// Appends a line to deployment `deployment_id`'s log, about operation `op` on
+/// the resource with the given GUResID if there is one.
+async fn log_in_tx(
+    conn: &mut SqliteConnection,
+    org: &str,
+    deployment_id: &str,
+    op: Option<(&String, &String)>,
+    level: &str,
+    message: &str,
+) -> Result<()> {
+    let (op, guresid) = op.unzip();
+    sqlx::query(
+        "INSERT INTO logs (org_id, app_id, env_id, deployment_id, operation_id, descriptor, \
+         guresid, at, level, message) \
+         SELECT org_id, app_id, env_id, id, ?, \
+         (SELECT descriptor FROM active_resources WHERE guresid = ?), ?, ?, ?, ? \
+         FROM deployments WHERE org_id = ? AND id = ?",
+    )
+    .bind(op)
+    .bind(guresid)
+    .bind(guresid)
+    .bind(now_ms())
+    .bind(level)
+    .bind(message)
+    .bind(org)
+    .bind(deployment_id)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Marks a running deployment finished and records the correlated audit outcome.
