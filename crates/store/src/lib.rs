@@ -23,8 +23,8 @@ mod sqlite_values;
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, Detach, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
-    OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
+    DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord, NewEnv, OperationKind,
+    OperationStart, OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
     UncertainOperation,
 };
 pub use error::StoreError;
@@ -250,6 +250,16 @@ pub trait Store: Send + Sync {
         env: &str,
         id: &str,
     ) -> impl Future<Output = Result<Option<DeploymentRecord>>> + Send;
+
+    /// How each resource fared in a deployment, by descriptor. Resources the
+    /// deployment has not reached yet are absent.
+    fn deployment_resources(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        id: &str,
+    ) -> impl Future<Output = Result<Vec<DeploymentResource>>> + Send;
 
     /// Persists a driver operation, allocating the resource's GUResID if it has
     /// none, before the driver is called.

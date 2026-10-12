@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::Descriptor;
 use openporch_engine::planner::{DestructiveAction, PermitRequest};
-use openporch_store::{ActiveResource, Detach, EnvRecord, Store, Tombstone};
+use openporch_store::{ActiveResource, DeploymentStatus, Detach, EnvRecord, Store, Tombstone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -229,6 +230,127 @@ pub async fn schedule_deletion(
     };
     let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
     Ok((StatusCode::ACCEPTED, Json(usage.view(resource))))
+}
+
+/// A resource in a deployment's graph.
+#[derive(Debug, Serialize)]
+pub struct GraphNode {
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: String,
+    /// The matched definition; absent for a resource the deployment deleted or
+    /// kept, which is not in its graph.
+    pub definition_id: Option<String>,
+    /// The definition's driver.
+    pub driver_type: Option<String>,
+    /// Its permanent identity, once it has one.
+    pub guresid: Option<String>,
+    /// How it fared: `pending` until the deployment reaches it.
+    pub status: String,
+    /// The failure, if any.
+    pub error: Option<String>,
+}
+
+/// A dependency: `from` uses `to`.
+#[derive(Debug, Serialize)]
+pub struct GraphEdge {
+    /// The dependent resource.
+    pub from: String,
+    /// The resource it depends on.
+    pub to: String,
+}
+
+/// The resource graph of an environment's latest deployment.
+#[derive(Debug, Serialize)]
+pub struct GraphView {
+    /// The deployment.
+    pub deployment_id: String,
+    /// Its status.
+    pub status: DeploymentStatus,
+    /// Its resources, by descriptor.
+    pub nodes: Vec<GraphNode>,
+    /// Their dependencies.
+    pub edges: Vec<GraphEdge>,
+}
+
+/// `GET /orgs/{org}/apps/{app}/envs/{env}/resources/graph`: the latest
+/// deployment's graph with each resource's status and error.
+pub async fn graph(
+    State(state): State<AppState>,
+    Path((_, app, env)): Path<(String, String, String)>,
+) -> ApiResult<Json<GraphView>> {
+    let env = env_or_404(&state, &app, &env).await?;
+    let org = state.org();
+    let latest = state
+        .store
+        .deployments(org, &env.app, &env.id, 1, None)
+        .await?;
+    let d = latest.into_iter().next().ok_or_else(|| {
+        ApiError::not_found(format!("`{}/{}` has no deployments yet", env.app, env.id))
+    })?;
+    let snapshot = state
+        .store
+        .deployment_snapshot(org, &env.app, &env.id, &d.id)
+        .await?
+        .unwrap_or_default();
+    if !snapshot["graph"].is_object() {
+        return Err(ApiError::conflict(format!(
+            "deployment `{}` recorded no graph",
+            d.id
+        )));
+    }
+    let graph: ResourceGraph = serde_json::from_value(snapshot["graph"].clone()).map_err(|e| {
+        ApiError::internal(format!("deployment `{}` has no readable graph: {e}", d.id))
+    })?;
+    let mut runs: BTreeMap<String, _> = state
+        .store
+        .deployment_resources(org, &env.app, &env.id, &d.id)
+        .await?
+        .into_iter()
+        .map(|r| (r.descriptor.clone(), r))
+        .collect();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for (descriptor, node) in &graph.nodes {
+        let descriptor = descriptor.to_string();
+        let run = runs.remove(&descriptor);
+        for dep in &node.depends_on {
+            edges.push(GraphEdge {
+                from: descriptor.clone(),
+                to: dep.to_string(),
+            });
+        }
+        nodes.push(GraphNode {
+            definition_id: Some(node.definition.to_string()),
+            driver_type: Some(node.driver_type.clone()),
+            guresid: run
+                .as_ref()
+                .map(|r| r.guresid.clone())
+                .filter(|g| !g.is_empty()),
+            status: run
+                .as_ref()
+                .map_or_else(|| "pending".to_owned(), |r| r.status.clone()),
+            error: run.and_then(|r| r.error),
+            descriptor,
+        });
+    }
+    // What the deployment deleted or kept while removing it.
+    for (descriptor, run) in runs {
+        nodes.push(GraphNode {
+            descriptor,
+            definition_id: None,
+            driver_type: None,
+            guresid: Some(run.guresid).filter(|g| !g.is_empty()),
+            status: run.status,
+            error: run.error,
+        });
+    }
+    nodes.sort_by(|a, b| a.descriptor.cmp(&b.descriptor));
+    Ok(Json(GraphView {
+        deployment_id: d.id,
+        status: d.status,
+        nodes,
+        edges,
+    }))
 }
 
 /// The longest detach reason accepted.

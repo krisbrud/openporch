@@ -310,6 +310,24 @@ impl ResourceRunStatus {
     }
 }
 
+/// How one resource fared in a deployment.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct DeploymentResource {
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: String,
+    /// Its permanent identity; empty if it never got one.
+    pub guresid: String,
+    /// `pending`, `provisioning`, `provisioned`, `deleted`, `failed`, `skipped`
+    /// or `unknown`.
+    pub status: String,
+    /// Driver attempts.
+    pub attempts: i64,
+    /// The failure, if any.
+    pub error: Option<String>,
+    /// When the status was last observed.
+    pub observed_at: Option<i64>,
+}
+
 /// A request to detach a resource.
 #[derive(Debug, Clone, Copy)]
 pub struct Detach<'a> {

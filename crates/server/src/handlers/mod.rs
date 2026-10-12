@@ -223,6 +223,12 @@ pub fn api(state: AppState) -> Api {
         )
         .route(
             get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/resources/graph",
+            App(AppPerm::Read),
+            resources::graph,
+        )
+        .route(
+            get(),
             "/orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}",
             App(AppPerm::Read),
             resources::get,
