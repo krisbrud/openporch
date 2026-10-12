@@ -1845,24 +1845,33 @@ async fn the_log_stops_at_its_quota_but_keeps_the_outcome() {
     let warning = &lines[quota];
     assert_eq!(warning.level, "warn");
     assert_eq!((&warning.descriptor, &warning.operation_id), (&None, &None));
-    let kept: usize = lines[..quota].iter().map(|l| l.message.len()).sum();
-    assert!(kept <= 120, "{lines:?}");
-    // The final status lines are written past the quota.
-    let after: Vec<_> = lines[quota + 1..]
+    // Final status lines neither count against the quota nor are dropped.
+    let status =
+        |m: &str| m == "provisioned" || m.starts_with("failed, ") || m.starts_with("not attempted");
+    let kept: usize = lines[..quota]
         .iter()
-        .map(|l| l.message.as_str())
-        .collect();
+        .filter(|l| !status(&l.message))
+        .map(|l| l.message.len())
+        .sum();
+    assert!(kept <= 120, "{lines:?}");
+    let messages: Vec<_> = lines.iter().map(|l| l.message.as_str()).collect();
     assert!(
-        after.contains(
+        messages.contains(
             &"failed, nothing changed; fix the cause and deploy again: 400: invalid zone"
         ),
-        "{after:?}"
+        "{messages:?}"
     );
     assert!(
-        after.last().unwrap().starts_with("deployment failed"),
-        "{after:?}"
+        messages.last().unwrap().starts_with("deployment failed"),
+        "{messages:?}"
     );
-    assert!(after.iter().all(|m| !m.contains("(attempt")), "{after:?}");
+    // Only those follow the warning.
+    assert!(
+        messages[quota + 1..]
+            .iter()
+            .all(|m| status(m) || m.starts_with("deployment failed")),
+        "{messages:?}"
+    );
 }
 
 #[tokio::test]

@@ -54,8 +54,14 @@ impl Writer {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
+        if exempt {
+            // Final status lines neither count against the quota nor are
+            // dropped by it.
+            let _ = self.tx.send(Message::Line(line));
+            return;
+        }
         let used = self.used.fetch_add(line.message.len(), Ordering::SeqCst) + line.message.len();
-        if used > self.quota && !exempt {
+        if used > self.quota {
             if !self.truncated.swap(true, Ordering::SeqCst) {
                 let _ = self.tx.send(Message::Line(LogLine {
                     seq: 0,
