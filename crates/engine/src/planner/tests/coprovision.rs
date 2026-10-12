@@ -96,6 +96,14 @@ async fn every_row_of_the_truth_table_orders_provisioning() {
             match_dependents,
             "{case}: {workload:?}"
         );
+        // The workload sees the policy's outputs exactly when it waits for it.
+        let dependencies = &fake.job(WORKLOAD).inputs.resource;
+        let rendered = serde_json::to_string(dependencies).unwrap();
+        assert_eq!(
+            rendered.contains(POLICY),
+            match_dependents,
+            "{case}: {rendered}"
+        );
         // Nothing provisioned twice.
         assert_eq!(fake.attempts(TABLE), 1, "{case}");
         assert_eq!(fake.attempts(POLICY), 1, "{case}");
@@ -131,9 +139,17 @@ async fn a_policy_is_in_place_before_the_workload_that_needs_it() {
         json!({"table": "dynamodb-table.internal"})
     );
     let workload = fake.job(WORKLOAD);
-    let rendered = serde_json::to_string(&workload.inputs.resource).unwrap();
-    assert!(rendered.contains("dynamodb-table.internal"), "{rendered}");
-    assert!(rendered.contains("aws-policy.internal"), "{rendered}");
+    let Resolved::Value(inputs) = &workload.inputs.resource else {
+        panic!("{:?}", workload.inputs.resource);
+    };
+    // The environment's base, which it also waits for, is not among them.
+    assert_eq!(
+        inputs["dependencies"],
+        json!({
+            "orders": {"host": "dynamodb-table.internal"},
+            POLICY: {"host": "aws-policy.internal"},
+        })
+    );
 
     // A policy that fails leaves the workload waiting, never running without
     // its access.
@@ -169,16 +185,24 @@ resources: {{orders: {{type: dynamodb-table, id: orders, params: {{hash_key: id}
     };
     let (alpha, beta) = (shared("alpha"), shared("beta"));
     let mut runs = Vec::new();
-    for order in [[&alpha, &beta], [&beta, &alpha]] {
+    // Workloads and definitions in either order, provisioned in parallel or
+    // one at a time, so resources finish in different orders.
+    for (reversed, concurrency) in [(false, 4), (true, 1)] {
         let f = Fixture::new().await;
         let fake = Fake::with(&[]);
-        let defs = coprovisioning(json!({"match_dependents": true}), json!({}));
-        let deployment = f
-            .accept_workloads(&[order[0].as_str(), order[1].as_str()], defs)
-            .await
-            .unwrap();
+        let mut defs = coprovisioning(json!({"match_dependents": true}), json!({}));
+        let mut workloads = [alpha.as_str(), beta.as_str()];
+        if reversed {
+            defs.reverse();
+            workloads.reverse();
+        }
+        let deployment = f.accept_workloads(&workloads, defs).await.unwrap();
         let graph = deployment.graph.clone();
-        let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+        let limits = Limits {
+            concurrency,
+            ..fast()
+        };
+        let outcomes = planner(&f, &fake, limits).run(deployment).await;
         assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
         // The shared table and its policy are one resource each.
         assert_eq!(fake.attempts("dynamodb-table.default#shared.orders"), 1);
@@ -262,9 +286,16 @@ resources: {{orders: {{type: dynamodb-table, id: orders}}}}
     );
 
     // Removing beta too leaves them tracked, since nothing scheduled them.
+    // So does a removed workload's own table and its policy.
+    let deployment = f.accept_workloads(&[TABLE_WORKLOAD], defs()).await.unwrap();
+    deleting(&f, &fake, &checks).run(deployment).await;
+    assert!(f.active(TABLE).await.is_some());
     let deployment = f.accept_workloads(&[], defs()).await.unwrap();
     deleting(&f, &fake, &checks).run(deployment).await;
     assert!(f.active("workload.default#modules.beta").await.is_none());
+    assert!(f.active(WORKLOAD).await.is_none());
+    assert!(f.active(TABLE).await.is_some());
+    assert!(f.active(POLICY).await.is_some());
     assert!(
         f.active("dynamodb-table.default#shared.orders")
             .await

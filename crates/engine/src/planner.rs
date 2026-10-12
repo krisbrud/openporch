@@ -775,12 +775,23 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
             }
         }
     }
-    // A workload's other direct dependencies, such as a policy co-provisioned
-    // with `match_dependents`, are keyed by descriptor. The environment's
-    // implicit resources are not dependencies of its own.
+    // A resource co-provisioned with one of the workload's dependencies and
+    // `match_dependents`, such as a policy for its table, is a dependency of
+    // the workload too, keyed by descriptor. Nothing else the workload
+    // depends on is added, so no other resource's secrets reach its job.
     if !own.is_empty() {
         for dep in &node.depends_on {
-            if keyed.contains(dep) || scope.implicit_types.contains(&dep.ty) {
+            if keyed.contains(dep) {
+                continue;
+            }
+            let Some(other) = deployment.graph.nodes.get(dep) else {
+                continue;
+            };
+            let coprovisioned = other.requests.iter().any(|r| {
+                coprovisioned_by(&r.path)
+                    .is_some_and(|source| node.depends_on.iter().any(|d| d.to_string() == source))
+            });
+            if !coprovisioned {
                 continue;
             }
             if let Some(finished) = done.get(dep) {
@@ -1331,6 +1342,15 @@ fn output_placeholders(key: &str, outputs: &ResourceOutputs) -> Value {
         })
         .collect::<serde_json::Map<_, _>>()
         .into()
+}
+
+/// The resource that co-provisioned a node, from the path of the request the
+/// graph records for it: ``definition `<id>` provision.<key> for `<source>` ``.
+fn coprovisioned_by(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("definition `")?;
+    let (_, rest) = rest.split_once("` provision.")?;
+    let (_, source) = rest.rsplit_once(" for `")?;
+    source.strip_suffix('`')
 }
 
 /// Whether `s` can follow a dot in a placeholder.
