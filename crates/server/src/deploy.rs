@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use openporch_engine::planner::{Deployment, Executor, NoPermits, PermitCheck, Planner};
-use openporch_store::{LogLine, SqliteStore, Store, now_ms};
+use openporch_store::{SqliteStore, Store};
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -112,16 +112,10 @@ async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
     )
 }
 
-/// Finishes `job`'s deployment, with its error as its only log line; a
+/// Finishes `job`'s deployment, which ends its log with the outcome; a
 /// failure to record it leaves the deployment running until restart recovery
 /// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
-    let error = match error {
-        Some(error) if !log_failure(state, job, &error).await => {
-            Some(format!("{error}; its log line could not be stored"))
-        }
-        error => error,
-    };
     if let Err(e) = state
         .store
         .finish_deployment(state.org(), &job.app, &job.env, &job.id, error)
@@ -129,34 +123,6 @@ pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
     {
         tracing::error!(deployment = %job.id, error = %e, "could not finish a deployment");
     }
-}
-
-/// Appends `deployment failed: {error}` to `job`'s log, retrying a few times.
-/// Returns whether it was stored.
-async fn log_failure(state: &AppState, job: &Job, error: &str) -> bool {
-    let line = LogLine {
-        seq: 0,
-        operation_id: None,
-        descriptor: None,
-        guresid: None,
-        at: now_ms(),
-        level: "error".into(),
-        message: format!("deployment failed: {error}"),
-    };
-    for attempt in 1..=3u64 {
-        match state
-            .store
-            .append_logs(state.org(), &job.app, &job.env, &job.id, vec![line.clone()])
-            .await
-        {
-            Ok(()) => return true,
-            Err(e) if attempt == 3 => {
-                tracing::error!(deployment = %job.id, error = %e, "could not write a log line");
-            }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50 * attempt)).await,
-        }
-    }
-    false
 }
 
 /// The runner a server hands accepted deployments to.

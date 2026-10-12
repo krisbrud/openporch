@@ -506,18 +506,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             (None, Err(e)) => Some(e),
             (Some(error), Err(e)) => Some(format!("{error}; {e}")),
         };
-        // A log with lines missing is reported, not presented as complete.
-        let synced = log.sync().await;
-        let error = with_lost_lines(error, synced);
-        match &error {
-            None => log.deployment().status("info", "deployment succeeded"),
-            Some(e) => log
-                .deployment()
-                .status("error", &format!("deployment failed: {e}")),
-        }
-        // The log is complete before the deployment is.
-        let closed = log.close().await;
-        let error = with_lost_lines(error, closed.saturating_sub(synced));
+        // Every line is written before the deployment finishes, which adds
+        // its outcome as the last line. A log with lines missing is reported,
+        // not presented as complete.
+        let error = with_lost_lines(error, log.close().await);
         if let Err(e) = self
             .store
             .finish_deployment(

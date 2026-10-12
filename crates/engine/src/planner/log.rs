@@ -30,9 +30,7 @@ const WRITE_ATTEMPTS: u32 = 3;
 enum Message {
     Line(LogLine),
     /// Everything sent before has been written once the reply arrives, which
-    /// counts the lines that could not be written so far.
-    Sync(oneshot::Sender<usize>),
-    /// Like `Sync`, and nothing sent after it is written.
+    /// counts the lines that could not be written, and nothing after it is.
     Close(oneshot::Sender<usize>),
 }
 
@@ -114,10 +112,6 @@ impl DeploymentLog {
                 while let Some(message) = next.take() {
                     match message {
                         Message::Line(line) => lines.push(line),
-                        Message::Sync(done) => {
-                            replies.push(done);
-                            break;
-                        }
                         Message::Close(done) => {
                             replies.push(done);
                             closed = true;
@@ -182,17 +176,7 @@ impl DeploymentLog {
     }
 
     /// Waits until every line sent so far is written, returning how many
-    /// lines could not be written.
-    pub async fn sync(&self) -> usize {
-        let (done, wait) = oneshot::channel();
-        match self.writer.tx.send(Message::Sync(done)) {
-            Ok(()) => wait.await.unwrap_or(0),
-            Err(_) => 0,
-        }
-    }
-
-    /// Like [`Self::sync`], and drops every line sent later, so that the log
-    /// is complete once the deployment finishes.
+    /// lines could not be written, and drops every line sent later.
     pub async fn close(&self) -> usize {
         let writer = &self.writer;
         writer.closed.store(true, Ordering::SeqCst);

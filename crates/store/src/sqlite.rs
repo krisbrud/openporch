@@ -2043,27 +2043,23 @@ impl Store for SqliteStore {
             .await?;
         }
         for (app, env, id) in &running {
+            // Cleanups were closed before, so count them separately.
             let open = uncertain.iter().filter(|(_, d, _)| d == id).count();
-            let line = if open == 0 {
-                "deployment failed: interrupted by a server restart; no operation was in \
-                 flight, so deploy again to continue"
-                    .to_owned()
-            } else {
-                format!(
-                    "deployment failed: interrupted by a server restart; {open} resource(s) may \
-                     have changed and need recovery before the environment is deployed again"
-                )
+            let cleanup = cleanups.iter().filter(|(_, d, _)| d == id).count();
+            let error = match (open, cleanup) {
+                (0, 0) => "interrupted by a server restart; no operation was in flight, so \
+                           deploy again to continue"
+                    .to_owned(),
+                (0, n) => format!(
+                    "interrupted by a server restart; {n} deleted resource(s) keep their \
+                     records until the next deployment finishes the cleanup"
+                ),
+                (n, _) => format!(
+                    "interrupted by a server restart; {n} resource(s) may have changed and need \
+                     recovery before the environment is deployed again"
+                ),
             };
-            log_in_tx(&mut tx, &self.org, id, None, "error", &line).await?;
-            finish_in_tx(
-                &mut tx,
-                &self.org,
-                app,
-                env,
-                id,
-                Some("interrupted by a server restart"),
-            )
-            .await?;
+            finish_in_tx(&mut tx, &self.org, app, env, id, Some(&error)).await?;
         }
         tx.commit().await?;
         Ok(RecoveryReport {
@@ -2153,6 +2149,13 @@ async fn finish_in_tx(
     } else {
         "succeeded"
     };
+    // The log ends with the outcome, written with it so that no other line
+    // can follow.
+    let (level, line) = match error {
+        None => ("info", "deployment succeeded".to_owned()),
+        Some(e) => ("error", format!("deployment failed: {e}")),
+    };
+    log_in_tx(&mut *conn, org, id, None, level, &line).await?;
     sqlx::query(
         "UPDATE deployments SET status = ?, error = ?, finished_at = ? \
          WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",

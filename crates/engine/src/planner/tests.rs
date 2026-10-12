@@ -1898,14 +1898,21 @@ async fn lost_log_lines_fail_the_deployment() {
     let f = Fixture::new().await;
     let fake = Arc::new(Fake::default());
     let deployment = f.accept().await;
-    sqlx::query("DROP TABLE logs")
-        .execute(f.store.pool())
-        .await
-        .unwrap();
+    // Every line but the outcome fails to be stored.
+    sqlx::query(
+        "CREATE TRIGGER logs_full BEFORE INSERT ON logs \
+         WHEN NEW.message NOT LIKE 'deployment failed%' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(f.store.pool())
+    .await
+    .unwrap();
     let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
     assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
     let (status, error) = f.status(&deployment).await;
     assert_eq!(status, DeploymentStatus::Failed);
     let error = error.unwrap();
     assert!(error.ends_with("log lines could not be stored"), "{error}");
+    let lines = logs(&f, &deployment).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].message, format!("deployment failed: {error}"));
 }
