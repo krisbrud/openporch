@@ -181,6 +181,7 @@ struct DeploymentRow {
     app_id: String,
     env_id: String,
     seq: i64,
+    kind: String,
     actor_id: String,
     set_id: Option<String>,
     delta_id: Option<String>,
@@ -199,6 +200,7 @@ impl DeploymentRow {
             app: self.app_id,
             env: self.env_id,
             seq: self.seq,
+            kind: DeploymentKind::parse(&self.kind)?,
             actor: self.actor_id,
             set_id: self.set_id,
             delta_id: self.delta_id,
@@ -245,7 +247,7 @@ impl EnvRow {
 const ENV_COLUMNS: &str = "app_id, id, name, type, generation, desired_set_id, \
      last_successful_set_id, last_successful_deploy_id, state";
 
-const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, seq, actor_id, set_id, delta_id, comment, \
+const DEPLOYMENT_COLUMNS: &str = "id, app_id, env_id, seq, kind, actor_id, set_id, delta_id, comment, \
      generation, status, error, created_at, finished_at";
 
 async fn fetch_deployment(
@@ -538,8 +540,8 @@ impl Store for SqliteStore {
         .await?;
         if deployed > 0 {
             return Err(StoreError::Conflict(format!(
-                "environment `{app}/{env}` has deployments; deleting deployed environments is \
-                 not supported yet"
+                "environment `{app}/{env}` has been deployed; delete it with \
+                 `expected_generation` to delete its resources first"
             )));
         }
         for table in [
@@ -1005,10 +1007,24 @@ impl Store for SqliteStore {
             &env_type,
         )
         .await?;
-        if state != "active" {
-            return Err(StoreError::Conflict(format!(
-                "environment `{app}/{env}` is {state}"
-            )));
+        match req.kind {
+            DeploymentKind::Deploy if state != "active" => {
+                return Err(StoreError::Conflict(format!(
+                    "environment `{app}/{env}` is {state}"
+                )));
+            }
+            // A deletion that failed can be retried; one that runs cannot.
+            DeploymentKind::DeleteEnv if state == "deleting" => {
+                return Err(StoreError::Conflict(format!(
+                    "environment `{app}/{env}` is already being deleted"
+                )));
+            }
+            DeploymentKind::DeleteEnv if env == "development" => {
+                return Err(StoreError::Conflict(
+                    "the `development` environment exists as long as its application".into(),
+                ));
+            }
+            _ => {}
         }
         if generation != req.expected_generation {
             return Err(StoreError::StaleGeneration {
@@ -1040,15 +1056,29 @@ impl Store for SqliteStore {
         if !uncertain.is_empty() {
             return Err(StoreError::RecoveryRequired(uncertain.join(", ")));
         }
-        let set_exists: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM sets WHERE org_id = ? AND app_id = ? AND id = ?")
+        match (req.kind, &req.set_id) {
+            (DeploymentKind::Deploy, None) => {
+                return Err(StoreError::Conflict("a deployment needs a set".into()));
+            }
+            (DeploymentKind::DeleteEnv, Some(_)) => {
+                return Err(StoreError::Conflict(
+                    "an environment deletion deploys no set".into(),
+                ));
+            }
+            (_, Some(set_id)) => {
+                let set_exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM sets WHERE org_id = ? AND app_id = ? AND id = ?",
+                )
                 .bind(org)
                 .bind(app)
-                .bind(&req.set_id)
+                .bind(set_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if set_exists.is_none() {
-            return Err(StoreError::NotFound(format!("set `{}`", req.set_id)));
+                if set_exists.is_none() {
+                    return Err(StoreError::NotFound(format!("set `{set_id}`")));
+                }
+            }
+            (_, None) => {}
         }
         if let (Some(delta), Some(expected)) = (&req.delta_id, &req.delta_content) {
             let stored: Option<String> = sqlx::query_scalar(
@@ -1096,15 +1126,17 @@ impl Store for SqliteStore {
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO deployments (org_id, app_id, env_id, id, seq, actor_id, set_id, delta_id, \
-             comment, generation, status, idempotency_key, request_fingerprint, snapshot, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
+            "INSERT INTO deployments (org_id, app_id, env_id, id, seq, kind, actor_id, set_id, \
+             delta_id, comment, generation, status, idempotency_key, request_fingerprint, \
+             snapshot, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)",
         )
         .bind(org)
         .bind(app)
         .bind(env)
         .bind(&id)
         .bind(seq)
+        .bind(req.kind.as_str())
         .bind(&req.actor)
         .bind(&req.set_id)
         .bind(&req.delta_id)
@@ -1116,12 +1148,16 @@ impl Store for SqliteStore {
         .bind(now_ms())
         .execute(&mut *tx)
         .await?;
+        // A deletion keeps the desired set, which still describes what is
+        // deployed until its resources are gone.
         sqlx::query(
-            "UPDATE envs SET generation = ?, desired_set_id = ? \
+            "UPDATE envs SET generation = ?, desired_set_id = COALESCE(?, desired_set_id), \
+             state = CASE WHEN ? THEN 'deleting' ELSE state END \
              WHERE org_id = ? AND app_id = ? AND id = ?",
         )
         .bind(new_generation)
         .bind(&req.set_id)
+        .bind(req.kind == DeploymentKind::DeleteEnv)
         .bind(org)
         .bind(app)
         .bind(env)
@@ -2124,6 +2160,54 @@ async fn log_in_tx(
     Ok(())
 }
 
+/// Removes a deleted environment and everything recorded about it, except
+/// the audit log and tombstones. What it still lists but does not own, adopted
+/// and external resources, is released from management with a tombstone, so
+/// the objects outside are known to have been left in place.
+async fn remove_env(conn: &mut SqliteConnection, org: &str, app: &str, env: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
+         actor_id, body, at) SELECT org_id, app_id, env_id, descriptor, guresid, 'released', \
+         NULL, json_object('definition_id', definition_id, 'driver_type', driver_type, \
+         'ownership', ownership, 'external_ids', json(external_ids), 'backend', backend, \
+         'outputs', json(outputs)), ? \
+         FROM active_resources WHERE org_id = ? AND app_id = ? AND env_id = ?",
+    )
+    .bind(now_ms())
+    .bind(org)
+    .bind(app)
+    .bind(env)
+    .execute(&mut *conn)
+    .await?;
+    for table in [
+        "active_resources",
+        "operations",
+        "logs",
+        "deployment_resources",
+        "deployments",
+        "app_values",
+        "value_set_versions",
+        "deltas",
+        "secret_grants",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE org_id = ? AND app_id = ? AND env_id = ?"
+        ))
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .execute(&mut *conn)
+        .await?;
+    }
+    sqlx::query("DELETE FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Marks a running deployment finished and records the correlated audit outcome.
 async fn finish_in_tx(
     conn: &mut SqliteConnection,
@@ -2133,8 +2217,8 @@ async fn finish_in_tx(
     id: &str,
     error: Option<&str>,
 ) -> Result<()> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT status, set_id FROM deployments \
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, kind, set_id FROM deployments \
          WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
     )
     .bind(org)
@@ -2143,12 +2227,34 @@ async fn finish_in_tx(
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    let (status, set_id) = row.ok_or_else(|| StoreError::NotFound(format!("deployment `{id}`")))?;
+    let (status, kind, set_id) =
+        row.ok_or_else(|| StoreError::NotFound(format!("deployment `{id}`")))?;
     if status != "in_progress" {
         return Err(StoreError::Conflict(format!(
             "deployment `{id}` is already {status}"
         )));
     }
+    let kind = DeploymentKind::parse(&kind)?;
+    let mut error = error.map(str::to_owned);
+    // An environment is removed only once nothing it owns is left.
+    if kind == DeploymentKind::DeleteEnv && error.is_none() {
+        let owned: Vec<String> = sqlx::query_scalar(
+            "SELECT descriptor FROM active_resources WHERE org_id = ? AND app_id = ? \
+             AND env_id = ? AND ownership = 'owned' ORDER BY descriptor LIMIT 5",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_all(&mut *conn)
+        .await?;
+        if !owned.is_empty() {
+            error = Some(format!(
+                "owned resources remain: {}; delete the environment again",
+                owned.join(", ")
+            ));
+        }
+    }
+    let error = error.as_deref();
     let status = if error.is_some() {
         "failed"
     } else {
@@ -2174,18 +2280,33 @@ async fn finish_in_tx(
     .bind(id)
     .execute(&mut *conn)
     .await?;
-    if error.is_none() {
-        sqlx::query(
-            "UPDATE envs SET last_successful_set_id = ?, last_successful_deploy_id = ? \
-             WHERE org_id = ? AND app_id = ? AND id = ?",
-        )
-        .bind(&set_id)
-        .bind(id)
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .execute(&mut *conn)
-        .await?;
+    match (kind, error) {
+        (DeploymentKind::Deploy, None) => {
+            sqlx::query(
+                "UPDATE envs SET last_successful_set_id = ?, last_successful_deploy_id = ? \
+                 WHERE org_id = ? AND app_id = ? AND id = ?",
+            )
+            .bind(&set_id)
+            .bind(id)
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *conn)
+            .await?;
+        }
+        (DeploymentKind::Deploy, Some(_)) => {}
+        // The environment stays, with what is left of it, for a retry.
+        (DeploymentKind::DeleteEnv, Some(_)) => {
+            sqlx::query(
+                "UPDATE envs SET state = 'deletion_failed' WHERE org_id = ? AND app_id = ? AND id = ?",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *conn)
+            .await?;
+        }
+        (DeploymentKind::DeleteEnv, None) => remove_env(&mut *conn, org, app, env).await?,
     }
     let accepted: Option<(String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT id, actor_id, method, path FROM audit_log WHERE org_id = ? AND operation_id = ? \

@@ -273,18 +273,20 @@ pub struct GraphView {
 }
 
 /// `GET /orgs/{org}/apps/{app}/envs/{env}/resources/graph`: the latest
-/// deployment's graph with each resource's status and error.
+/// attempt's graph with each resource's status and error.
 pub async fn graph(
     State(state): State<AppState>,
     Path((_, app, env)): Path<(String, String, String)>,
 ) -> ApiResult<Json<GraphView>> {
     let env = env_or_404(&state, &app, &env).await?;
     let org = state.org();
+    // The latest attempt, also an environment deletion, whose graph is empty
+    // and whose nodes are what it deleted, kept or failed to delete.
     let latest = state
         .store
-        .deployments(org, &env.app, &env.id, 1, None)
+        .latest_deployment(org, &env.app, &env.id)
         .await?;
-    let d = latest.into_iter().next().ok_or_else(|| {
+    let d = latest.ok_or_else(|| {
         ApiError::not_found(format!("`{}/{}` has no deployments yet", env.app, env.id))
     })?;
     let snapshot = state

@@ -1,5 +1,6 @@
 //! Deleting the resources a deployment leaves out: workloads it removed and
-//! resources scheduled for deletion.
+//! resources scheduled for deletion, or, when it deletes the environment,
+//! every owned resource.
 //!
 //! A resource is deleted only after every resource that depends on it is gone,
 //! so deletion runs in reverse dependency order. A resource something still
@@ -125,7 +126,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         };
         let mut candidates: BTreeMap<Descriptor, ActiveResource> = BTreeMap::new();
         // Removals the deployment must complete to succeed: removed workloads
-        // and what they own.
+        // and what they own, or everything owned when the environment goes.
         let mut mandatory: BTreeSet<String> = BTreeSet::new();
         let mut left_out: Vec<(Descriptor, &ActiveResource)> = Vec::new();
         for r in &active {
@@ -134,10 +135,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 continue;
             };
             // External resources are never deleted, and adopted ones only when
-            // explicitly scheduled.
-            let removed_workload = descriptor.ty.as_str() == "workload" && r.ownership == "owned";
+            // explicitly scheduled. Removed workloads go, and when the
+            // environment is deleted, everything it owns.
+            let must_go =
+                r.ownership == "owned" && (d.teardown || descriptor.ty.as_str() == "workload");
             let deletable = match r.ownership.as_str() {
-                "owned" | "adopted" => r.scheduled_deletion || removed_workload,
+                "owned" | "adopted" => r.scheduled_deletion || must_go,
                 _ => false,
             };
             // One whose deletion the driver already confirmed only needs its
@@ -149,7 +152,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 left_out.push((descriptor, r));
                 continue;
             }
-            if removed_workload {
+            if must_go {
                 mandatory.insert(r.descriptor.clone());
             }
             candidates.insert(descriptor, r.clone());

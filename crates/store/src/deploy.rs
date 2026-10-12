@@ -87,8 +87,11 @@ pub struct DeploymentRequest {
     pub idempotency_key: Option<String>,
     /// A digest of the request content, compared on retries with the same key.
     pub fingerprint: String,
-    /// The desired set, already stored with [`crate::Store::put_set`].
-    pub set_id: String,
+    /// What the deployment does.
+    pub kind: DeploymentKind,
+    /// The desired set, already stored with [`crate::Store::put_set`]; `None`
+    /// for an environment deletion, which deploys no set.
+    pub set_id: Option<String>,
     /// The delta being deployed, frozen on acceptance.
     pub delta_id: Option<String>,
     /// The delta's content the set was derived from; acceptance fails if the
@@ -100,6 +103,37 @@ pub struct DeploymentRequest {
     pub snapshot: Value,
     /// The audit intent of the request.
     pub audit: AuditIntent,
+}
+
+/// What a deployment does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentKind {
+    /// Converges the environment to a set.
+    #[default]
+    Deploy,
+    /// Deletes the environment: deprovisions its owned resources, then
+    /// removes it once all of them are gone.
+    DeleteEnv,
+}
+
+impl DeploymentKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::DeleteEnv => "delete_env",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> crate::Result<Self> {
+        match s {
+            "deploy" => Ok(Self::Deploy),
+            "delete_env" => Ok(Self::DeleteEnv),
+            other => Err(crate::StoreError::Corrupt(format!(
+                "deployment kind `{other}`"
+            ))),
+        }
+    }
 }
 
 /// The status of a deployment.
@@ -138,6 +172,8 @@ pub struct DeploymentRecord {
     pub env: String,
     /// Attempt order within the environment, starting at 1.
     pub seq: i64,
+    /// What it does.
+    pub kind: DeploymentKind,
     /// The principal that requested it.
     pub actor: String,
     /// The desired set.

@@ -20,6 +20,8 @@ struct Fake {
     guresids: Mutex<Vec<(String, String)>>,
     /// The descriptors deleted, in order.
     deleted: Mutex<Vec<String>>,
+    /// Types whose deletion fails.
+    undeletable: Mutex<BTreeSet<String>>,
     /// A secret value the executor resolves for postgres, and then leaks into
     /// its output and error.
     leak: Mutex<Option<String>>,
@@ -62,6 +64,12 @@ impl Executor for Fake {
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let ty = job.job.descriptor.ty.to_string();
+        if self.undeletable.lock().unwrap().contains(&ty) {
+            return Err(ExecFailure::Permanent(format!(
+                "{ty} has deletion protection"
+            )));
+        }
         self.deleted
             .lock()
             .unwrap()
@@ -134,14 +142,19 @@ impl Server {
 
     /// [`Self::deploy_web`] with destructive-action permits.
     async fn deploy_web_with(&self, image: &str, db: bool, permits: &[&str]) -> Value {
+        self.deploy_web_in("development", image, db, permits).await
+    }
+
+    /// [`Self::deploy_web_with`] to environment `env`.
+    async fn deploy_web_in(&self, env: &str, image: &str, db: bool, permits: &[&str]) -> Value {
+        let env_path = format!("/orgs/acme/apps/shop/envs/{env}");
+        let deploys = format!("{env_path}/deploys");
         let externals = if db {
             json!({"db": {"type": "postgres"}})
         } else {
             json!({})
         };
-        let (s, env) = self
-            .get("/orgs/acme/apps/shop/envs/development", &self.admin)
-            .await;
+        let (s, env) = self.get(&env_path, &self.admin).await;
         assert_eq!(s, StatusCode::OK, "{env}");
         // Replace `web` once the environment has it.
         let remove = if env["desired_set_id"].is_null() {
@@ -160,7 +173,7 @@ impl Server {
         assert_eq!(s, StatusCode::CREATED, "{delta}");
         let (s, d) = self
             .post(
-                DEPLOYS,
+                &deploys,
                 &self.admin,
                 json!({"delta_id": delta["id"], "expected_generation": env["generation"],
                     "permits": permits}),
@@ -169,7 +182,7 @@ impl Server {
         assert_eq!(s, StatusCode::ACCEPTED, "{d}");
         let id = d["id"].as_str().unwrap().to_owned();
         for _ in 0..500 {
-            let (s, d) = self.get(&format!("{DEPLOYS}/{id}"), &self.admin).await;
+            let (s, d) = self.get(&format!("{deploys}/{id}"), &self.admin).await;
             assert_eq!(s, StatusCode::OK, "{d}");
             if d["status"] != "in_progress" {
                 return d;
@@ -745,4 +758,130 @@ async fn read_a_deployments_redacted_log() {
     let stranger = s.member("sam", "member").await;
     let (status, b) = s.get(&logs, &stranger).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+}
+
+#[tokio::test]
+async fn delete_a_deployed_environment() {
+    const ENV: &str = "/orgs/acme/apps/shop/envs/pr-42";
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "pr-42", "name": "PR 42", "type": "development"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let d = s.deploy_web_in("pr-42", "nginx:1", true, &[]).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    fake.undeletable.lock().unwrap().insert("postgres".into());
+
+    // A deployed environment needs its generation and permits.
+    let (status, b) = s.delete(ENV, &s.admin).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (_, env) = s.get(ENV, &s.admin).await;
+    let (status, b) = s
+        .call(
+            Method::DELETE,
+            "/orgs/acme/apps/shop/envs/development",
+            Some(&s.admin),
+            Some(json!({"expected_generation": 0})),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+
+    // The database cannot be deleted, so the environment stays with it.
+    let deletion = s.delete_env(ENV, env["generation"].as_i64().unwrap()).await;
+    assert_eq!(deletion["retained"], json!([]), "{deletion}");
+    assert_eq!(deletion["deployment"]["kind"], "delete_env");
+    let id = deletion["deployment"]["id"].as_str().unwrap();
+    let d = s.finished_at(&format!("{ENV}/deploys/{id}")).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    assert!(d["error"].as_str().unwrap().contains(DB), "{d}");
+    let (_, env) = s.get(ENV, &s.admin).await;
+    assert_eq!(env["state"], "deletion_failed", "{env}");
+    assert_eq!(env["latest_deployment"]["kind"], "delete_env", "{env}");
+    let (status, graph) = s.get(&format!("{ENV}/resources/graph"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{graph}");
+    let node = |descriptor: &str| {
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["descriptor"] == descriptor)
+            .cloned()
+            .unwrap_or_else(|| panic!("{descriptor}: {graph}"))
+    };
+    assert_eq!(node(DB)["status"], "failed", "{graph}");
+    assert!(
+        node(DB)["error"]
+            .as_str()
+            .unwrap()
+            .contains("deletion protection")
+    );
+    assert_eq!(node("workload.default#modules.web")["status"], "deleted");
+    let (_, resources) = s.get(&format!("{ENV}/resources"), &s.admin).await;
+    let db = resources["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["descriptor"] == DB)
+        .cloned()
+        .unwrap();
+    assert_eq!(db["status"], "deletion_failed");
+    // It is not deployed again while the deletion waits for a retry.
+    let (status, b) = s
+        .post(
+            &format!("{ENV}/deploys"),
+            &s.admin,
+            json!({"deploy_id": "+1", "expected_generation": env["generation"]}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+
+    // The retry deletes the rest and then the environment.
+    fake.undeletable.lock().unwrap().clear();
+    s.delete_env(ENV, env["generation"].as_i64().unwrap()).await;
+    for _ in 0..500 {
+        let (status, _) = s.get(ENV, &s.admin).await;
+        if status == StatusCode::NOT_FOUND {
+            let deleted = fake.deleted.lock().unwrap().clone();
+            let at = |d: &str| deleted.iter().position(|x| x == d).unwrap();
+            assert!(at("workload.default#modules.web") < at(DB), "{deleted:?}");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the environment was not deleted");
+}
+
+impl Server {
+    /// Starts deleting `env` with the permit `permit-1`.
+    async fn delete_env(&self, env: &str, generation: i64) -> Value {
+        let (status, b) = self
+            .call(
+                Method::DELETE,
+                env,
+                Some(&self.admin),
+                Some(json!({"expected_generation": generation, "permits": ["permit-1"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{b}");
+        b
+    }
+
+    /// The deployment at `path` once it finished.
+    async fn finished_at(&self, path: &str) -> Value {
+        for _ in 0..500 {
+            let (status, d) = self.get(path, &self.admin).await;
+            assert_eq!(status, StatusCode::OK, "{d}");
+            if d["status"] != "in_progress" {
+                return d;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{path} did not finish");
+    }
 }

@@ -11,8 +11,10 @@ use openporch_core::workload::Workload;
 use openporch_store::secrets::{
     BuiltinSecretStore, Keyring, MasterKey, SecretStore as _, SecretValue,
 };
-use openporch_store::{AuditIntent, DeploymentRequest, DeploymentStatus, Ownership, SqliteStore};
-use openporch_store::{Detach, Tombstone};
+use openporch_store::{
+    AuditIntent, DeploymentKind, DeploymentRequest, DeploymentStatus, Ownership, SqliteStore,
+};
+use openporch_store::{Detach, NewEnv, Tombstone};
 use tokio::sync::Barrier;
 
 use super::*;
@@ -313,6 +315,8 @@ impl PermitCheck for AllowAll {
 struct Fixture {
     _dir: tempfile::TempDir,
     store: Arc<SqliteStore>,
+    /// The environment deployments go to.
+    env: &'static str,
 }
 
 impl Fixture {
@@ -361,7 +365,30 @@ impl Fixture {
         Self {
             _dir: dir,
             store: Arc::new(store),
+            env: "development",
         }
+    }
+
+    /// A fixture whose deployments go to a new `development`-type
+    /// environment `env`.
+    async fn in_env(env: &'static str) -> Self {
+        let mut f = Self::new().await;
+        f.store
+            .create_env(
+                ORG,
+                "shop",
+                NewEnv {
+                    id: env.into(),
+                    name: env.into(),
+                    env_type: "development".into(),
+                    draft: None,
+                },
+                audit("POST", "/orgs/acme/apps/shop/envs"),
+            )
+            .await
+            .unwrap();
+        f.env = env;
+        f
     }
 
     /// Accepts a deployment of the `web` workload and reads it back from its
@@ -395,7 +422,7 @@ impl Fixture {
         let (org, app, env, env_type) = (
             ORG.parse().unwrap(),
             "shop".parse().unwrap(),
-            "development".parse().unwrap(),
+            self.env.parse().unwrap(),
             "development".parse().unwrap(),
         );
         let graph = build_graph(GraphInput {
@@ -422,7 +449,7 @@ impl Fixture {
         let set_id = self.store.put_set(ORG, "shop", &set).await.unwrap();
         let generation = self
             .store
-            .env(ORG, "shop", "development")
+            .env(ORG, "shop", self.env)
             .await
             .unwrap()
             .unwrap()
@@ -432,12 +459,13 @@ impl Fixture {
             .accept_deployment(DeploymentRequest {
                 org: ORG.into(),
                 app: "shop".into(),
-                env: "development".into(),
+                env: self.env.into(),
                 actor: "ci".into(),
                 expected_generation: generation,
                 idempotency_key: None,
                 fingerprint: format!("body-{generation}"),
-                set_id: set_id.clone(),
+                kind: DeploymentKind::Deploy,
+                set_id: Some(set_id.clone()),
                 delta_id: None,
                 delta_content: None,
                 comment: String::new(),
@@ -460,7 +488,7 @@ impl Fixture {
     async fn status(&self, deployment: &Deployment) -> (DeploymentStatus, Option<String>) {
         let record = self
             .store
-            .deployment(ORG, "shop", "development", &deployment.id)
+            .deployment(ORG, "shop", self.env, &deployment.id)
             .await
             .unwrap()
             .unwrap();
@@ -859,7 +887,7 @@ impl Fixture {
             .schedule_deletion(
                 ORG,
                 "shop",
-                "development",
+                self.env,
                 descriptor,
                 audit("DELETE", "/orgs/acme/apps/shop/envs/development/resources"),
             )
@@ -869,7 +897,7 @@ impl Fixture {
 
     async fn active(&self, descriptor: &str) -> Option<openporch_store::ActiveResource> {
         self.store
-            .active_resource(ORG, "shop", "development", descriptor)
+            .active_resource(ORG, "shop", self.env, descriptor)
             .await
             .unwrap()
     }
@@ -1727,7 +1755,7 @@ async fn a_resource_with_an_uncertain_operation_is_not_detached() {
 /// Every log line of `deployment`, as `(descriptor, operation, guresid, message)`.
 async fn logs(f: &Fixture, deployment: &Deployment) -> Vec<openporch_store::LogLine> {
     f.store
-        .deployment_logs(ORG, "shop", "development", &deployment.id, None, 10_000)
+        .deployment_logs(ORG, "shop", f.env, &deployment.id, None, 10_000)
         .await
         .unwrap()
 }
@@ -1916,3 +1944,5 @@ async fn lost_log_lines_fail_the_deployment() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].message, format!("deployment failed: {error}"));
 }
+
+mod teardown;

@@ -33,7 +33,8 @@ impl Server {
                 expected_generation: generation,
                 idempotency_key: None,
                 fingerprint: format!("body-{set_id}"),
-                set_id,
+                kind: openporch_store::DeploymentKind::Deploy,
+                set_id: Some(set_id),
                 delta_id: None,
                 delta_content: None,
                 comment: String::new(),
@@ -266,14 +267,20 @@ async fn clone_an_environment_from_a_deployment() {
     let (status, _) = s.get("/orgs/acme/apps/billing/envs/copy", &s.admin).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Deployed environments are kept until deprovisioning on delete exists.
+    // A deployed environment is deleted only with a generation and permits.
     s.deployed("shop", "pr-42", "web:2", false).await;
     let (_, pr) = s.get("/orgs/acme/apps/shop/envs/pr-42", &s.admin).await;
     assert_eq!(pr["latest_deployment"]["status"], "failed");
     assert_eq!(pr["convergence"], "partial");
     assert!(pr["last_successful_deploy_id"].is_null());
     let (status, b) = s.delete("/orgs/acme/apps/shop/envs/pr-42", &s.admin).await;
-    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected_generation")
+    );
 }
 
 #[tokio::test]

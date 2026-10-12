@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use openporch_engine::planner::{Deployment, Executor, NoPermits, PermitCheck, Planner};
-use openporch_store::{SqliteStore, Store};
+use openporch_store::{DeploymentKind, SqliteStore, Store};
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -47,7 +47,7 @@ impl Runner for Unimplemented {
                 &job,
                 Some(
                     "provisioning resources is not implemented yet; nothing changed; \
-                     deploy again once the server runs with an executor"
+                     retry once the server runs with an executor"
                         .into(),
                 ),
             )
@@ -98,15 +98,15 @@ async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
         .await
         .map_err(|e| format!("the environment could not be read: {e}"))?
         .ok_or_else(|| format!("environment `{}/{}` no longer exists", job.app, job.env))?;
-    let set_id = state
+    let record = state
         .store
         .deployment(org, &job.app, &job.env, &job.id)
         .await
         .map_err(|e| format!("the deployment could not be read: {e}"))?
-        .and_then(|d| d.set_id)
-        .unwrap_or_default();
+        .ok_or_else(|| format!("deployment `{}` no longer exists", job.id))?;
+    let set_id = record.set_id.unwrap_or_default();
     let invalid = |what: &str| format!("the stored {what} ID is invalid");
-    Deployment::from_snapshot(
+    let mut deployment = Deployment::from_snapshot(
         org.parse().map_err(|_| invalid("organization"))?,
         job.app.parse().map_err(|_| invalid("application"))?,
         job.env.parse().map_err(|_| invalid("environment"))?,
@@ -116,7 +116,14 @@ async fn deployment(state: &AppState, job: &Job) -> Result<Deployment, String> {
         job.id.clone(),
         set_id,
         &job.snapshot,
-    )
+    )?;
+    // Whether it deletes the environment comes from the record, never from
+    // the snapshot, so a replayed snapshot cannot turn into a deletion.
+    deployment.teardown = record.kind == DeploymentKind::DeleteEnv;
+    if deployment.teardown && !deployment.graph.nodes.is_empty() {
+        return Err("an environment deletion has resources to provision".into());
+    }
+    Ok(deployment)
 }
 
 /// Finishes `job`'s deployment, which ends its log with the outcome; a

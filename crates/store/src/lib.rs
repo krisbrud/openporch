@@ -22,9 +22,9 @@ mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
-    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord, LogLine, NewEnv,
-    OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
+    Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentKind, DeploymentRecord,
+    DeploymentRequest, DeploymentResource, DeploymentStatus, Detach, DraftDelta, EnvRecord,
+    LogLine, NewEnv, OperationKind, OperationStart, OperationStarted, Provisioned, RecoveryReport,
     ResourceRunStatus, Tombstone, UncertainOperation,
 };
 pub use error::StoreError;

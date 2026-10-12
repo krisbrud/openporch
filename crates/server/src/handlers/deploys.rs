@@ -15,8 +15,8 @@ use openporch_core::catalog::{ClassRegistry, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_store::{
-    Acceptance, CatalogStore, DeploymentRecord, DeploymentRequest, DeploymentStatus, EnvRecord,
-    LogLine, Store, StoreError,
+    Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
+    DeploymentStatus, EnvRecord, LogLine, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,7 +29,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The snapshot format this server writes and replays.
-const SNAPSHOT_VERSION: u64 = 1;
+pub(super) const SNAPSHOT_VERSION: u64 = 1;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -119,14 +119,7 @@ pub async fn trigger(
         return Err(ApiError::invalid("`replay` applies only to `deploy_id`"));
     }
     let key = idempotency_key(&headers)?;
-    let fingerprint = {
-        let body = serde_json::to_value(&req).map_err(ApiError::internal)?;
-        let digest = Sha256::digest(to_canonical_string(&body).as_bytes());
-        digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
+    let fingerprint = fingerprint(&serde_json::to_value(&req).map_err(ApiError::internal)?);
     // A retry returns the original deployment without deriving anything again:
     // the desired set it would apply a delta to has moved on.
     if let Some(key) = &key
@@ -177,7 +170,8 @@ pub async fn trigger(
             expected_generation: req.expected_generation,
             idempotency_key: key,
             fingerprint,
-            set_id,
+            kind: DeploymentKind::Deploy,
+            set_id: Some(set_id),
             delta_id: resolved.delta_id,
             delta_content: resolved.delta_content,
             comment: req.comment,
@@ -199,8 +193,17 @@ pub async fn trigger(
     Ok((StatusCode::ACCEPTED, Json(acceptance.deployment().clone())))
 }
 
+/// A digest of a request body, compared on retries with the same idempotency
+/// key.
+pub(super) fn fingerprint(body: &Value) -> String {
+    Sha256::digest(to_canonical_string(body).as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The `Idempotency-Key` header, if sent.
-fn idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>> {
+pub(super) fn idempotency_key(headers: &HeaderMap) -> ApiResult<Option<String>> {
     let Some(value) = headers.get("idempotency-key") else {
         return Ok(None);
     };
