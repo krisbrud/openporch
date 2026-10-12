@@ -277,7 +277,7 @@ bucket = "acme-openporch-state"
 region = "eu-north-1"
 key_prefix = "openporch"               # the default
 # lock_table = "openporch-locks"       # without it, S3 lock files
-# endpoint = "http://localhost:4566"   # an S3-compatible endpoint; plain http only on loopback
+# endpoint = "http://localhost:4566"   # S3-compatible; plain http only on loopback, no credentials in the URL
 # role_arn = "arn:aws:iam::123456789012:role/openporch-state"
 ```
 

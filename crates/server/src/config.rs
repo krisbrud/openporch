@@ -121,6 +121,24 @@ impl Default for StateSettings {
     }
 }
 
+/// An S3 endpoint in canonical form, so that spelling it differently is not
+/// a state migration. It names where state is in API responses and logs, so
+/// it must not carry credentials.
+fn state_endpoint(endpoint: &str) -> Result<String, ConfigError> {
+    let url = crate::identity::check_base_url("opentofu.state.endpoint", endpoint)
+        .map_err(ConfigError)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError(
+            "`opentofu.state.endpoint` must not contain credentials, a query or a fragment".into(),
+        ));
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
 fn default_key_prefix() -> String {
     "openporch".into()
 }
@@ -286,18 +304,30 @@ impl Config {
         if let StateSettings::S3 {
             bucket,
             region,
+            key_prefix,
+            lock_table,
             endpoint,
-            ..
+            role_arn,
         } = &self.opentofu.state
         {
-            if bucket.trim().is_empty() || region.trim().is_empty() {
+            for (name, value) in [
+                ("bucket", Some(bucket)),
+                ("region", Some(region)),
+                ("key_prefix", Some(key_prefix)),
+                ("lock_table", lock_table.as_ref()),
+                ("role_arn", role_arn.as_ref()),
+            ] {
+                if value.is_some_and(|v| v.trim().is_empty()) {
+                    return Err(ConfigError(format!("`opentofu.state.{name}` is empty")));
+                }
+            }
+            if key_prefix.starts_with('/') || key_prefix.ends_with('/') {
                 return Err(ConfigError(
-                    "`opentofu.state.bucket` and `opentofu.state.region` are required".into(),
+                    "`opentofu.state.key_prefix` must not start or end with `/`".into(),
                 ));
             }
             if let Some(endpoint) = endpoint {
-                crate::identity::check_base_url("opentofu.state.endpoint", endpoint)
-                    .map_err(ConfigError)?;
+                state_endpoint(endpoint)?;
             }
         }
         Ok(())
@@ -328,7 +358,9 @@ impl Config {
                 let mut s3 = openporch_drivers::OpenTofuS3State::new(bucket, region);
                 s3.key_prefix = key_prefix.clone();
                 s3.lock_table = lock_table.clone();
-                s3.endpoint = endpoint.clone();
+                s3.endpoint = endpoint
+                    .as_deref()
+                    .map(|e| state_endpoint(e).unwrap_or_else(|_| e.to_owned()));
                 s3.role_arn = role_arn.clone();
                 openporch_drivers::OpenTofuStateBackend::S3(Box::new(s3))
             }
@@ -426,6 +458,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("must use https"), "{e}");
+        for endpoint in [
+            "https://AKIA:secret@s3.example.com",
+            "https://s3.example.com/?X-Amz-Credential=AKIA",
+        ] {
+            let e = load(&format!(
+                "[opentofu.state]\nbackend = \"s3\"\nbucket = \"tf\"\nregion = \"r\"\n\
+                 endpoint = \"{endpoint}\"\n"
+            ))
+            .unwrap_err();
+            assert!(
+                e.to_string().contains("must not contain credentials"),
+                "{e}"
+            );
+            assert!(!e.to_string().contains("secret"), "{e}");
+        }
+        // Spelling the same endpoint differently is not a move.
+        let same = load(
+            "[opentofu.state]\nbackend = \"s3\"\nbucket = \"tf\"\nregion = \"r\"\n\
+             endpoint = \"HTTP://LOCALHOST:4566/\"\n",
+        )
+        .unwrap()
+        .opentofu();
+        assert_eq!(
+            same.state.location(),
+            "s3://tf/openporch at http://localhost:4566"
+        );
+        for bad in ["lock_table = \"\"", "key_prefix = \"/x/\""] {
+            let e = load(&format!(
+                "[opentofu.state]\nbackend = \"s3\"\nbucket = \"tf\"\nregion = \"r\"\n{bad}\n"
+            ))
+            .unwrap_err();
+            assert!(e.to_string().contains("opentofu.state."), "{e}");
+        }
         let e = load("[opentofu.state]\nbackend = \"s3\"\nbucket = \"tf\"\n").unwrap_err();
         assert!(e.to_string().contains("region"), "{e}");
         let e = load("[opentofu.state]\nbackend = \"local\"\nbucket = \"tf\"\n").unwrap_err();

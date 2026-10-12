@@ -1705,6 +1705,30 @@ Authorization: Bearer $ADMIN_TOKEN
 }
 ```
 
+A page of one line, followed by the next:
+
+```http
+GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs?limit=1
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"lines": [{"seq": 1, "level": "info"}], "next": 1, "finished": false}
+```
+
+```http
+GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs?limit=1&after=1
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+{"lines": [{"seq": 2}], "next": 2, "finished": false}
+```
+
 ## Previews and permits
 
 | Method | Path | Permission |
@@ -1765,7 +1789,7 @@ Authorization: Bearer $ADMIN_TOKEN
   "expires_at": "…",
   "complete": false,
   "resources": [
-    {"descriptor": "…", "definition": "…", "action": "update", "known": "…",
+    {"descriptor": "…", "definition": "…", "action": "update", "known": false,
      "reason": "…", "permit_required": false, "digest": "…"},
     "…"
   ]

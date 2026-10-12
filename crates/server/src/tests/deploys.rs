@@ -756,4 +756,44 @@ async fn a_started_server_provisions_deployments() {
     assert_eq!(st, StatusCode::OK, "{db}");
     assert_eq!(db["outputs"]["host"], "db.internal");
     assert_eq!(db["status"], "provisioned", "{db}");
+
+    // Removing the workload deletes it behind a permit; the database it used
+    // stays until it is scheduled for deletion.
+    let env_path = "/orgs/acme/apps/shop/envs/development";
+    let (st, removal) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"remove": ["web"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{removal}");
+    let generation = s.generation("development").await;
+    let body = json!({"delta_id": removal["id"], "expected_generation": generation});
+    let (st, b) = s.deploy(&s.admin, body.clone(), None).await;
+    assert_error(st, &b, StatusCode::CONFLICT, "DPL-001");
+    let permits = s
+        .permits_for(env_path, json!({"delta_id": removal["id"]}))
+        .await;
+    assert!(!permits.is_empty());
+    let mut body = body;
+    body["permits"] = json!(permits);
+    let (st, d) = s.deploy(&s.admin, body, None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let (_, left) = s.get(&format!("{env_path}/resources"), &s.admin).await;
+    let left: Vec<&str> = left["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["descriptor"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "base-env.default#base-env",
+            "postgres.default#modules.web.externals.db"
+        ]
+    );
 }

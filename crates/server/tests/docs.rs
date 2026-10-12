@@ -194,8 +194,10 @@ async fn run(file: &Path) {
         let (method, path) = first
             .split_once(' ')
             .unwrap_or_else(|| panic!("{at}: expected `METHOD /path`"));
-        // Deployments run in the background, so a read is repeated until it
+        // Deployments run in the background, so a read of an environment's
+        // state that returns the expected status is repeated until its body
         // shows what the example expects, or for a few seconds.
+        let polls = method == "GET" && path.contains("/envs/");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let mut req = client.request(method.parse().unwrap(), format!("{base}{path}"));
@@ -237,9 +239,8 @@ async fn run(file: &Path) {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| panic!("{at}: bad status line `{status_line}`"));
             let mut captured = vars.clone();
-            let outcome = if status != want {
-                Err(format!("returned {status}"))
-            } else if expected.is_empty() {
+            assert_eq!(status, want, "{at}: {first} returned {actual}");
+            let outcome = if expected.is_empty() {
                 if actual == Value::Null {
                     Ok(())
                 } else {
@@ -255,7 +256,7 @@ async fn run(file: &Path) {
                     vars = captured;
                     break;
                 }
-                Err(_) if method == "GET" && std::time::Instant::now() < deadline => {
+                Err(_) if polls && std::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(e) => panic!("{at}: {first}: {e}\nactual: {actual:#}"),
