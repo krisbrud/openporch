@@ -1666,6 +1666,46 @@ impl Store for SqliteStore {
         .bind(&self.org)
         .fetch_all(&mut *tx)
         .await?;
+        let now = now_ms();
+        // Removing the record of a deletion the driver already confirmed has a
+        // known outcome: the record stays, still marked for cleanup.
+        let cleanups: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT o.id, o.deployment_id, o.guresid FROM operations o \
+             JOIN active_resources r ON r.guresid = o.guresid \
+             WHERE o.org_id = ? AND o.state = 'started' AND o.kind = 'delete' \
+             AND COALESCE(json_extract(r.recovery, '$.cleanup_pending'), 0) = 1",
+        )
+        .bind(&self.org)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (op, deployment, guresid) in &cleanups {
+            let error = "interrupted by a restart; cleanup pending";
+            sqlx::query(
+                "UPDATE operations SET state = 'failed', error = ?, finished_at = ? WHERE id = ?",
+            )
+            .bind(error)
+            .bind(now)
+            .bind(op)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE active_resources SET status = 'deletion_failed', updated_at = ? \
+                 WHERE guresid = ?",
+            )
+            .bind(now)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE deployment_resources SET status = 'failed', error = ? \
+                 WHERE deployment_id = ? AND guresid = ?",
+            )
+            .bind(error)
+            .bind(deployment)
+            .bind(guresid)
+            .execute(&mut *tx)
+            .await?;
+        }
         let uncertain: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, deployment_id, guresid FROM operations WHERE org_id = ? AND state = 'started' \
              ORDER BY started_at",
@@ -1673,7 +1713,6 @@ impl Store for SqliteStore {
         .bind(&self.org)
         .fetch_all(&mut *tx)
         .await?;
-        let now = now_ms();
         for (op, deployment, guresid) in &uncertain {
             sqlx::query(
                 "UPDATE operations SET state = 'unknown', error = 'interrupted by a restart' \

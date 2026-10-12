@@ -1216,6 +1216,34 @@ async fn a_confirmed_deletion_is_finished_without_the_driver() {
     assert!(db.cleanup_pending);
     assert_eq!(db.status, "deletion_failed");
 
+    // A restart while the record is being removed keeps it marked for cleanup
+    // instead of leaving its outcome unknown.
+    let retry = f
+        .store
+        .begin_operation(OperationStart {
+            org: ORG.into(),
+            app: "shop".into(),
+            env: "development".into(),
+            deployment_id: deployment.id.clone(),
+            descriptor: d(DB),
+            definition_id: None,
+            definition_version: None,
+            driver_type: None,
+            kind: OperationKind::Delete,
+            input_fingerprint: "delete".into(),
+            recovery: json!({"cleanup_pending": true}),
+        })
+        .await
+        .unwrap();
+    let report = f.store.recover_interrupted().await.unwrap();
+    assert!(report.uncertain.is_empty(), "{report:?}");
+    assert!(report.failed_deployments.contains(&deployment.id));
+    let db = f.active(DB).await.unwrap();
+    assert!(db.cleanup_pending);
+    assert_eq!(db.status, "deletion_failed");
+    drop(retry);
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+
     // It was never scheduled, yet the deployment removes the record without
     // asking the driver or a permit again.
     let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
