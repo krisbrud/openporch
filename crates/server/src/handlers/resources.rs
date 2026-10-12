@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use openporch_core::ids::Descriptor;
 use openporch_store::{ActiveResource, EnvRecord, Store};
 use serde::Serialize;
@@ -14,6 +15,7 @@ use serde_json::Value;
 
 use super::catalog::definition_or_404;
 use super::envs::env_or_404;
+use crate::api::Ctx;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -184,6 +186,45 @@ pub async fn get(
     let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
     let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
     Ok(Json(usage.view(resource)))
+}
+
+/// `DELETE /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}`:
+/// schedules the resource for deletion. The next deployment that leaves it
+/// out deletes it, given a destructive-action permit; until then it stays.
+pub async fn schedule_deletion(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env, ty, res_id)): Path<(String, String, String, String, String)>,
+) -> ApiResult<(StatusCode, Json<ResourceView>)> {
+    let env = env_or_404(&state, &app, &env).await?;
+    let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
+    let org = state.org();
+    state
+        .store
+        .schedule_deletion(
+            org,
+            &env.app,
+            &env.id,
+            &resource.descriptor,
+            ctx.audit(
+                org,
+                "resource.schedule_deletion",
+                format!("{}/{}/{}", env.app, env.id, resource.descriptor),
+            ),
+        )
+        .await?;
+    let resource = state
+        .store
+        .active_resource(org, &env.app, &env.id, &resource.descriptor)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "resource `{ty}/{res_id}` not found in `{}/{}`",
+                env.app, env.id
+            ))
+        })?;
+    let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
+    Ok((StatusCode::ACCEPTED, Json(usage.view(resource))))
 }
 
 /// `GET /orgs/{org}/resources/defs/{def}/resources`: every environment's

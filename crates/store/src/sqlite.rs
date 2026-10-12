@@ -1530,6 +1530,66 @@ impl Store for SqliteStore {
         rows.into_iter().map(ResourceRow::into_resource).collect()
     }
 
+    async fn schedule_deletion(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let env_type: Option<String> =
+            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
+                .bind(org)
+                .bind(app)
+                .bind(env)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let env_type =
+            env_type.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
+        // The route checked the caller's roles; they may have changed since.
+        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
+        let ownership: Option<String> = sqlx::query_scalar(
+            "SELECT ownership FROM active_resources \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(descriptor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match ownership.as_deref() {
+            None => {
+                return Err(StoreError::NotFound(format!(
+                    "active resource `{descriptor}`"
+                )));
+            }
+            Some("external") => {
+                return Err(StoreError::Conflict(format!(
+                    "`{descriptor}` is external; openporch never deletes it"
+                )));
+            }
+            Some(_) => {}
+        }
+        sqlx::query(
+            "UPDATE active_resources SET scheduled_deletion = 1, updated_at = ? \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
+        )
+        .bind(now_ms())
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .bind(descriptor)
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn finish_deployment(
         &self,
         org: &str,

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,6 +36,18 @@ containers:
       DB_PASSWORD: "${resources.db.password}"
 resources:
   db: {type: postgres}
+  route: {type: route}
+"#;
+
+/// `web` without its database.
+const WEB_NO_DB: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web:
+    image: nginx
+resources:
   route: {type: route}
 "#;
 
@@ -108,6 +121,10 @@ struct Fake {
     most: AtomicUsize,
     secrets: Option<BuiltinSecretStore>,
     read: Mutex<Vec<String>>,
+    /// How deletions answer, by resource type.
+    deletions: Mutex<BTreeMap<String, Behavior>>,
+    /// Every deletion job, in the order they started.
+    deleted: Mutex<Vec<ProvisionJob>>,
 }
 
 /// The secret references in `r`.
@@ -217,6 +234,53 @@ impl Executor for Fake {
         }
         Ok(provisioned)
     }
+
+    async fn deprovision(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+        let behavior = self
+            .deletions
+            .lock()
+            .unwrap()
+            .get(job.descriptor.ty.as_str())
+            .cloned()
+            .unwrap_or(Behavior::Succeed);
+        self.deleted.lock().unwrap().push(job);
+        match behavior {
+            Behavior::Succeed => Ok(()),
+            Behavior::Meet(barrier) => {
+                barrier.wait().await;
+                Ok(())
+            }
+            Behavior::Retryable(retry_after) => Err(ExecFailure::Retryable {
+                error: "503 from the database API".into(),
+                retry_after,
+            }),
+            Behavior::Permanent => Err(ExecFailure::Permanent(
+                "409: the database has deletion protection".into(),
+            )),
+            Behavior::Hang => std::future::pending().await,
+            Behavior::Panic => panic!("the driver crashed"),
+        }
+    }
+}
+
+/// Allows every destructive action and records what it was asked.
+#[derive(Debug, Default)]
+struct AllowAll {
+    asked: Mutex<Vec<(String, DestructiveAction, Vec<String>)>>,
+}
+
+impl PermitCheck for AllowAll {
+    fn check<'a>(
+        &'a self,
+        req: PermitRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.asked.lock().unwrap().push((
+            req.descriptor.to_owned(),
+            req.action,
+            req.permits.to_vec(),
+        ));
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct Fixture {
@@ -280,12 +344,23 @@ impl Fixture {
     }
 
     async fn accept_with(&self, defs: Vec<ResourceDefinition>) -> Result<Deployment, StoreError> {
+        self.accept_set(Some(WEB), defs).await
+    }
+
+    /// Accepts a deployment of `workload`, or of no workload at all.
+    async fn accept_set(
+        &self,
+        workload: Option<&str>,
+        defs: Vec<ResourceDefinition>,
+    ) -> Result<Deployment, StoreError> {
         let mut set = DeploymentSet::default();
-        let c = Workload::parse(WEB, None)
-            .unwrap()
-            .to_module(&builtin_types())
-            .unwrap();
-        set.modules.insert(c.id, c.module);
+        if let Some(workload) = workload {
+            let c = Workload::parse(workload, None)
+                .unwrap()
+                .to_module(&builtin_types())
+                .unwrap();
+            set.modules.insert(c.id, c.module);
+        }
         let (org, app, env, env_type) = (
             ORG.parse().unwrap(),
             "shop".parse().unwrap(),
@@ -306,7 +381,7 @@ impl Fixture {
         let snapshot = json!({
             "version": 1,
             "mode": "full",
-            "permits": [],
+            "permits": ["permit-1"],
             "graph": graph,
             "definitions": defs
                 .iter()
@@ -741,4 +816,289 @@ async fn the_executor_learns_the_previous_target() {
     let dns: Vec<_> = jobs.iter().filter(|j| j.descriptor == d(DNS)).collect();
     assert_eq!(dns.len(), 2);
     assert_eq!(dns[1].target.as_deref(), Some("111122223333"));
+}
+
+fn deleting(f: &Fixture, fake: &Arc<Fake>, checks: &Arc<AllowAll>) -> Planner<SqliteStore, Fake> {
+    planner(f, fake, fast()).with_permit_check(checks.clone())
+}
+
+impl Fixture {
+    async fn schedule(&self, descriptor: &str) {
+        self.store
+            .schedule_deletion(
+                ORG,
+                "shop",
+                "development",
+                descriptor,
+                audit("DELETE", "/orgs/acme/apps/shop/envs/development/resources"),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn active(&self, descriptor: &str) -> Option<openporch_store::ActiveResource> {
+        self.store
+            .active_resource(ORG, "shop", "development", descriptor)
+            .await
+            .unwrap()
+    }
+
+    /// `(descriptor, guresid, reason)` of every tombstone.
+    async fn tombstones(&self) -> Vec<(String, String, String)> {
+        sqlx::query_as("SELECT descriptor, guresid, reason FROM tombstones ORDER BY descriptor")
+            .fetch_all(self.store.pool())
+            .await
+            .unwrap()
+    }
+}
+
+impl Fake {
+    /// The descriptors of deletion jobs, in the order they started.
+    fn deletions(&self) -> Vec<String> {
+        let jobs = self.deleted.lock().unwrap();
+        jobs.iter().map(|j| j.descriptor.to_string()).collect()
+    }
+}
+
+#[tokio::test]
+async fn a_scheduled_resource_is_deleted_by_the_next_deployment_without_it() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let db = f.active(DB).await.unwrap();
+    let provisioned = fake.job(DB);
+
+    // Left out but not scheduled: retained.
+    let retained = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(retained).await;
+    assert!(!outcomes.contains_key(&d(DB)));
+    assert!(f.active(DB).await.is_some());
+    assert!(fake.deletions().is_empty());
+
+    f.schedule(DB).await;
+    assert!(f.active(DB).await.unwrap().scheduled_deletion);
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(DB)], Outcome::Deleted);
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+    assert_eq!(f.resources(&deployment).await[DB], "deleted");
+
+    // The driver deleted it with the identity and inputs it was provisioned with.
+    let deleted = fake.deleted.lock().unwrap().clone();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].guresid.as_str(), db.guresid);
+    assert_eq!(deleted[0].inputs, provisioned.inputs);
+    assert_eq!(deleted[0].driver_type, "openporch/echo");
+    assert_eq!(
+        checks.asked.lock().unwrap().clone(),
+        vec![(
+            DB.to_owned(),
+            DestructiveAction::Delete,
+            vec!["permit-1".to_owned()]
+        )]
+    );
+    assert!(f.active(DB).await.is_none());
+    assert_eq!(
+        f.tombstones().await,
+        vec![(DB.to_owned(), db.guresid, "deleted".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_removed_workload_is_deleted_before_what_it_used() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    for descriptor in [DB, ROUTE, DNS] {
+        f.schedule(descriptor).await;
+    }
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    for descriptor in [WORKLOAD, DB, ROUTE, DNS] {
+        assert_eq!(outcomes[&d(descriptor)], Outcome::Deleted, "{descriptor}");
+        assert!(f.active(descriptor).await.is_none(), "{descriptor}");
+    }
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+    let order = fake.deletions();
+    let at = |descriptor: &str| order.iter().position(|d| d == descriptor).unwrap();
+    assert_eq!(order.len(), 4);
+    assert!(
+        at(WORKLOAD) < at(DB) && at(WORKLOAD) < at(ROUTE),
+        "{order:?}"
+    );
+    assert!(at(ROUTE) < at(DNS), "{order:?}");
+    assert!(f.active(BASE).await.is_some());
+}
+
+#[tokio::test]
+async fn a_removed_workload_keeps_its_unscheduled_dependencies() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // DNS is scheduled, but the retained route still uses it.
+    f.schedule(DNS).await;
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert_eq!(
+        outcomes[&d(DNS)],
+        Outcome::Pending(format!("still used by `{ROUTE}`"))
+    );
+    assert!(!outcomes.contains_key(&d(DB)));
+    assert!(!outcomes.contains_key(&d(ROUTE)));
+    assert_eq!(fake.deletions(), vec![WORKLOAD.to_owned()]);
+    for descriptor in [DB, ROUTE, DNS] {
+        assert!(f.active(descriptor).await.is_some(), "{descriptor}");
+    }
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_failed_deletion_blocks_what_it_uses_until_retried() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    fake.deletions
+        .lock()
+        .unwrap()
+        .insert("route".into(), Behavior::Retryable(None));
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let route = f.active(ROUTE).await.unwrap();
+    f.schedule(ROUTE).await;
+    f.schedule(DNS).await;
+
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert!(
+        matches!(&outcomes[&d(ROUTE)], Outcome::Failed(e) if e.contains("after 3 attempts")),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[&d(DNS)],
+        Outcome::Pending(format!("waiting for `{ROUTE}` to be deleted"))
+    );
+    let (status, error) = f.status(&deployment).await;
+    assert_eq!(status, DeploymentStatus::Failed);
+    assert!(error.unwrap().contains(ROUTE));
+    assert_eq!(f.active(ROUTE).await.unwrap().status, "deletion_failed");
+    assert!(f.active(DNS).await.is_some());
+    assert!(f.active(WORKLOAD).await.is_none());
+
+    // The retry deletes the same route and then DNS, and leaves the deleted
+    // workload alone.
+    fake.deletions.lock().unwrap().clear();
+    let retry = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(retry.clone()).await;
+    assert_eq!(outcomes[&d(ROUTE)], Outcome::Deleted);
+    assert_eq!(outcomes[&d(DNS)], Outcome::Deleted);
+    assert!(!outcomes.contains_key(&d(WORKLOAD)));
+    assert_eq!(f.status(&retry).await, (DeploymentStatus::Succeeded, None));
+    let deleted = fake.deleted.lock().unwrap().clone();
+    let routes: Vec<_> = deleted
+        .iter()
+        .filter(|j| j.descriptor == d(ROUTE))
+        .collect();
+    assert_eq!(routes.len(), 4);
+    assert!(routes.iter().all(|j| j.guresid.as_str() == route.guresid));
+    assert_eq!(
+        fake.deletions().iter().filter(|d| *d == WORKLOAD).count(),
+        1
+    );
+    assert_eq!(fake.deletions().last().map(String::as_str), Some(DNS));
+}
+
+#[tokio::test]
+async fn deletion_without_a_permit_needs_approval() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    f.schedule(DB).await;
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(
+        matches!(&outcomes[&d(DB)], Outcome::Failed(e) if e.starts_with("approval_required")),
+        "{outcomes:?}"
+    );
+    assert!(fake.deletions().is_empty());
+    assert!(f.active(DB).await.is_some());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn adopted_and_external_resources_are_not_deleted() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    sqlx::query("UPDATE active_resources SET ownership = 'external' WHERE descriptor = ?")
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let refused = f
+        .store
+        .schedule_deletion(ORG, "shop", "development", DB, audit("DELETE", "/"))
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::Conflict(_))),
+        "{refused:?}"
+    );
+    // Even when marked by other means, an external resource stays; an
+    // adopted one stays unless scheduled.
+    sqlx::query("UPDATE active_resources SET scheduled_deletion = 1 WHERE descriptor = ?")
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE active_resources SET ownership = 'adopted' WHERE descriptor IN (?, ?)")
+        .bind(ROUTE)
+        .bind(DNS)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    f.schedule(DNS).await;
+
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert!(!outcomes.contains_key(&d(DB)));
+    assert!(!outcomes.contains_key(&d(ROUTE)));
+    // The scheduled adopted DNS waits for the route that still uses it.
+    assert!(matches!(outcomes[&d(DNS)], Outcome::Pending(_)));
+    assert_eq!(fake.deletions(), vec![WORKLOAD.to_owned()]);
+    for descriptor in [DB, ROUTE, DNS] {
+        assert!(f.active(descriptor).await.is_some(), "{descriptor}");
+    }
+}
+
+#[tokio::test]
+async fn nothing_is_deleted_while_the_deployment_has_not_converged() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    f.schedule(DB).await;
+    fake.behavior
+        .lock()
+        .unwrap()
+        .insert("dns".into(), Behavior::Permanent);
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    assert!(
+        matches!(outcomes[&d(DB)], Outcome::Pending(_)),
+        "{outcomes:?}"
+    );
+    assert!(fake.deletions().is_empty());
+    assert!(checks.asked.lock().unwrap().is_empty());
+    assert!(f.active(DB).await.is_some());
 }

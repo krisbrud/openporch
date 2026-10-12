@@ -35,8 +35,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+mod deprovision;
 #[cfg(test)]
 mod tests;
+
+pub use deprovision::{DestructiveAction, NoPermits, PermitCheck, PermitRequest};
 
 /// A deployment as the planner runs it: the accepted configuration, never the
 /// current one.
@@ -60,6 +63,8 @@ pub struct Deployment {
     pub definitions: BTreeMap<DefinitionId, (i64, ResourceDefinition)>,
     /// Shared values, environment overrides applied.
     pub values: BTreeMap<String, SharedValue>,
+    /// The destructive-action permits the deployment was submitted with.
+    pub permits: Vec<String>,
 }
 
 impl Deployment {
@@ -94,6 +99,12 @@ impl Deployment {
             graph,
             definitions,
             values: BTreeMap::new(),
+            permits: snapshot["permits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .collect(),
         })
     }
 }
@@ -135,7 +146,7 @@ pub struct ProvisionJob {
 }
 
 /// A resource's resolved inputs.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct JobInputs {
     /// Non-secret driver inputs.
     pub values: Value,
@@ -186,6 +197,13 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         job: ProvisionJob,
     ) -> impl Future<Output = Result<ProvisionResult, ExecFailure>> + Send;
+
+    /// Deletes one resource with the driver and state it was provisioned with.
+    /// `Ok` means the deletion is confirmed.
+    fn deprovision(
+        &self,
+        job: ProvisionJob,
+    ) -> impl Future<Output = Result<(), ExecFailure>> + Send;
 }
 
 /// Planner limits.
@@ -226,6 +244,8 @@ pub enum Outcome {
     Unknown(String),
     /// Never started.
     Pending(String),
+    /// Deleted, because the deployment no longer includes it.
+    Deleted,
 }
 
 /// The planner, shared by all deployments of a server.
@@ -234,6 +254,7 @@ pub struct Planner<S, E> {
     executor: Arc<E>,
     limits: Limits,
     permits: Arc<Semaphore>,
+    checks: Arc<dyn PermitCheck>,
 }
 
 impl<S, E> std::fmt::Debug for Planner<S, E> {
@@ -259,7 +280,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             executor,
             limits,
             permits,
+            checks: Arc::new(NoPermits),
         }
+    }
+
+    /// Checks destructive actions against `checks` instead of refusing them.
+    pub fn with_permit_check(mut self, checks: Arc<dyn PermitCheck>) -> Self {
+        self.checks = checks;
+        self
     }
 
     /// Runs `deployment` to the end and finishes its record: succeeded when
@@ -354,11 +382,17 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             };
             outcomes.insert(node.descriptor.clone(), Outcome::Pending(reason));
         }
+        // Resources the deployment leaves out are deleted only once everything
+        // it includes provisioned.
+        let converged = outcomes.values().all(|o| *o == Outcome::Provisioned);
+        self.deprovision(&deployment, deadline, converged, &mut outcomes)
+            .await;
+
         // Every resource gets a record, also those that ended before an
         // operation was recorded; the store keeps any status an operation set.
         for (d, outcome) in &outcomes {
             let (status, reason) = match outcome {
-                Outcome::Provisioned => continue,
+                Outcome::Provisioned | Outcome::Deleted => continue,
                 Outcome::Pending(r) => (ResourceRunStatus::Pending, r),
                 Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
                 Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
@@ -405,7 +439,7 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
     let mut pending = 0;
     for (d, o) in outcomes {
         match o {
-            Outcome::Provisioned => {}
+            Outcome::Provisioned | Outcome::Deleted => {}
             Outcome::Failed(e) => failed.push(format!("`{d}` failed: {e}")),
             Outcome::Unknown(e) => unknown.push(format!(
                 "`{d}` has an unknown outcome and needs recovery: {e}"

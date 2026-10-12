@@ -314,6 +314,18 @@ pub trait Store: Send + Sync {
         definition: &str,
     ) -> impl Future<Output = Result<Vec<ActiveResource>>> + Send;
 
+    /// Schedules an active resource for deletion by the next deployment that
+    /// leaves it out. Scheduling twice is harmless; external resources are
+    /// never deleted and cannot be scheduled.
+    fn schedule_deletion(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Finishes a deployment and records its correlated audit outcome. Success also
     /// sets the environment's last successful deployment and set.
     fn finish_deployment(

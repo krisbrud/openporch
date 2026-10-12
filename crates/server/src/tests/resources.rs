@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use openporch_core::model::SecretRef;
 use openporch_engine::planner::{
-    ExecFailure, Executor, Limits, Planner, ProvisionJob, ProvisionResult,
+    ExecFailure, Executor, Limits, PermitCheck, PermitRequest, Planner, ProvisionJob,
+    ProvisionResult,
 };
 use serde_json::{Value, json};
 
@@ -17,6 +18,8 @@ struct Fake {
     failing: Mutex<BTreeSet<String>>,
     /// The GUResID each job was handed, by descriptor.
     guresids: Mutex<Vec<(String, String)>>,
+    /// The descriptors deleted, in order.
+    deleted: Mutex<Vec<String>>,
 }
 
 impl Executor for Fake {
@@ -44,6 +47,34 @@ impl Executor for Fake {
             );
         }
         Ok(result)
+    }
+
+    async fn deprovision(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+        self.deleted
+            .lock()
+            .unwrap()
+            .push(job.descriptor.to_string());
+        Ok(())
+    }
+}
+
+/// Accepts the permit `permit-1` for any destructive action.
+#[derive(Debug)]
+struct OnePermit;
+
+impl PermitCheck for OnePermit {
+    fn check<'a>(
+        &'a self,
+        req: PermitRequest<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        let ok = req.permits.iter().any(|p| p == "permit-1");
+        Box::pin(async move {
+            if ok {
+                Ok(())
+            } else {
+                Err("no matching permit".into())
+            }
+        })
     }
 }
 
@@ -75,7 +106,8 @@ impl Server {
             max_backoff: std::time::Duration::from_millis(1),
             ..Limits::default()
         };
-        let planner = Planner::new(Arc::new(self.state.store.clone()), fake, limits);
+        let planner = Planner::new(Arc::new(self.state.store.clone()), fake, limits)
+            .with_permit_check(Arc::new(OnePermit));
         self.state
             .runners
             .set(Arc::new(PlannerRunner::new(Arc::new(planner))));
@@ -84,6 +116,11 @@ impl Server {
     /// Deploys `web` with image `image` and, when `db`, its database, and
     /// waits for the outcome.
     async fn deploy_web(&self, image: &str, db: bool) -> Value {
+        self.deploy_web_with(image, db, &[]).await
+    }
+
+    /// [`Self::deploy_web`] with destructive-action permits.
+    async fn deploy_web_with(&self, image: &str, db: bool, permits: &[&str]) -> Value {
         let externals = if db {
             json!({"db": {"type": "postgres"}})
         } else {
@@ -112,7 +149,8 @@ impl Server {
             .post(
                 DEPLOYS,
                 &self.admin,
-                json!({"delta_id": delta["id"], "expected_generation": env["generation"]}),
+                json!({"delta_id": delta["id"], "expected_generation": env["generation"],
+                    "permits": permits}),
             )
             .await;
         assert_eq!(s, StatusCode::ACCEPTED, "{d}");
@@ -388,4 +426,70 @@ async fn an_account_holding_resources_is_not_deleted() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{b}");
     assert!(b["message"].as_str().unwrap().contains(DB), "{b}");
+}
+
+#[tokio::test]
+async fn scheduled_deletion() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    s.deploy_web("nginx:1", true).await;
+    let path = format!("{RESOURCES}/postgres/modules.web.externals.db");
+
+    // Viewers may not schedule it, and members without a role do not see it.
+    let viewer = s.member("vic", "member").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/users",
+            &s.admin,
+            json!({"id": "vic", "role": "viewer"}),
+        )
+        .await;
+    assert!(status.is_success(), "{b}");
+    let (status, b) = s.delete(&path, &viewer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{b}");
+    let stranger = s.member("sam", "member").await;
+    let (status, b) = s.delete(&path, &stranger).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    let (status, b) = s
+        .delete(
+            &format!("{RESOURCES}/postgres/modules.web.externals.nope"),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+
+    let (status, db) = s.delete(&path, &s.admin).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{db}");
+    assert_eq!(db["scheduled_deletion"], true);
+    assert_eq!(db["status"], "provisioned");
+
+    // A deployment that still includes it keeps it.
+    let d = s.deploy_web("nginx:2", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(s.resource(DB).await["scheduled_deletion"], true);
+
+    // Leaving it out without a permit fails, and the database stays.
+    let d = s.deploy_web("nginx:3", false).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    assert!(
+        d["error"].as_str().unwrap().contains("approval_required"),
+        "{d}"
+    );
+    assert_eq!(s.resource(DB).await["status"], "provisioned");
+    assert!(fake.deleted.lock().unwrap().is_empty());
+
+    // With a permit, the driver deletes it and the record disappears.
+    let d = s.deploy_web_with("nginx:4", false, &["permit-1"]).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(*fake.deleted.lock().unwrap(), vec![DB.to_owned()]);
+    let (status, b) = s.get(&path, &s.admin).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    let (status, b) = s.delete(&path, &s.admin).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    let (_, audit) = s.get("/orgs/acme/audit-logs?method=DELETE", &s.admin).await;
+    assert!(
+        audit.to_string().contains("resource.schedule_deletion"),
+        "{audit}"
+    );
 }
