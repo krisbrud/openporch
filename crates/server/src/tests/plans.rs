@@ -378,3 +378,45 @@ async fn a_refused_deletion_in_a_driver_plan_gets_a_delete_permit() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_state_backend_move_is_refused_before_acceptance() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    // The database is an OpenTofu module, provisioned with local state.
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "pg-tofu", "type": "postgres", "driver_type": "openporch/opentofu",
+                   "driver_inputs": {"values": {"script": "output \"host\" { value = \"db\" }"}},
+                   "criteria": [{"app_id": "shop"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    s.deploy_web("nginx:1", true).await;
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    assert_eq!(entry(&plan, DB)["action"], "update", "{plan}");
+
+    // The server is reconfigured with S3 state.
+    let mut tofu = openporch_drivers::OpenTofuConfig::new(s.dir.path().join("opentofu"));
+    let s3 = openporch_drivers::OpenTofuS3State::new("state", "eu-north-1");
+    tofu.state = openporch_drivers::OpenTofuStateBackend::S3(Box::new(s3));
+    let backend = tofu.state.location();
+    let registry = openporch_drivers::DriverRegistry::with_builtins().with_opentofu(tofu);
+    s.state.drivers.set(Arc::new(registry), Some(backend));
+
+    let (status, b) = s.plan(s.redeploy_body().await).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-002");
+    assert!(
+        b["message"].as_str().unwrap().contains(
+            "keeps its state in local state, but its driver now uses s3://state/openporch"
+        ),
+        "{b}"
+    );
+    let mut body = s.redeploy_body().await;
+    body["expected_generation"] = s.dev_generation().await;
+    let (status, b) = s.post(&format!("{ENV_DEV}/deploys"), &s.admin, body).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-002");
+}

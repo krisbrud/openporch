@@ -4,11 +4,15 @@ use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use openporch_store::secrets::{Keyring, MasterKey, Sealed, SecretError};
+use openporch_drivers::DriverRegistry;
+use openporch_engine::executor::LocalExecutor;
+use openporch_engine::planner::{Limits, PermitCheck, Planner};
+use openporch_store::secrets::{BuiltinSecretStore, Keyring, MasterKey, Sealed, SecretError};
 use openporch_store::{AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError};
 
 use crate::auth::{self, SessionSigner};
 use crate::config::Config;
+use crate::deploy::{PlannerRunner, StorePermits};
 use crate::rate_limit::RateLimiter;
 use openporch_engine::cloud::{AwsSts, CredentialResolver, Sts};
 
@@ -34,7 +38,7 @@ pub struct Inner {
     /// The GitHub identity provider, when configured.
     pub github: Option<Arc<dyn IdentityProvider>>,
     /// Resolves cloud accounts into credentials.
-    pub cloud: CredentialResolver,
+    pub cloud: Arc<CredentialResolver>,
     /// Login requests per client address.
     pub login_limit: RateLimiter,
     /// Token creation per principal.
@@ -205,14 +209,47 @@ pub async fn start_with(
         signer,
         not_ready,
         github,
-        cloud: CredentialResolver::new(sts),
+        cloud: Arc::new(CredentialResolver::new(sts)),
         login_limit,
         token_limit,
         runners: crate::deploy::Runners::default(),
         drivers: crate::deploy::Drivers::default(),
     }));
     prune_sessions(&state);
+    if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {
+        run_deployments(&state, keyring);
+    }
     Ok(state)
+}
+
+/// Runs accepted deployments with the built-in drivers and the OpenTofu
+/// driver, in this process. Without the master keys nothing is accepted, so
+/// nothing runs.
+fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
+    let tofu = state.config.opentofu();
+    let backend = tofu.state.location();
+    let registry = Arc::new(DriverRegistry::with_builtins().with_opentofu(tofu));
+    state.drivers.set(registry.clone(), Some(backend));
+    let store = state.store.clone();
+    let checks: Arc<dyn PermitCheck> = Arc::new(StorePermits(store.clone()));
+    let secrets = Arc::new(BuiltinSecretStore::new(
+        &store,
+        keyring.clone(),
+        state.org(),
+    ));
+    let executor = LocalExecutor::new(
+        Arc::new(store.clone()),
+        registry,
+        secrets,
+        keyring,
+        state.cloud.clone(),
+        checks.clone(),
+    );
+    let planner = Planner::new(Arc::new(store), Arc::new(executor), Limits::default())
+        .with_permit_check(checks);
+    state
+        .runners
+        .set(Arc::new(PlannerRunner::new(Arc::new(planner))));
 }
 
 /// Drops expired cloud role sessions every minute while the state is in use.

@@ -111,8 +111,15 @@ impl std::fmt::Display for BackendId {
         match self {
             Self::Local => f.write_str("local state"),
             Self::S3 {
-                bucket, key_prefix, ..
+                bucket,
+                key_prefix,
+                endpoint: None,
             } => write!(f, "s3://{bucket}/{key_prefix}"),
+            Self::S3 {
+                bucket,
+                key_prefix,
+                endpoint: Some(endpoint),
+            } => write!(f, "s3://{bucket}/{key_prefix} at {endpoint}"),
         }
     }
 }

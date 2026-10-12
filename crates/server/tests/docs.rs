@@ -194,52 +194,71 @@ async fn run(file: &Path) {
         let (method, path) = first
             .split_once(' ')
             .unwrap_or_else(|| panic!("{at}: expected `METHOD /path`"));
-        let mut req = client.request(method.parse().unwrap(), format!("{base}{path}"));
-        for h in headers {
-            let (k, v) = h
-                .split_once(':')
-                .unwrap_or_else(|| panic!("{at}: bad header `{h}`"));
-            req = req.header(k.trim(), v.trim());
-        }
-        if !body.is_empty() {
-            let json: Value = serde_json::from_str(body)
-                .unwrap_or_else(|e| panic!("{at}: request body is not JSON: {e}"));
-            req = req.json(&json);
-        }
-        let res = req.send().await.unwrap();
-        let status = res.status().as_u16();
-        let bytes = res.bytes().await.unwrap();
-        let actual: Value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-        };
-        if print {
-            println!("{at}: {first}\n{status}\n{actual:#}\n");
-        }
-        let Some(response) = ex.response else {
-            // While drafting, print mode runs examples that have no response yet.
-            assert!(
-                print,
-                "{at}: no `http-response` block; got {status} {actual}"
-            );
-            continue;
-        };
-        let (status_line, _, expected) = parts(&response);
-        let want: u16 = status_line
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| panic!("{at}: bad status line `{status_line}`"));
-        assert_eq!(status, want, "{at}: {first} returned {actual}");
-        if expected.is_empty() {
-            assert_eq!(actual, Value::Null, "{at}: {first} returned a body");
-        } else {
-            let pattern: Value = serde_json::from_str(expected)
-                .unwrap_or_else(|e| panic!("{at}: response body is not JSON: {e}"));
-            if let Err(e) = matches(&pattern, &actual, &mut vars, "body") {
-                panic!("{at}: {first}: {e}\nactual: {actual:#}");
+        // Deployments run in the background, so a read is repeated until it
+        // shows what the example expects, or for a few seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut req = client.request(method.parse().unwrap(), format!("{base}{path}"));
+            for h in &headers {
+                let (k, v) = h
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("{at}: bad header `{h}`"));
+                req = req.header(k.trim(), v.trim());
+            }
+            if !body.is_empty() {
+                let json: Value = serde_json::from_str(body)
+                    .unwrap_or_else(|e| panic!("{at}: request body is not JSON: {e}"));
+                req = req.json(&json);
+            }
+            let res = req.send().await.unwrap();
+            let status = res.status().as_u16();
+            let bytes = res.bytes().await.unwrap();
+            let actual: Value = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+            };
+            if print {
+                println!("{at}: {first}\n{status}\n{actual:#}\n");
+            }
+            let Some(response) = &ex.response else {
+                // While drafting, print mode runs examples that have no response yet.
+                assert!(
+                    print,
+                    "{at}: no `http-response` block; got {status} {actual}"
+                );
+                break;
+            };
+            let (status_line, _, expected) = parts(response);
+            let want: u16 = status_line
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("{at}: bad status line `{status_line}`"));
+            let mut captured = vars.clone();
+            let outcome = if status != want {
+                Err(format!("returned {status}"))
+            } else if expected.is_empty() {
+                if actual == Value::Null {
+                    Ok(())
+                } else {
+                    Err("returned a body".to_owned())
+                }
+            } else {
+                let pattern: Value = serde_json::from_str(expected)
+                    .unwrap_or_else(|e| panic!("{at}: response body is not JSON: {e}"));
+                matches(&pattern, &actual, &mut captured, "body")
+            };
+            match outcome {
+                Ok(()) => {
+                    vars = captured;
+                    break;
+                }
+                Err(_) if method == "GET" && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("{at}: {first}: {e}\nactual: {actual:#}"),
             }
         }
     }

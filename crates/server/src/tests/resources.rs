@@ -46,6 +46,9 @@ impl Executor for Fake {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
         }
         let mut result = ProvisionResult::default();
+        if job.driver_type == "openporch/opentofu" {
+            result.backend = Some("local state".into());
+        }
         if ty == "postgres" {
             result.outputs.insert("host".into(), json!("db.internal"));
             result.outputs.insert("port".into(), json!(5432));

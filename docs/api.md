@@ -23,9 +23,9 @@ group. The examples run in order against a fresh dev server in
   one that does not exist. An object you can see but not change returns `403`.
 - **Secrets.** Secret values are accepted on write and never returned. Responses
   show secret references `{store, ref, version}` instead.
-- **Work in progress.** This page covers the configuration API. Deployments,
-  driver execution and external secret store adapters are not implemented yet;
-  where a route registers something the server cannot use yet, its section says so.
+- **Work in progress.** External secret store adapters are not implemented
+  yet; where a route registers something the server cannot use yet, its
+  section says so.
 
 ### Errors
 
@@ -590,8 +590,7 @@ the failed resource has its error in `GET .../resources/graph`, the deletion's
 error names it, and nothing can be deployed there. Fixing the cause, scheduling
 an adopted resource for deletion or detaching a resource, and sending the
 request again with the new generation retries the deletion with the same
-resource identities. Deployments do not run yet, so until they do every
-deletion of a deployed environment fails and leaves it `deletion_failed`.
+resource identities.
 
 ```http
 POST /orgs/acme/apps/shop/envs
@@ -1506,9 +1505,6 @@ later edits do not affect it. The deployment is returned at once with status
 `in_progress`. It then becomes `succeeded` or `failed`, and only success changes
 the environment's last successful deployment and set.
 
-The server does not provision resources yet, so for now every deployment fails
-once accepted.
-
 ```http
 POST /orgs/acme/apps
 Authorization: Bearer $ADMIN_TOKEN
@@ -1692,7 +1688,7 @@ follow it. If some lines could not be stored, the deployment fails and its error
 says how many.
 
 ```http
-GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs?limit=1
+GET /orgs/acme/apps/blog/envs/development/deploys/+0/logs
 Authorization: Bearer $ADMIN_TOKEN
 ```
 
@@ -1701,7 +1697,8 @@ Authorization: Bearer $ADMIN_TOKEN
 
 {
   "lines": [
-    {"seq": "…", "operation_id": null, "descriptor": null, "guresid": null, "at": "…", "level": "…", "message": "…"}
+    {"seq": 1, "operation_id": null, "descriptor": null, "guresid": null, "at": "…", "level": "info", "message": "…"},
+    "…"
   ],
   "next": "…",
   "finished": true
@@ -1768,8 +1765,8 @@ Authorization: Bearer $ADMIN_TOKEN
   "expires_at": "…",
   "complete": false,
   "resources": [
-    {"descriptor": "…", "definition": "…", "action": "create", "known": true,
-     "reason": "not provisioned yet", "permit_required": false, "digest": "…"},
+    {"descriptor": "…", "definition": "…", "action": "update", "known": "…",
+     "reason": "…", "permit_required": false, "digest": "…"},
     "…"
   ]
 }
@@ -1903,8 +1900,8 @@ object elsewhere, plus the reason, which the audit log records too. The driver's
 encrypted cookie and its secret-output references are kept with the tombstone
 but never returned. Everything in `body` is non-secret, so anyone who can read
 the application can list tombstones. Object IDs and
-the state backend are reported by the executor, which is not implemented yet,
-so until then they are empty. A deployment that still includes a detached resource fails for it rather
+the state backend are those the driver reported when it last provisioned the
+resource; drivers that report none leave them empty. A deployment that still includes a detached resource fails for it rather
 than creating a second object; bringing it back under management is an explicit
 adoption, which is not implemented yet. The permit comes from a `detach`
 [preview](#previews-and-permits) and is used with the detach, so a refused
@@ -1935,7 +1932,14 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 200 OK
 
-{"resources": []}
+{
+  "resources": [
+    {"descriptor": "base-env.default#base-env", "guresid": "…", "driver_type": "openporch/none",
+     "status": "…", "usage": {"deploys_ago": "…", "referenced": true}},
+    {"descriptor": "workload.default#modules.web", "guresid": "…", "driver_type": "…",
+     "status": "…", "usage": {"deploys_ago": "…", "referenced": true}}
+  ]
+}
 ```
 
 ```http

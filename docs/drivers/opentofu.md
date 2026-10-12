@@ -261,12 +261,34 @@ that openporch manages:
   module code can read them during a run, so give them access to the state bucket
   and nothing else.
 
-Configuring the backend in the server's settings arrives with the deployment
-executor. The driver's own `StateBackend` configuration is already in place.
+The server's configuration file picks the backend, along with the binaries and
+the driver's root, which defaults to `<data_dir>/opentofu`:
 
-Each resource remembers the backend its state is in. If the server is later
-configured with a different backend, the driver refuses that resource with
-`TOFU-004` instead of starting from empty state. Move the state first.
+```toml
+[opentofu]
+tofu = "/usr/local/bin/tofu"           # default: `tofu` on the PATH
+git = "git"
+# root = "/var/lib/openporch/opentofu"
+# ssh_known_hosts = "/etc/openporch/known_hosts"
+
+[opentofu.state]
+backend = "s3"                         # or "local", the default
+bucket = "acme-openporch-state"
+region = "eu-north-1"
+key_prefix = "openporch"               # the default
+# lock_table = "openporch-locks"       # without it, S3 lock files
+# endpoint = "http://localhost:4566"   # an S3-compatible endpoint; plain http only on loopback
+# role_arn = "arn:aws:iam::123456789012:role/openporch-state"
+```
+
+The S3 backend authenticates with the server's `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
+
+Each resource remembers the backend its state is in: the bucket, prefix and
+endpoint. If the server is later configured with a different backend, previews
+and deployments that touch that resource are refused with `409` `DPL-002`, and
+the driver itself refuses it with `TOFU-004`, instead of starting from empty
+state. Move the state first.
 
 The same applies when state disappears. A resource whose cookie shows it was
 applied, but whose state is missing, is reported as needing recovery instead of
@@ -352,6 +374,4 @@ registries and module sources such as `app.terraform.io` work as usual.
 
 ## Not yet
 
-- The deployment executor, which calls the driver, passes it permits and
-  configures its state backend from the server's settings.
 - The `backend` input.

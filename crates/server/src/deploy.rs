@@ -1,9 +1,10 @@
 //! Running accepted deployments in the background.
 //!
 //! Acceptance returns at once; a [`Runner`] then converges the environment and
-//! finishes the deployment. Provisioning resources arrives with the planner, so
-//! until then the default runner fails every deployment it is handed, which keeps
-//! the environment free for the next one.
+//! finishes the deployment. A server that starts with its master keys runs
+//! deployments through the planner and the local executor; until then the
+//! default runner fails every deployment it is handed, which keeps the
+//! environment free for the next one.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -40,7 +41,7 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
     fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
-/// The runner until the planner exists: nothing is provisioned, so every
+/// The runner without an executor: nothing is provisioned, so every
 /// deployment fails with an explanation.
 #[derive(Debug)]
 pub struct Unimplemented;
