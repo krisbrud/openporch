@@ -277,7 +277,7 @@ impl JobLog {
     pub fn redacting(&self) -> RedactingLog {
         RedactingLog {
             log: self.clone(),
-            redactor: Redactor::default(),
+            redactor: Arc::default(),
         }
     }
 
@@ -339,18 +339,25 @@ impl std::fmt::Debug for JobLog {
 /// `[REDACTED]` first.
 pub struct RedactingLog {
     log: JobLog,
-    redactor: Redactor,
+    /// Shared with the driver's run-log sink, so values registered while a
+    /// driver runs are redacted there too.
+    redactor: Arc<Mutex<Redactor>>,
 }
 
 impl RedactingLog {
+    fn redactor(&self) -> std::sync::MutexGuard<'_, Redactor> {
+        // A panic while holding the lock leaves only a set of values.
+        self.redactor.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Registers secret values to redact from now on.
     pub fn secret(&mut self, values: impl IntoIterator<Item = impl AsRef<str>>) {
-        self.redactor.add(values);
+        self.redactor().add(values);
     }
 
     /// `text` with every registered value replaced.
     pub fn redact(&self, text: &str) -> String {
-        self.redactor.redact(text)
+        self.redactor().redact(text)
     }
 
     /// `failure` with every registered value replaced, for returning to the
@@ -364,6 +371,16 @@ impl RedactingLog {
                 retry_after,
             },
         }
+    }
+
+    /// A sink for a driver's run log, redacting the registered values.
+    pub fn sink(&self) -> openporch_drivers::LogSink {
+        let log = RedactingLog {
+            log: self.log.clone(),
+            redactor: self.redactor.clone(),
+        };
+        // Values registered later are redacted from it too.
+        openporch_drivers::LogSink::new(move |line| log.info(line))
     }
 
     /// Writes an informational line.
