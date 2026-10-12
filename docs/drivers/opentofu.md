@@ -363,7 +363,9 @@ logged, since it holds every value.
 
 ## Git sources
 
-Modules are fetched with a shallow fetch of exactly `source.rev`. `https`
+Modules are fetched with a shallow fetch of exactly `source.rev`. A deployment replayed from its snapshot fetches `source.rev` again, so a
+branch can resolve to a newer commit than the one first applied; name a commit
+or tag for replays that apply the same code. `https`
 repositories authenticate with `source.username` and `source.password`, which
 travel in the environment, not the URL. `ssh` repositories authenticate with
 `source.ssh_key`. Host keys are checked against the known hosts configured for

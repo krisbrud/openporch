@@ -300,3 +300,193 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     assert_eq!(variables(&staging)["API_HOST"], "api.staging");
     assert_eq!(variables(&staging)["DB_PORT"], 6432);
 }
+
+/// Writes a new version of the built-in secret `name`.
+async fn write_secret(s: &Server, name: &str, value: &str) {
+    use openporch_store::secrets::{BuiltinSecretStore, SecretStore, SecretValue};
+    let keyring = s.state.keyring.clone().unwrap();
+    BuiltinSecretStore::new(&s.state.store, keyring, "acme")
+        .write(name, &SecretValue::new(value))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_deployment_pins_its_versions_and_replay_refuses_missing_inputs() {
+    let s = server().await;
+    s.app("shop").await;
+    write_secret(&s, "shop/pg-password", "first").await;
+    s.grant_secret("openporch", "shop/pg-password").await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "pg",
+            "postgres",
+            "openporch/echo",
+            json!({"values": {"host": "db.internal"},
+                   "secret_refs": {"password": {"store": "openporch", "ref": "shop/pg-password"}}}),
+        ),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
+                       "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, b) = s
+        .post(
+            &format!("{APP}/values"),
+            &s.admin,
+            json!({"key": "API_HOST", "description": "", "value": "api.v1"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let (st, delta) = s
+        .post(
+            &format!("{APP}/deltas"),
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}},
+                         "env": {"API_HOST": "${values.API_HOST}"}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let first = s
+        .deploy_to("development", json!({"delta_id": delta["id"]}))
+        .await;
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let read = |id: String| {
+        let s = &s;
+        async move {
+            let (st, d) = s
+                .get(&format!("{APP}/envs/development/deploys/{id}"), &s.admin)
+                .await;
+            assert_eq!(st, StatusCode::OK, "{d}");
+            d
+        }
+    };
+    let snapshot = |id: String| {
+        let s = &s;
+        async move {
+            s.state
+                .store
+                .deployment_snapshot("acme", "shop", "development", &id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let password = |snapshot: &Value| {
+        snapshot["definitions"]["pg"]["definition"]["driver_inputs"]["secret_refs"]["password"]
+            ["version"]
+            .clone()
+    };
+    // The deployment names the value set version it resolved, and its
+    // snapshot pins the secret version the definition left open.
+    assert_eq!(
+        read(first_id.clone()).await["value_versions"],
+        json!({"app": "1", "env": null})
+    );
+    assert_eq!(password(&snapshot(first_id.clone()).await), "1");
+
+    // A value changes and the secret rotates.
+    let (st, b) = s
+        .put(
+            &format!("{APP}/values/API_HOST"),
+            &s.admin,
+            json!({"description": "", "value": "api.v2"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    write_secret(&s, "shop/pg-password", "second").await;
+    assert_eq!(
+        read(first_id.clone()).await["value_versions"]["app"],
+        "1",
+        "the record still names the earlier version"
+    );
+
+    // Snapshot replay uses the recorded versions; `current` the new ones.
+    let replayed = s
+        .deploy_to(
+            "development",
+            json!({"deploy_id": first_id, "replay": "snapshot"}),
+        )
+        .await;
+    let replayed_id = replayed["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        read(replayed_id.clone()).await["value_versions"]["app"],
+        "1"
+    );
+    assert_eq!(password(&snapshot(replayed_id).await), "1");
+    let web = "workload.default#modules.web";
+    assert_eq!(
+        s.active("development").await[web]["outputs"]["spec"]["env"]["API_HOST"],
+        "api.v1"
+    );
+    let current = s
+        .deploy_to(
+            "development",
+            json!({"deploy_id": first_id, "replay": "current"}),
+        )
+        .await;
+    let current_id = current["id"].as_str().unwrap().to_owned();
+    assert_eq!(read(current_id.clone()).await["value_versions"]["app"], "2");
+    assert_eq!(password(&snapshot(current_id.clone()).await), "2");
+    assert_eq!(
+        s.active("development").await[web]["outputs"]["spec"]["env"]["API_HOST"],
+        "api.v2"
+    );
+
+    // A secret version the snapshot pinned is gone: replay fails before
+    // anything runs, naming it.
+    sqlx::query("DELETE FROM secret_versions WHERE ref = 'shop/pg-password' AND version = 1")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let path = format!("{APP}/envs/development");
+    let generation = s.get(&path, &s.admin).await.1["generation"].clone();
+    let (st, b) = s
+        .post(
+            &format!("{path}/deploys"),
+            &s.admin,
+            json!({"deploy_id": first_id, "replay": "snapshot",
+                   "expected_generation": generation}),
+        )
+        .await;
+    super::assert_error(st, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("secret `openporch/shop/pg-password` version 1, which no longer exists"),
+        "{b}"
+    );
+    // So is a driver this server no longer runs.
+    let mut registry = openporch_drivers::DriverRegistry::default();
+    registry
+        .register(std::sync::Arc::new(openporch_drivers::NoneDriver::new()) as _)
+        .ok();
+    s.state.drivers.set(std::sync::Arc::new(registry), None);
+    let (st, b) = s
+        .post(
+            &format!("{path}/deploys"),
+            &s.admin,
+            json!({"deploy_id": current_id, "replay": "snapshot",
+                   "expected_generation": generation}),
+        )
+        .await;
+    super::assert_error(st, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains(
+            "driver `openporch/echo` at protocol builtin, which this server no longer runs"
+        ),
+        "{b}"
+    );
+    let (_, env) = s.get(&path, &s.admin).await;
+    assert_eq!(env["generation"], generation, "nothing was accepted");
+}
