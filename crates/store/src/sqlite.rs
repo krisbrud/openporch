@@ -2043,8 +2043,18 @@ impl Store for SqliteStore {
             .await?;
         }
         for (app, env, id) in &running {
-            let line = "deployment failed: interrupted by a server restart";
-            log_in_tx(&mut tx, &self.org, id, None, "error", line).await?;
+            let open = uncertain.iter().filter(|(_, d, _)| d == id).count();
+            let line = if open == 0 {
+                "deployment failed: interrupted by a server restart; no operation was in \
+                 flight, so deploy again to continue"
+                    .to_owned()
+            } else {
+                format!(
+                    "deployment failed: interrupted by a server restart; {open} resource(s) may \
+                     have changed and need recovery before the environment is deployed again"
+                )
+            };
+            log_in_tx(&mut tx, &self.org, id, None, "error", &line).await?;
             finish_in_tx(
                 &mut tx,
                 &self.org,

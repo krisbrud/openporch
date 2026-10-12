@@ -287,6 +287,10 @@ pub enum Outcome {
     Kept(String),
 }
 
+/// How a failure starts when the driver confirmed a deletion but its record
+/// could not be removed.
+const CLEANUP_PENDING: &str = "cleanup pending: ";
+
 /// The planner, shared by all deployments of a server.
 pub struct Planner<S, E> {
     store: Arc<S>,
@@ -453,6 +457,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             // Terminal lines say what is known about the effects and what to
             // do next.
             match status {
+                ResourceRunStatus::Failed if reason.starts_with(CLEANUP_PENDING) => {
+                    resource_log.status(
+                        "error",
+                        &format!(
+                            "deleted, but its record remains; the next deployment finishes the \
+                             cleanup: {reason}"
+                        ),
+                    );
+                }
                 ResourceRunStatus::Failed => resource_log.status(
                     "error",
                     &format!("failed, nothing changed; fix the cause and deploy again: {reason}"),

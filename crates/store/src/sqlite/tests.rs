@@ -629,7 +629,8 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
     assert_eq!(lines[0].guresid.as_deref(), Some(op.guresid.as_str()));
     assert_eq!(
         lines[1].message,
-        "deployment failed: interrupted by a server restart"
+        "deployment failed: interrupted by a server restart; 1 resource(s) may have changed \
+         and need recovery before the environment is deployed again"
     );
     // A finished deployment's log takes no more lines.
     let late = LogLine {
