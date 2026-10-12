@@ -335,10 +335,6 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         let d = &self.deployment;
         let r = &self.resource;
         let failed = |e: String| Outcome::Failed(e);
-        // Removing the record of a confirmed deletion was already permitted.
-        if !r.cleanup_pending {
-            self.check_permit().await?;
-        }
         let driver_type = r
             .driver_type
             .clone()
@@ -384,6 +380,12 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             };
             if Instant::now() >= self.deadline {
                 return Err(Outcome::Pending("the deployment ran out of time".into()));
+            }
+            // The permit is used only once the deletion can start, so one that
+            // waited for a slot until the deadline is still unused. Removing
+            // the record of a confirmed deletion was already permitted.
+            if attempt == 1 && !r.cleanup_pending {
+                self.check_permit().await?;
             }
             let started = self
                 .store
