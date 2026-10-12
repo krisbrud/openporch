@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_core::placeholder::Resolved;
@@ -102,7 +103,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         deadline: Instant,
         converged: bool,
         outcomes: &mut BTreeMap<Descriptor, Outcome>,
-    ) {
+    ) -> Result<(), String> {
         let d = deployment;
         let active = match self
             .store
@@ -112,7 +113,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             Ok(active) => active,
             Err(e) => {
                 tracing::error!(deployment = %d.id, error = %e, "could not list active resources");
-                return;
+                // Removed workloads and scheduled resources may remain, so the
+                // deployment has not converged.
+                return Err(format!("the resources to delete could not be listed: {e}"));
             }
         };
         let mut candidates: BTreeMap<Descriptor, ActiveResource> = BTreeMap::new();
@@ -128,13 +131,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 "owned" | "adopted" => r.scheduled_deletion || removed_workload,
                 _ => false,
             };
-            if d.graph.nodes.contains_key(&descriptor) || !deletable {
+            // One whose deletion the driver already confirmed only needs its
+            // record removed.
+            if d.graph.nodes.contains_key(&descriptor) || !(deletable || r.cleanup_pending) {
                 continue;
             }
             candidates.insert(descriptor, r.clone());
         }
         if candidates.is_empty() {
-            return;
+            return Ok(());
         }
         if !converged {
             for descriptor in candidates.into_keys() {
@@ -145,7 +150,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     ),
                 );
             }
-            return;
+            return Ok(());
         }
         // Who uses each resource, by the dependencies recorded when they last
         // provisioned.
@@ -166,9 +171,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut tasks = BTreeMap::new();
         loop {
             for (descriptor, r) in &candidates {
-                let ready = users
-                    .get(&r.descriptor)
-                    .is_none_or(|u| u.iter().all(|u| deleted.contains(u)));
+                // A resource already deleted in the cloud is gone for its users
+                // too.
+                let ready = r.cleanup_pending
+                    || users
+                        .get(&r.descriptor)
+                        .is_none_or(|u| u.iter().all(|u| deleted.contains(u)));
                 if started.contains(descriptor) || !ready {
                     continue;
                 }
@@ -242,6 +250,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             };
             outcomes.insert(descriptor, Outcome::Pending(reason));
         }
+        Ok(())
     }
 }
 
@@ -270,18 +279,9 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         let d = &self.deployment;
         let r = &self.resource;
         let failed = |e: String| Outcome::Failed(e);
-        let check = self.checks.check(PermitRequest {
-            org: d.org.as_str(),
-            app: d.app.as_str(),
-            env: d.env.as_str(),
-            descriptor: &r.descriptor,
-            action: DestructiveAction::Delete,
-            permits: &d.permits,
-        });
-        match tokio::time::timeout_at(self.deadline, check).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(failed(format!("approval_required: {e}"))),
-            Err(_) => return Err(Outcome::Pending("the deployment ran out of time".into())),
+        // Removing the record of a confirmed deletion was already permitted.
+        if !r.cleanup_pending {
+            self.check_permit().await?;
         }
         let driver_type = r
             .driver_type
@@ -295,7 +295,8 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             .map_err(|_| failed("the resource has no valid recorded definition".into()))?;
         // A resource that never provisioned has no recorded inputs; its driver
         // deletes whatever an attempt left behind from the GUResID alone.
-        let inputs: JobInputs = if r.inputs.is_null() {
+        let absent = r.inputs.is_null() || r.inputs.as_object().is_some_and(|o| o.is_empty());
+        let inputs: JobInputs = if absent {
             JobInputs {
                 values: Value::Null,
                 secrets: Resolved::Value(Value::Null),
@@ -372,27 +373,14 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 target: r.target.clone(),
                 deadline: self.deadline,
             };
-            let result = self.execute(job).await;
+            let result = if r.cleanup_pending {
+                Ok(())
+            } else {
+                self.execute(job).await
+            };
             drop(permit);
             let failure = match result {
-                Ok(()) => {
-                    return if self
-                        .checkpoint(&started.operation_id, CheckpointResult::Deleted)
-                        .await
-                    {
-                        Ok(())
-                    } else {
-                        let error = "the resource was deleted, but that could not be recorded";
-                        self.checkpoint(
-                            &started.operation_id,
-                            CheckpointResult::Unknown {
-                                error: error.into(),
-                            },
-                        )
-                        .await;
-                        Err(Outcome::Unknown(error.into()))
-                    };
-                }
+                Ok(()) => return self.record_deletion(&started.operation_id).await,
                 Err(f) => f,
             };
             match failure {
@@ -437,6 +425,61 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 }
             }
         }
+    }
+
+    /// Checks the deployment's permits for this deletion, within the deadline.
+    async fn check_permit(&self) -> Result<(), Outcome> {
+        let d = &self.deployment;
+        let check = self.checks.check(PermitRequest {
+            org: d.org.as_str(),
+            app: d.app.as_str(),
+            env: d.env.as_str(),
+            descriptor: &self.resource.descriptor,
+            action: DestructiveAction::Delete,
+            permits: &d.permits,
+        });
+        match tokio::time::timeout_at(self.deadline, check).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Outcome::Failed(format!("approval_required: {e}"))),
+            Err(_) => Err(Outcome::Pending("the deployment ran out of time".into())),
+        }
+    }
+
+    /// Records a deletion the driver confirmed. When the record cannot be
+    /// removed, the resource is marked so that a later attempt only removes
+    /// it, without deleting in the cloud again.
+    async fn record_deletion(&self, operation_id: &str) -> Result<(), Outcome> {
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(50) * attempt).await;
+            }
+            if self
+                .checkpoint(operation_id, CheckpointResult::Deleted)
+                .await
+            {
+                return Ok(());
+            }
+        }
+        let error = "the resource was deleted, but its record could not be removed";
+        if self
+            .checkpoint(
+                operation_id,
+                CheckpointResult::CleanupPending {
+                    error: error.into(),
+                },
+            )
+            .await
+        {
+            return Err(Outcome::Failed(format!("cleanup pending: {error}")));
+        }
+        self.checkpoint(
+            operation_id,
+            CheckpointResult::Unknown {
+                error: error.into(),
+            },
+        )
+        .await;
+        Err(Outcome::Unknown(error.into()))
     }
 
     /// Runs the executor until the deadline; a panic or the deadline leaves the

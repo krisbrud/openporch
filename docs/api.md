@@ -1652,7 +1652,9 @@ resource that a kept resource still uses stays, with status `skipped` in the
 deployment, without failing it. A resource
 whose deletion fails keeps its record with status `deletion_failed`, and the
 resources it uses stay too; the next deployment retries it with the same
-`guresid`. External resources are never deleted and cannot be scheduled
+`guresid`. If the driver confirmed a deletion but the record could not be
+removed, the resource stays `deletion_failed` and the next deployment that
+leaves it out removes the record without deleting in the cloud again. External resources are never deleted and cannot be scheduled
 (`409`); adopted resources are deleted only when scheduled. Scheduling advances
 the environment's `generation`, except when the resource is already scheduled,
 and returns `409` while a deployment is running.

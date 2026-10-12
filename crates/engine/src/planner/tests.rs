@@ -1176,3 +1176,74 @@ async fn scheduling_advances_the_generation_and_waits_for_a_running_deployment()
     );
     assert!(!f.active(ROUTE).await.unwrap().scheduled_deletion);
 }
+
+#[tokio::test]
+async fn a_confirmed_deletion_is_finished_without_the_driver() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // An earlier attempt of this deployment deleted the database, but its
+    // record could not be removed.
+    let deployment = f.accept_set(Some(WEB_NO_DB), definitions()).await.unwrap();
+    let started = f
+        .store
+        .begin_operation(OperationStart {
+            org: ORG.into(),
+            app: "shop".into(),
+            env: "development".into(),
+            deployment_id: deployment.id.clone(),
+            descriptor: d(DB),
+            definition_id: None,
+            definition_version: None,
+            driver_type: None,
+            kind: OperationKind::Delete,
+            input_fingerprint: "delete".into(),
+            recovery: json!({}),
+        })
+        .await
+        .unwrap();
+    f.store
+        .checkpoint_operation(
+            &started.operation_id,
+            CheckpointResult::CleanupPending {
+                error: "database is locked".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let db = f.active(DB).await.unwrap();
+    assert!(db.cleanup_pending);
+    assert_eq!(db.status, "deletion_failed");
+
+    // It was never scheduled, yet the deployment removes the record without
+    // asking the driver or a permit again.
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(DB)], Outcome::Deleted);
+    assert!(fake.deletions().is_empty());
+    assert!(checks.asked.lock().unwrap().is_empty());
+    assert!(f.active(DB).await.is_none());
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+}
+
+#[tokio::test]
+async fn a_workload_that_never_provisioned_is_deleted_by_its_identity() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("workload", Behavior::Permanent)]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let workload = f.active(WORKLOAD).await.unwrap();
+    assert_eq!(workload.status, "failed");
+    assert!(workload.last_deploy_id.is_none());
+
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    let deleted = fake.deleted.lock().unwrap().clone();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].guresid.as_str(), workload.guresid);
+    assert_eq!(deleted[0].inputs.values, Value::Null);
+}

@@ -268,6 +268,13 @@ pub enum CheckpointResult {
         /// The redacted error.
         error: String,
     },
+    /// The driver confirmed a deletion, but the record could not be removed.
+    /// The resource stays `deletion_failed` and is marked so that the next
+    /// attempt removes the record without calling the driver again.
+    CleanupPending {
+        /// The redacted error.
+        error: String,
+    },
     /// It is unknown whether the operation took effect.
     Unknown {
         /// The redacted error.
@@ -341,6 +348,9 @@ pub struct ActiveResource {
     pub last_deploy_id: Option<String>,
     /// Whether it is deleted by the next deployment that leaves it out.
     pub scheduled_deletion: bool,
+    /// Whether the driver confirmed its deletion and only the record remains
+    /// to be removed.
+    pub cleanup_pending: bool,
     /// When the status was last observed.
     pub observed_at: Option<i64>,
     /// When it was first recorded.

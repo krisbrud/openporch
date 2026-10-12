@@ -388,7 +388,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // Resources the deployment leaves out are deleted only once everything
         // it includes provisioned.
         let converged = outcomes.values().all(|o| *o == Outcome::Provisioned);
-        self.deprovision(&deployment, deadline, converged, &mut outcomes)
+        let listed = self
+            .deprovision(&deployment, deadline, converged, &mut outcomes)
             .await;
 
         // Every resource gets a record, also those that ended before an
@@ -418,7 +419,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             }
         }
 
-        let error = summary(&outcomes);
+        let error = match (summary(&outcomes), listed) {
+            (error, Ok(())) => error,
+            (None, Err(e)) => Some(e),
+            (Some(error), Err(e)) => Some(format!("{error}; {e}")),
+        };
         if let Err(e) = self
             .store
             .finish_deployment(

@@ -1264,7 +1264,13 @@ impl Store for SqliteStore {
         }
         match (&result, kind.as_str()) {
             (CheckpointResult::Provisioned(_), "put") | (CheckpointResult::Deleted, "delete") => {}
-            (CheckpointResult::Provisioned(_) | CheckpointResult::Deleted, _) => {
+            (CheckpointResult::CleanupPending { .. }, "delete") if state == "started" => {}
+            (
+                CheckpointResult::Provisioned(_)
+                | CheckpointResult::Deleted
+                | CheckpointResult::CleanupPending { .. },
+                _,
+            ) => {
                 return Err(StoreError::Conflict(format!(
                     "operation `{operation_id}` is a {kind}; the result does not match it"
                 )));
@@ -1366,6 +1372,22 @@ impl Store for SqliteStore {
                 Some(error.clone()),
                 None,
             ),
+            CheckpointResult::CleanupPending { error } => {
+                sqlx::query(
+                    "UPDATE active_resources SET recovery = json_set(recovery, \
+                     '$.cleanup_pending', json('true')) WHERE guresid = ?",
+                )
+                .bind(&guresid)
+                .execute(&mut *tx)
+                .await?;
+                (
+                    "failed",
+                    Some("deletion_failed"),
+                    "failed",
+                    Some(format!("cleanup pending: {error}")),
+                    None,
+                )
+            }
             CheckpointResult::Unknown { error } => (
                 "unknown",
                 Some("unknown"),
@@ -1810,6 +1832,7 @@ async fn finish_in_tx(
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
      definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, ownership, dependencies, last_deploy_id, scheduled_deletion, \
+     COALESCE(json_extract(recovery, '$.cleanup_pending'), 0) AS cleanup_pending, \
      observed_at, created_at FROM active_resources";
 
 /// An `active_resources` row.
@@ -1836,6 +1859,7 @@ struct ResourceRow {
     dependencies: String,
     last_deploy_id: Option<String>,
     scheduled_deletion: bool,
+    cleanup_pending: bool,
     observed_at: Option<i64>,
     created_at: i64,
 }
@@ -1870,6 +1894,7 @@ impl ResourceRow {
             dependencies: serde_json::from_str(&self.dependencies)?,
             last_deploy_id: self.last_deploy_id,
             scheduled_deletion: self.scheduled_deletion,
+            cleanup_pending: self.cleanup_pending,
             observed_at: self.observed_at,
             created_at: self.created_at,
         })
