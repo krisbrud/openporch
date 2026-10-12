@@ -45,7 +45,7 @@ impl Runner for Unimplemented {
             finish(
                 &state,
                 &job,
-                Some("provisioning resources is not implemented yet".into()),
+                Some("provisioning resources is not implemented yet; nothing changed".into()),
             )
             .await;
         })
@@ -76,7 +76,7 @@ impl<E: Executor> Runner for PlannerRunner<E> {
                 Ok(deployment) => {
                     planner.run(deployment).await;
                 }
-                Err(error) => finish(&state, &job, Some(error)).await,
+                Err(error) => finish(&state, &job, Some(format!("{error}; nothing changed"))).await,
             }
         })
     }
@@ -186,7 +186,11 @@ impl Runners {
                 finish(
                     &state,
                     &job,
-                    Some("the deployment stopped unexpectedly".into()),
+                    Some(
+                        "the deployment stopped unexpectedly; resources it was changing may have \
+                         changed and need recovery before the environment is deployed again"
+                            .into(),
+                    ),
                 )
                 .await;
             }

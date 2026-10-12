@@ -1988,14 +1988,15 @@ impl Store for SqliteStore {
             .bind(guresid)
             .execute(&mut *tx)
             .await?;
-            let line = format!("failed: {error}");
+            let line = "deleted, but removing its record was interrupted by a restart; deploy \
+                        again to finish the cleanup";
             log_in_tx(
                 &mut tx,
                 &self.org,
                 deployment,
                 Some((op, guresid)),
-                "error",
-                &line,
+                "warn",
+                line,
             )
             .await?;
         }

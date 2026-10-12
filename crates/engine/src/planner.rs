@@ -795,7 +795,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         )
                         .await;
                     if recorded {
-                        log.info("provisioned");
+                        log.status("info", "provisioned");
                         return Ok(outputs);
                     }
                     let error = "the resource provisioned, but its result could not be recorded";

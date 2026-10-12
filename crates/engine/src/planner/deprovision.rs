@@ -493,7 +493,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 Ok(()) => {
                     let recorded = self.record_deletion(&started.operation_id).await;
                     if recorded.is_ok() {
-                        log.info("deleted");
+                        log.status("info", "deleted");
                     }
                     return recorded;
                 }
