@@ -1482,7 +1482,10 @@ of:
   works in the same environment and while what it used still exists: the
   definitions, the drivers at the same protocol version, and the pinned secret
   versions; otherwise the request is `400`, naming what is missing, before
-  anything runs. `"replay": "current"` matches definitions and reads
+  anything runs. Cloud-account credentials are not pinned; every
+  deployment gets fresh ones. Since a preview covers the pinned secret
+  versions too, writing a new version of a secret a resource reads makes the
+  permits issued for it stale (`DPL-003`); preview again. `"replay": "current"` matches definitions and reads
   values again as they are now. `replay` is
   only valid with `deploy_id`.
 
@@ -1538,7 +1541,8 @@ the workload's outputs. `${values.KEY}` in a workload resolves to the
 environment's value for `KEY` when it has one, and otherwise to the
 application's; the values are read when the deployment is accepted, so later
 edits apply to the next deployment. Deployments accepted before workloads
-received their inputs, or before deployments recorded their values, cannot be
+received their inputs, or before deployments recorded their values and pinned
+secret versions, cannot be
 replayed from their snapshot; redeploy them with `"replay": "current"`.
 
 ```http
