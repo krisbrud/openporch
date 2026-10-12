@@ -1551,8 +1551,8 @@ impl Store for SqliteStore {
             env_type.ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
         // The route checked the caller's roles; they may have changed since.
         check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
-        let ownership: Option<String> = sqlx::query_scalar(
-            "SELECT ownership FROM active_resources \
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT ownership, scheduled_deletion FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1561,7 +1561,8 @@ impl Store for SqliteStore {
         .bind(descriptor)
         .fetch_optional(&mut *tx)
         .await?;
-        match ownership.as_deref() {
+        let scheduled = row.as_ref().is_some_and(|(_, s)| *s);
+        match row.as_ref().map(|(o, _)| o.as_str()) {
             None => {
                 return Err(StoreError::NotFound(format!(
                     "active resource `{descriptor}`"
@@ -1573,6 +1574,13 @@ impl Store for SqliteStore {
                 )));
             }
             Some(_) => {}
+        }
+        // Scheduling again changes nothing, so a retried request does not
+        // advance the generation.
+        if scheduled {
+            audit::insert(&mut tx, &audit, None, None).await?;
+            tx.commit().await?;
+            return Ok(());
         }
         // A running deployment was accepted without this change; it must not
         // act on it.

@@ -1160,6 +1160,9 @@ async fn scheduling_advances_the_generation_and_waits_for_a_running_deployment()
     let before = generation(&f).await;
     f.schedule(DB).await;
     assert_eq!(generation(&f).await, before + 1);
+    // A retry changes nothing.
+    f.schedule(DB).await;
+    assert_eq!(generation(&f).await, before + 1);
 
     // Accepted but not yet run: the deployment is in progress.
     let running = f.accept().await;

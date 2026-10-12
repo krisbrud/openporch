@@ -1654,7 +1654,8 @@ whose deletion fails keeps its record with status `deletion_failed`, and the
 resources it uses stay too; the next deployment retries it with the same
 `guresid`. External resources are never deleted and cannot be scheduled
 (`409`); adopted resources are deleted only when scheduled. Scheduling advances
-the environment's `generation` and returns `409` while a deployment is running.
+the environment's `generation`, except when the resource is already scheduled,
+and returns `409` while a deployment is running.
 
 Every deletion needs a destructive-action permit in the deployment's `permits`.
 Without one the resource fails with `approval_required` and the deployment
