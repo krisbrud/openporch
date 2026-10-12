@@ -694,3 +694,106 @@ async fn a_delta_changed_after_it_was_read_is_not_frozen() {
     assert_eq!(d["frozen"], false);
     assert_eq!(s.generation("development").await, 0);
 }
+
+#[tokio::test]
+async fn a_started_server_provisions_deployments() {
+    let s = server().await;
+    s.app("shop").await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "pg",
+            "postgres",
+            "openporch/echo",
+            json!({"values": {"host": "db.internal"}}),
+        ),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
+                       "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    // The OpenTofu driver is registered, with the configured state backend.
+    let tofu = s.state.drivers.facts("openporch/opentofu").unwrap();
+    assert_eq!(tofu.backend.as_deref(), Some("local state"));
+
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+
+    let (_, env) = s
+        .get("/orgs/acme/apps/shop/envs/development", &s.admin)
+        .await;
+    assert_eq!(env["last_successful_set_id"], d["set_id"]);
+    let (st, db) = s
+        .get(
+            "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db",
+            &s.admin,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{db}");
+    assert_eq!(db["outputs"]["host"], "db.internal");
+    assert_eq!(db["status"], "provisioned", "{db}");
+
+    // Removing the workload deletes it behind a permit; the database it used
+    // stays until it is scheduled for deletion.
+    let env_path = "/orgs/acme/apps/shop/envs/development";
+    let (st, removal) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"remove": ["web"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{removal}");
+    let generation = s.generation("development").await;
+    let body = json!({"delta_id": removal["id"], "expected_generation": generation});
+    let (st, b) = s.deploy(&s.admin, body.clone(), None).await;
+    assert_error(st, &b, StatusCode::CONFLICT, "DPL-001");
+    let permits = s
+        .permits_for(env_path, json!({"delta_id": removal["id"]}))
+        .await;
+    assert!(!permits.is_empty());
+    let mut body = body;
+    body["permits"] = json!(permits);
+    let (st, d) = s.deploy(&s.admin, body, None).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let (_, left) = s.get(&format!("{env_path}/resources"), &s.admin).await;
+    let left: Vec<&str> = left["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["descriptor"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "base-env.default#base-env",
+            "postgres.default#modules.web.externals.db"
+        ]
+    );
+}
