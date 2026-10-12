@@ -91,6 +91,9 @@ pub struct DeploymentRequest {
     pub set_id: String,
     /// The delta being deployed, frozen on acceptance.
     pub delta_id: Option<String>,
+    /// The delta's content the set was derived from; acceptance fails if the
+    /// stored delta differs.
+    pub delta_content: Option<Value>,
     /// Free-text comment.
     pub comment: String,
     /// The execution snapshot: configuration captured at acceptance.

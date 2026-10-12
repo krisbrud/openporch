@@ -34,7 +34,7 @@ pub struct SetId {
 }
 
 /// Reads a set of `app`; the empty set exists in every application.
-async fn set_or_404(state: &AppState, app: &str, id: &str) -> ApiResult<DeploymentSet> {
+pub(super) async fn set_or_404(state: &AppState, app: &str, id: &str) -> ApiResult<DeploymentSet> {
     let empty = DeploymentSet::default();
     if id == EMPTY_SET_ALIAS || id == empty.id() {
         return Ok(empty);
@@ -102,7 +102,7 @@ impl From<DeltaRecord> for DeltaView {
     }
 }
 
-async fn delta_or_404(state: &AppState, app: &str, id: &str) -> ApiResult<DeltaRecord> {
+pub(super) async fn delta_or_404(state: &AppState, app: &str, id: &str) -> ApiResult<DeltaRecord> {
     state
         .store
         .delta(state.org(), app, id)

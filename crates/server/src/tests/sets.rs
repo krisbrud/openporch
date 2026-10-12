@@ -257,6 +257,7 @@ async fn deltas_are_mutable_until_deployed() {
             fingerprint: "body".into(),
             set_id,
             delta_id: Some(id.clone()),
+            delta_content: None,
             comment: String::new(),
             snapshot: json!({}),
             audit: AuditIntent::accepted("acme", "bootstrap", "POST", "/deploys", "deploy"),

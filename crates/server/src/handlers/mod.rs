@@ -4,6 +4,7 @@ mod accounts;
 mod apps;
 mod audit;
 mod catalog;
+mod deploys;
 mod envs;
 mod health;
 mod login;
@@ -192,6 +193,25 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/envs/{env}",
             App(AppPerm::Deploy),
             envs::delete,
+        )
+        // Deployments.
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/deploys",
+            App(AppPerm::Read),
+            deploys::list,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/apps/{app}/envs/{env}/deploys",
+            App(AppPerm::Deploy),
+            deploys::trigger,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/apps/{app}/envs/{env}/deploys/{deploy}",
+            App(AppPerm::Read),
+            deploys::get,
         )
         // Sets and deltas.
         .route(

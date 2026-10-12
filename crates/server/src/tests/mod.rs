@@ -26,6 +26,7 @@ struct Server {
 
 mod accounts;
 mod catalog;
+mod deploys;
 mod envs;
 mod github;
 mod keys;
@@ -70,7 +71,21 @@ impl Server {
         token: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.call_with(method, path, token, body, &[]).await
+    }
+
+    async fn call_with(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
         let mut req = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
         if let Some(t) = token {
             req = req.header("authorization", format!("Bearer {t}"));
         }
