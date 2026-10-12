@@ -479,6 +479,65 @@ async fn guresid_is_allocated_once_and_kept_across_deployments() {
 }
 
 #[tokio::test]
+async fn a_driver_cannot_take_over_what_a_failed_attempt_left_behind() {
+    let f = Fixture::new().await;
+    let d1 = f.deploy("nginx:1").await;
+    let op = f.start(&d1.id, DB).await.unwrap();
+    f.store
+        .checkpoint_operation(
+            &op.operation_id,
+            CheckpointResult::Failed {
+                error: "apply failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+    f.store
+        .finish_deployment(ORG, "shop", "development", &d1.id, Some("failed".into()))
+        .await
+        .unwrap();
+    let other = |deployment: &str| OperationStart {
+        org: ORG.into(),
+        app: "shop".into(),
+        env: "development".into(),
+        deployment_id: deployment.into(),
+        descriptor: Descriptor::parse(DB).unwrap(),
+        definition_id: Some("rds".into()),
+        definition_version: Some(1),
+        driver_type: Some("openporch/template".into()),
+        kind: OperationKind::Put,
+        input_fingerprint: "inputs-1".into(),
+        recovery: json!({}),
+    };
+
+    // The first attempt left a target behind, so its driver keeps the resource.
+    sqlx::query("UPDATE active_resources SET target = 'aws:111122223333' WHERE descriptor = ?")
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let d2 = f.deploy("nginx:2").await;
+    let err = f.store.begin_operation(other(&d2.id)).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::MigrationRequired { .. }),
+        "{err:?}"
+    );
+    f.store
+        .finish_deployment(ORG, "shop", "development", &d2.id, Some("failed".into()))
+        .await
+        .unwrap();
+
+    // An attempt that left nothing behind may be retried with another driver.
+    sqlx::query("UPDATE active_resources SET target = NULL WHERE descriptor = ?")
+        .bind(DB)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let d3 = f.deploy("nginx:3").await;
+    f.store.begin_operation(other(&d3.id)).await.unwrap();
+}
+
+#[tokio::test]
 async fn checkpoints_survive_partial_failure() {
     let f = Fixture::new().await;
     let d1 = f.deploy("nginx:1").await;

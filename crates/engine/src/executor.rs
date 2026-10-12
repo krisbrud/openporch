@@ -408,6 +408,8 @@ where
             app: c.app.as_str(),
             env: c.env.as_str(),
             descriptor: &descriptor,
+            guresid: Some(job.guresid.as_str()),
+            deployment: Some(&c.deployment_id),
             action,
             permits: &c.permits,
             plan,

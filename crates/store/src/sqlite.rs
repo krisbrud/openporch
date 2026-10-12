@@ -1053,8 +1053,12 @@ impl Store for SqliteStore {
                 )));
             }
         }
-        let existing: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT guresid, status, driver_type, last_deploy_id FROM active_resources \
+        // A resource counts as provisioned once a deployment succeeded or a
+        // driver left a cookie or target behind, as the preview judges it.
+        let existing: Option<(String, String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT guresid, status, driver_type, \
+             (last_deploy_id IS NOT NULL OR cookie IS NOT NULL OR target IS NOT NULL) \
+             FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1073,7 +1077,7 @@ impl Store for SqliteStore {
             }
             // A different driver cannot take over a resource another driver
             // provisioned: that is a migration, which only an operator starts.
-            Some((_, _, Some(current), Some(_)))
+            Some((_, _, Some(current), true))
                 if start.kind == OperationKind::Put
                     && start.driver_type.as_ref().is_some_and(|d| *d != current) =>
             {
@@ -2460,7 +2464,7 @@ async fn finish_in_tx(
 }
 
 const RESOURCE_COLUMNS: &str = "SELECT app_id, env_id, descriptor, guresid, definition_id, \
-     definition_version, driver_type, driver_account, target, status, inputs, outputs, secret_outputs, cookie_key_id, \
+     definition_version, driver_type, driver_account, target, backend, status, inputs, outputs, secret_outputs, cookie_key_id, \
      cookie_nonce, cookie, snapshot, recovery, ownership, dependencies, last_deploy_id, scheduled_deletion, \
      cleanup_pending, \
      observed_at, created_at FROM active_resources";
@@ -2477,6 +2481,7 @@ struct ResourceRow {
     driver_type: Option<String>,
     driver_account: Option<String>,
     target: Option<String>,
+    backend: Option<String>,
     status: String,
     inputs: String,
     outputs: String,
@@ -2515,6 +2520,7 @@ impl ResourceRow {
             driver_type: self.driver_type,
             driver_account: self.driver_account,
             target: self.target,
+            backend: self.backend,
             status: self.status,
             inputs: serde_json::from_str(&self.inputs)?,
             outputs: serde_json::from_str(&self.outputs)?,

@@ -40,7 +40,9 @@ mod log;
 #[cfg(test)]
 mod tests;
 
-pub use deprovision::{DestructiveAction, NoPermits, PermitCheck, PermitRequest};
+pub use deprovision::{
+    DestructiveAction, NoPermits, PermitCheck, PermitRequest, deletion_candidates,
+};
 use log::DeploymentLog;
 pub use log::{JobLog, RedactingLog};
 

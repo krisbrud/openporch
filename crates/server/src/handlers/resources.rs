@@ -395,6 +395,8 @@ pub async fn detach(
             app: &env.app,
             env: &env.id,
             descriptor: &resource.descriptor,
+            guresid: Some(&resource.guresid),
+            deployment: None,
             action: DestructiveAction::Detach,
             permits: &req.permits,
             plan: None,

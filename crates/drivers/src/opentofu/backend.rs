@@ -118,6 +118,11 @@ impl std::fmt::Display for BackendId {
 }
 
 impl StateBackend {
+    /// Where resources' state goes, as their footprints record it.
+    pub fn location(&self) -> String {
+        self.id().to_string()
+    }
+
     pub(super) fn id(&self) -> BackendId {
         match self {
             Self::Local => BackendId::Local,
