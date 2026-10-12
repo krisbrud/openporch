@@ -16,7 +16,7 @@ use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ResourceUse, builtin_types};
 use openporch_core::graph::{Node, ResourceGraph};
 use openporch_core::ids::{
-    AppId, DefinitionId, Descriptor, EnvId, EnvTypeId, Guresid, OrgId, ResourceTypeId,
+    AccountId, AppId, DefinitionId, Descriptor, EnvId, EnvTypeId, Guresid, OrgId, ResourceTypeId,
 };
 use openporch_core::model::{ResourceDefinition, SecretRef};
 use openporch_core::placeholder::{
@@ -118,7 +118,7 @@ pub struct ProvisionJob {
     /// The driver.
     pub driver_type: String,
     /// The cloud account the driver gets credentials for.
-    pub driver_account: Option<String>,
+    pub driver_account: Option<AccountId>,
     /// The resolved inputs.
     pub inputs: JobInputs,
     /// The digest of the inputs, so retries can be recognized.
@@ -570,13 +570,36 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     return Err(Outcome::Failed(error));
                 }
             };
-            let result = match self.with_cookie(job, node).await {
-                Ok(job) => self.provision(job).await,
-                // Without the cookie the driver might create a duplicate.
+            let account = job.driver_account.clone();
+            let recorded = self
+                .store
+                .record_operation_inputs(
+                    &started.operation_id,
+                    json!({
+                        "definition_id": def.id,
+                        "definition_version": version,
+                        "driver_type": def.driver_type,
+                        "driver_account": job.driver_account,
+                        "guresid": job.guresid,
+                        "inputs": job.inputs,
+                        "dependencies": self.dependencies,
+                    }),
+                )
+                .await
+                .map_err(|e| format!("the operation's inputs were not recorded: {e}"));
+            let result = match recorded {
                 Err(error) => Err(ExecFailure::Retryable {
                     error,
                     retry_after: None,
                 }),
+                Ok(()) => match self.with_cookie(job, node).await {
+                    Ok(job) => self.provision(job).await,
+                    // Without the cookie the driver might create a duplicate.
+                    Err(error) => Err(ExecFailure::Retryable {
+                        error,
+                        retry_after: None,
+                    }),
+                },
             };
             drop(permit);
             let failure = match result {
@@ -585,7 +608,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         values: provisioned.outputs.clone(),
                         secrets: provisioned.secret_outputs.clone(),
                         guresid: Some(started.guresid.clone()),
-                        account: None,
+                        account,
                     };
                     let recorded = self
                         .checkpoint(
@@ -702,8 +725,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 .map_err(|e| at(&e.to_string()))?
                 .as_plain()
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| at("driver_account must resolve to a string"))?,
+                .ok_or_else(|| at("driver_account must resolve to a string"))?
+                .parse::<AccountId>()
+                .map_err(|e| at(&format!("driver_account: {e}")))?,
             ),
             None => None,
         };

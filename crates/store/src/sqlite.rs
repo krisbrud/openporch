@@ -1375,6 +1375,32 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn record_operation_inputs(
+        &self,
+        operation_id: &str,
+        recovery: serde_json::Value,
+    ) -> Result<()> {
+        let org: Option<(String,)> = sqlx::query_as("SELECT org_id FROM operations WHERE id = ?")
+            .bind(operation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let (org,) =
+            org.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        self.check_org(&org)?;
+        let updated =
+            sqlx::query("UPDATE operations SET recovery = ? WHERE id = ? AND state = 'started'")
+                .bind(recovery.to_string())
+                .bind(operation_id)
+                .execute(&self.pool)
+                .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::Conflict(format!(
+                "operation `{operation_id}` is no longer started"
+            )));
+        }
+        Ok(())
+    }
+
     async fn record_resource_status(
         &self,
         org: &str,

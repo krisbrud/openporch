@@ -50,11 +50,17 @@ fn d(s: &str) -> Descriptor {
 
 fn definitions() -> Vec<ResourceDefinition> {
     let def = |id: &str, ty: &str, inputs: Value| {
-        serde_json::from_value(json!({
+        let mut def = json!({
             "id": id, "type": ty, "driver_type": "openporch/echo",
             "driver_inputs": inputs, "criteria": [{}],
-        }))
-        .unwrap()
+        });
+        // DNS runs in an account, and its route in the same one.
+        match ty {
+            "dns" => def["driver_account"] = json!("aws-dns"),
+            "route" => def["driver_account"] = json!("${resources.dns.account}"),
+            _ => {}
+        }
+        serde_json::from_value(def).unwrap()
     };
     vec![
         def("none-workload", "workload", json!({})),
@@ -453,10 +459,9 @@ async fn independent_branches_run_in_parallel() {
     let pos = |s: &str| order.iter().position(|x| x == s).unwrap();
     assert!(pos(DNS) < pos(ROUTE));
     assert!(pos(ROUTE) < pos(WORKLOAD) && pos(DB) < pos(WORKLOAD));
-    assert_eq!(
-        fake.job(ROUTE).inputs.values,
-        json!({"host": "dns.internal"})
-    );
+    let route = fake.job(ROUTE);
+    assert_eq!(route.inputs.values, json!({"host": "dns.internal"}));
+    assert_eq!(route.driver_account.unwrap().as_str(), "aws-dns");
 }
 
 #[tokio::test]
@@ -542,6 +547,23 @@ async fn a_timeout_leaves_the_resource_unknown_until_recovered() {
         "{outcomes:?}"
     );
     assert_eq!(f.resources(&deployment).await[DNS], "unknown");
+    // The operation kept what recovery needs to observe or repeat it.
+    let (recovery,): (String,) = sqlx::query_as(
+        "SELECT recovery FROM operations WHERE deployment_id = ? AND state = 'unknown'",
+    )
+    .bind(&deployment.id)
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap();
+    let recovery: Value = serde_json::from_str(&recovery).unwrap();
+    let job = fake.job(DNS);
+    assert_eq!(recovery["guresid"], job.guresid.to_string());
+    assert_eq!(recovery["driver_account"], "aws-dns");
+    assert_eq!(
+        recovery["inputs"],
+        serde_json::to_value(&job.inputs).unwrap()
+    );
+    assert_eq!(recovery["definition_id"], "dns");
     let (status, error) = f.status(&deployment).await;
     assert_eq!(status, DeploymentStatus::Failed);
     assert!(error.unwrap().contains("needs recovery"));

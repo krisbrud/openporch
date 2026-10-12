@@ -264,6 +264,15 @@ pub trait Store: Send + Sync {
         result: CheckpointResult,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Adds the resolved inputs to a started operation's recovery metadata
+    /// before the driver runs, so recovery can observe or repeat it exactly.
+    /// The inputs hold secret references, never secret values.
+    fn record_operation_inputs(
+        &self,
+        operation_id: &str,
+        recovery: serde_json::Value,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Records the status of a resource that no operation decided in a
     /// deployment, such as `pending` behind a failed dependency. A status an
     /// operation recorded is kept. A resource with no GUResID yet is recorded
