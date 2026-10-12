@@ -5,7 +5,8 @@
 //! output print it in. Every non-empty value is redacted, however short: a
 //! short secret garbles the text it appears in, which is the safer failure.
 
-/// What a redacted value is replaced with.
+/// What a redacted value is replaced with, unless a secret occurs in the
+/// marker itself; such values are removed without a marker.
 pub const REDACTED: &str = "[REDACTED]";
 
 /// Known secret values and how to recognize them in text.
@@ -42,7 +43,8 @@ impl Redactor {
         self.forms.is_empty()
     }
 
-    /// `text` with every known value replaced by [`REDACTED`]. Matches are
+    /// `text` with every known value replaced by [`REDACTED`], or removed if
+    /// a known value occurs in the marker. Matches are
     /// found in the original text and overlapping or adjacent ones merged, so
     /// no part of a secret that overlaps another is left behind.
     pub fn redact(&self, text: &str) -> String {
@@ -65,6 +67,11 @@ impl Redactor {
             return text.to_owned();
         }
         ranges.sort_unstable();
+        let marker = if self.forms.iter().any(|f| REDACTED.contains(f.as_str())) {
+            ""
+        } else {
+            REDACTED
+        };
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         let mut i = 0;
@@ -75,7 +82,7 @@ impl Redactor {
                 end = end.max(ranges[i].1);
             }
             out.push_str(&text[at..start]);
-            out.push_str(REDACTED);
+            out.push_str(marker);
             at = end;
             i += 1;
         }
@@ -130,6 +137,15 @@ mod tests {
             r#"a\u2028b\u2029\u003c$${c}"#,
         ] {
             assert_eq!(r.redact(text), REDACTED, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_secret_in_the_marker_is_removed() {
+        for secret in ["REDACTED", "[", "A"] {
+            let r = Redactor::new([secret]);
+            let out = r.redact(&format!("x{secret}y"));
+            assert_eq!(out, "xy", "{secret}");
         }
     }
 
