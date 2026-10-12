@@ -10,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::ids::Descriptor;
 use openporch_engine::planner::{DestructiveAction, PermitRequest};
-use openporch_store::{ActiveResource, EnvRecord, Store, Tombstone};
+use openporch_store::{ActiveResource, Detach, EnvRecord, Store, Tombstone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -284,7 +284,17 @@ pub async fn detach(
     audit.reason = Some(reason.to_owned());
     let tombstone = state
         .store
-        .detach_resource(org, &env.app, &env.id, &resource.descriptor, reason, audit)
+        .detach_resource(
+            org,
+            &env.app,
+            &env.id,
+            Detach {
+                descriptor: &resource.descriptor,
+                guresid: &resource.guresid,
+                reason,
+            },
+            audit,
+        )
         .await?;
     Ok(Json(tombstone))
 }

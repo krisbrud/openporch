@@ -23,7 +23,7 @@ mod sqlite_values;
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
 pub use deploy::{
     Acceptance, ActiveResource, CheckpointResult, DeltaRecord, DeploymentRecord, DeploymentRequest,
-    DeploymentStatus, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
+    DeploymentStatus, Detach, DraftDelta, EnvRecord, NewEnv, OperationKind, OperationStart,
     OperationStarted, Provisioned, RecoveryReport, ResourceRunStatus, Tombstone,
     UncertainOperation,
 };
@@ -331,14 +331,14 @@ pub trait Store: Send + Sync {
     /// Detaches an active resource: removes it from management without calling
     /// its driver and leaves a tombstone. Needs an administrator, and no
     /// running deployment or open or uncertain operation on the resource. The
-    /// descriptor is not provisioned again until it is adopted.
+    /// descriptor is not provisioned again until it is adopted. A resource
+    /// replaced since the caller checked its permit is refused.
     fn detach_resource(
         &self,
         org: &str,
         app: &str,
         env: &str,
-        descriptor: &str,
-        reason: &str,
+        detach: Detach<'_>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Tombstone>> + Send;
 

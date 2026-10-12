@@ -12,6 +12,7 @@ use openporch_store::secrets::{
     BuiltinSecretStore, Keyring, MasterKey, SecretStore as _, SecretValue,
 };
 use openporch_store::{AuditIntent, DeploymentRequest, DeploymentStatus, Ownership, SqliteStore};
+use openporch_store::{Detach, Tombstone};
 use tokio::sync::Barrier;
 
 use super::*;
@@ -1511,6 +1512,7 @@ async fn a_detached_resource_is_not_provisioned_again() {
     let db = f.active(DB).await.unwrap();
     let detach = |actor: &str| {
         let store = f.store.clone();
+        let guresid = db.guresid.clone();
         let audit = AuditIntent::accepted(ORG, actor, "POST", "/detach", "resource.detach");
         async move {
             store
@@ -1518,8 +1520,11 @@ async fn a_detached_resource_is_not_provisioned_again() {
                     ORG,
                     "shop",
                     "development",
-                    DB,
-                    "moved to a shared cluster",
+                    Detach {
+                        descriptor: DB,
+                        guresid: &guresid,
+                        reason: "moved to a shared cluster",
+                    },
                     audit,
                 )
                 .await
@@ -1574,6 +1579,100 @@ async fn a_detached_resource_is_not_provisioned_again() {
     assert!(f.active(DB).await.is_none());
 }
 
+/// Detaches `descriptor` as the administrator.
+async fn detach_as_root(f: &Fixture, descriptor: &str) -> Result<Tombstone, StoreError> {
+    let guresid = f.active(descriptor).await.unwrap().guresid;
+    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
+    f.store
+        .detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor,
+                guresid: &guresid,
+                reason: "gone",
+            },
+            audit,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn what_a_detached_resource_uses_is_kept() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+    let workload = f.active(WORKLOAD).await.unwrap();
+    assert!(workload.dependencies.contains(&DB.to_owned()));
+    detach_as_root(&f, WORKLOAD).await.unwrap();
+
+    // The workload keeps running outside openporch, so its database stays even
+    // when scheduled for deletion.
+    f.schedule(DB).await;
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let checks = Arc::new(AllowAll::default());
+    let outcomes = deleting(&f, &fake, &checks).run(deployment).await;
+    assert_eq!(
+        outcomes[&d(DB)],
+        Outcome::Kept(format!(
+            "scheduled for deletion, but still used by `{WORKLOAD} (detached)`"
+        ))
+    );
+    assert!(!fake.deletions().contains(&DB.to_owned()));
+    assert!(f.active(DB).await.is_some());
+}
+
+#[tokio::test]
+async fn detach_is_refused_while_anything_is_in_flight_or_changed() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("workload", Behavior::Permanent)]);
+    planner(&f, &fake, fast()).run(f.accept().await).await;
+
+    // A resource that never provisioned has nothing to detach.
+    let refused = detach_as_root(&f, WORKLOAD).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("never provisioned")),
+        "{refused:?}"
+    );
+
+    // The permit was checked against another resource with the same descriptor.
+    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
+    let refused = f
+        .store
+        .detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor: DB,
+                guresid: "older-guresid",
+                reason: "gone",
+            },
+            audit,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("replaced")),
+        "{refused:?}"
+    );
+
+    // A deployment is running.
+    let running = f.accept().await;
+    let refused = detach_as_root(&f, DB).await;
+    assert!(matches!(refused, Err(StoreError::Busy(_))), "{refused:?}");
+
+    // An operation on the resource is still open after its deployment ended.
+    open_deletion(&f, &running, DB).await;
+    planner(&f, &fake, fast()).run(running).await;
+    let refused = detach_as_root(&f, DB).await;
+    assert!(
+        matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("has not finished")),
+        "{refused:?}"
+    );
+    assert!(f.active(DB).await.is_some());
+}
+
 #[tokio::test]
 async fn a_deleted_resource_awaiting_cleanup_is_not_detached() {
     let f = Fixture::new().await;
@@ -1587,11 +1686,7 @@ async fn a_deleted_resource_awaiting_cleanup_is_not_detached() {
     .execute(f.store.pool())
     .await
     .unwrap();
-    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
-    let refused = f
-        .store
-        .detach_resource(ORG, "shop", "development", DB, "gone", audit)
-        .await;
+    let refused = detach_as_root(&f, DB).await;
     assert!(
         matches!(&refused, Err(StoreError::Conflict(e)) if e.contains("already deleted")),
         "{refused:?}"
@@ -1604,11 +1699,7 @@ async fn a_resource_with_an_uncertain_operation_is_not_detached() {
     let f = Fixture::new().await;
     let fake = Fake::with(&[("dns", Behavior::Panic)]);
     planner(&f, &fake, fast()).run(f.accept().await).await;
-    let audit = AuditIntent::accepted(ORG, "root", "POST", "/detach", "resource.detach");
-    let refused = f
-        .store
-        .detach_resource(ORG, "shop", "development", DNS, "gone", audit)
-        .await;
+    let refused = detach_as_root(&f, DNS).await;
     assert!(
         matches!(refused, Err(StoreError::RecoveryRequired(_))),
         "{refused:?}"

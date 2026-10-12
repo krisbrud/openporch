@@ -1622,10 +1622,14 @@ impl Store for SqliteStore {
         org: &str,
         app: &str,
         env: &str,
-        descriptor: &str,
-        reason: &str,
+        detach: Detach<'_>,
         audit: AuditIntent,
     ) -> Result<Tombstone> {
+        let Detach {
+            descriptor,
+            guresid: expected,
+            reason,
+        } = detach;
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
@@ -1641,8 +1645,8 @@ impl Store for SqliteStore {
         if let Some(id) = running {
             return Err(StoreError::Busy(id));
         }
-        let row: Option<(String, String, bool)> = sqlx::query_as(
-            "SELECT guresid, status, cleanup_pending FROM active_resources \
+        let row: Option<(String, String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT guresid, status, cleanup_pending, last_deploy_id FROM active_resources \
              WHERE org_id = ? AND app_id = ? AND env_id = ? AND descriptor = ?",
         )
         .bind(org)
@@ -1651,10 +1655,22 @@ impl Store for SqliteStore {
         .bind(descriptor)
         .fetch_optional(&mut *tx)
         .await?;
-        let (guresid, status, cleanup_pending) =
+        let (guresid, status, cleanup_pending, last_deploy) =
             row.ok_or_else(|| StoreError::NotFound(format!("active resource `{descriptor}`")))?;
+        if guresid != expected {
+            return Err(StoreError::Conflict(format!(
+                "`{descriptor}` was replaced by another resource; check it again"
+            )));
+        }
         if status == "unknown" || status == "recovery_required" {
             return Err(StoreError::RecoveryRequired(descriptor.to_owned()));
+        }
+        // Nothing was created, so nothing is left to manage elsewhere; a
+        // tombstone would only block the descriptor.
+        if last_deploy.is_none() {
+            return Err(StoreError::Conflict(format!(
+                "`{descriptor}` never provisioned; delete it or deploy it instead"
+            )));
         }
         // The object is already gone; only its record remains to be removed.
         if cleanup_pending {
@@ -1677,13 +1693,15 @@ impl Store for SqliteStore {
         let now = now_ms();
         sqlx::query(
             "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
-             actor_id, body, at, cookie_key_id, cookie_nonce, cookie) SELECT org_id, app_id, \
+             actor_id, body, at, cookie_key_id, cookie_nonce, cookie, secret_outputs) \
+             SELECT org_id, app_id, \
              env_id, descriptor, guresid, 'detached', ?, json_object('definition_id', \
              definition_id, 'definition_version', definition_version, 'driver_type', \
              driver_type, 'driver_account', driver_account, 'target', target, 'ownership', \
              ownership, 'external_ids', json(external_ids), 'backend', backend, 'outputs', \
              json(outputs), 'snapshot', json(snapshot), 'recovery', json(recovery), \
-             'reason', ?), ?, cookie_key_id, cookie_nonce, cookie \
+             'dependencies', json(dependencies), 'reason', ?), ?, cookie_key_id, \
+             cookie_nonce, cookie, secret_outputs \
              FROM active_resources WHERE guresid = ?",
         )
         .bind(&audit.actor)

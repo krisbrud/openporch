@@ -1673,13 +1673,20 @@ Detaching stops openporch from managing a resource without calling its driver,
 so the real object keeps running. It needs an administrator, a `reason` and a
 matching permit in `permits`, and is refused with `409` while a deployment runs
 or while an operation on the resource is open or has an unknown outcome. A
-resource whose deletion the driver already confirmed cannot be detached; the
-next deployment that leaves it out removes its record. The response is the
+resource that never provisioned has nothing to detach and is refused too; delete
+or deploy it instead. So is one whose deletion the driver already confirmed;
+the next deployment that leaves it out removes its record. If the resource was
+replaced by another with the same descriptor after the permit was checked, the
+request is refused with `409`. What a detached resource used stays: a
+deployment never deletes it while the detached resource depended on it, and
+reports it as kept. The response is the
 resource's tombstone. Its `body` holds the definition and the snapshot it was
 provisioned from, the driver, cloud account, target, object IDs, state backend,
 the driver's recovery data and the outputs, which are enough to adopt the
 object elsewhere, plus the reason, which the audit log records too. The driver's
-encrypted cookie is kept with the tombstone but never returned. Object IDs and
+encrypted cookie and its secret-output references are kept with the tombstone
+but never returned. Everything in `body` is non-secret, so anyone who can read
+the application can list tombstones. Object IDs and
 the state backend are reported by the executor, which is not implemented yet,
 so until then they are empty. A deployment that still includes a detached resource fails for it rather
 than creating a second object; bringing it back under management is an explicit

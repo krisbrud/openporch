@@ -310,6 +310,17 @@ impl ResourceRunStatus {
     }
 }
 
+/// A request to detach a resource.
+#[derive(Debug, Clone, Copy)]
+pub struct Detach<'a> {
+    /// `<type>.<class>#<res_id>`.
+    pub descriptor: &'a str,
+    /// The identity the caller checked its permit against.
+    pub guresid: &'a str,
+    /// Why; recorded in the tombstone and the audit log.
+    pub reason: &'a str,
+}
+
 /// What remains of a resource that was deleted or detached.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Tombstone {
