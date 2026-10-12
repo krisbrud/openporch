@@ -246,6 +246,8 @@ struct Fixture {
     sts: Arc<FakeSts>,
     cloud: Arc<CredentialResolver>,
     drivers: Arc<DriverRegistry>,
+    /// Where the shared value `API_TOKEN` points.
+    token: Mutex<String>,
 }
 
 fn audit(method: &str, path: &str) -> AuditIntent {
@@ -324,6 +326,7 @@ impl Fixture {
             sts,
             cloud,
             drivers: Arc::new(drivers),
+            token: Mutex::new("apps/shop/values/API_TOKEN".into()),
         }
     }
 
@@ -441,7 +444,7 @@ impl Fixture {
             "API_TOKEN".into(),
             SharedValue::Secret(SecretRef {
                 store: "openporch".into(),
-                reference: "apps/shop/values/API_TOKEN".into(),
+                reference: self.token.lock().unwrap().clone(),
                 version: None,
             }),
         );
@@ -647,19 +650,61 @@ async fn a_definition_that_no_longer_matches_does_not_get_its_secrets() {
     assert!(f.driver.puts().is_empty());
 }
 
+impl Fixture {
+    /// Creates the `aws-main` account with static keys.
+    async fn account(&self) {
+        let account: CloudAccount = serde_json::from_value(json!({
+            "id": "aws-main", "type": "aws",
+            "config": {"access_key_id": "AKIATEST", "region": "eu-north-1"},
+            "secret_refs": {"secret_access_key": {"store": "openporch", "ref": "accounts/aws-main/secret_access_key"}},
+        }))
+        .unwrap();
+        self.store
+            .create_account(ORG, &account, audit("POST", "/orgs/acme/accounts"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_definition_that_no_longer_matches_does_not_get_its_cloud_account() {
+    let f = Fixture::new().await;
+    f.account().await;
+    let mut pg = plain_pg();
+    pg.driver_account = Some("aws-main".into());
+    let defs = f.define(pg, "openporch/none").await;
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, DB);
+    assert!(error.contains("no longer matches"), "{error}");
+    assert!(f.driver.puts().is_empty());
+}
+
+#[tokio::test]
+async fn a_shared_value_without_a_grant_is_not_read() {
+    let f = Fixture::new().await;
+    // `API_TOKEN` points at a secret written for no value of `shop`.
+    *f.token.lock().unwrap() = "shared/pg-master".into();
+    let defs = f.define(plain_pg(), "test/fake").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, WORKLOAD);
+    assert!(error.contains("no grant"), "{error}");
+    assert!(
+        f.driver
+            .puts()
+            .iter()
+            .all(|r| r.resource_type != "workload"),
+        "the workload's driver was called"
+    );
+}
+
 #[tokio::test]
 async fn a_resource_is_not_provisioned_in_another_aws_account() {
     let f = Fixture::new().await;
-    let account: CloudAccount = serde_json::from_value(json!({
-        "id": "aws-main", "type": "aws",
-        "config": {"access_key_id": "AKIATEST", "region": "eu-north-1"},
-        "secret_refs": {"secret_access_key": {"store": "openporch", "ref": "accounts/aws-main/secret_access_key"}},
-    }))
-    .unwrap();
-    f.store
-        .create_account(ORG, &account, audit("POST", "/orgs/acme/accounts"))
-        .await
-        .unwrap();
+    f.account().await;
     let mut pg = plain_pg();
     pg.driver_account = Some("aws-main".into());
     let defs = f.define(pg, "openporch/none").await;
@@ -976,4 +1021,24 @@ output "n" { value = tonumber(nonsensitive(var.token)) }
     assert!(recorded.contains("$ tofu plan"), "{recorded}");
     assert!(recorded.contains("[REDACTED]"), "{recorded}");
     assert!(!recorded.contains("hunter2-not-a-number"), "{recorded}");
+}
+
+#[test]
+fn a_failure_after_the_driver_accepted_a_change_is_uncertain() {
+    let transient = || DriverError::Transient {
+        message: "503 while polling".into(),
+        retry_after: None,
+    };
+    assert!(matches!(
+        mutation_failure(transient(), false),
+        ExecFailure::Retryable { .. }
+    ));
+    assert!(matches!(
+        mutation_failure(transient(), true),
+        ExecFailure::Uncertain(e) if e.contains("503 while polling")
+    ));
+    assert!(matches!(
+        mutation_failure(DriverError::Conflict("state is locked".into()), false),
+        ExecFailure::Permanent(_)
+    ));
 }

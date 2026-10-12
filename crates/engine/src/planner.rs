@@ -1160,9 +1160,12 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 name(&account),
             )));
         }
+        // A failed first attempt that left driver state behind counts too.
+        job.existing = resource.last_deploy_id.is_some()
+            || resource.cookie.is_some()
+            || resource.target.is_some();
         job.cookie = resource.cookie;
         job.target = resource.target;
-        job.existing = resource.last_deploy_id.is_some();
         Ok(job)
     }
 

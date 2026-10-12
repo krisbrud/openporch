@@ -176,7 +176,9 @@ where
         references(&job.inputs.secrets, &mut input_refs);
         references(&job.inputs.resource, &mut input_refs);
 
-        if check_criteria && !definition_refs.is_empty() {
+        // The definition's own secrets and its cloud account are the
+        // definition's to give, so only to deployments its criteria match.
+        if check_criteria && (!definition_refs.is_empty() || job.driver_account.is_some()) {
             self.check_criteria(job).await?;
         }
         let definition = job.definition_id.as_str();
@@ -339,6 +341,12 @@ where
             .identity(&credentials)
             .await
             .map_err(cloud_failure)?;
+        if job.target.is_none() && job.existing {
+            log.warn(&format!(
+                "`{}` has no recorded AWS account; it is now recorded as {}",
+                job.descriptor, identity.account
+            ));
+        }
         if let Some(previous) = &job.target
             && *previous != identity.account
         {
@@ -479,9 +487,14 @@ where
             }
             Plan::Unknown => {}
         }
-        let remaining = job.deadline.saturating_duration_since(Instant::now());
-        let settled = converge(driver.as_ref(), &req, timeout.min(remaining)).await;
-        let outputs = settled.result.map_err(driver_failure)?;
+        let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
+        let target = match self.refresh(job, &mut req, timeout, log).await? {
+            Some(refreshed) => Some(refreshed),
+            None => target,
+        };
+        let settled = converge(driver.as_ref(), &req, timeout).await;
+        let accepted = settled.cookie != req.cookie;
+        let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
         let mut result = ProvisionResult {
             outputs: outputs.values,
             target,
@@ -490,7 +503,11 @@ where
             ..ProvisionResult::default()
         };
         let secrets = outputs.secrets.expose();
-        log.secret(secrets.values().map(secret_text).collect::<Vec<_>>());
+        let mut texts = Vec::new();
+        for value in secrets.values() {
+            secret_texts(value, &mut texts);
+        }
+        log.secret(texts);
         for (key, value) in secrets {
             let name = format!("resources/{}/outputs/{key}", job.guresid);
             let reference = self
@@ -540,11 +557,27 @@ where
             }
             Plan::NoEffects | Plan::Unknown => {}
         }
-        let remaining = job.deadline.saturating_duration_since(Instant::now());
-        remove(driver.as_ref(), &req, timeout.min(remaining))
-            .await
-            .result
-            .map_err(driver_failure)
+        let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
+        self.refresh(job, &mut req, timeout, log).await?;
+        let settled = remove(driver.as_ref(), &req, timeout).await;
+        let accepted = settled.cookie != req.cookie;
+        settled.result.map_err(|e| mutation_failure(e, accepted))
+    }
+
+    /// Replaces the request's credentials, obtained for the plan, with ones
+    /// that last for the whole mutation, checking their target again.
+    async fn refresh(
+        &self,
+        job: &ProvisionJob,
+        req: &mut DriverRequest,
+        window: Duration,
+        log: &mut RedactingLog,
+    ) -> Result<Option<String>, ExecFailure> {
+        let Some((credentials, target)) = self.credentials(job, window, log).await? else {
+            return Ok(None);
+        };
+        req.credentials = Some(credentials);
+        Ok(Some(target))
     }
 }
 
@@ -690,6 +723,24 @@ fn secret_text(v: &Value) -> String {
     }
 }
 
+/// Every text a secret output holds: the value as stored, and each string
+/// inside a structured one.
+fn secret_texts(v: &Value, out: &mut Vec<String>) {
+    out.push(secret_text(v));
+    if matches!(v, Value::Array(_) | Value::Object(_)) {
+        secret_leaves(v, out);
+    }
+}
+
+fn secret_leaves(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => items.iter().for_each(|i| secret_leaves(i, out)),
+        Value::Object(fields) => fields.values().for_each(|f| secret_leaves(f, out)),
+        _ => {}
+    }
+}
+
 fn driver_failure(e: DriverError) -> ExecFailure {
     match e {
         DriverError::Invalid { .. } | DriverError::Unsupported(_) => {
@@ -702,15 +753,26 @@ fn driver_failure(e: DriverError) -> ExecFailure {
             error: message,
             retry_after,
         },
-        // The driver refused to start: nothing changed, and the conflicting
-        // operation may finish.
-        DriverError::Conflict(_) => ExecFailure::Retryable {
-            error: e.to_string(),
-            retry_after: None,
-        },
+        // Another operation holds the resource: observe it before mutating
+        // again rather than retrying into it.
+        DriverError::Conflict(_) => ExecFailure::Permanent(e.to_string()),
         DriverError::Timeout(_) | DriverError::Uncertain(_) => {
             ExecFailure::Uncertain(e.to_string())
         }
+    }
+}
+
+/// A failed `put` or `delete`. Once the driver accepted the mutation, which
+/// shows as a new cookie, any failure may have left changes behind.
+fn mutation_failure(e: DriverError, accepted: bool) -> ExecFailure {
+    match driver_failure(e) {
+        f @ ExecFailure::Uncertain(_) => f,
+        ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if accepted => {
+            ExecFailure::Uncertain(format!(
+                "the driver accepted the change, then failed: {error}"
+            ))
+        }
+        f => f,
     }
 }
 
