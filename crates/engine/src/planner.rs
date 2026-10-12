@@ -486,6 +486,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             (None, Err(e)) => Some(e),
             (Some(error), Err(e)) => Some(format!("{error}; {e}")),
         };
+        // A log with lines missing is reported, not presented as complete.
+        let synced = log.sync().await;
+        let error = with_lost_lines(error, synced);
         match &error {
             None => log.deployment().status("info", "deployment succeeded"),
             Some(e) => log
@@ -493,7 +496,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 .status("error", &format!("deployment failed: {e}")),
         }
         // The log is complete before the deployment is.
-        log.close().await;
+        let closed = log.close().await;
+        let error = with_lost_lines(error, closed.saturating_sub(synced));
         if let Err(e) = self
             .store
             .finish_deployment(
@@ -508,6 +512,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
         }
         outcomes
+    }
+}
+
+/// `error`, noting that `lost` log lines could not be stored.
+fn with_lost_lines(error: Option<String>, lost: usize) -> Option<String> {
+    match (error, lost) {
+        (error, 0) => error,
+        (None, n) => Some(format!("{n} log lines could not be stored")),
+        (Some(e), n) => Some(format!("{e}; {n} log lines could not be stored")),
     }
 }
 

@@ -1878,3 +1878,20 @@ async fn nothing_is_logged_after_the_log_closes() {
         .collect();
     assert_eq!(messages, ["before"]);
 }
+
+#[tokio::test]
+async fn lost_log_lines_fail_the_deployment() {
+    let f = Fixture::new().await;
+    let fake = Arc::new(Fake::default());
+    let deployment = f.accept().await;
+    sqlx::query("DROP TABLE logs")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    let (status, error) = f.status(&deployment).await;
+    assert_eq!(status, DeploymentStatus::Failed);
+    let error = error.unwrap();
+    assert!(error.ends_with("log lines could not be stored"), "{error}");
+}

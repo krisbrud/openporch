@@ -29,9 +29,11 @@ const WRITE_ATTEMPTS: u32 = 3;
 
 enum Message {
     Line(LogLine),
-    /// Everything sent before has been persisted once the reply arrives, and
-    /// nothing after it is.
-    Close(oneshot::Sender<()>),
+    /// Everything sent before has been written once the reply arrives, which
+    /// counts the lines that could not be written so far.
+    Sync(oneshot::Sender<usize>),
+    /// Like `Sync`, and nothing sent after it is written.
+    Close(oneshot::Sender<usize>),
 }
 
 /// The sending side of a deployment's log, shared by all of its logs.
@@ -96,16 +98,23 @@ impl DeploymentLog {
         let env = deployment.env.to_string();
         let id = deployment.id.clone();
         tokio::spawn(async move {
-            let mut closed = None;
-            while closed.is_none() {
+            let mut lost = 0;
+            let mut closed = false;
+            while !closed {
                 let Some(first) = rx.recv().await else { break };
                 let mut lines = Vec::new();
+                let mut replies = Vec::new();
                 let mut next = Some(first);
                 while let Some(message) = next.take() {
                     match message {
                         Message::Line(line) => lines.push(line),
+                        Message::Sync(done) => {
+                            replies.push(done);
+                            break;
+                        }
                         Message::Close(done) => {
-                            closed = Some(done);
+                            replies.push(done);
+                            closed = true;
                             break;
                         }
                     }
@@ -113,10 +122,10 @@ impl DeploymentLog {
                         next = rx.try_recv().ok();
                     }
                 }
-                write(&*store, [&org, &app, &env, &id], lines).await;
-            }
-            if let Some(done) = closed {
-                let _ = done.send(());
+                lost += write(&*store, [&org, &app, &env, &id], lines).await;
+                for done in replies {
+                    let _ = done.send(lost);
+                }
             }
         });
         Self {
@@ -166,26 +175,38 @@ impl DeploymentLog {
         }
     }
 
-    /// Waits until every line sent so far is persisted, and drops every line
-    /// sent later, so that the log is complete once the deployment finishes.
-    pub async fn close(&self) {
+    /// Waits until every line sent so far is written, returning how many
+    /// lines could not be written.
+    pub async fn sync(&self) -> usize {
+        let (done, wait) = oneshot::channel();
+        match self.writer.tx.send(Message::Sync(done)) {
+            Ok(()) => wait.await.unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Like [`Self::sync`], and drops every line sent later, so that the log
+    /// is complete once the deployment finishes.
+    pub async fn close(&self) -> usize {
         let writer = &self.writer;
         writer.closed.store(true, Ordering::SeqCst);
         let (done, wait) = oneshot::channel();
-        if writer.tx.send(Message::Close(done)).is_ok() {
-            let _ = wait.await;
+        match writer.tx.send(Message::Close(done)) {
+            Ok(()) => wait.await.unwrap_or(0),
+            Err(_) => 0,
         }
     }
 }
 
-/// Persists `lines`, retrying a failed write a few times.
-async fn write<S: Store>(store: &S, [org, app, env, id]: [&str; 4], lines: Vec<LogLine>) {
+/// Persists `lines`, retrying a failed write a few times. Returns how many
+/// lines were lost.
+async fn write<S: Store>(store: &S, [org, app, env, id]: [&str; 4], lines: Vec<LogLine>) -> usize {
     if lines.is_empty() {
-        return;
+        return 0;
     }
     for attempt in 1..=WRITE_ATTEMPTS {
         match store.append_logs(org, app, env, id, lines.clone()).await {
-            Ok(()) => return,
+            Ok(()) => return 0,
             Err(e) if attempt == WRITE_ATTEMPTS => {
                 tracing::error!(
                     deployment = %id, error = %e, lines = lines.len(),
@@ -195,6 +216,7 @@ async fn write<S: Store>(store: &S, [org, app, env, id]: [&str; 4], lines: Vec<L
             Err(_) => tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await,
         }
     }
+    lines.len()
 }
 
 struct Shared {
