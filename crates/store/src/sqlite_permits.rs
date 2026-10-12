@@ -22,6 +22,9 @@ use crate::{Result, StoreError, now_ms, random_hex};
 /// How long a plan and an unbound permit stay valid, in milliseconds.
 pub const PERMIT_TTL_MS: i64 = 60 * 60 * 1000;
 
+/// The actions a permit can authorize.
+const ACTIONS: [&str; 4] = ["delete", "detach", "replace", "unknown"];
+
 /// What `bound_to` holds for a permit a detach used.
 const DETACHED: &str = "detach";
 
@@ -228,6 +231,10 @@ type PermitRow = (
     Option<String>,
 );
 
+/// A permit as `bind_permits` reads it: descriptor, action, base
+/// generation, configuration digest, expiry, binding and issuer.
+type BindRow = (String, String, i64, String, i64, Option<String>, String);
+
 type PlanRow = (
     String,
     String,
@@ -354,6 +361,30 @@ impl PermitStore for SqliteStore {
                 "plan `{plan}` has expired; preview again"
             )));
         }
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_one(&mut *tx)
+        .await?;
+        if base_generation != generation {
+            return Err(StoreError::PermitInvalid(format!(
+                "plan `{plan}` was made at generation {base_generation}, but the environment is \
+                 at {generation}; preview again"
+            )));
+        }
+        if let Some(p) = permits
+            .iter()
+            .find(|p| !ACTIONS.contains(&p.action.as_str()))
+        {
+            return Err(StoreError::Invalid(format!(
+                "`{}` is not a destructive action; use one of {}",
+                p.action,
+                ACTIONS.join(", ")
+            )));
+        }
         let env_type = env_type(&mut tx, org, app, env).await?;
         // The issuer needs the authority the actions need, checked with the
         // issue.
@@ -409,119 +440,15 @@ impl PermitStore for SqliteStore {
 
     async fn use_permit(&self, u: PermitUse<'_>) -> Result<()> {
         self.check_org(u.org)?;
-        let mut tx = self.begin().await?;
-        let env_type = env_type(&mut tx, u.org, u.app, u.env).await?;
-        let candidates: Vec<PermitRow> = match u.deployment {
-            Some(deployment) => {
-                sqlx::query_as(
-                    "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
-                         expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
-                         AND env_id = ? AND bound_to = ? AND descriptor = ? AND action = ? \
-                         ORDER BY id",
-                )
-                .bind(u.org)
-                .bind(u.app)
-                .bind(u.env)
-                .bind(deployment)
-                .bind(u.descriptor)
-                .bind(u.action)
-                .fetch_all(&mut *tx)
-                .await?
-            }
-            None => {
-                let mut rows = Vec::new();
-                for id in u.presented {
-                    let row: Option<PermitRow> = sqlx::query_as(
-                        "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
-                             expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
-                             AND env_id = ? AND id = ? AND descriptor = ? AND action = ?",
-                    )
-                    .bind(u.org)
-                    .bind(u.app)
-                    .bind(u.env)
-                    .bind(id)
-                    .bind(u.descriptor)
-                    .bind(u.action)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    rows.extend(row);
-                }
-                rows
-            }
-        };
-        let generation: i64 = sqlx::query_scalar(
-            "SELECT generation FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
-        )
-        .bind(u.org)
-        .bind(u.app)
-        .bind(u.env)
-        .fetch_one(&mut *tx)
-        .await?;
-        let now = now_ms();
-        let mut refused = Vec::new();
-        for (id, issuer, guresid, fingerprint, base_generation, expires_at, bound_to) in candidates
-        {
-            if guresid.is_some() && guresid.as_deref() != u.guresid {
-                refused.push(format!("permit `{id}` is for another resource identity"));
-                continue;
-            }
-            if fingerprint.is_some() && fingerprint.as_deref() != u.fingerprint {
-                refused.push(format!(
-                    "permit `{id}` covers driver plan {}, not this one",
-                    fingerprint.as_deref().unwrap_or_default()
-                ));
-                continue;
-            }
-            if u.deployment.is_none() {
-                // A detach binds the permit itself, with the checks an
-                // acceptance makes.
-                if bound_to.is_some() {
-                    refused.push(format!("permit `{id}` was already used"));
-                    continue;
-                }
-                if expires_at <= now {
-                    refused.push(format!("permit `{id}` has expired"));
-                    continue;
-                }
-                if base_generation != generation {
-                    refused.push(format!(
-                        "permit `{id}` was issued at generation {base_generation}, but the \
-                         environment is at {generation}"
-                    ));
-                    continue;
-                }
-            }
-            // A permit is only as good as its issuer's authority now.
-            let authority = if u.action == "detach" {
-                check_admin_authority(&mut tx, u.org, Some(&issuer)).await
-            } else {
-                check_env_authority(&mut tx, u.org, Some(&issuer), u.app, &env_type).await
-            };
-            if let Err(e) = authority {
-                refused.push(format!("permit `{id}` no longer holds: {e}"));
-                continue;
-            }
-            sqlx::query(
-                "UPDATE permits SET used_at = COALESCE(used_at, ?), \
-                 bound_to = COALESCE(bound_to, ?), bound_at = COALESCE(bound_at, ?) \
-                 WHERE org_id = ? AND id = ?",
-            )
-            .bind(now)
-            .bind(DETACHED)
-            .bind(now)
-            .bind(u.org)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(());
+        if u.deployment.is_none() {
+            return Err(StoreError::Invalid(
+                "a detach uses its permit inside the detach itself".into(),
+            ));
         }
-        let what = format!("{} of `{}`", u.action, u.descriptor);
-        Err(StoreError::ApprovalRequired(if refused.is_empty() {
-            format!("no permit covers the {what}")
-        } else {
-            format!("no permit covers the {what}: {}", refused.join("; "))
-        }))
+        let mut tx = self.begin().await?;
+        consume_permit(&mut tx, &u).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn record_approval_request(
@@ -592,6 +519,145 @@ impl PermitStore for SqliteStore {
     }
 }
 
+/// Authorizes a destructive action with a permit inside the caller's
+/// transaction, as [`PermitStore::use_permit`] describes; a detach passes
+/// the permits it presents, which only a detach may consume this way.
+pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_>) -> Result<()> {
+    if u.deployment.is_none() && u.action != "detach" {
+        return Err(StoreError::Invalid(format!(
+            "a {} permit is used only by the deployment it is bound to",
+            u.action
+        )));
+    }
+    let env_type = env_type(&mut *conn, u.org, u.app, u.env).await?;
+    let candidates: Vec<PermitRow> = match u.deployment {
+        Some(deployment) => {
+            sqlx::query_as(
+                "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
+                     expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
+                     AND env_id = ? AND bound_to = ? AND descriptor = ? AND action = ? \
+                     ORDER BY id",
+            )
+            .bind(u.org)
+            .bind(u.app)
+            .bind(u.env)
+            .bind(deployment)
+            .bind(u.descriptor)
+            .bind(u.action)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        None => {
+            let mut rows = Vec::new();
+            for id in u.presented {
+                let row: Option<PermitRow> = sqlx::query_as(
+                    "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
+                         expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
+                         AND env_id = ? AND id = ? AND descriptor = ? AND action = ?",
+                )
+                .bind(u.org)
+                .bind(u.app)
+                .bind(u.env)
+                .bind(id)
+                .bind(u.descriptor)
+                .bind(u.action)
+                .fetch_optional(&mut *conn)
+                .await?;
+                rows.extend(row);
+            }
+            rows
+        }
+    };
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT generation FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+    )
+    .bind(u.org)
+    .bind(u.app)
+    .bind(u.env)
+    .fetch_one(&mut *conn)
+    .await?;
+    let now = now_ms();
+    let mut refused = Vec::new();
+    for (id, issuer, guresid, fingerprint, base_generation, expires_at, bound_to) in candidates {
+        if guresid.is_some() && guresid.as_deref() != u.guresid {
+            refused.push(format!("permit `{id}` is for another resource identity"));
+            continue;
+        }
+        if fingerprint.is_some() && fingerprint.as_deref() != u.fingerprint {
+            refused.push(format!(
+                "permit `{id}` covers driver plan {}, not this one",
+                fingerprint.as_deref().unwrap_or_default()
+            ));
+            continue;
+        }
+        if u.deployment.is_none() {
+            // A detach binds the permit itself, with the checks an
+            // acceptance makes.
+            if bound_to.is_some() {
+                refused.push(format!("permit `{id}` was already used"));
+                continue;
+            }
+            if expires_at <= now {
+                refused.push(format!("permit `{id}` has expired"));
+                continue;
+            }
+            if base_generation != generation {
+                refused.push(format!(
+                    "permit `{id}` was issued at generation {base_generation}, but the \
+                     environment is at {generation}"
+                ));
+                continue;
+            }
+        }
+        // A permit is only as good as its issuer's authority now.
+        if let Some(e) = issuer_lost(conn, u.org, u.app, &env_type, u.action, &issuer).await? {
+            refused.push(format!("permit `{id}` no longer holds: {e}"));
+            continue;
+        }
+        sqlx::query(
+            "UPDATE permits SET used_at = COALESCE(used_at, ?), \
+             bound_to = COALESCE(bound_to, ?), bound_at = COALESCE(bound_at, ?) \
+             WHERE org_id = ? AND id = ?",
+        )
+        .bind(now)
+        .bind(DETACHED)
+        .bind(now)
+        .bind(u.org)
+        .bind(&id)
+        .execute(&mut *conn)
+        .await?;
+        return Ok(());
+    }
+    let what = format!("{} of `{}`", u.action, u.descriptor);
+    Err(StoreError::ApprovalRequired(if refused.is_empty() {
+        format!("no permit covers the {what}")
+    } else {
+        format!("no permit covers the {what}: {}", refused.join("; "))
+    }))
+}
+
+/// Why `issuer` no longer holds the authority an `action` permit needs, or
+/// `None` while it does.
+async fn issuer_lost(
+    conn: &mut SqliteConnection,
+    org: &str,
+    app: &str,
+    env_type: &str,
+    action: &str,
+    issuer: &str,
+) -> Result<Option<String>> {
+    let authority = if action == "detach" {
+        check_admin_authority(&mut *conn, org, Some(issuer)).await
+    } else {
+        check_env_authority(&mut *conn, org, Some(issuer), app, env_type).await
+    };
+    match authority {
+        Ok(()) => Ok(None),
+        Err(StoreError::Forbidden(e)) => Ok(Some(e)),
+        Err(e) => Err(e),
+    }
+}
+
 async fn env_type(conn: &mut SqliteConnection, org: &str, app: &str, env: &str) -> Result<String> {
     sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
         .bind(org)
@@ -619,10 +685,15 @@ pub(crate) async fn bind_permits(
     let now = now_ms();
     let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
     let presented: BTreeSet<&String> = binding.presented.iter().collect();
+    let env_type = if presented.is_empty() {
+        String::new()
+    } else {
+        env_type(conn, org, app, env).await?
+    };
     for id in presented {
-        let row: Option<(String, String, i64, String, i64, Option<String>)> = sqlx::query_as(
+        let row: Option<BindRow> = sqlx::query_as(
             "SELECT descriptor, action, base_generation, config_digest, expires_at, \
-                 bound_to FROM permits \
+                 bound_to, issuer_id FROM permits \
                  WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
         )
         .bind(org)
@@ -631,7 +702,8 @@ pub(crate) async fn bind_permits(
         .bind(id)
         .fetch_optional(&mut *conn)
         .await?;
-        let Some((descriptor, action, base_generation, digest, expires_at, bound_to)) = row else {
+        let Some((descriptor, action, base_generation, digest, expires_at, bound_to, issuer)) = row
+        else {
             return Err(StoreError::PermitInvalid(format!(
                 "permit `{id}` was not issued for `{app}/{env}`"
             )));
@@ -652,6 +724,16 @@ pub(crate) async fn bind_permits(
             return Err(StoreError::PermitInvalid(format!(
                 "permit `{id}` was issued at generation {base_generation}, but the environment \
                  is at {generation}; preview again"
+            )));
+        }
+        if action == "detach" {
+            return Err(StoreError::PermitInvalid(format!(
+                "permit `{id}` is for a detach, which no deployment runs"
+            )));
+        }
+        if let Some(e) = issuer_lost(conn, org, app, &env_type, &action, &issuer).await? {
+            return Err(StoreError::PermitInvalid(format!(
+                "permit `{id}` no longer holds: {e}"
             )));
         }
         if binding.digests.get(&descriptor) != Some(&digest) {

@@ -426,6 +426,9 @@ pub struct Detach<'a> {
     pub guresid: &'a str,
     /// Why; recorded in the tombstone and the audit log.
     pub reason: &'a str,
+    /// The detach permits presented, one of which is used with the detach;
+    /// `None` while the caller checks the permit itself.
+    pub permits: Option<&'a [String]>,
 }
 
 /// What remains of a resource that was deleted or detached.

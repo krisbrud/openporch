@@ -1595,6 +1595,7 @@ impl Store for SqliteStore {
             descriptor,
             guresid: expected,
             reason,
+            permits,
         } = detach;
         self.check_org(org)?;
         let mut tx = self.begin().await?;
@@ -1655,6 +1656,24 @@ impl Store for SqliteStore {
             return Err(StoreError::Conflict(format!(
                 "operation `{op}` on `{descriptor}` has not finished"
             )));
+        }
+        // The permit is used with the detach, so a refused detach keeps it.
+        if let Some(presented) = permits {
+            crate::sqlite_permits::consume_permit(
+                &mut tx,
+                &crate::PermitUse {
+                    org,
+                    app,
+                    env,
+                    deployment: None,
+                    presented,
+                    descriptor,
+                    guresid: Some(&guresid),
+                    action: "detach",
+                    fingerprint: None,
+                },
+            )
+            .await?;
         }
         let now = now_ms();
         sqlx::query(
@@ -2274,6 +2293,9 @@ async fn remove_env(conn: &mut SqliteConnection, org: &str, app: &str, env: &str
     .execute(&mut *conn)
     .await?;
     for table in [
+        "permits",
+        "plans",
+        "approval_requests",
         "active_resources",
         "operations",
         "logs",

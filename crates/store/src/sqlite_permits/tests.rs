@@ -4,7 +4,7 @@ use openporch_core::sets::DeploymentSet;
 use serde_json::json;
 
 use super::*;
-use crate::{Acceptance, DeploymentKind, DeploymentRequest, Ownership, Store};
+use crate::{Acceptance, DeploymentKind, DeploymentRequest, Detach, Ownership, Store};
 
 const ORG: &str = "acme";
 const DB: &str = "postgres.default#modules.web.externals.db";
@@ -122,6 +122,10 @@ impl Fixture {
     /// Accepts a deployment that deletes the database, presenting `permits`,
     /// with the database's configuration at `digest`.
     async fn deploy(&self, permits: &[&str], digest: &str) -> Result<String> {
+        self.deploy_as("ci", permits, digest).await
+    }
+
+    async fn deploy_as(&self, actor: &str, permits: &[&str], digest: &str) -> Result<String> {
         let set: DeploymentSet = serde_json::from_value(json!({"modules": {}})).unwrap();
         let set_id = self.store.put_set(ORG, "shop", &set).await.unwrap();
         let acceptance = self
@@ -130,7 +134,7 @@ impl Fixture {
                 org: ORG.into(),
                 app: "shop".into(),
                 env: "development".into(),
-                actor: "ci".into(),
+                actor: actor.into(),
                 expected_generation: self.generation().await,
                 idempotency_key: None,
                 fingerprint: "f".into(),
@@ -140,7 +144,7 @@ impl Fixture {
                 delta_content: None,
                 comment: String::new(),
                 snapshot: json!({}),
-                audit: audit("ci"),
+                audit: audit(actor),
                 permits: PermitBinding {
                     presented: permits.iter().map(|p| (*p).to_owned()).collect(),
                     digests: BTreeMap::from([(DB.to_owned(), digest.to_owned())]),
@@ -300,26 +304,121 @@ async fn issuing_needs_an_unexpired_plan_and_the_authority() {
 }
 
 #[tokio::test]
-async fn a_detach_uses_its_presented_permit_once() {
+async fn a_detach_uses_its_permit_with_the_detach() {
     let f = Fixture::new().await;
+    sqlx::query(
+        "INSERT INTO active_resources (org_id, app_id, env_id, descriptor, guresid, status, \
+         last_deploy_id, created_at, updated_at) \
+         VALUES ('acme', 'shop', 'development', ?, 'g1', 'provisioned', 'd0', 0, 0)",
+    )
+    .bind(DB)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
     let permit = f.permit("detach", None).await;
-    let detach = |presented| PermitUse {
-        org: ORG,
-        app: "shop",
-        env: "development",
-        deployment: None,
-        presented,
-        descriptor: DB,
-        guresid: Some("g1"),
-        action: "detach",
-        fingerprint: None,
+    let detach = |permits| {
+        f.store.detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor: DB,
+                guresid: "g1",
+                reason: "moved to another tool",
+                permits: Some(permits),
+            },
+            audit("root"),
+        )
     };
-    let presented = [permit.id.clone()];
-    f.store.use_permit(detach(&presented)).await.unwrap();
-    let err = f.store.use_permit(detach(&presented)).await.unwrap_err();
-    assert!(err.to_string().contains("already used"), "{err}");
-    let err = f.store.use_permit(detach(&[])).await.unwrap_err();
+    // Without the permit nothing happens.
+    let err = detach(&[]).await.unwrap_err();
     assert!(matches!(err, StoreError::ApprovalRequired(_)), "{err:?}");
+    // A detach permit is not used outside a detach.
+    let err = f
+        .store
+        .use_permit(PermitUse {
+            org: ORG,
+            app: "shop",
+            env: "development",
+            deployment: None,
+            presented: std::slice::from_ref(&permit.id),
+            descriptor: DB,
+            guresid: Some("g1"),
+            action: "detach",
+            fingerprint: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    // Nor bound to a deployment.
+    let err = f.deploy(&[&permit.id], "digest-1").await.unwrap_err();
+    assert!(err.to_string().contains("detach"), "{err}");
+
+    let presented = [permit.id.clone()];
+    detach(&presented).await.unwrap();
+    let used: Option<String> = sqlx::query_scalar("SELECT bound_to FROM permits WHERE id = ?")
+        .bind(&permit.id)
+        .fetch_one(f.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(used.as_deref(), Some("detach"));
+}
+
+#[tokio::test]
+async fn a_refused_acceptance_binds_none_of_its_permits() {
+    let f = Fixture::new().await;
+    let good = f.permit("delete", None).await;
+    let err = f
+        .deploy(&[&good.id, "prm-nope"], "digest-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::PermitInvalid(_)), "{err:?}");
+    // The valid permit is still unbound and binds to the next deployment.
+    f.deploy(&[&good.id], "digest-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn an_issuer_who_lost_the_role_cannot_bind() {
+    let f = Fixture::new().await;
+    let permit = f.permit("delete", None).await;
+    sqlx::query("DELETE FROM app_roles WHERE principal_id = 'ci'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let err = f
+        .deploy_as("root", &[&permit.id], "digest-1")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no longer holds"), "{err}");
+}
+
+#[tokio::test]
+async fn permits_come_from_a_current_plan_for_known_actions() {
+    let f = Fixture::new().await;
+    let plan = f.plan("ci").await;
+    let issue = |action: &'static str| {
+        f.store.issue_permits(
+            ORG,
+            "shop",
+            "development",
+            &plan.id,
+            vec![NewPermit {
+                descriptor: DB.into(),
+                guresid: None,
+                action: action.into(),
+                plan_fingerprint: None,
+                config_digest: "digest-1".into(),
+            }],
+            audit("ci"),
+        )
+    };
+    let err = issue("format").await.unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    // Once the environment moves on, the plan is stale.
+    let other = f.permit("delete", None).await;
+    f.deploy(&[&other.id], "digest-1").await.unwrap();
+    let err = issue("delete").await.unwrap_err();
+    assert!(err.to_string().contains("generation"), "{err}");
 }
 
 #[tokio::test]
