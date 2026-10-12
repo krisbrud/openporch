@@ -63,8 +63,10 @@ pub struct PermitRequest<'a> {
     pub permits: &'a [String],
 }
 
-/// Decides whether presented permits allow a destructive action, and uses up
-/// the permit that does.
+/// Decides whether presented permits allow a destructive action. A permit
+/// authorizes one action on one resource and its retries: checking it again
+/// for the same action, such as after a deletion that could not be recorded
+/// or failed and is retried, must succeed.
 pub trait PermitCheck: Send + Sync + std::fmt::Debug {
     /// `Ok` when a permit allows the action; otherwise why not.
     fn check<'a>(
