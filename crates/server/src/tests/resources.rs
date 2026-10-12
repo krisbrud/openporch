@@ -843,18 +843,40 @@ async fn delete_a_deployed_environment() {
 
     // The retry deletes the rest and then the environment.
     fake.undeletable.lock().unwrap().clear();
-    s.delete_env(ENV, env["generation"].as_i64().unwrap()).await;
+    let body = json!({"expected_generation": env["generation"], "permits": ["permit-1"]});
+    let retry = || {
+        s.call_with(
+            Method::DELETE,
+            ENV,
+            Some(&s.admin),
+            Some(body.clone()),
+            &[("idempotency-key", "drop-pr-42")],
+        )
+    };
+    let (status, first) = retry().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    // A retry while it runs returns the same deletion.
+    let (status, again) = retry().await;
+    if status == StatusCode::ACCEPTED {
+        assert_eq!(again["deployment"]["id"], first["deployment"]["id"]);
+    } else {
+        assert_error(status, &again, StatusCode::NOT_FOUND, "API-001");
+    }
+    let mut gone = false;
     for _ in 0..500 {
-        let (status, _) = s.get(ENV, &s.admin).await;
-        if status == StatusCode::NOT_FOUND {
-            let deleted = fake.deleted.lock().unwrap().clone();
-            let at = |d: &str| deleted.iter().position(|x| x == d).unwrap();
-            assert!(at("workload.default#modules.web") < at(DB), "{deleted:?}");
-            return;
+        if s.get(ENV, &s.admin).await.0 == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("the environment was not deleted");
+    assert!(gone, "the environment was not deleted");
+    let deleted = fake.deleted.lock().unwrap().clone();
+    let at = |d: &str| deleted.iter().position(|x| x == d).unwrap();
+    assert!(at("workload.default#modules.web") < at(DB), "{deleted:?}");
+    // Once the environment is gone, a retry finds nothing to delete.
+    let (status, b) = retry().await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 }
 
 impl Server {

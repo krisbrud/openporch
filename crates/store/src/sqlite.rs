@@ -510,62 +510,6 @@ impl Store for SqliteStore {
         Ok(rows.into_iter().map(EnvRow::into_record).collect())
     }
 
-    async fn delete_env(&self, org: &str, app: &str, env: &str, audit: AuditIntent) -> Result<()> {
-        self.check_org(org)?;
-        let mut tx = self.begin().await?;
-        let env_type: Option<String> =
-            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
-                .bind(org)
-                .bind(app)
-                .bind(env)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(env_type) = env_type else {
-            return Err(StoreError::NotFound(format!("environment `{app}/{env}`")));
-        };
-        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
-        if env == "development" {
-            return Err(StoreError::Conflict(
-                "the `development` environment exists as long as its application".into(),
-            ));
-        }
-        let (deployed,): (i64,) = sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM deployments WHERE org_id = ?1 AND app_id = ?2 AND env_id = ?3) \
-                  + (SELECT COUNT(*) FROM active_resources WHERE org_id = ?1 AND app_id = ?2 AND env_id = ?3)",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(env)
-        .fetch_one(&mut *tx)
-        .await?;
-        if deployed > 0 {
-            return Err(StoreError::Conflict(format!(
-                "environment `{app}/{env}` has been deployed; delete it with \
-                 `expected_generation` to delete its resources first"
-            )));
-        }
-        for table in [
-            "app_values",
-            "value_set_versions",
-            "deltas",
-            "secret_grants",
-            "envs",
-        ] {
-            let column = if table == "envs" { "id" } else { "env_id" };
-            sqlx::query(&format!(
-                "DELETE FROM {table} WHERE org_id = ? AND app_id = ? AND {column} = ?"
-            ))
-            .bind(org)
-            .bind(app)
-            .bind(env)
-            .execute(&mut *tx)
-            .await?;
-        }
-        audit::insert(&mut tx, &audit, None, None).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     async fn delete_env_type(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
@@ -2236,11 +2180,13 @@ async fn finish_in_tx(
     }
     let kind = DeploymentKind::parse(&kind)?;
     let mut error = error.map(str::to_owned);
-    // An environment is removed only once nothing it owns is left.
+    // An environment is removed only once nothing it owns, and no adopted
+    // resource scheduled for deletion, is left.
     if kind == DeploymentKind::DeleteEnv && error.is_none() {
         let owned: Vec<String> = sqlx::query_scalar(
             "SELECT descriptor FROM active_resources WHERE org_id = ? AND app_id = ? \
-             AND env_id = ? AND ownership = 'owned' ORDER BY descriptor LIMIT 5",
+             AND env_id = ? AND (ownership = 'owned' OR (ownership = 'adopted' \
+             AND scheduled_deletion = 1)) ORDER BY descriptor LIMIT 5",
         )
         .bind(org)
         .bind(app)
@@ -2249,7 +2195,7 @@ async fn finish_in_tx(
         .await?;
         if !owned.is_empty() {
             error = Some(format!(
-                "owned resources remain: {}; delete the environment again",
+                "resources to delete remain: {}; delete the environment again",
                 owned.join(", ")
             ));
         }
@@ -2306,7 +2252,9 @@ async fn finish_in_tx(
             .execute(&mut *conn)
             .await?;
         }
-        (DeploymentKind::DeleteEnv, None) => remove_env(&mut *conn, org, app, env).await?,
+        (DeploymentKind::DeleteEnv, None) => {
+            remove_env(&mut *conn, org, app, env).await?;
+        }
     }
     let accepted: Option<(String, Option<String>, String, String)> = sqlx::query_as(
         "SELECT id, actor_id, method, path FROM audit_log WHERE org_id = ? AND operation_id = ? \

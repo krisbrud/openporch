@@ -550,17 +550,21 @@ deployment of the same application into a draft delta and returns its `delta_id`
 Nothing is deployed. The default `development` environment cannot be deleted while
 its application exists (`409`).
 
-An environment that has never been deployed is deleted at once (`204`). Deleting
-one that has been deployed deletes its resources first, so the request needs a
-body like a deployment's: `expected_generation`, the `permits` for deleting its
-resources and an optional `comment`, with an optional `Idempotency-Key` header.
-Without the body the request is `400`. It returns `202` with the deletion's
-`deployment`, whose `kind` is `delete_env`, and the resources it leaves in place
-as `retained`: external ones, and adopted ones not scheduled for deletion.
-The environment is `deleting` while the deletion deletes every resource it owns
-in reverse dependency order, each behind its permit, and then the environment
-with its deployments, values and deltas; the audit log and tombstones remain,
-and retained resources get a `released` tombstone. If a resource cannot be
+Deleting an environment runs like a deployment, so the request needs a body
+like a deployment's: `expected_generation`, the `permits` for deleting its
+resources and an optional `comment`, with an optional `Idempotency-Key` header
+that returns the same deletion to a retry while the environment exists.
+Without the body the request is `400`, and a stale generation, a running
+deployment or a resource that needs recovery is `409`. It returns `202` with
+the deletion's `deployment`, whose `kind` is `delete_env`, and the resources it
+leaves in place as `retained`: external ones, and adopted ones not scheduled
+for deletion. An environment without resources is deleted at once, and the
+deployment is already `succeeded`. Otherwise the environment is `deleting`
+while the deletion deletes every resource it owns, and every adopted one
+scheduled for deletion, in reverse dependency order, each behind its permit,
+and then the environment with its deployments, values and deltas; the audit
+log and tombstones remain, and retained resources get a `released` tombstone.
+Once the environment is gone, the request is `404`. If a resource cannot be
 deleted, the environment stays in state `deletion_failed` with what is left:
 the failed resource has its error in `GET .../resources/graph`, the deletion's
 error names it, and nothing can be deployed there. Fixing the cause, scheduling
@@ -1939,13 +1943,30 @@ Authorization: Bearer $CI_TOKEN
 204 No Content
 ```
 
+Deleting an environment sends the generation the client read:
+
 ```http
-DELETE /orgs/acme/apps/shop/envs/production
+GET /orgs/acme/apps/shop/envs/production
 Authorization: Bearer $CI_TOKEN
 ```
 
 ```http-response
-204 No Content
+200 OK
+
+{"id": "production", "generation": "$PRODUCTION_GENERATION"}
+```
+
+```http
+DELETE /orgs/acme/apps/shop/envs/production
+Authorization: Bearer $CI_TOKEN
+
+{"expected_generation": $PRODUCTION_GENERATION}
+```
+
+```http-response
+202 Accepted
+
+{"deployment": {"kind": "delete_env", "status": "succeeded"}, "retained": []}
 ```
 
 ```http

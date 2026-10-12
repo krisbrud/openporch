@@ -110,17 +110,6 @@ pub trait Store: Send + Sync {
     /// Lists an application's environments.
     fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
 
-    /// Deletes an environment that has never been deployed, with its drafts and
-    /// values. `development` stays while its application exists, and deployed
-    /// environments are rejected until deprovisioning on delete exists.
-    fn delete_env(
-        &self,
-        org: &str,
-        app: &str,
-        env: &str,
-        audit: AuditIntent,
-    ) -> impl Future<Output = Result<()>> + Send;
-
     /// Deletes an environment type no environment uses.
     fn delete_env_type(
         &self,

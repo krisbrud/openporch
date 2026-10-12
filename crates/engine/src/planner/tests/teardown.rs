@@ -290,3 +290,38 @@ async fn a_running_deletion_is_not_started_again_and_a_restart_fails_it() {
     assert_eq!(f.env_state().await.as_deref(), Some("deletion_failed"));
     f.accept_teardown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_scheduled_adopted_resource_must_be_deleted_before_the_environment_goes() {
+    let f = Fixture::in_env(ENV).await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // The base environment was adopted and scheduled for deletion, but the
+    // external DNS zone, which stays, uses it.
+    for (descriptor, ownership) in [(BASE, "adopted"), (DNS, "external")] {
+        sqlx::query("UPDATE active_resources SET ownership = ? WHERE descriptor = ?")
+            .bind(ownership)
+            .bind(descriptor)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE active_resources SET dependencies = ? WHERE descriptor = ?")
+        .bind(json!([BASE]).to_string())
+        .bind(DNS)
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    f.schedule(BASE).await;
+
+    let teardown = f.accept_teardown().await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(teardown.clone()).await;
+    assert!(
+        matches!(&outcomes[&d(BASE)], Outcome::Pending(r) if r.contains(DNS)),
+        "{outcomes:?}"
+    );
+    assert_eq!(f.status(&teardown).await.0, DeploymentStatus::Failed);
+    assert_eq!(f.env_state().await.as_deref(), Some("deletion_failed"));
+    assert!(f.active(BASE).await.is_some());
+}

@@ -136,9 +136,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             };
             // External resources are never deleted, and adopted ones only when
             // explicitly scheduled. Removed workloads go, and when the
-            // environment is deleted, everything it owns.
-            let must_go =
-                r.ownership == "owned" && (d.teardown || descriptor.ty.as_str() == "workload");
+            // environment is deleted, everything it owns and every adopted
+            // resource scheduled for deletion.
+            let must_go = match r.ownership.as_str() {
+                "owned" => d.teardown || descriptor.ty.as_str() == "workload",
+                "adopted" => d.teardown && r.scheduled_deletion,
+                _ => false,
+            };
             let deletable = match r.ownership.as_str() {
                 "owned" | "adopted" => r.scheduled_deletion || must_go,
                 _ => false,

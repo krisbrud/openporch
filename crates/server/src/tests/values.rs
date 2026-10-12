@@ -287,8 +287,10 @@ async fn delete_environment() {
     )
     .await;
 
-    let (status, _) = s.delete("/orgs/acme/apps/shop/envs/pr-42", &s.admin).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, b) = s
+        .remove_env("/orgs/acme/apps/shop/envs/pr-42", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{b}");
     let (_, app) = s.get(APP, &s.admin).await;
     assert_eq!(app[0]["value"], "base");
     // A new environment with the same ID starts without the overrides.
