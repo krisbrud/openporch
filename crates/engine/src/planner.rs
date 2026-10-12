@@ -282,14 +282,14 @@ pub enum Outcome {
     Pending(String),
     /// Deleted, because the deployment no longer includes it.
     Deleted,
+    /// The driver confirmed the deletion, but the resource's record could not
+    /// be removed; the next deployment finishes the cleanup. This fails the
+    /// deployment.
+    CleanupPending(String),
     /// Scheduled for deletion but kept, because a resource that stays still
     /// uses it. This does not fail the deployment.
     Kept(String),
 }
-
-/// How a failure starts when the driver confirmed a deletion but its record
-/// could not be removed.
-const CLEANUP_PENDING: &str = "cleanup pending: ";
 
 /// The planner, shared by all deployments of a server.
 pub struct Planner<S, E> {
@@ -446,44 +446,48 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // Every resource gets a record, also those that ended before an
         // operation was recorded; the store keeps any status an operation set.
         for (d, outcome) in &outcomes {
-            let (status, reason) = match outcome {
-                Outcome::Provisioned | Outcome::Deleted => continue,
-                Outcome::Pending(r) => (ResourceRunStatus::Pending, r),
-                Outcome::Kept(r) => (ResourceRunStatus::Skipped, r),
-                Outcome::Failed(r) => (ResourceRunStatus::Failed, r),
-                Outcome::Unknown(r) => (ResourceRunStatus::Unknown, r),
-            };
-            let resource_log = log.resource(d);
             // Terminal lines say what is known about the effects and what to
             // do next.
-            match status {
-                ResourceRunStatus::Failed if reason.starts_with(CLEANUP_PENDING) => {
-                    resource_log.status(
-                        "error",
-                        &format!(
-                            "deleted, but its record remains; the next deployment finishes the \
-                             cleanup: {reason}"
-                        ),
-                    );
-                }
-                ResourceRunStatus::Failed => resource_log.status(
-                    "error",
-                    &format!("failed, nothing changed; fix the cause and deploy again: {reason}"),
+            let (status, reason, level, line) = match outcome {
+                Outcome::Provisioned | Outcome::Deleted => continue,
+                Outcome::Pending(r) => (
+                    ResourceRunStatus::Pending,
+                    r.clone(),
+                    "warn",
+                    format!("not attempted: {r}"),
                 ),
-                ResourceRunStatus::Unknown => resource_log.status(
+                Outcome::Kept(r) => (
+                    ResourceRunStatus::Skipped,
+                    r.clone(),
+                    "info",
+                    format!("kept: {r}"),
+                ),
+                Outcome::Failed(r) => (
+                    ResourceRunStatus::Failed,
+                    r.clone(),
                     "error",
-                    &format!(
-                        "outcome unknown, the resource may have changed; recover it before \
-                         deploying again: {reason}"
+                    format!("failed, nothing changed; fix the cause and deploy again: {r}"),
+                ),
+                Outcome::CleanupPending(r) => (
+                    ResourceRunStatus::Failed,
+                    format!("cleanup pending: {r}"),
+                    "error",
+                    format!(
+                        "deleted, but its record remains; the next deployment finishes the \
+                         cleanup: {r}"
                     ),
                 ),
-                ResourceRunStatus::Pending => {
-                    resource_log.status("warn", &format!("not attempted: {reason}"));
-                }
-                ResourceRunStatus::Skipped => {
-                    resource_log.status("info", &format!("kept: {reason}"));
-                }
-            }
+                Outcome::Unknown(r) => (
+                    ResourceRunStatus::Unknown,
+                    r.clone(),
+                    "error",
+                    format!(
+                        "outcome unknown, the resource may have changed; recover it before \
+                         deploying again: {r}"
+                    ),
+                ),
+            };
+            log.resource(d).status(level, &line);
             if let Err(e) = self
                 .store
                 .record_resource_status(
@@ -554,6 +558,9 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
         match o {
             Outcome::Provisioned | Outcome::Deleted | Outcome::Kept(_) => {}
             Outcome::Failed(e) => failed.push(format!("`{d}` failed: {e}")),
+            Outcome::CleanupPending(e) => {
+                failed.push(format!("`{d}` failed: cleanup pending: {e}"));
+            }
             Outcome::Unknown(e) => unknown.push(format!(
                 "`{d}` has an unknown outcome and needs recovery: {e}"
             )),

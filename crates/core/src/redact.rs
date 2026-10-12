@@ -9,6 +9,9 @@
 /// marker itself; such values are removed without a marker.
 pub const REDACTED: &str = "[REDACTED]";
 
+/// Further passes over redacted text before giving up on it.
+const PASSES: usize = 8;
+
 /// Known secret values and how to recognize them in text.
 #[derive(Clone, Default)]
 pub struct Redactor {
@@ -44,10 +47,32 @@ impl Redactor {
     }
 
     /// `text` with every known value replaced by [`REDACTED`], or removed if
-    /// a known value occurs in the marker. Matches are
-    /// found in the original text and overlapping or adjacent ones merged, so
-    /// no part of a secret that overlaps another is left behind.
+    /// a known value occurs in the marker. Matches are found in the original
+    /// text and overlapping or adjacent ones merged, so no part of a secret
+    /// that overlaps another is left behind. A replacement can join text into
+    /// another known value, so the text is redacted again until none is left;
+    /// if that does not settle, only the marker is returned.
     pub fn redact(&self, text: &str) -> String {
+        let marker = if self.forms.iter().any(|f| REDACTED.contains(f.as_str())) {
+            ""
+        } else {
+            REDACTED
+        };
+        let Some(mut out) = self.pass(text, marker) else {
+            return text.to_owned();
+        };
+        for _ in 0..PASSES {
+            match self.pass(&out, marker) {
+                Some(next) => out = next,
+                None => return out,
+            }
+        }
+        marker.to_owned()
+    }
+
+    /// `text` with every match replaced by `marker`, or `None` if nothing
+    /// matches.
+    fn pass(&self, text: &str, marker: &str) -> Option<String> {
         let mut ranges: Vec<(usize, usize)> = self
             .forms
             .iter()
@@ -64,14 +89,9 @@ impl Redactor {
             })
             .collect();
         if ranges.is_empty() {
-            return text.to_owned();
+            return None;
         }
         ranges.sort_unstable();
-        let marker = if self.forms.iter().any(|f| REDACTED.contains(f.as_str())) {
-            ""
-        } else {
-            REDACTED
-        };
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         let mut i = 0;
@@ -87,7 +107,7 @@ impl Redactor {
             i += 1;
         }
         out.push_str(&text[at..]);
-        out
+        Some(out)
     }
 }
 
@@ -147,6 +167,14 @@ mod tests {
             let out = r.redact(&format!("x{secret}y"));
             assert_eq!(out, "xy", "{secret}");
         }
+    }
+
+    #[test]
+    fn a_marker_never_completes_another_secret() {
+        let r = Redactor::new(["x", "a[R"]);
+        assert_eq!(r.redact("ax"), "[REDACTED]EDACTED]");
+        let r = Redactor::new(["[", "ab"]);
+        assert_eq!(r.redact("a[b"), "");
     }
 
     #[test]

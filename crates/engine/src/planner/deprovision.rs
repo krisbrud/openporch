@@ -25,8 +25,8 @@ use tokio::time::Instant;
 
 use super::log::DeploymentLog;
 use super::{
-    CLEANUP_PENDING, Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, JobLog, Limits,
-    Outcome, Planner, ProvisionJob, backoff, log_retry,
+    Deployment, DeprovisionJob, ExecFailure, Executor, JobInputs, JobLog, Limits, Outcome, Planner,
+    ProvisionJob, backoff, log_retry,
 };
 
 /// A destructive action that needs a permit.
@@ -595,7 +595,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             )
             .await
         {
-            return Err(Outcome::Failed(format!("{CLEANUP_PENDING}{error}")));
+            return Err(Outcome::CleanupPending(error.into()));
         }
         self.checkpoint(
             operation_id,
