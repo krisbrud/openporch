@@ -549,8 +549,17 @@ impl Fixture {
         workload: Option<&str>,
         defs: Vec<ResourceDefinition>,
     ) -> Result<Deployment, StoreError> {
+        self.accept_workloads(workload.as_slice(), defs).await
+    }
+
+    /// Accepts a deployment of `workloads`, added to the set in that order.
+    async fn accept_workloads(
+        &self,
+        workloads: &[&str],
+        defs: Vec<ResourceDefinition>,
+    ) -> Result<Deployment, StoreError> {
         let mut set = DeploymentSet::default();
-        if let Some(workload) = workload {
+        for workload in workloads {
             let c = Workload::parse(workload, None)
                 .unwrap()
                 .to_module(&builtin_types())
@@ -2099,6 +2108,7 @@ async fn lost_log_lines_fail_the_deployment() {
     assert_eq!(lines[0].message, format!("deployment failed: {error}"));
 }
 
+mod coprovision;
 mod recovery;
 mod teardown;
 mod workloads;

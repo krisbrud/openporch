@@ -752,6 +752,7 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
         .filter(|r| r.path.starts_with("modules.") && !r.path.contains(".externals."))
         .map(|r| r.path.as_str())
         .collect();
+    let mut keyed = BTreeSet::new();
     for other in deployment.graph.nodes.values() {
         let Some(finished) = done.get(&other.descriptor) else {
             continue;
@@ -769,7 +770,23 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
                     scope
                         .externals
                         .insert(key.to_owned(), finished.outputs.clone());
+                    keyed.insert(other.descriptor.clone());
                 }
+            }
+        }
+    }
+    // A workload's other direct dependencies, such as a policy co-provisioned
+    // with `match_dependents`, are keyed by descriptor. The environment's
+    // implicit resources are not dependencies of its own.
+    if !own.is_empty() {
+        for dep in &node.depends_on {
+            if keyed.contains(dep) || scope.implicit_types.contains(&dep.ty) {
+                continue;
+            }
+            if let Some(finished) = done.get(dep) {
+                scope
+                    .externals
+                    .insert(dep.to_string(), finished.outputs.clone());
             }
         }
     }
@@ -1303,14 +1320,24 @@ fn output_placeholders(key: &str, outputs: &ResourceOutputs) -> Value {
         .values
         .keys()
         .chain(outputs.secrets.keys())
-        .filter(|n| {
-            !n.is_empty()
-                && n.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .filter(|n| is_name(n))
+        .map(|name| {
+            let placeholder = if is_name(key) {
+                format!("${{externals.{key}.{name}}}")
+            } else {
+                format!("${{externals['{key}'].{name}}}")
+            };
+            (name.clone(), json!(placeholder))
         })
-        .map(|name| (name.clone(), json!(format!("${{externals.{key}.{name}}}"))))
         .collect::<serde_json::Map<_, _>>()
         .into()
+}
+
+/// Whether `s` can follow a dot in a placeholder.
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Gives a workload's inputs its direct dependencies' outputs by key.

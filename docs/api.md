@@ -1533,7 +1533,9 @@ Every graph has a `base-env` node, and every workload is a `workload` node, so
 both need a matching definition. A workload's class picks its definition like
 any other resource's, and that definition's driver receives the resource
 inputs `id`, `class`, `spec` (the workload document) and `dependencies` (the
-outputs of its direct dependencies by key), resolved at deploy time: the
+outputs of its direct dependencies by key; one it did not request itself, such
+as a policy a definition co-provisions with `match_dependents`, is keyed by its
+descriptor), resolved at deploy time: the
 placeholders take its dependencies' outputs, secret outputs stay references
 that only the executor reads, and each trigger that names one of its resources
 gets that resource's outputs under `outputs`. Content of files marked
