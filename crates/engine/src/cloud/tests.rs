@@ -528,10 +528,38 @@ fn only_an_s3_object_with_a_version_is_an_s3_version() {
     }
 }
 
+#[test]
+fn an_s3_object_without_a_version_round_trips() {
+    let o = S3Object::parse("s3://artifacts/a%3Fb%25c%23d.zip").unwrap();
+    assert_eq!(o.key, "a?b%c#d.zip");
+    let pinned = o.at("v&1".into()).to_string();
+    assert_eq!(
+        S3Version::parse(&pinned),
+        Some(S3Version {
+            bucket: "artifacts".into(),
+            key: "a?b%c#d.zip".into(),
+            version: "v&1".into()
+        }),
+        "{pinned}"
+    );
+    assert_eq!(S3Object::parse(&o.to_string()), Some(o));
+    for uri in [
+        "s3://artifacts/k?versionId=v",
+        "s3://artifacts/",
+        "s3://artifacts",
+        "s3:///k",
+        "s3://artifacts/k#f",
+        "https://example.com/k",
+    ] {
+        assert_eq!(S3Object::parse(uri), None, "{uri}");
+    }
+}
+
 /// Checks object versions in a real or emulated versioned bucket with the
-/// host's identity. CI's Floci job uploads the object and sets
-/// `OPENPORCH_TEST_ARTIFACT_BUCKET`, `OPENPORCH_TEST_ARTIFACT_KEY` and
-/// `OPENPORCH_TEST_ARTIFACT_VERSION`.
+/// host's identity, and pins objects to their current version. CI's Floci job
+/// uploads the object and sets `OPENPORCH_TEST_ARTIFACT_BUCKET`,
+/// `OPENPORCH_TEST_ARTIFACT_KEY` and `OPENPORCH_TEST_ARTIFACT_VERSION`, and
+/// puts the same key in the unversioned `OPENPORCH_TEST_PLAIN_BUCKET`.
 #[tokio::test]
 #[ignore = "needs S3 and a versioned bucket"]
 async fn real_artifact_check() {
@@ -548,4 +576,30 @@ async fn real_artifact_check() {
         ..object.clone()
     };
     assert!(!resolver.object_exists(None, &missing).await.unwrap());
+
+    // The current version pins the object; an unversioned bucket has none.
+    let object = S3Object {
+        bucket: object.bucket.clone(),
+        key: object.key.clone(),
+    };
+    assert_eq!(
+        resolver.latest_version(None, &object).await.unwrap(),
+        Latest::Version(var("OPENPORCH_TEST_ARTIFACT_VERSION"))
+    );
+    let missing = S3Object {
+        key: format!("{}.missing", object.key),
+        ..object.clone()
+    };
+    assert_eq!(
+        resolver.latest_version(None, &missing).await.unwrap(),
+        Latest::Missing
+    );
+    let plain = S3Object {
+        bucket: var("OPENPORCH_TEST_PLAIN_BUCKET"),
+        key: object.key.clone(),
+    };
+    assert_eq!(
+        resolver.latest_version(None, &plain).await.unwrap(),
+        Latest::Unversioned
+    );
 }

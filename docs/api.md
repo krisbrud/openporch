@@ -1552,6 +1552,20 @@ later edits do not affect it. The deployment is returned at once with status
 `in_progress`. It then becomes `succeeded` or `failed`, and only success changes
 the environment's last successful deployment and set.
 
+A function artifact must have an identity that cannot change. Acceptance pins
+one named as an S3 object without a version, `s3://<bucket>/<key>` (literally
+or through shared values), to the object's current version, read with the
+workload definition's cloud account (`s3:GetObject` on it). The server's own
+identity is never used for this. The recorded graph names that version, so the
+deployment, and every snapshot replay of it, runs the object as it was then,
+while the set keeps the name it was given; a `current` replay pins again. An
+object in a bucket that does not keep versions, a missing object, an artifact
+that is not an S3 object, or one whose workload definition has no cloud
+account known before the deployment runs is refused with `400` before anything
+is accepted; naming the version with `?versionId=` avoids the lookup. When S3
+cannot be reached, the request fails with `502` (`CLD-002`) and can be sent
+again.
+
 Before a deployment changes anything, it checks that every function artifact
 its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`
 (key percent-encoded), still exists, reading it with the workload definition's
@@ -1559,9 +1573,9 @@ cloud account, which needs `s3:GetObjectVersion` on it. If one is gone, as when
 a replay names a version that was deleted, the workload fails naming the
 artifact, every other resource is left `pending`, and the deployment fails with
 nothing changed. Checks that fail in a way that may pass are retried like
-provisioning. An artifact named without a version, or by a workload whose
-definition has no cloud account or one that comes from another resource's
-outputs, is not checked; its driver reports a missing artifact when it runs.
+provisioning. An artifact of a workload whose definition has no cloud account, or one
+that comes from another resource's outputs, is not checked; its driver reports
+a missing artifact when it runs.
 
 ```http
 POST /orgs/acme/apps

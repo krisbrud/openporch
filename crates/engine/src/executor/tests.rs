@@ -23,7 +23,7 @@ use openporch_store::{
 use serde_json::json;
 
 use super::*;
-use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, S3Version, Sts};
+use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, Latest, S3Object, S3Version, Sts};
 use crate::planner::{
     Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
 };
@@ -236,6 +236,25 @@ impl Sts for FakeSts {
         ));
         let exists = object.version != "gone";
         Box::pin(async move { Ok(exists) })
+    }
+
+    /// Bucket `artifacts` keeps versions (`v7`), `plain` does not, and
+    /// nothing else exists.
+    fn latest_version<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Object,
+    ) -> BoxFuture<'a, Result<Latest, CloudError>> {
+        self.objects.lock().unwrap().push((
+            credentials.map(|c| c.access_key_id.clone()),
+            object.to_string(),
+        ));
+        let latest = match object.bucket.as_str() {
+            "artifacts" => Latest::Version("v7".into()),
+            "plain" => Latest::Unversioned,
+            _ => Latest::Missing,
+        };
+        Box::pin(async move { Ok(latest) })
     }
 }
 
@@ -1219,4 +1238,69 @@ async fn pinned_artifacts_are_checked_with_the_workloads_account() {
         "{failure:?}"
     );
     assert_eq!(checked().len(), 2);
+}
+
+#[tokio::test]
+async fn artifacts_are_pinned_to_their_current_version_with_the_workloads_account() {
+    let f = Fixture::new().await;
+    f.account().await;
+    let mut pg = plain_pg();
+    pg.driver_account = Some("aws-main".into());
+    f.define(pg, "openporch/none").await;
+    let executor = f.executor(Arc::new(NoPermits));
+    let pin = |artifact: &str| crate::planner::ArtifactPin {
+        context: crate::planner::JobContext {
+            org: ORG.parse().unwrap(),
+            app: "shop".parse().unwrap(),
+            env: "development".parse().unwrap(),
+            env_type: "development".parse().unwrap(),
+            deployment_id: "acceptance".into(),
+            permits: Vec::new(),
+        },
+        descriptor: Descriptor::parse(DB).unwrap(),
+        definition_id: "pg".parse().unwrap(),
+        account: "aws-main".parse().unwrap(),
+        artifact: artifact.to_owned(),
+    };
+    let read = || f.sts.objects.lock().unwrap().clone();
+
+    let pinned = executor
+        .pin_artifact(pin("s3://artifacts/w%20x.zip"))
+        .await
+        .unwrap();
+    assert_eq!(pinned, "s3://artifacts/w x.zip?versionId=v7");
+    assert_eq!(
+        read(),
+        [(
+            Some("AKIATEST".to_owned()),
+            "s3://artifacts/w x.zip".to_owned()
+        )]
+    );
+
+    for (artifact, expected) in [
+        ("s3://plain/w.zip", "enable versioning"),
+        ("s3://other/w.zip", "does not exist"),
+        ("https://example.com/w.zip", "not an S3 object"),
+    ] {
+        let failure = executor.pin_artifact(pin(artifact)).await.unwrap_err();
+        assert!(
+            matches!(&failure, ExecFailure::Permanent(e) if e.contains(expected)),
+            "{artifact}: {failure:?}"
+        );
+    }
+
+    // A definition that no longer matches does not lend its account.
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let failure = executor
+        .pin_artifact(pin("s3://artifacts/w.zip"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e) if e.contains("no longer matches")),
+        "{failure:?}"
+    );
+    assert_eq!(read().len(), 3);
 }

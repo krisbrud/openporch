@@ -6,14 +6,15 @@
 //! default runner fails every deployment it is handed, which keeps the
 //! environment free for the next one.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::planner::{
-    Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, Planner, RecoverError,
-    Recovered,
+    Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, PinError, Planner,
+    RecoverError, Recovered,
 };
 use openporch_engine::preview::DriverFacts;
 use openporch_store::{
@@ -50,6 +51,15 @@ pub struct Recovery {
     pub audit: AuditIntent,
 }
 
+/// What pinning artifacts returns: the pinned artifact URI of each workload
+/// that named one without a fixed identity, by descriptor.
+pub type PinFuture =
+    Pin<Box<dyn Future<Output = Result<BTreeMap<String, String>, PinError>> + Send>>;
+
+/// How long pinning a deployment's artifacts may take at acceptance.
+/// Well within a client's request timeout, so the client hears why.
+pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// What recovering a resource returns.
 pub type RecoverFuture = Pin<Box<dyn Future<Output = Result<Recovered, RecoverError>> + Send>>;
 
@@ -61,6 +71,19 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
     /// Observes a resource whose last operation has an unknown outcome and
     /// records what the observation establishes. A runner without an
     /// executor cannot.
+    /// Pins the artifacts `deployment`'s workloads name without a fixed
+    /// identity. A runner without an executor cannot.
+    fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
+        let _ = deployment;
+        Box::pin(async {
+            Err(PinError::Refused(
+                "artifacts cannot be pinned until the server runs with an executor; name each \
+                 S3 object version as `s3://<bucket>/<key>?versionId=<version>`"
+                    .into(),
+            ))
+        })
+    }
+
     fn recover(&self, recovery: Recovery) -> RecoverFuture {
         let _ = recovery;
         Box::pin(async {
@@ -122,6 +145,17 @@ impl<E: Executor> Runner for PlannerRunner<E> {
                     finish(&state, &job, Some(error)).await;
                 }
             }
+        })
+    }
+
+    fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
+        let planner = self.0.clone();
+        Box::pin(async move {
+            let pinned = planner.pin_artifacts(&deployment, PIN_TIMEOUT).await?;
+            Ok(pinned
+                .into_iter()
+                .map(|(d, uri)| (d.to_string(), uri))
+                .collect())
         })
     }
 
@@ -227,6 +261,11 @@ impl Runners {
     /// The runner for deployments accepted now.
     pub fn current(&self) -> Arc<dyn Runner> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Pins artifacts with the current runner.
+    pub fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
+        self.current().pin_artifacts(deployment)
     }
 
     /// Recovers a resource with the current runner.

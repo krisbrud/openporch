@@ -25,11 +25,13 @@ use openporch_store::{AccountStore, CatalogStore, SecretOwner, SecretUseStore, S
 use serde_json::{Map, Value};
 use tokio::time::Instant;
 
-use crate::cloud::{AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, S3Version};
+use crate::cloud::{
+    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, Latest, S3Object, S3Version,
+};
 use crate::planner::{
-    ArtifactCheck, DeprovisionJob, DestructiveAction, ExecFailure, Executor, JobContext, JobLog,
-    Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult, RedactingLog,
-    SecretSource,
+    ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor,
+    JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
+    RedactingLog, SecretSource,
 };
 
 /// The version of the sealed cookie format, bound into its associated data.
@@ -747,6 +749,36 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
+        let object = S3Object::parse(&pin.artifact).ok_or_else(|| {
+            ExecFailure::Permanent(format!(
+                "artifact `{}` of `{}` is not an S3 object (`s3://<bucket>/<key>`)",
+                pin.artifact, pin.descriptor
+            ))
+        })?;
+        let mut log = JobLog::discard().redacting();
+        self.definition_matches(&pin.context, &pin.definition_id, &pin.descriptor)
+            .await?;
+        let credentials = self
+            .account_credentials(&pin.context, &pin.account, CHECK_WINDOW, &mut log)
+            .await
+            .map_err(|f| log.failure(f))?;
+        match self.cloud.latest_version(Some(&credentials), &object).await {
+            Ok(Latest::Version(v)) => Ok(object.at(v).to_string()),
+            Ok(Latest::Unversioned) => Err(ExecFailure::Permanent(format!(
+                "artifact `{object}` of `{}` needs an immutable identity, but its bucket does \
+                 not keep versions: enable versioning on the bucket, or name an object version \
+                 with `?versionId=`",
+                pin.descriptor
+            ))),
+            Ok(Latest::Missing) => Err(ExecFailure::Permanent(format!(
+                "artifact `{object}` of `{}` does not exist",
+                pin.descriptor
+            ))),
+            Err(e) => Err(log.failure(cloud_failure(e))),
+        }
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {

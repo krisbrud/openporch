@@ -14,6 +14,8 @@ use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ClassRegistry, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
+use openporch_engine::cloud::S3Version;
+use openporch_engine::planner::PinError;
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
     DeploymentStatus, EnvRecord, LogLine, Store, StoreError, ValueStore,
@@ -450,8 +452,60 @@ async fn snapshot(
         "drivers": drivers,
         "values": values(state, env).await?,
     });
+    pin_artifacts(state, env, &mut snapshot).await?;
     pin_secrets(state, &mut snapshot).await?;
     Ok(snapshot)
+}
+
+/// Where a workload node keeps its function's artifact.
+const ARTIFACT: &str = "/params/spec/function/package/artifact";
+
+/// Pins the artifacts the snapshot's workloads name without a fixed identity,
+/// in the snapshot's graph: the set keeps the name it was given, and the
+/// deployment, and any replay of it, runs the object as it was now.
+async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) -> ApiResult<()> {
+    let unpinned = snapshot["graph"]["nodes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, node)| node.pointer(ARTIFACT).and_then(Value::as_str))
+        .any(|a| S3Version::parse(a).is_none());
+    // Not a deployment yet: the label stands in for its ID.
+    if !unpinned {
+        return Ok(());
+    }
+    let deployment = crate::deploy::planned(
+        state,
+        &env.app,
+        &env.id,
+        "acceptance",
+        String::new(),
+        snapshot,
+        false,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let pinned = state
+        .runners
+        .pin_artifacts(deployment)
+        .await
+        .map_err(|e| match e {
+            PinError::Refused(e) => ApiError::invalid(e),
+            PinError::Unavailable(e) => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                crate::error::code::CLOUD_UNAVAILABLE,
+                format!("{e}; nothing was deployed; try again"),
+            ),
+        })?;
+    for (descriptor, uri) in pinned {
+        if let Some(slot) = snapshot["graph"]["nodes"]
+            .get_mut(&descriptor)
+            .and_then(|n| n.pointer_mut(ARTIFACT))
+        {
+            *slot = Value::String(uri);
+        }
+    }
+    Ok(())
 }
 
 /// The built-in secret references a snapshot reads: those of the definitions'
