@@ -28,8 +28,19 @@ pub struct RouteSpec {
     pub permission: Permission,
 }
 
+/// The only routes that may be served without credentials.
+pub const PUBLIC_ROUTES: [(Method, &str); 6] = [
+    (Method::GET, "/livez"),
+    (Method::GET, "/readyz"),
+    (Method::GET, "/healthz"),
+    (Method::GET, "/version"),
+    (Method::POST, "/auth/github/device"),
+    (Method::POST, "/auth/github/token"),
+];
+
 /// Builds the router. Routes can only be added together with their permission, so
-/// no route can exist without one.
+/// no route can exist without one, and a public route outside [`PUBLIC_ROUTES`]
+/// stops the server from starting.
 pub struct Api {
     state: AppState,
     router: Router<AppState>,
@@ -64,6 +75,13 @@ impl Api {
                 .iter()
                 .any(|s| s.method == method && s.path == path),
             "route {method} {path} registered twice"
+        );
+        assert!(
+            permission != Permission::Public
+                || PUBLIC_ROUTES
+                    .iter()
+                    .any(|(m, p)| *m == method && *p == path),
+            "route {method} {path} is public but not a known public route"
         );
         let filter = MethodFilter::try_from(method.clone()).expect("standard method");
         let layer = middleware::from_fn_with_state(

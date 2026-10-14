@@ -342,6 +342,10 @@ async fn deploying_needs_the_deployer_role() {
         let (status, b) = s.post(path, token, body.clone()).await;
         assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     }
+    // The developer is told which role is missing.
+    let (status, b) = s.post(path, &dev, body.clone()).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    assert!(b["message"].as_str().unwrap().contains("`deployer`"), "{b}");
     let (_, page) = s.get(path, &s.admin).await;
     assert_eq!(page["deployments"], json!([]));
     // Viewers can read the history.
@@ -869,4 +873,151 @@ async fn a_restart_observes_resources_left_with_an_unknown_outcome() {
     assert_eq!(status, "failed");
     let (_, audit) = s.get("/orgs/acme/audit-logs", &s.admin).await;
     assert!(audit.to_string().contains("resource.recover"), "{audit}");
+}
+
+#[tokio::test]
+async fn cross_application_references_are_hidden() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let delta = s.delta("web:secret-tag").await;
+    let (status, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    gate.add_permits(1);
+    let source = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(source["status"], "succeeded", "{source}");
+
+    // A developer and deployer on `blog` who cannot see `shop`.
+    s.app("blog").await;
+    let dev = s.member("dev", "member").await;
+    s.grant_app("blog", "dev", "developer").await;
+    s.grant_deployer("development", "dev").await;
+    // The developer can deploy `blog` itself.
+    let blog = "/orgs/acme/apps/blog/envs/development/deploys";
+    let (status, own) = s
+        .post(blog, &dev, json!({"set_id": "0", "expected_generation": 0}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{own}");
+    gate.add_permits(1);
+    let own = own["id"].as_str().unwrap();
+    for _ in 0..200 {
+        let (_, d) = s.get(&format!("{blog}/{own}"), &s.admin).await;
+        if d["status"] != "in_progress" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (_, env) = s
+        .get("/orgs/acme/apps/blog/envs/development", &s.admin)
+        .await;
+    let generation = env["generation"].clone();
+    let id = d["id"].as_str().unwrap();
+    let set = source["set_id"].as_str().unwrap();
+    for replay in ["current", "snapshot"] {
+        let (status, b) = s
+            .post(
+                blog,
+                &dev,
+                json!({"deploy_id": id, "replay": replay, "expected_generation": generation}),
+            )
+            .await;
+        assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+        let text = b.to_string();
+        assert!(
+            !text.contains(set) && !text.contains("secret-tag"),
+            "{text}"
+        );
+    }
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/blog/envs",
+            &dev,
+            json!({"id": "copy", "type": "development", "from_deploy_id": id}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    assert!(!b.to_string().contains(set), "{b}");
+    // Nothing was deployed or created.
+    let (_, page) = s.get(blog, &s.admin).await;
+    assert_eq!(page["deployments"].as_array().unwrap().len(), 1, "{page}");
+    assert_eq!(
+        s.get("/orgs/acme/apps/blog/envs/copy", &s.admin).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Nor can the developer read the source deployment directly.
+    let (status, b) = s.get(&format!("{DEPLOYS}/{id}"), &dev).await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+}
+
+#[tokio::test]
+async fn deployments_are_recorded_with_their_correlated_outcome() {
+    let s = server().await;
+    s.deployable().await;
+    let ci = s.member("ci", "member").await;
+    s.grant_app("shop", "ci", "developer").await;
+    s.grant_deployer("development", "ci").await;
+    // The request is accepted, but its cloud operation fails.
+    s.state.runners.set(Arc::new(deploy::Unimplemented));
+    let (status, d) = s
+        .deploy(&ci, json!({"set_id": "0", "expected_generation": 0}), None)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap();
+    assert_eq!(s.finished(id).await["status"], "failed");
+
+    let (_, page) = s
+        .get(
+            &format!("/orgs/acme/audit-logs?user_id=ci&path_prefix={DEPLOYS}"),
+            &s.admin,
+        )
+        .await;
+    let entries = page["entries"].as_array().unwrap();
+    let accepted: Vec<_> = entries
+        .iter()
+        .filter(|e| e["outcome"] == "accepted")
+        .collect();
+    assert_eq!(accepted.len(), 1, "{page}");
+    let accepted = accepted[0];
+    assert_eq!(accepted["user_id"], "ci");
+    assert_eq!(accepted["method"], "POST");
+    assert_eq!(accepted["path"], DEPLOYS);
+    assert_eq!(accepted["operation_id"], id);
+    assert_eq!(accepted["action"], "deployment.create");
+
+    let failed: Vec<_> = entries
+        .iter()
+        .filter(|e| e["outcome"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{page}");
+    let failed = failed[0];
+    assert_eq!(failed["user_id"], "ci");
+    assert_eq!(failed["action"], "deployment.finish");
+    assert_eq!(failed["operation_id"], id);
+    assert_eq!(failed["correlates"], accepted["id"]);
+    assert_eq!(failed["reason"], "deployment_failed");
+    // Both entries keep their IDs after later writes, on a later page.
+    s.app("later").await;
+    let (_, newest) = s.get("/orgs/acme/audit-logs?limit=1", &s.admin).await;
+    let before = newest["next"].as_i64().unwrap();
+    let (_, again) = s
+        .get(
+            &format!("/orgs/acme/audit-logs?user_id=ci&before={before}"),
+            &s.admin,
+        )
+        .await;
+    for entry in [accepted, failed] {
+        assert!(
+            again["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == entry),
+            "{again}"
+        );
+    }
 }

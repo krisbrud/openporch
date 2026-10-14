@@ -277,14 +277,7 @@ async fn authentication_and_authorization_on_every_route() {
 #[tokio::test]
 async fn router_walk_every_route_declares_a_permission_and_requires_credentials() {
     let s = server().await;
-    let public = [
-        "/livez",
-        "/readyz",
-        "/healthz",
-        "/version",
-        "/auth/github/device",
-        "/auth/github/token",
-    ];
+    let public = crate::api::PUBLIC_ROUTES;
     assert!(!s.specs.is_empty());
     for spec in &s.specs {
         let path = spec
@@ -298,8 +291,11 @@ async fn router_walk_every_route_declares_a_permission_and_requires_credentials(
         let (status, b) = s.call(spec.method.clone(), &path, None, body).await;
         if spec.permission == Permission::Public {
             assert!(
-                public.contains(&spec.path),
-                "unexpected public route {}",
+                public
+                    .iter()
+                    .any(|(m, p)| *m == spec.method && *p == spec.path),
+                "unexpected public route {} {}",
+                spec.method,
                 spec.path
             );
             assert_ne!(
@@ -313,10 +309,27 @@ async fn router_walk_every_route_declares_a_permission_and_requires_credentials(
             assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
         }
     }
-    // Every public path is registered.
-    for p in public {
-        assert!(s.specs.iter().any(|r| r.path == p), "{p}");
+    // Every listed public route is registered as public.
+    for (m, p) in public {
+        assert!(
+            s.specs
+                .iter()
+                .any(|r| r.method == m && r.path == p && r.permission == Permission::Public),
+            "{m} {p}"
+        );
     }
+}
+
+#[tokio::test]
+#[should_panic(expected = "is public but not a known public route")]
+async fn an_unexpected_public_route_stops_the_server_from_starting() {
+    let s = server().await;
+    let _ = crate::api::Api::new(s.state.clone()).route(
+        Method::GET,
+        "/orgs/{org}/apps",
+        Permission::Public,
+        || async { "" },
+    );
 }
 
 #[tokio::test]
@@ -1057,6 +1070,15 @@ async fn union_of_roles_and_hidden_applications() {
         .collect();
     assert_eq!(ids, vec![json!("billing"), json!("shop")]);
     assert_eq!(s.get("/orgs/acme/apps/shop", &bob).await.0, StatusCode::OK);
+    // He changes configuration in `billing` but not in `shop`.
+    let delta = json!({"modules": {"add": {"web": {"spec": {"containers": {
+        "web": {"image": "web:1"}}}}}}});
+    let (status, body) = s
+        .post("/orgs/acme/apps/billing/deltas", &bob, delta.clone())
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = s.post("/orgs/acme/apps/shop/deltas", &bob, delta).await;
+    assert_error(status, &body, StatusCode::FORBIDDEN, "AUTH-002");
     let (status, body) = s.get("/orgs/acme/apps/secret-project", &bob).await;
     assert_error(status, &body, StatusCode::NOT_FOUND, "API-001");
     // Hidden and missing applications look the same.
