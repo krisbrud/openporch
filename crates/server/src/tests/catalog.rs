@@ -298,6 +298,14 @@ async fn definition_over_the_api() {
             .await;
         assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     }
+    // An application developer is no administrator either.
+    s.app("shop").await;
+    let developer = s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "developer").await;
+    let (status, b) = s
+        .post("/orgs/acme/resources/defs", &developer, def.clone())
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     let created = s.created("/orgs/acme/resources/defs", def.clone()).await;
     assert_eq!(created["version"], 1);
     let member = s.member("mia", "member").await;
@@ -402,7 +410,12 @@ async fn definition_secrets_are_stored_as_references() {
         )
         .await;
     let (_, read) = s.get("/orgs/acme/resources/defs/pg", &s.admin).await;
-    for body in [&created, &read] {
+    // Org viewers read the same references and no values.
+    let viewer = s.member("auditor", "orgViewer").await;
+    let (status, viewed) = s.get("/orgs/acme/resources/defs/pg", &viewer).await;
+    assert_eq!(status, StatusCode::OK, "{viewed}");
+    assert_eq!(viewed, read);
+    for body in [&created, &read, &viewed] {
         let text = body.to_string();
         for secret in ["hunter2", "s3cr3t-token", "admin-user"] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
