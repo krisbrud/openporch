@@ -2,14 +2,19 @@
 //! `Follow logs`, `Raw get` and `Response lost after acceptance` in `cli`, and
 //! the workload deploy scenarios of `deployment-sets-and-deltas`.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::Request;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use openporch_server::deploy::{Job, Runner};
+use openporch_server::state::AppState;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use super::objects::{admin_client, admin_machine};
 use super::{DevServer, Machine};
@@ -245,7 +250,7 @@ async fn score_alias_redeploys_and_diffs() {
     );
 }
 
-/// `Follow logs` in `cli`, `deploy deploy` replays and `deploy delta`.
+/// `deploy deploy` replays and `deploy delta`.
 #[tokio::test]
 async fn logs_replays_and_stored_deltas() {
     let server = DevServer::start(None).await;
@@ -255,10 +260,8 @@ async fn logs_replays_and_stored_deltas() {
     assert_eq!(r.code, 0, "{r:?}");
     let id = deploys(&server).await[0]["id"].as_str().unwrap().to_owned();
 
-    // Logs follow the deployment until it finishes.
     let r = m.porch(&["logs", "deploy", &id], "").await;
     assert_eq!(r.code, 0, "{r:?}");
-    assert!(r.out.contains("workload.default#modules.web: "), "{r:?}");
     assert_eq!(deploys(&server).await[0]["status"], "succeeded");
 
     for replay in ["snapshot", "current"] {
@@ -347,6 +350,79 @@ async fn raw_api_requests() {
     assert!(r.err.contains("HTTP 404"), "{r:?}");
 }
 
+/// Serves `router` on a loopback port.
+async fn serve(router: axum::Router, data: tempfile::TempDir) -> DevServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
+    DevServer {
+        url: format!("http://{addr}"),
+        admin: std::fs::read_to_string(data.path().join("bootstrap-token"))
+            .unwrap()
+            .trim()
+            .to_owned(),
+        _data: data,
+    }
+}
+
+/// Holds each deployment until the test releases it, then runs it.
+#[derive(Debug)]
+struct Gated {
+    gate: Arc<Semaphore>,
+    inner: Arc<dyn Runner>,
+}
+
+impl Runner for Gated {
+    fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let (gate, inner) = (self.gate.clone(), self.inner.clone());
+        Box::pin(async move {
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
+            inner.run(state, job).await;
+        })
+    }
+}
+
+/// `Follow logs` in `cli`: the log is followed while the deployment is in
+/// progress, until it finishes.
+#[tokio::test]
+async fn follow_logs_of_a_running_deployment() {
+    let data = tempfile::tempdir().unwrap();
+    let state = openporch_server::start(openporch_server::Config::new("acme", data.path()), None)
+        .await
+        .unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    state.runners.set(Arc::new(Gated {
+        gate: gate.clone(),
+        inner: state.runners.current(),
+    }));
+    let (router, _) = openporch_server::router(state);
+    let server = serve(router, data).await;
+    let m = deployable(&server, json!({"driver_type": "openporch/none"})).await;
+    let f = file(&m, "workload.yaml", SCORE_AS_WORKLOAD);
+    let r = m.porch(&["workload", "deploy", "-f", &f], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let status = deploys(&server).await[0]["status"].clone();
+        gate.add_permits(1);
+        status
+    };
+    let (r, status_at_release) = tokio::join!(m.porch(&["logs", "deploy", "+0"], ""), release);
+    assert_eq!(status_at_release, "in_progress");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("workload.default#modules.web: "), "{r:?}");
+    assert_eq!(deploys(&server).await[0]["status"], "succeeded");
+}
+
 /// Answers the first deployment request with a response cut off after the
 /// server accepted it.
 async fn lose_first_deploy(lost: Arc<AtomicBool>, req: Request, next: Next) -> Response {
@@ -376,23 +452,7 @@ async fn lost_acceptance_response_returns_the_original_deployment() {
         let lost = lost.clone();
         move |req, next| lose_first_deploy(lost.clone(), req, next)
     }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-    });
-    let server = DevServer {
-        url: format!("http://{addr}"),
-        admin: std::fs::read_to_string(data.path().join("bootstrap-token"))
-            .unwrap()
-            .trim()
-            .to_owned(),
-        _data: data,
-    };
+    let server = serve(router, data).await;
     let m = deployable(&server, json!({"driver_type": "openporch/none"})).await;
     let f = file(&m, "workload.yaml", SCORE_AS_WORKLOAD);
     let r = m

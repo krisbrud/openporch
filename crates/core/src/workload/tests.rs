@@ -684,10 +684,14 @@ fn property_scalars_keep_the_type_the_document_needs() {
             &[
                 ("function.concurrency.reserved", "5"),
                 ("function.variables.DEBUG", "true"),
+                ("function.variables.PAIR", "a: b"),
+                ("function.variables.OPEN", "[x"),
             ],
         ))
         .unwrap();
     let f = w.function.unwrap();
     assert_eq!(f.concurrency.unwrap().reserved, Some(5));
     assert_eq!(f.variables["DEBUG"], "true");
+    assert_eq!(f.variables["PAIR"], "a: b");
+    assert_eq!(f.variables["OPEN"], "[x");
 }

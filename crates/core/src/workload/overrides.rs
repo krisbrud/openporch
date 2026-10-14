@@ -23,7 +23,7 @@ pub struct Overrides {
     pub artifacts: IndexMap<String, String>,
     /// Values by dotted path into the workload document, applied in order. A
     /// value is read as YAML, except that it stays a string where it replaces
-    /// a string or where the document needs a string.
+    /// a string, is not YAML, or the document needs a string.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub properties: IndexMap<String, String>,
 }
@@ -88,8 +88,8 @@ impl Workload {
             for (path, raw) in &overrides.properties {
                 let before = doc.clone();
                 let as_yaml = set_property(&mut doc, path, raw)?;
-                // A scalar the document needs as a string, such as a
-                // variable's `20`, stays the string it was written as.
+                // A value the document needs as a string, such as a
+                // variable's `20` or `a: b`, stays the string it was written as.
                 if as_yaml && serde_json::from_value::<Workload>(doc.clone()).is_err() {
                     let mut as_string = before;
                     set_value(&mut as_string, path, Value::String(raw.clone()))?;
@@ -139,22 +139,18 @@ impl Workload {
 }
 
 /// Sets `path` to `raw` read as YAML, or as a string where it replaces a
-/// string. Returns whether it was read as a non-string YAML scalar.
+/// string or is not YAML. Returns whether it was read as something other
+/// than a string.
 fn set_property(doc: &mut Value, path: &str, raw: &str) -> Result<bool, WorkloadError> {
     let slot = slot(doc, path)?;
-    if slot.is_string() {
-        *slot = Value::String(raw.to_owned());
-        return Ok(false);
-    }
-    let value: Value = serde_yaml_ng::from_str(raw).map_err(|e| {
-        WorkloadError::new(
-            format!("properties.{path}"),
-            format!("not a YAML value: {e}"),
-        )
-    })?;
-    let scalar = !value.is_object() && !value.is_array() && !value.is_string();
-    *slot = value;
-    Ok(scalar)
+    let value = if slot.is_string() {
+        None
+    } else {
+        serde_yaml_ng::from_str::<Value>(raw).ok()
+    };
+    let as_yaml = value.as_ref().is_some_and(|v| !v.is_string());
+    *slot = value.unwrap_or_else(|| Value::String(raw.to_owned()));
+    Ok(as_yaml)
 }
 
 fn set_value(doc: &mut Value, path: &str, value: Value) -> Result<(), WorkloadError> {

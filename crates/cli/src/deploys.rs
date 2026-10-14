@@ -383,35 +383,42 @@ const LOG_PAGE: u32 = 500;
 /// The pause before asking again when a log has no new lines.
 const LOG_POLL: Duration = Duration::from_millis(500);
 
-/// Prints deployment `reference`'s log lines until it finishes.
+/// Prints deployment `id`'s log lines until it finishes. A lost response is
+/// asked for again; the deployment carries on either way.
 async fn follow(
     session: &Session,
     client: &Client,
     env: &str,
-    reference: &str,
+    id: &str,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let path = env_path(
-        session,
-        env,
-        &format!("/deploys/{}/logs", segment(reference)),
-    )?;
+    let path = env_path(session, env, &format!("/deploys/{}/logs", segment(id)))?;
     let mut after = 0;
+    let mut failures = 0;
     loop {
-        let page = client
-            .request(
-                Method::GET,
-                &with_query(
-                    &path,
-                    &[
-                        ("after", Some(after.to_string())),
-                        ("limit", Some(LOG_PAGE.to_string())),
-                    ],
-                ),
-                None,
-            )
+        let query = [
+            ("after", Some(after.to_string())),
+            ("limit", Some(LOG_PAGE.to_string())),
+        ];
+        let page = match client
+            .request(Method::GET, &with_query(&path, &query), None)
             .await
-            .map_err(api)?;
+        {
+            Ok(page) => page,
+            Err(ApiError::Transport(e)) if failures < RETRIES => {
+                failures += 1;
+                let _ = writeln!(io.err, "warning: {e}; asking again");
+                tokio::time::sleep(Duration::from_millis(500 << failures)).await;
+                continue;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{}; deployment {id} may still be running: follow it with `porch logs deploy {id}`",
+                    api(e)
+                ));
+            }
+        };
+        failures = 0;
         let lines = page["lines"]
             .as_array()
             .map(Vec::as_slice)
@@ -474,7 +481,20 @@ pub(crate) async fn logs(session: &Session, cmd: LogsCmd, io: &mut Io<'_>) -> Re
     let LogsCmd::Deploy { reference } = cmd;
     let client = session.client()?;
     let env = session.env()?.to_owned();
-    follow(session, &client, &env, &reference, io).await
+    // `+0` names a different deployment once another starts, so the log is
+    // followed by the ID it names now.
+    let d = client
+        .request(
+            Method::GET,
+            &env_path(session, &env, &format!("/deploys/{}", segment(&reference)))?,
+            None,
+        )
+        .await
+        .map_err(api)?;
+    let id = d["id"]
+        .as_str()
+        .ok_or("unexpected response from the server: no deployment ID")?;
+    follow(session, &client, &env, id, io).await
 }
 
 /// The set ID a `diff sets` argument names.
