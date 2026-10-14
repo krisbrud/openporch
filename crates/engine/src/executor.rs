@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openporch_core::criteria::definition_weight;
+use openporch_core::ids::AccountId;
 use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
@@ -24,10 +25,11 @@ use openporch_store::{AccountStore, CatalogStore, SecretOwner, SecretUseStore, S
 use serde_json::{Map, Value};
 use tokio::time::Instant;
 
-use crate::cloud::{CloudError, CredentialResolver};
+use crate::cloud::{AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, S3Version};
 use crate::planner::{
-    DeprovisionJob, DestructiveAction, ExecFailure, Executor, Observed, PermitCheck, PermitRequest,
-    ProvisionJob, ProvisionResult, RedactingLog, SecretSource,
+    ArtifactCheck, DeprovisionJob, DestructiveAction, ExecFailure, Executor, JobContext, JobLog,
+    Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult, RedactingLog,
+    SecretSource,
 };
 
 /// The version of the sealed cookie format, bound into its associated data.
@@ -186,7 +188,7 @@ where
         let definition = job.definition_id.as_str();
         let mut read = BTreeMap::new();
         for r in &definition_refs {
-            self.authorize(job, &[SecretOwner::Definition(definition)], r)
+            self.authorize(&job.context, &[SecretOwner::Definition(definition)], r)
                 .await?;
             let value = self.read(r).await?;
             log.secret([value.expose()]);
@@ -211,7 +213,7 @@ where
                     r.reference, r.store
                 )));
             }
-            self.authorize(job, &owners, r).await?;
+            self.authorize(&job.context, &owners, r).await?;
             let value = self.read(r).await?;
             log.secret([value.expose()]);
             read.insert(r.clone(), value);
@@ -255,11 +257,10 @@ where
     /// environment.
     async fn authorize(
         &self,
-        job: &ProvisionJob,
+        c: &JobContext,
         owners: &[SecretOwner<'_>],
         r: &SecretRef,
     ) -> Result<(), ExecFailure> {
-        let c = &job.context;
         let mut refused = None;
         for owner in owners {
             match self
@@ -310,34 +311,9 @@ where
         let Some(id) = &job.driver_account else {
             return Ok(None);
         };
-        let c = &job.context;
-        let read_at = self.cloud.generation();
-        let account = self
-            .store
-            .account(c.org.as_str(), id.as_str())
-            .await
-            .map_err(|e| store_failure(e, "the cloud account could not be read"))?
-            .ok_or_else(|| ExecFailure::Permanent(format!("cloud account `{id}` does not exist")))?
-            .account;
-        for r in account.secret_refs.values() {
-            self.authorize(job, &[SecretOwner::Account(id.as_str())], r)
-                .await?;
-        }
         let credentials = self
-            .cloud
-            .resolve(&account, read_at, self.secrets.as_ref(), window)
-            .await
-            .map_err(cloud_failure)?;
-        log.secret(
-            [
-                Some(&credentials.secret_access_key),
-                credentials.session_token.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(SecretValue::expose)
-            .filter(|s| !s.is_empty()),
-        );
+            .account_credentials(&job.context, id, window, log)
+            .await?;
         let identity = self
             .cloud
             .identity(&credentials)
@@ -364,6 +340,45 @@ where
             .map(|(k, v)| (k.to_owned(), Value::String(v.expose().to_owned())))
             .collect();
         Ok(Some((SecretMap::new(map), identity.account)))
+    }
+
+    /// Credentials for cloud account `id`, used in `c`'s scope, valid for
+    /// `window`. Their secrets are registered with `log`.
+    async fn account_credentials(
+        &self,
+        c: &JobContext,
+        id: &AccountId,
+        window: Duration,
+        log: &mut RedactingLog,
+    ) -> Result<AwsCredentials, ExecFailure> {
+        let read_at = self.cloud.generation();
+        let account = self
+            .store
+            .account(c.org.as_str(), id.as_str())
+            .await
+            .map_err(|e| store_failure(e, "the cloud account could not be read"))?
+            .ok_or_else(|| ExecFailure::Permanent(format!("cloud account `{id}` does not exist")))?
+            .account;
+        for r in account.secret_refs.values() {
+            self.authorize(c, &[SecretOwner::Account(id.as_str())], r)
+                .await?;
+        }
+        let credentials = self
+            .cloud
+            .resolve(&account, read_at, self.secrets.as_ref(), window)
+            .await
+            .map_err(cloud_failure)?;
+        log.secret(
+            [
+                Some(&credentials.secret_access_key),
+                credentials.session_token.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(SecretValue::expose)
+            .filter(|s| !s.is_empty()),
+        );
+        Ok(credentials)
     }
 
     /// The cookie the job carries, decrypted.
@@ -688,6 +703,45 @@ where
         self.run_provision(&job, &mut log)
             .await
             .map_err(|f| log.failure(f))
+    }
+
+    async fn check_artifacts(&self, check: ArtifactCheck) -> Result<(), ExecFailure> {
+        // Only an artifact pinned to a version names something that can be
+        // gone; acceptance pins S3 objects to versions.
+        let versions: Vec<S3Version> = check
+            .artifacts
+            .iter()
+            .filter_map(|a| S3Version::parse(a))
+            .collect();
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let mut log = JobLog::discard().redacting();
+        let credentials = match &check.account {
+            Some(id) => Some(
+                self.account_credentials(&check.context, id, CHECK_WINDOW, &mut log)
+                    .await
+                    .map_err(|f| log.failure(f))?,
+            ),
+            None => None,
+        };
+        for version in &versions {
+            match self
+                .cloud
+                .object_exists(credentials.as_ref(), version)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ExecFailure::Permanent(format!(
+                        "artifact `{version}` of `{}` no longer exists; nothing changed",
+                        check.descriptor
+                    )));
+                }
+                Err(e) => return Err(log.failure(cloud_failure(e))),
+            }
+        }
+        Ok(())
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {

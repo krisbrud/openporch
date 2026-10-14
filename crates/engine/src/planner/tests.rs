@@ -134,6 +134,9 @@ enum Behavior {
 #[derive(Default)]
 struct Fake {
     behavior: Mutex<BTreeMap<String, Behavior>>,
+    /// The artifact checks asked for, and the artifacts that are gone.
+    artifact_checks: Mutex<Vec<ArtifactCheck>>,
+    gone: Mutex<BTreeSet<String>>,
     jobs: Mutex<Vec<ProvisionJob>>,
     running: AtomicUsize,
     most: AtomicUsize,
@@ -292,6 +295,17 @@ fn none_outputs(
 }
 
 impl Executor for Fake {
+    async fn check_artifacts(&self, check: ArtifactCheck) -> Result<(), ExecFailure> {
+        self.artifact_checks.lock().unwrap().push(check.clone());
+        let gone = self.gone.lock().unwrap();
+        match check.artifacts.iter().find(|a| gone.contains(*a)) {
+            Some(a) => Err(ExecFailure::Permanent(format!(
+                "artifact `{a}` no longer exists"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let behavior = self
             .behavior

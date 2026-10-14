@@ -1518,6 +1518,14 @@ later edits do not affect it. The deployment is returned at once with status
 `in_progress`. It then becomes `succeeded` or `failed`, and only success changes
 the environment's last successful deployment and set.
 
+Before a deployment changes anything, it checks that every function artifact
+its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`,
+still exists, reading it with the workload definition's cloud account or, without
+one, the server's own AWS identity. If one is gone, as when a replay names a
+version that was deleted, the workload fails naming the artifact, every other
+resource is left `pending`, and the deployment fails with nothing changed. An
+artifact named without a version is not checked.
+
 ```http
 POST /orgs/acme/apps
 Authorization: Bearer $ADMIN_TOKEN

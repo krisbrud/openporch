@@ -495,3 +495,48 @@ async fn real_account_check() {
         "{err}"
     );
 }
+
+#[test]
+fn only_an_s3_object_with_a_version_is_an_s3_version() {
+    let v = S3Version::parse("s3://artifacts/order-worker/abc.zip?versionId=3HL4kqtJ").unwrap();
+    assert_eq!(
+        (v.bucket.as_str(), v.key.as_str(), v.version.as_str()),
+        ("artifacts", "order-worker/abc.zip", "3HL4kqtJ")
+    );
+    assert_eq!(
+        v.to_string(),
+        "s3://artifacts/order-worker/abc.zip?versionId=3HL4kqtJ"
+    );
+    for uri in [
+        "s3://artifacts/latest.zip",
+        "s3://artifacts/latest.zip?versionId=",
+        "s3:///k?versionId=v",
+        "s3://artifacts?versionId=v",
+        "https://artifacts.s3.amazonaws.com/k?versionId=v",
+        ".",
+    ] {
+        assert_eq!(S3Version::parse(uri), None, "{uri}");
+    }
+}
+
+/// Checks object versions in a real or emulated versioned bucket with the
+/// host's identity. CI's Floci job uploads the object and sets
+/// `OPENPORCH_TEST_ARTIFACT_BUCKET`, `OPENPORCH_TEST_ARTIFACT_KEY` and
+/// `OPENPORCH_TEST_ARTIFACT_VERSION`.
+#[tokio::test]
+#[ignore = "needs S3 and a versioned bucket"]
+async fn real_artifact_check() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+    let object = S3Version {
+        bucket: var("OPENPORCH_TEST_ARTIFACT_BUCKET"),
+        key: var("OPENPORCH_TEST_ARTIFACT_KEY"),
+        version: var("OPENPORCH_TEST_ARTIFACT_VERSION"),
+    };
+    let resolver = CredentialResolver::new(Arc::new(AwsSts::new()));
+    assert!(resolver.object_exists(None, &object).await.unwrap());
+    let missing = S3Version {
+        key: format!("{}.missing", object.key),
+        ..object.clone()
+    };
+    assert!(!resolver.object_exists(None, &missing).await.unwrap());
+}

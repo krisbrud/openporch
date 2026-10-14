@@ -15,6 +15,7 @@ openporch-drivers.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-sts.workspace = true
+aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
 rand.workspace = true
 serde.workspace = true

@@ -230,3 +230,57 @@ resources:
     );
     assert_eq!(files["/etc/app/db"]["content"], "host=postgres.internal");
 }
+
+#[tokio::test]
+async fn a_missing_artifact_stops_the_deployment_before_anything_runs() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    fake.gone
+        .lock()
+        .unwrap()
+        .insert("s3://artifacts/worker.zip".into());
+    let deployment = f
+        .accept_set(Some(WORKER), with_workloads("openporch/echo"))
+        .await
+        .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
+
+    // The workload names the artifact; nothing else started.
+    assert!(
+        matches!(&outcomes[&d(WORKER_WORKLOAD)], Outcome::Failed(e)
+            if e.contains("artifact `s3://artifacts/worker.zip` no longer exists")),
+        "{outcomes:?}"
+    );
+    for (descriptor, outcome) in &outcomes {
+        if descriptor.to_string() != WORKER_WORKLOAD {
+            assert!(
+                matches!(outcome, Outcome::Pending(r) if r.contains("artifact")),
+                "{descriptor}: {outcome:?}"
+            );
+        }
+    }
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    let (status, error) = f.status(&deployment).await;
+    assert_eq!(status, DeploymentStatus::Failed);
+    assert!(error.unwrap().contains("no longer exists"));
+
+    // Checked once per workload, with the definition's account.
+    let checks = fake.artifact_checks.lock().unwrap().clone();
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(checks[0].descriptor.to_string(), WORKER_WORKLOAD);
+    assert_eq!(checks[0].artifacts, ["s3://artifacts/worker.zip"]);
+    assert_eq!(checks[0].account, None);
+    assert_eq!(checks[0].context.deployment_id, deployment.id);
+
+    // Once it exists again, the deployment runs.
+    fake.gone.lock().unwrap().clear();
+    let deployment = f
+        .accept_set(Some(WORKER), with_workloads("openporch/echo"))
+        .await
+        .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+    assert!(
+        outcomes.values().all(|o| *o == Outcome::Provisioned),
+        "{outcomes:?}"
+    );
+}
