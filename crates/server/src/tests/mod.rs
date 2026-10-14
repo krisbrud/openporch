@@ -277,7 +277,7 @@ async fn authentication_and_authorization_on_every_route() {
 #[tokio::test]
 async fn router_walk_every_route_declares_a_permission_and_requires_credentials() {
     let s = server().await;
-    let public = crate::api::PUBLIC_PATHS;
+    let public = crate::api::PUBLIC_ROUTES;
     assert!(!s.specs.is_empty());
     for spec in &s.specs {
         let path = spec
@@ -291,8 +291,11 @@ async fn router_walk_every_route_declares_a_permission_and_requires_credentials(
         let (status, b) = s.call(spec.method.clone(), &path, None, body).await;
         if spec.permission == Permission::Public {
             assert!(
-                public.contains(&spec.path),
-                "unexpected public route {}",
+                public
+                    .iter()
+                    .any(|(m, p)| *m == spec.method && *p == spec.path),
+                "unexpected public route {} {}",
+                spec.method,
                 spec.path
             );
             assert_ne!(
@@ -306,14 +309,19 @@ async fn router_walk_every_route_declares_a_permission_and_requires_credentials(
             assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
         }
     }
-    // Every public path is registered.
-    for p in public {
-        assert!(s.specs.iter().any(|r| r.path == p), "{p}");
+    // Every listed public route is registered as public.
+    for (m, p) in public {
+        assert!(
+            s.specs
+                .iter()
+                .any(|r| r.method == m && r.path == p && r.permission == Permission::Public),
+            "{m} {p}"
+        );
     }
 }
 
 #[tokio::test]
-#[should_panic(expected = "is public but not a known public path")]
+#[should_panic(expected = "is public but not a known public route")]
 async fn an_unexpected_public_route_stops_the_server_from_starting() {
     let s = server().await;
     let _ = crate::api::Api::new(s.state.clone()).route(

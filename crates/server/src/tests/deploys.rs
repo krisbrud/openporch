@@ -343,7 +343,8 @@ async fn deploying_needs_the_deployer_role() {
         assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     }
     // The developer is told which role is missing.
-    let (_, b) = s.post(path, &dev, body.clone()).await;
+    let (status, b) = s.post(path, &dev, body.clone()).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     assert!(b["message"].as_str().unwrap().contains("`deployer`"), "{b}");
     let (_, page) = s.get(path, &s.admin).await;
     assert_eq!(page["deployments"], json!([]));
@@ -896,14 +897,33 @@ async fn cross_application_references_are_hidden() {
     let dev = s.member("dev", "member").await;
     s.grant_app("blog", "dev", "developer").await;
     s.grant_deployer("development", "dev").await;
+    // The developer can deploy `blog` itself.
+    let blog = "/orgs/acme/apps/blog/envs/development/deploys";
+    let (status, own) = s
+        .post(blog, &dev, json!({"set_id": "0", "expected_generation": 0}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{own}");
+    gate.add_permits(1);
+    let own = own["id"].as_str().unwrap();
+    for _ in 0..200 {
+        let (_, d) = s.get(&format!("{blog}/{own}"), &s.admin).await;
+        if d["status"] != "in_progress" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (_, env) = s
+        .get("/orgs/acme/apps/blog/envs/development", &s.admin)
+        .await;
+    let generation = env["generation"].clone();
     let id = d["id"].as_str().unwrap();
     let set = source["set_id"].as_str().unwrap();
     for replay in ["current", "snapshot"] {
         let (status, b) = s
             .post(
-                "/orgs/acme/apps/blog/envs/development/deploys",
+                blog,
                 &dev,
-                json!({"deploy_id": id, "replay": replay, "expected_generation": 0}),
+                json!({"deploy_id": id, "replay": replay, "expected_generation": generation}),
             )
             .await;
         assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
@@ -923,10 +943,8 @@ async fn cross_application_references_are_hidden() {
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
     assert!(!b.to_string().contains(set), "{b}");
     // Nothing was deployed or created.
-    let (_, page) = s
-        .get("/orgs/acme/apps/blog/envs/development/deploys", &s.admin)
-        .await;
-    assert_eq!(page["deployments"], json!([]));
+    let (_, page) = s.get(blog, &s.admin).await;
+    assert_eq!(page["deployments"].as_array().unwrap().len(), 1, "{page}");
     assert_eq!(
         s.get("/orgs/acme/apps/blog/envs/copy", &s.admin).await.0,
         StatusCode::NOT_FOUND
@@ -982,8 +1000,16 @@ async fn deployments_are_recorded_with_their_correlated_outcome() {
     assert_eq!(failed["operation_id"], id);
     assert_eq!(failed["correlates"], accepted["id"]);
     assert_eq!(failed["reason"], "deployment_failed");
-    // Both entries have stable IDs: a later page returns them unchanged.
-    let (_, again) = s.get("/orgs/acme/audit-logs?user_id=ci", &s.admin).await;
+    // Both entries keep their IDs after later writes, on a later page.
+    s.app("later").await;
+    let (_, newest) = s.get("/orgs/acme/audit-logs?limit=1", &s.admin).await;
+    let before = newest["next"].as_i64().unwrap();
+    let (_, again) = s
+        .get(
+            &format!("/orgs/acme/audit-logs?user_id=ci&before={before}"),
+            &s.admin,
+        )
+        .await;
     for entry in [accepted, failed] {
         assert!(
             again["entries"]
