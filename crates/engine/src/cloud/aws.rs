@@ -12,7 +12,9 @@ use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
-use super::{AssumeRole, AwsCredentials, CallerIdentity, CloudError, S3Version, Sts};
+use super::{
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, S3Version, Sts,
+};
 
 /// The region STS is called in when neither the account nor the host names one.
 const FALLBACK_REGION: &str = "us-east-1";
@@ -180,66 +182,110 @@ impl Sts for AwsSts {
         object: &'a S3Version,
     ) -> BoxFuture<'a, Result<bool, CloudError>> {
         Box::pin(async move {
-            let mut region = credentials.and_then(|c| c.region.clone());
-            // A bucket in another region than the one asked answers with its
-            // own, and is asked again there once.
-            for _ in 0..2 {
-                let client = self.s3(region.as_deref(), credentials.map(provider)).await;
-                let out = client
-                    .head_object()
-                    .bucket(&object.bucket)
-                    .key(&object.key)
-                    .version_id(&object.version)
-                    .send()
-                    .await;
-                let s = match out {
-                    Ok(_) => return Ok(true),
-                    Err(SdkError::ServiceError(s)) => s,
-                    Err(e) => {
-                        return Err(CloudError::Unavailable(format!(
-                            "S3 HeadObject on `{object}` failed: {}",
-                            DisplayErrorContext(&e)
-                        )));
-                    }
-                };
-                let status = s.raw().status().as_u16();
-                let bucket_region = s
-                    .raw()
-                    .headers()
-                    .get("x-amz-bucket-region")
-                    .map(str::to_owned);
-                match status {
-                    // No such object or version; 405 is a version that is a
-                    // delete marker.
-                    404 | 405 => return Ok(false),
-                    301 | 400 if bucket_region.is_some() && bucket_region != region => {
-                        region = bucket_region;
-                    }
-                    403 => {
-                        return Err(CloudError::Rejected(format!(
-                            "S3 HeadObject on `{object}` was denied; without `s3:ListBucket` \
-                             S3 also denies reading an object that does not exist"
-                        )));
-                    }
-                    500.. => {
-                        return Err(CloudError::Unavailable(format!(
-                            "S3 HeadObject on `{object}` failed with status {status}"
-                        )));
-                    }
-                    _ => {
-                        return Err(CloudError::Rejected(format!(
-                            "S3 HeadObject on `{object}` failed with status {status}{}; check \
-                             the version ID and the account's region",
-                            bucket_region
-                                .map(|r| format!(" (the bucket is in {r})"))
-                                .unwrap_or_default()
-                        )));
-                    }
+            let name = object.to_string();
+            let head = self
+                .head(
+                    credentials,
+                    &object.bucket,
+                    &object.key,
+                    Some(&object.version),
+                    &name,
+                )
+                .await?;
+            Ok(head.is_some())
+        })
+    }
+
+    fn latest_version<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Object,
+    ) -> BoxFuture<'a, Result<Latest, CloudError>> {
+        Box::pin(async move {
+            let name = object.to_string();
+            let head = self
+                .head(credentials, &object.bucket, &object.key, None, &name)
+                .await?;
+            Ok(match head {
+                None => Latest::Missing,
+                // An unversioned bucket reports no version, or `null`.
+                Some(Some(v)) if v != "null" => Latest::Version(v),
+                Some(_) => Latest::Unversioned,
+            })
+        })
+    }
+}
+
+impl AwsSts {
+    /// HeadObject on `key` (at `version`): `None` when there is no such
+    /// object or version, otherwise the version ID S3 reports.
+    async fn head(
+        &self,
+        credentials: Option<&AwsCredentials>,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Option<String>>, CloudError> {
+        let mut region = credentials.and_then(|c| c.region.clone());
+        // A bucket in another region than the one asked answers with its
+        // own, and is asked again there once.
+        for _ in 0..2 {
+            let client = self.s3(region.as_deref(), credentials.map(provider)).await;
+            let out = client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .set_version_id(version.map(str::to_owned))
+                .send()
+                .await;
+            let s = match out {
+                Ok(out) => return Ok(Some(out.version_id().map(str::to_owned))),
+                Err(SdkError::ServiceError(s)) => s,
+                Err(e) => {
+                    return Err(CloudError::Unavailable(format!(
+                        "S3 HeadObject on `{name}` failed: {}",
+                        DisplayErrorContext(&e)
+                    )));
+                }
+            };
+            let status = s.raw().status().as_u16();
+            let bucket_region = s
+                .raw()
+                .headers()
+                .get("x-amz-bucket-region")
+                .map(str::to_owned);
+            match status {
+                // No such object or version; 405 is a version that is a
+                // delete marker.
+                404 | 405 => return Ok(None),
+                301 | 400 if bucket_region.is_some() && bucket_region != region => {
+                    region = bucket_region;
+                }
+                403 => {
+                    return Err(CloudError::Rejected(format!(
+                        "S3 HeadObject on `{name}` was denied; without `s3:ListBucket` \
+                         S3 also denies reading an object that does not exist"
+                    )));
+                }
+                500.. => {
+                    return Err(CloudError::Unavailable(format!(
+                        "S3 HeadObject on `{name}` failed with status {status}"
+                    )));
+                }
+                _ => {
+                    return Err(CloudError::Rejected(format!(
+                        "S3 HeadObject on `{name}` failed with status {status}{}; check \
+                         the version ID and the account's region",
+                        bucket_region
+                            .map(|r| format!(" (the bucket is in {r})"))
+                            .unwrap_or_default()
+                    )));
                 }
             }
-            Err(CloudError::Rejected(format!(
-                "S3 HeadObject on `{object}` was redirected more than once"
-            )))
-        })
+        }
+        Err(CloudError::Rejected(format!(
+            "S3 HeadObject on `{name}` was redirected more than once"
+        )))
     }
 }

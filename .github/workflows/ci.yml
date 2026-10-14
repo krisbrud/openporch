@@ -82,6 +82,10 @@ jobs:
           export OPENPORCH_TEST_ARTIFACT_VERSION=$(aws s3api put-object \
             --bucket openporch-artifacts --key "$OPENPORCH_TEST_ARTIFACT_KEY" \
             --body worker.zip --query VersionId --output text)
+          aws s3api create-bucket --bucket openporch-plain
+          aws s3api put-object --bucket openporch-plain --key "$OPENPORCH_TEST_ARTIFACT_KEY" \
+            --body worker.zip
+          export OPENPORCH_TEST_PLAIN_BUCKET=openporch-plain
           cargo test -p openporch-engine real_artifact_check -- --ignored
 
   opentofu:

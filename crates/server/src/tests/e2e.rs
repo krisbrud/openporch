@@ -3,13 +3,68 @@
 //! redeploys it unchanged, and replays a recorded snapshot after the
 //! configuration changed.
 
+use std::sync::{Arc, Mutex};
+
 use axum::http::StatusCode;
 use openporch_core::catalog::builtin_types;
 use openporch_core::workload::Workload;
+use openporch_engine::cloud::{
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, Sts,
+};
 use openporch_store::Store;
+use openporch_store::secrets::BoxFuture;
 use serde_json::{Value, json};
 
-use super::{Server, server};
+use super::{Server, server, server_from};
+
+/// S3 as the host sees it: bucket `artifacts` keeps versions, and its objects'
+/// current version is `version`; bucket `plain` does not; nothing else exists.
+#[derive(Default)]
+struct ArtifactSts {
+    version: Mutex<String>,
+}
+
+impl ArtifactSts {
+    fn set(&self, version: &str) {
+        *self.version.lock().unwrap() = version.to_owned();
+    }
+}
+
+impl Sts for ArtifactSts {
+    fn assume_role(&self, _: AssumeRole) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
+        Box::pin(async { Err(CloudError::Unavailable("no STS here".into())) })
+    }
+
+    fn caller_identity<'a>(
+        &'a self,
+        _: &'a AwsCredentials,
+    ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>> {
+        Box::pin(async { Err(CloudError::Unavailable("no STS here".into())) })
+    }
+
+    fn latest_version<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Object,
+    ) -> BoxFuture<'a, Result<Latest, CloudError>> {
+        Box::pin(async move {
+            assert!(credentials.is_none(), "without an account the host reads");
+            Ok(match object.bucket.as_str() {
+                "artifacts" => Latest::Version(self.version.lock().unwrap().clone()),
+                "plain" => Latest::Unversioned,
+                _ => Latest::Missing,
+            })
+        })
+    }
+}
+
+/// A server whose host sees S3 as `sts` does.
+async fn server_with_s3(sts: Arc<ArtifactSts>) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::Config::new("acme", dir.path());
+    let state = crate::start_with(config, None, sts).await.unwrap();
+    server_from(dir, state)
+}
 
 /// A zip function that uses a database and reads from a queue.
 const WORKER: &str = r#"
@@ -81,6 +136,11 @@ impl Server {
     }
 }
 
+/// The artifact the worker deployed.
+fn artifact(active: &std::collections::BTreeMap<String, Value>) -> Value {
+    active[WORKLOAD]["outputs"]["spec"]["function"]["package"]["artifact"].clone()
+}
+
 /// The worker's resolved variables, as its `openporch/none` definition stored
 /// them.
 fn variables(active: &std::collections::BTreeMap<String, Value>) -> Value {
@@ -89,7 +149,9 @@ fn variables(active: &std::collections::BTreeMap<String, Value>) -> Value {
 
 #[tokio::test]
 async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
-    let s = server().await;
+    let sts = Arc::new(ArtifactSts::default());
+    sts.set("v1");
+    let s = server_with_s3(sts.clone()).await;
     s.app("shop").await;
     for (id, ty, driver, inputs) in [
         ("env", "base-env", "openporch/none", json!({})),
@@ -224,6 +286,15 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
             .iter()
             .any(|d| d == DB)
     );
+    // The artifact deployed is the object version current at acceptance; the
+    // set keeps the name it was given.
+    assert_eq!(artifact(&dev), "s3://artifacts/worker.zip?versionId=v1");
+    let (_, set) = s.get(&format!("{APP}/sets/{set_id}"), &s.admin).await;
+    assert_eq!(
+        set["modules"]["worker"]["spec"]["function"]["package"]["artifact"],
+        "s3://artifacts/worker.zip"
+    );
+    sts.set("v2");
 
     // The same set in staging resolves the override.
     let staged = s.deploy_to("staging", json!({"set_id": set_id})).await;
@@ -275,6 +346,7 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
         json!({"host": "db.internal", "port": 5432})
     );
     assert_eq!(variables(&old)["API_HOST"], "api.shared");
+    assert_eq!(artifact(&old), "s3://artifacts/worker.zip?versionId=v1");
     assert_eq!(old[DB]["guresid"], dev[DB]["guresid"]);
     assert_eq!(old[DB]["definition_version"], 1);
 
@@ -290,6 +362,7 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
         json!({"host": "db.internal", "port": 6432})
     );
     assert_eq!(variables(&current)["API_HOST"], "api.v2");
+    assert_eq!(artifact(&current), "s3://artifacts/worker.zip?versionId=v2");
     assert_eq!(current[DB]["guresid"], dev[DB]["guresid"]);
     assert_eq!(current[DB]["definition_version"], 2);
     assert_eq!(variables(&current)["DB_PORT"], 6432);
@@ -299,6 +372,60 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     let staging = s.active("staging").await;
     assert_eq!(variables(&staging)["API_HOST"], "api.staging");
     assert_eq!(variables(&staging)["DB_PORT"], 6432);
+}
+
+/// `Mutable artifact` in `workload-spec`: an artifact without a fixed identity
+/// is pinned, or the deployment is refused before anything changes.
+#[tokio::test]
+async fn artifacts_without_a_fixed_identity_are_refused() {
+    let s = server_with_s3(Arc::new(ArtifactSts::default())).await;
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": "openporch/none", "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    for (artifact, expected) in [
+        ("s3://plain/worker.zip", "enable versioning"),
+        ("s3://elsewhere/worker.zip", "does not exist"),
+        ("https://example.com/worker.zip", "no fixed identity"),
+    ] {
+        let doc = format!(
+            "apiVersion: openporch.dev/v1\nkind: Workload\nmetadata: {{name: worker}}\n\
+             function: {{package: {{type: zip, artifact: \"{artifact}\", runtime: python3.12, \
+             handler: app.handler}}}}\n"
+        );
+        let (st, delta) = s
+            .post(
+                &format!("{APP}/deltas"),
+                &s.admin,
+                json!({"env": "development", "workload": doc}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{delta}");
+        let (st, b) = s
+            .post(
+                &format!("{APP}/envs/development/deploys"),
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": delta["base_generation"]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{artifact}: {b}");
+        assert!(
+            b["message"].as_str().unwrap().contains(expected),
+            "{artifact}: {b}"
+        );
+    }
+    // Nothing was deployed.
+    let (_, page) = s
+        .get(&format!("{APP}/envs/development/deploys"), &s.admin)
+        .await;
+    assert_eq!(page["deployments"], json!([]));
 }
 
 /// Writes a new version of the built-in secret `name`.

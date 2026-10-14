@@ -179,6 +179,19 @@ impl S3Version {
     }
 }
 
+/// `s` with the characters that would change how a URI parses escaped, so
+/// that [`percent_decode`] gives `s` back.
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' | '?' | '#' | '&' => out.push_str(&format!("%{:02X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `s` with `%XX` escapes decoded; `None` when an escape is malformed or the
 /// result is not UTF-8.
 fn percent_decode(s: &str) -> Option<String> {
@@ -201,12 +214,70 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// An S3 object named without a version, as `s3://<bucket>/<key>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Object {
+    /// The bucket.
+    pub bucket: String,
+    /// The object key.
+    pub key: String,
+}
+
+impl S3Object {
+    /// `uri` as an S3 object without a version, with its key percent-decoded;
+    /// `None` for anything else.
+    pub fn parse(uri: &str) -> Option<Self> {
+        let path = uri.strip_prefix("s3://")?;
+        if path.contains(['?', '#']) {
+            return None;
+        }
+        let (bucket, key) = path.split_once('/')?;
+        let key = percent_decode(key)?;
+        if bucket.is_empty() || key.is_empty() {
+            return None;
+        }
+        Some(Self {
+            bucket: bucket.to_owned(),
+            key,
+        })
+    }
+
+    /// The object at `version`.
+    pub fn at(&self, version: String) -> S3Version {
+        S3Version {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            version,
+        }
+    }
+}
+
+impl fmt::Display for S3Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "s3://{}/{}", self.bucket, escape(&self.key))
+    }
+}
+
+/// What S3 reports as an object's current version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Latest {
+    /// There is no such object.
+    Missing,
+    /// The bucket does not keep versions, so the object has no identity that
+    /// stays fixed.
+    Unversioned,
+    /// The current version ID.
+    Version(String),
+}
+
 impl fmt::Display for S3Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "s3://{}/{}?versionId={}",
-            self.bucket, self.key, self.version
+            self.bucket,
+            escape(&self.key),
+            escape(&self.version)
         )
     }
 }
@@ -231,6 +302,17 @@ pub trait Sts: Send + Sync {
         credentials: Option<&'a AwsCredentials>,
         object: &'a S3Version,
     ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        let _ = (credentials, object);
+        Box::pin(async { Err(CloudError::Unavailable("S3 cannot be reached".into())) })
+    }
+
+    /// The current version of `object`, read with `credentials` or, without
+    /// them, the host's own identity.
+    fn latest_version<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Object,
+    ) -> BoxFuture<'a, Result<Latest, CloudError>> {
         let _ = (credentials, object);
         Box::pin(async { Err(CloudError::Unavailable("S3 cannot be reached".into())) })
     }
@@ -328,6 +410,20 @@ impl CredentialResolver {
         match credentials {
             Some(c) => exists.map_err(|e| redacted(e, c)),
             None => exists,
+        }
+    }
+
+    /// The current version of `object`, read with `credentials` or the
+    /// host's own identity.
+    pub async fn latest_version(
+        &self,
+        credentials: Option<&AwsCredentials>,
+        object: &S3Object,
+    ) -> Result<Latest, CloudError> {
+        let latest = self.sts.latest_version(credentials, object).await;
+        match credentials {
+            Some(c) => latest.map_err(|e| redacted(e, c)),
+            None => latest,
         }
     }
 

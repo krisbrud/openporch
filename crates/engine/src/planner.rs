@@ -35,7 +35,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::cloud::S3Version;
+use crate::cloud::{S3Object, S3Version};
 
 mod deprovision;
 mod log;
@@ -362,6 +362,52 @@ pub trait Executor: Send + Sync + 'static {
         let _ = check;
         async { Ok(()) }
     }
+
+    /// Pins each of `pin.artifacts` to the identity it has now, such as an S3
+    /// object version, in the same order. An artifact without a fixed
+    /// identity, such as an object in an unversioned bucket, is refused.
+    fn pin_artifacts(
+        &self,
+        pin: ArtifactPin,
+    ) -> impl Future<Output = Result<Vec<String>, ExecFailure>> + Send {
+        async move {
+            Err(ExecFailure::Permanent(format!(
+                "artifacts of `{}` cannot be pinned by this executor; name each S3 object \
+                 version as `s3://<bucket>/<key>?versionId=<version>`",
+                pin.descriptor
+            )))
+        }
+    }
+}
+
+/// Why artifacts could not be pinned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PinError {
+    /// An artifact has no fixed identity, or cannot be read; asking again
+    /// does not help.
+    #[error("{0}")]
+    Refused(String),
+    /// The cloud could not be asked; asking again later may work.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// Artifacts named without a fixed identity, to pin before a deployment is
+/// accepted.
+#[derive(Debug, Clone)]
+pub struct ArtifactPin {
+    /// The deployment the workload belongs to.
+    pub context: JobContext,
+    /// The workload.
+    pub descriptor: Descriptor,
+    /// The definition it matched.
+    pub definition_id: DefinitionId,
+    /// The cloud account the workload's driver gets credentials for, which
+    /// reads the artifacts; without one, the host's own identity reads them,
+    /// as the driver would.
+    pub account: Option<AccountId>,
+    /// The artifact URIs, such as `s3://bucket/key`.
+    pub artifacts: Vec<String>,
 }
 
 /// The artifacts a workload deploys, checked before its deployment changes
@@ -549,6 +595,101 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             }
         }
         missing
+    }
+
+    /// Pins every artifact the deployment's workloads name without a fixed
+    /// identity: the pinned URI of each such workload. Artifacts already
+    /// pinned to an S3 object version are kept; anything else that cannot be
+    /// pinned, such as another kind of URI, is refused.
+    pub async fn pin_artifacts(
+        &self,
+        deployment: &Deployment,
+        timeout: Duration,
+    ) -> Result<BTreeMap<Descriptor, String>, PinError> {
+        let deadline = Instant::now() + timeout;
+        let mut pinned = BTreeMap::new();
+        for node in deployment.graph.nodes.values() {
+            let unpinned: Vec<String> = artifacts(node)
+                .into_iter()
+                .filter(|a| S3Version::parse(a).is_none())
+                .collect();
+            let Some(artifact) = unpinned.first() else {
+                continue;
+            };
+            if S3Object::parse(artifact).is_none() {
+                return Err(PinError::Refused(format!(
+                    "artifact `{artifact}` of `{}` has no fixed identity: name an S3 object \
+                     (`s3://<bucket>/<key>` in a versioned bucket, or with `?versionId=`)",
+                    node.descriptor
+                )));
+            }
+            let def = deployment
+                .definitions
+                .get(&node.definition)
+                .map(|(_, def)| def)
+                .ok_or_else(|| {
+                    PinError::Refused(format!(
+                        "definition `{}` of `{}` is not in the deployment",
+                        node.definition, node.descriptor
+                    ))
+                })?;
+            let account = driver_account(def, &scope_for(deployment, node, &BTreeMap::new()))
+                .map_err(PinError::Refused)?;
+            let pin = ArtifactPin {
+                context: JobContext::of(deployment),
+                descriptor: node.descriptor.clone(),
+                definition_id: def.id.clone(),
+                account,
+                artifacts: unpinned,
+            };
+            let versions = self
+                .with_retries(&pin.descriptor, deadline, || {
+                    self.executor.pin_artifacts(pin.clone())
+                })
+                .await?;
+            let version = versions.into_iter().next().ok_or_else(|| {
+                PinError::Refused(format!("no pinned artifact for `{}`", node.descriptor))
+            })?;
+            pinned.insert(node.descriptor.clone(), version);
+        }
+        Ok(pinned)
+    }
+
+    /// Runs `call`, retrying failures that may pass with backoff, within the
+    /// deployment's attempts and `deadline`.
+    async fn with_retries<T, F, Fut>(
+        &self,
+        descriptor: &Descriptor,
+        deadline: Instant,
+        call: F,
+    ) -> Result<T, PinError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, ExecFailure>>,
+    {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (error, retry_after) = match tokio::time::timeout_at(deadline, call()).await {
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => {
+                    return Err(PinError::Refused(e));
+                }
+                Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
+                Err(_) => {
+                    return Err(PinError::Unavailable(format!(
+                        "ran out of time pinning the artifacts of `{descriptor}`"
+                    )));
+                }
+            };
+            let delay = retry_after.unwrap_or_else(|| backoff(&self.limits, attempt));
+            if attempt >= self.limits.attempts || Instant::now() + delay >= deadline {
+                return Err(PinError::Unavailable(format!(
+                    "{error} (after {attempt} attempts)"
+                )));
+            }
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Runs `check`, retrying failures that may pass with backoff, within the
