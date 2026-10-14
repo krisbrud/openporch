@@ -174,7 +174,7 @@ pub struct App {
 }
 
 /// A started device login.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceLogin {
     /// The code the client polls with.
     pub device_code: String,
@@ -186,6 +186,19 @@ pub struct DeviceLogin {
     pub expires_in: u64,
     /// The minimum number of seconds between polls.
     pub interval: u64,
+}
+
+impl fmt::Debug for DeviceLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The device code can be polled for a session.
+        f.debug_struct("DeviceLogin")
+            .field("device_code", &"<redacted>")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 /// A session issued by a login.
@@ -237,7 +250,12 @@ impl Client {
         let base = server_url(url)?;
         // `ring` is the crypto provider; installing it twice is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        if base.scheme() == "http" {
+            // Plain HTTP is only for this machine: a proxy would see the token.
+            builder = builder.no_proxy();
+        }
+        let http = builder
             .user_agent(concat!("porch/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))

@@ -59,6 +59,12 @@ fn tokens_are_redacted_in_debug_and_display() {
     assert!(!format!("{t:?} {t}").contains(SECRET));
     let client = Client::new("http://127.0.0.1:1", "acme", Some(t)).unwrap();
     assert!(!format!("{client:?}").contains(SECRET));
+    let device: DeviceLogin = serde_json::from_value(serde_json::json!({
+        "device_code": "dev-secret", "user_code": "ABCD-1234",
+        "verification_uri": "https://github.com/login/device", "expires_in": 900, "interval": 5,
+    }))
+    .unwrap();
+    assert!(!format!("{device:?}").contains("dev-secret"));
     assert_eq!(Token::new("  \n"), None);
     assert_eq!(Token::new(" x \n").unwrap().expose(), "x");
 }

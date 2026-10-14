@@ -115,8 +115,14 @@ impl Paths {
     /// Reads the config file; a missing file is empty.
     pub fn read_config(&self) -> Result<FileConfig, String> {
         match std::fs::read_to_string(&self.config) {
-            Ok(text) => toml::from_str(&text)
-                .map_err(|e| format!("config file {}: {e}", self.config.display())),
+            // Only the parser's message and line: its snippet would quote the file.
+            Ok(text) => toml::from_str(&text).map_err(|e| {
+                let line = e
+                    .span()
+                    .map(|s| text[..s.start.min(text.len())].matches('\n').count() + 1);
+                let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
+                format!("config file {}{at}: {}", self.config.display(), e.message())
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileConfig::default()),
             Err(e) => Err(format!("reading {}: {e}", self.config.display())),
         }
@@ -178,9 +184,10 @@ fn check_owner_only(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), Strin
     Ok(())
 }
 
-/// Writes `path` through a temporary file in the same directory, so a crash
-/// leaves the old or the new file. Private files and their new directory are
-/// owner-only.
+/// Writes `path` through a new, randomly named temporary file in the same
+/// directory, so a crash leaves the old or the new file and nobody can plant the
+/// temporary file in advance. Private files are owner-only, and their directory is
+/// created owner-only and refused when others can write to it.
 fn write_file(path: &Path, contents: &[u8], private: bool) -> Result<(), String> {
     let display = path.display();
     let dir = path
@@ -197,34 +204,36 @@ fn write_file(path: &Path, contents: &[u8], private: bool) -> Result<(), String>
     builder
         .create(dir)
         .map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(if private { 0o600 } else { 0o644 });
+    if private {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir)
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{} can be written by other users (mode {:o}); keep the credentials file in an owner-only directory",
+                dir.display(),
+                mode & 0o777
+            ));
+        }
     }
     let result = (|| {
-        let mut file = options.open(&tmp)?;
+        // Created with `O_EXCL` and mode `0600`.
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
         #[cfg(unix)]
-        if private {
-            // An existing temporary file keeps its old mode.
+        if !private {
             use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))?;
         }
         file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|e| e.error)?;
+        Ok::<_, std::io::Error>(())
     })();
-    result.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("writing {display}: {e}")
-    })
+    result.map_err(|e| format!("writing {display}: {e}"))
 }
 
 /// Settings given as flags.

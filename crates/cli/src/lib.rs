@@ -102,7 +102,7 @@ where
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
-            let text = e.render().to_string();
+            let text = scrubbed(&e);
             let target: &mut dyn Write = if e.use_stderr() { io.err } else { io.out };
             let _ = target.write_all(text.as_bytes());
             return e.exit_code();
@@ -115,6 +115,27 @@ where
             1
         }
     }
+}
+
+/// A parse error's text without the arguments it quotes, which may be a token:
+/// `porch login --token <value>` is an easy mistake.
+fn scrubbed(e: &clap::Error) -> String {
+    use clap::error::{ContextKind, ContextValue};
+    let mut text = e.render().to_string();
+    for kind in [ContextKind::InvalidArg, ContextKind::InvalidValue] {
+        let Some(ContextValue::String(arg)) = e.get(kind) else {
+            continue;
+        };
+        // A flag name is safe to show; a value, or `--flag=value`'s value, is not.
+        let value = match arg.strip_prefix('-') {
+            Some(_) => arg.split_once('=').map(|(_, v)| v).unwrap_or_default(),
+            None => arg.as_str(),
+        };
+        if !value.is_empty() {
+            text = text.replace(value, "<hidden>");
+        }
+    }
+    text
 }
 
 /// What a command needs: the files and the resolved settings.
@@ -160,6 +181,12 @@ fn api(e: ApiError) -> String {
 }
 
 async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
+    if cli.token.is_some() {
+        let _ = writeln!(
+            io.err,
+            "warning: --token can end up in your shell history; prefer OPENPORCH_TOKEN or `porch login --token`"
+        );
+    }
     let paths = Paths::locate(cli.config.as_deref(), io.env)?;
     let file = paths.read_config()?;
     let creds = paths.read_credentials()?;
@@ -241,6 +268,11 @@ async fn login_token(session: &Session, io: &mut Io<'_>) -> Result<(), String> {
     writeln!(io.out, "Logged in to {} as {id}.", url_key(client.url())).map_err(|e| e.to_string())
 }
 
+/// The longest a device login waits for the person.
+const MAX_LOGIN_SECS: u64 = 3600;
+/// The longest wait between two polls.
+const MAX_POLL_SECS: u64 = 60;
+
 async fn login_device(
     session: &Session,
     invitation: Option<&str>,
@@ -255,11 +287,15 @@ async fn login_device(
         device.verification_uri, device.user_code
     )
     .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(device.expires_in);
-    let mut interval = device.interval.max(1);
+    // The server's timings are bounded, so a bad reply cannot stall the CLI.
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(device.expires_in.min(MAX_LOGIN_SECS));
+    let initial = device.interval.clamp(1, MAX_POLL_SECS);
+    let mut interval = initial;
     let login = loop {
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-        if Instant::now() > deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(Duration::from_secs(interval).min(left)).await;
+        if Instant::now() >= deadline {
             return Err("the login code expired; run `porch login` again".into());
         }
         match client
@@ -267,7 +303,9 @@ async fn login_device(
             .await
             .map_err(|e| e.to_string())?
         {
-            DevicePoll::Pending { interval: next } => interval = next.max(1),
+            DevicePoll::Pending { interval: next } => {
+                interval = next.clamp(initial, MAX_POLL_SECS);
+            }
             DevicePoll::Session(s) => break s,
         }
     };

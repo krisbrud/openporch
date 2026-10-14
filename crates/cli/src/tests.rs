@@ -489,3 +489,70 @@ fn the_command_line_is_well_formed() {
     use clap::CommandFactory as _;
     Cli::command().debug_assert();
 }
+
+#[tokio::test]
+async fn mistyped_and_malformed_input_does_not_echo_tokens() {
+    let mut m = Machine::new();
+    m.set("OPENPORCH_URL", "https://porch.example.com")
+        .set("OPENPORCH_ORG", "acme");
+    // `--token` on `login` takes no value: the value is not echoed.
+    for args in [
+        &["login", "--token", "opt_SECRET123"][..],
+        &["login", "--token=opt_SECRET123"][..],
+        &["get", "apps", "opt_SECRET123"][..],
+    ] {
+        let r = m.porch(args, "").await;
+        assert_eq!(r.code, 2, "{r:?}");
+        assert!(r.err.contains("<hidden>"), "{r:?}");
+        assert_no_secret(&r, "opt_SECRET123");
+    }
+
+    // A config file the parser rejects is not quoted.
+    std::fs::create_dir_all(m.dir()).unwrap();
+    for text in [
+        "token = \"opt_SECRET789\"\n",
+        "url = \"https://x.example.com\"\norg = opt_SECRET789\n",
+    ] {
+        std::fs::write(m.dir().join("config.toml"), text).unwrap();
+        let r = m.porch(&["get", "apps"], "").await;
+        assert_eq!(r.code, 1, "{r:?}");
+        assert!(
+            r.err.contains("config file") && r.err.contains("line"),
+            "{r:?}"
+        );
+        assert_no_secret(&r, "opt_SECRET789");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn credentials_are_not_written_where_others_can_write() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let server = DevServer::start(None).await;
+    let m = Machine::new();
+    let shared = m.home.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let config = shared.join("config.toml");
+    let stdin = format!("{}\n", server.admin);
+    let r = m
+        .porch(
+            &[
+                "login",
+                "--token",
+                "--url",
+                &server.url,
+                "--org",
+                "acme",
+                "--config",
+                config.to_str().unwrap(),
+            ],
+            &stdin,
+        )
+        .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("owner-only directory"), "{r:?}");
+    assert_no_secret(&r, &server.admin);
+    assert!(!shared.join("credentials.toml").exists());
+    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+}

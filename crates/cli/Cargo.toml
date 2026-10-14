@@ -19,13 +19,13 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 openporch-server = { path = "../server" }
-tempfile.workspace = true
 
 [lints]
 workspace = true
