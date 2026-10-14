@@ -363,16 +363,16 @@ pub trait Executor: Send + Sync + 'static {
         async { Ok(()) }
     }
 
-    /// Pins each of `pin.artifacts` to the identity it has now, such as an S3
-    /// object version, in the same order. An artifact without a fixed
-    /// identity, such as an object in an unversioned bucket, is refused.
-    fn pin_artifacts(
+    /// Pins `pin.artifact` to the identity it has now, such as an S3 object
+    /// version. An artifact without a fixed identity, such as an object in an
+    /// unversioned bucket, is refused.
+    fn pin_artifact(
         &self,
         pin: ArtifactPin,
-    ) -> impl Future<Output = Result<Vec<String>, ExecFailure>> + Send {
+    ) -> impl Future<Output = Result<String, ExecFailure>> + Send {
         async move {
             Err(ExecFailure::Permanent(format!(
-                "artifacts of `{}` cannot be pinned by this executor; name each S3 object \
+                "the artifact of `{}` cannot be pinned by this executor; name each S3 object \
                  version as `s3://<bucket>/<key>?versionId=<version>`",
                 pin.descriptor
             )))
@@ -392,7 +392,7 @@ pub enum PinError {
     Unavailable(String),
 }
 
-/// Artifacts named without a fixed identity, to pin before a deployment is
+/// An artifact named without a fixed identity, to pin before a deployment is
 /// accepted.
 #[derive(Debug, Clone)]
 pub struct ArtifactPin {
@@ -403,11 +403,10 @@ pub struct ArtifactPin {
     /// The definition it matched.
     pub definition_id: DefinitionId,
     /// The cloud account the workload's driver gets credentials for, which
-    /// reads the artifacts; without one, the host's own identity reads them,
-    /// as the driver would.
-    pub account: Option<AccountId>,
-    /// The artifact URIs, such as `s3://bucket/key`.
-    pub artifacts: Vec<String>,
+    /// reads the artifact.
+    pub account: AccountId,
+    /// The artifact URI, such as `s3://bucket/key`.
+    pub artifact: String,
 }
 
 /// The artifacts a workload deploys, checked before its deployment changes
@@ -598,9 +597,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 
     /// Pins every artifact the deployment's workloads name without a fixed
-    /// identity: the pinned URI of each such workload. Artifacts already
-    /// pinned to an S3 object version are kept; anything else that cannot be
-    /// pinned, such as another kind of URI, is refused.
+    /// identity: the pinned URI of each such workload, with shared values
+    /// resolved. Artifacts already pinned to an S3 object version are kept;
+    /// anything else that cannot be pinned, such as another kind of URI or a
+    /// workload whose definition has no cloud account, is refused.
     pub async fn pin_artifacts(
         &self,
         deployment: &Deployment,
@@ -609,47 +609,95 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let deadline = Instant::now() + timeout;
         let mut pinned = BTreeMap::new();
         for node in deployment.graph.nodes.values() {
-            let unpinned: Vec<String> = artifacts(node)
-                .into_iter()
-                .filter(|a| S3Version::parse(a).is_none())
-                .collect();
-            let Some(artifact) = unpinned.first() else {
+            let Some(named) = artifacts(node).into_iter().next() else {
                 continue;
             };
-            if S3Object::parse(artifact).is_none() {
-                return Err(PinError::Refused(format!(
-                    "artifact `{artifact}` of `{}` has no fixed identity: name an S3 object \
-                     (`s3://<bucket>/<key>` in a versioned bucket, or with `?versionId=`)",
-                    node.descriptor
-                )));
+            let refused = |why: String| {
+                PinError::Refused(format!("artifact `{named}` of `{}` {why}", node.descriptor))
+            };
+            let scope = scope_for(deployment, node, &BTreeMap::new());
+            // Shared values are known now; outputs of other resources are not.
+            let artifact = if named.contains("${") {
+                resolve_value(
+                    &Value::String(named.clone()),
+                    Dialect::Set,
+                    &scope,
+                    Sink::Plain,
+                    "artifact",
+                )
+                .ok()
+                .and_then(|r| r.as_plain().and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| {
+                    refused(
+                        "must be known before the deployment runs to be pinned: name it \
+                         literally or through shared values"
+                            .into(),
+                    )
+                })?
+            } else {
+                named.clone()
+            };
+            if S3Version::parse(&artifact).is_some() {
+                if artifact != named {
+                    pinned.insert(node.descriptor.clone(), artifact);
+                }
+                continue;
+            }
+            if artifact == "." {
+                return Err(refused(
+                    "was not supplied: pass `--artifact main=<uri>`".into(),
+                ));
+            }
+            if S3Object::parse(&artifact).is_none() {
+                return Err(refused(
+                    "has no fixed identity: name an S3 object (`s3://<bucket>/<key>` in a \
+                     versioned bucket, or with `?versionId=`)"
+                        .into(),
+                ));
             }
             let def = deployment
                 .definitions
                 .get(&node.definition)
                 .map(|(_, def)| def)
                 .ok_or_else(|| {
-                    PinError::Refused(format!(
-                        "definition `{}` of `{}` is not in the deployment",
-                        node.definition, node.descriptor
+                    refused(format!(
+                        "cannot be pinned: definition `{}` is not in the deployment",
+                        node.definition
                     ))
                 })?;
-            let account = driver_account(def, &scope_for(deployment, node, &BTreeMap::new()))
-                .map_err(PinError::Refused)?;
+            // The artifact is read as the driver reads it: with the
+            // definition's account, which must be known now. The server's own
+            // identity is never used for it.
+            let account = match driver_account(def, &scope) {
+                Ok(Some(account)) => account,
+                Ok(None) => {
+                    return Err(refused(format!(
+                        "cannot be pinned to a version: definition `{}` has no cloud account to \
+                         read it with; give it one, or name the version with `?versionId=`",
+                        def.id
+                    )));
+                }
+                Err(_) => {
+                    return Err(refused(format!(
+                        "cannot be pinned to a version: the cloud account of definition `{}` \
+                         comes from another resource, which is not known before the deployment \
+                         runs; name the version with `?versionId=`",
+                        def.id
+                    )));
+                }
+            };
             let pin = ArtifactPin {
                 context: JobContext::of(deployment),
                 descriptor: node.descriptor.clone(),
                 definition_id: def.id.clone(),
                 account,
-                artifacts: unpinned,
+                artifact: artifact.clone(),
             };
-            let versions = self
+            let version = self
                 .with_retries(&pin.descriptor, deadline, || {
-                    self.executor.pin_artifacts(pin.clone())
+                    self.executor.pin_artifact(pin.clone())
                 })
                 .await?;
-            let version = versions.into_iter().next().ok_or_else(|| {
-                PinError::Refused(format!("no pinned artifact for `{}`", node.descriptor))
-            })?;
             pinned.insert(node.descriptor.clone(), version);
         }
         Ok(pinned)

@@ -751,56 +751,34 @@ where
         Ok(())
     }
 
-    async fn pin_artifacts(&self, pin: ArtifactPin) -> Result<Vec<String>, ExecFailure> {
-        let mut objects = Vec::new();
-        for artifact in &pin.artifacts {
-            objects.push(S3Object::parse(artifact).ok_or_else(|| {
-                ExecFailure::Permanent(format!(
-                    "artifact `{artifact}` of `{}` is not an S3 object (`s3://<bucket>/<key>`)",
-                    pin.descriptor
-                ))
-            })?);
-        }
+    async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
+        let object = S3Object::parse(&pin.artifact).ok_or_else(|| {
+            ExecFailure::Permanent(format!(
+                "artifact `{}` of `{}` is not an S3 object (`s3://<bucket>/<key>`)",
+                pin.artifact, pin.descriptor
+            ))
+        })?;
         let mut log = JobLog::discard().redacting();
-        let credentials = match &pin.account {
-            Some(account) => {
-                self.definition_matches(&pin.context, &pin.definition_id, &pin.descriptor)
-                    .await?;
-                Some(
-                    self.account_credentials(&pin.context, account, CHECK_WINDOW, &mut log)
-                        .await
-                        .map_err(|f| log.failure(f))?,
-                )
-            }
-            // Without an account the driver runs as the host, so the host reads.
-            None => None,
-        };
-        let mut pinned = Vec::new();
-        for object in objects {
-            match self
-                .cloud
-                .latest_version(credentials.as_ref(), &object)
-                .await
-            {
-                Ok(Latest::Version(v)) => pinned.push(object.at(v).to_string()),
-                Ok(Latest::Unversioned) => {
-                    return Err(ExecFailure::Permanent(format!(
-                        "artifact `{object}` of `{}` needs an immutable identity, but its bucket \
-                         does not keep versions: enable versioning on the bucket, or name an \
-                         object version with `?versionId=`",
-                        pin.descriptor
-                    )));
-                }
-                Ok(Latest::Missing) => {
-                    return Err(ExecFailure::Permanent(format!(
-                        "artifact `{object}` of `{}` does not exist",
-                        pin.descriptor
-                    )));
-                }
-                Err(e) => return Err(log.failure(cloud_failure(e))),
-            }
+        self.definition_matches(&pin.context, &pin.definition_id, &pin.descriptor)
+            .await?;
+        let credentials = self
+            .account_credentials(&pin.context, &pin.account, CHECK_WINDOW, &mut log)
+            .await
+            .map_err(|f| log.failure(f))?;
+        match self.cloud.latest_version(Some(&credentials), &object).await {
+            Ok(Latest::Version(v)) => Ok(object.at(v).to_string()),
+            Ok(Latest::Unversioned) => Err(ExecFailure::Permanent(format!(
+                "artifact `{object}` of `{}` needs an immutable identity, but its bucket does \
+                 not keep versions: enable versioning on the bucket, or name an object version \
+                 with `?versionId=`",
+                pin.descriptor
+            ))),
+            Ok(Latest::Missing) => Err(ExecFailure::Permanent(format!(
+                "artifact `{object}` of `{}` does not exist",
+                pin.descriptor
+            ))),
+            Err(e) => Err(log.failure(cloud_failure(e))),
         }
-        Ok(pinned)
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {

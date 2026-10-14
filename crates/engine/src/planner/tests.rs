@@ -136,6 +136,8 @@ struct Fake {
     behavior: Mutex<BTreeMap<String, Behavior>>,
     /// The artifact checks asked for, and the artifacts that are gone.
     artifact_checks: Mutex<Vec<ArtifactCheck>>,
+    /// Every artifact pinned; each pins to version `v9`.
+    artifact_pins: Mutex<Vec<ArtifactPin>>,
     gone: Mutex<BTreeSet<String>>,
     /// How many artifact checks fail in a way that may pass before one
     /// answers.
@@ -317,6 +319,21 @@ impl Executor for Fake {
             ))),
             None => Ok(()),
         }
+    }
+
+    async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
+        self.artifact_pins.lock().unwrap().push(pin.clone());
+        {
+            let mut flakes = self.artifact_flakes.lock().unwrap();
+            if *flakes > 0 {
+                *flakes -= 1;
+                return Err(ExecFailure::Retryable {
+                    error: "S3 is slow down".into(),
+                    retry_after: None,
+                });
+            }
+        }
+        Ok(format!("{}?versionId=v9", pin.artifact))
     }
 
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {

@@ -1248,27 +1248,27 @@ async fn artifacts_are_pinned_to_their_current_version_with_the_workloads_accoun
     pg.driver_account = Some("aws-main".into());
     f.define(pg, "openporch/none").await;
     let executor = f.executor(Arc::new(NoPermits));
-    let pin = |account: Option<&str>, artifacts: &[&str]| crate::planner::ArtifactPin {
+    let pin = |artifact: &str| crate::planner::ArtifactPin {
         context: crate::planner::JobContext {
             org: ORG.parse().unwrap(),
             app: "shop".parse().unwrap(),
             env: "development".parse().unwrap(),
             env_type: "development".parse().unwrap(),
-            deployment_id: "d-test".into(),
+            deployment_id: "acceptance".into(),
             permits: Vec::new(),
         },
         descriptor: Descriptor::parse(DB).unwrap(),
         definition_id: "pg".parse().unwrap(),
-        account: account.map(|a| a.parse().unwrap()),
-        artifacts: artifacts.iter().map(|a| (*a).to_owned()).collect(),
+        account: "aws-main".parse().unwrap(),
+        artifact: artifact.to_owned(),
     };
     let read = || f.sts.objects.lock().unwrap().clone();
 
     let pinned = executor
-        .pin_artifacts(pin(Some("aws-main"), &["s3://artifacts/w%20x.zip"]))
+        .pin_artifact(pin("s3://artifacts/w%20x.zip"))
         .await
         .unwrap();
-    assert_eq!(pinned, ["s3://artifacts/w x.zip?versionId=v7"]);
+    assert_eq!(pinned, "s3://artifacts/w x.zip?versionId=v7");
     assert_eq!(
         read(),
         [(
@@ -1277,25 +1277,30 @@ async fn artifacts_are_pinned_to_their_current_version_with_the_workloads_accoun
         )]
     );
 
-    // Without an account, the host reads, as the driver would run.
-    executor
-        .pin_artifacts(pin(None, &["s3://artifacts/w.zip"]))
-        .await
-        .unwrap();
-    assert_eq!(read()[1].0, None);
-
     for (artifact, expected) in [
         ("s3://plain/w.zip", "enable versioning"),
         ("s3://other/w.zip", "does not exist"),
         ("https://example.com/w.zip", "not an S3 object"),
     ] {
-        let failure = executor
-            .pin_artifacts(pin(Some("aws-main"), &[artifact]))
-            .await
-            .unwrap_err();
+        let failure = executor.pin_artifact(pin(artifact)).await.unwrap_err();
         assert!(
             matches!(&failure, ExecFailure::Permanent(e) if e.contains(expected)),
             "{artifact}: {failure:?}"
         );
     }
+
+    // A definition that no longer matches does not lend its account.
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let failure = executor
+        .pin_artifact(pin("s3://artifacts/w.zip"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e) if e.contains("no longer matches")),
+        "{failure:?}"
+    );
+    assert_eq!(read().len(), 3);
 }

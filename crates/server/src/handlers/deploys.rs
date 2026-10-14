@@ -470,13 +470,21 @@ async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) 
         .flatten()
         .filter_map(|(_, node)| node.pointer(ARTIFACT).and_then(Value::as_str))
         .any(|a| S3Version::parse(a).is_none());
+    // Not a deployment yet: the label stands in for its ID.
     if !unpinned {
         return Ok(());
     }
-    let deployment =
-        crate::deploy::planned(state, &env.app, &env.id, "", String::new(), snapshot, false)
-            .await
-            .map_err(ApiError::internal)?;
+    let deployment = crate::deploy::planned(
+        state,
+        &env.app,
+        &env.id,
+        "acceptance",
+        String::new(),
+        snapshot,
+        false,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let pinned = state
         .runners
         .pin_artifacts(deployment)

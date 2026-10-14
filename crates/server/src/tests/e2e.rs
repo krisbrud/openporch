@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use openporch_core::catalog::builtin_types;
 use openporch_core::workload::Workload;
 use openporch_engine::cloud::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, S3Version, Sts,
 };
 use openporch_store::Store;
 use openporch_store::secrets::BoxFuture;
@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 
 use super::{Server, server, server_from};
 
-/// S3 as the host sees it: bucket `artifacts` keeps versions, and its objects'
-/// current version is `version`; bucket `plain` does not; nothing else exists.
+/// S3 as the account `aws-dev` sees it: bucket `artifacts` keeps versions, and
+/// its objects' current version is `version`; bucket `plain` does not; nothing
+/// else exists.
 #[derive(Default)]
 struct ArtifactSts {
     version: Mutex<String>,
@@ -39,7 +40,23 @@ impl Sts for ArtifactSts {
         &'a self,
         _: &'a AwsCredentials,
     ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>> {
-        Box::pin(async { Err(CloudError::Unavailable("no STS here".into())) })
+        Box::pin(async {
+            Ok(CallerIdentity {
+                arn: "arn:aws:iam::111122223333:user/openporch".into(),
+                account: "111122223333".into(),
+                user_id: "AIDAEXAMPLE".into(),
+            })
+        })
+    }
+
+    fn object_exists<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Version,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        assert!(credentials.is_some());
+        let exists = object.bucket == "artifacts";
+        Box::pin(async move { Ok(exists) })
     }
 
     fn latest_version<'a>(
@@ -48,7 +65,8 @@ impl Sts for ArtifactSts {
         object: &'a S3Object,
     ) -> BoxFuture<'a, Result<Latest, CloudError>> {
         Box::pin(async move {
-            assert!(credentials.is_none(), "without an account the host reads");
+            let c = credentials.expect("read with the definition's account");
+            assert_eq!(c.access_key_id, "AKIAEXAMPLE");
             Ok(match object.bucket.as_str() {
                 "artifacts" => Latest::Version(self.version.lock().unwrap().clone()),
                 "plain" => Latest::Unversioned,
@@ -58,12 +76,15 @@ impl Sts for ArtifactSts {
     }
 }
 
-/// A server whose host sees S3 as `sts` does.
+/// A server whose cloud accounts see S3 as `sts` does, with the static
+/// account `aws-dev`.
 async fn server_with_s3(sts: Arc<ArtifactSts>) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::Config::new("acme", dir.path());
     let state = crate::start_with(config, None, sts).await.unwrap();
-    server_from(dir, state)
+    let s = server_from(dir, state);
+    s.static_account("aws-dev").await;
+    s
 }
 
 /// A zip function that uses a database and reads from a queue.
@@ -164,14 +185,13 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
             json!({"values": {"url": "https://sqs.example/orders"}}),
         ),
     ] {
-        let (st, b) = s
-            .post(
-                "/orgs/acme/resources/defs",
-                &s.admin,
-                json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
-                       "criteria": [{}]}),
-            )
-            .await;
+        let mut def = json!({"id": id, "type": ty, "driver_type": driver,
+                             "driver_inputs": inputs, "criteria": [{}]});
+        // The worker's artifact is read with the workload definition's account.
+        if ty == "workload" {
+            def["driver_account"] = json!("aws-dev");
+        }
+        let (st, b) = s.post("/orgs/acme/resources/defs", &s.admin, def).await;
         assert_eq!(st, StatusCode::CREATED, "{b}");
     }
     // Shared values, with a staging override for the API host.
@@ -385,7 +405,8 @@ async fn artifacts_without_a_fixed_identity_are_refused() {
             .post(
                 "/orgs/acme/resources/defs",
                 &s.admin,
-                json!({"id": id, "type": ty, "driver_type": "openporch/none", "criteria": [{}]}),
+                json!({"id": id, "type": ty, "driver_type": "openporch/none",
+                       "driver_account": "aws-dev", "criteria": [{}]}),
             )
             .await;
         assert_eq!(st, StatusCode::CREATED, "{b}");

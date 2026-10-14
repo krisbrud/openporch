@@ -1553,16 +1553,18 @@ later edits do not affect it. The deployment is returned at once with status
 the environment's last successful deployment and set.
 
 A function artifact must have an identity that cannot change. Acceptance pins
-one named as an S3 object without a version, `s3://<bucket>/<key>`, to the
-object's current version, read with the workload definition's cloud account
-(`s3:GetObject` on it; without an account, the server host's own identity, as
-the driver would use). The recorded graph names that version, so the
+one named as an S3 object without a version, `s3://<bucket>/<key>` (literally
+or through shared values), to the object's current version, read with the
+workload definition's cloud account (`s3:GetObject` on it). The server's own
+identity is never used for this. The recorded graph names that version, so the
 deployment, and every snapshot replay of it, runs the object as it was then,
 while the set keeps the name it was given; a `current` replay pins again. An
-object in a bucket that does not keep versions, a missing object, or an
-artifact that is not an S3 object is refused with `400` before anything is
-accepted; when S3 cannot be reached, the request fails with `502` (`CLD-002`)
-and can be sent again.
+object in a bucket that does not keep versions, a missing object, an artifact
+that is not an S3 object, or one whose workload definition has no cloud
+account known before the deployment runs is refused with `400` before anything
+is accepted; naming the version with `?versionId=` avoids the lookup. When S3
+cannot be reached, the request fails with `502` (`CLD-002`) and can be sent
+again.
 
 Before a deployment changes anything, it checks that every function artifact
 its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`

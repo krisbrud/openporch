@@ -57,7 +57,8 @@ pub type PinFuture =
     Pin<Box<dyn Future<Output = Result<BTreeMap<String, String>, PinError>> + Send>>;
 
 /// How long pinning a deployment's artifacts may take at acceptance.
-pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Well within a client's request timeout, so the client hears why.
+pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// What recovering a resource returns.
 pub type RecoverFuture = Pin<Box<dyn Future<Output = Result<Recovered, RecoverError>> + Send>>;

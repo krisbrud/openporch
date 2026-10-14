@@ -358,3 +358,92 @@ async fn a_check_that_may_pass_is_retried() {
     );
     assert_eq!(fake.artifact_checks.lock().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn unpinned_artifacts_are_pinned_with_the_definitions_account() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    *fake.artifact_flakes.lock().unwrap() = 1;
+    let deployment = f
+        .accept_set(Some(WORKER), with_lambda_account(Some("aws-lambda")))
+        .await
+        .unwrap();
+    let pinned = planner(&f, &fake, fast())
+        .pin_artifacts(&deployment, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned,
+        BTreeMap::from([(
+            d(WORKER_WORKLOAD),
+            "s3://artifacts/worker.zip?versionId=v9".to_owned()
+        )])
+    );
+    // Asked again after a failure that may pass, with the definition's account.
+    let pins = fake.artifact_pins.lock().unwrap().clone();
+    assert_eq!(pins.len(), 2);
+    assert_eq!(pins[1].account.as_str(), "aws-lambda");
+    assert_eq!(pins[1].definition_id.as_str(), "lambda");
+    assert_eq!(pins[1].artifact, "s3://artifacts/worker.zip");
+
+    // An artifact already pinned is kept as it is.
+    let worker = pinned_worker();
+    let f = Fixture::new().await;
+    let deployment = f
+        .accept_set(Some(&worker), with_lambda_account(Some("aws-lambda")))
+        .await
+        .unwrap();
+    let pinned = planner(&f, &fake, fast())
+        .pin_artifacts(&deployment, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(pinned.is_empty(), "{pinned:?}");
+
+    // A shared value that names a version is used as it resolves.
+    let named = WORKER.replace("s3://artifacts/worker.zip", "${values.ARTIFACT}");
+    let f = Fixture::new().await;
+    let mut deployment = f
+        .accept_set(Some(&named), with_lambda_account(Some("aws-lambda")))
+        .await
+        .unwrap();
+    deployment.values.insert(
+        "ARTIFACT".into(),
+        SharedValue::Value(json!("s3://artifacts/worker.zip?versionId=v3")),
+    );
+    let pinned = planner(&f, &fake, fast())
+        .pin_artifacts(&deployment, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned[&d(WORKER_WORKLOAD)],
+        "s3://artifacts/worker.zip?versionId=v3"
+    );
+    assert_eq!(fake.artifact_pins.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn artifacts_are_not_pinned_without_an_account_known_up_front() {
+    for (account, expected) in [
+        (None, "has no cloud account"),
+        (
+            Some("${resources['postgres.default#modules.worker.externals.db'].account}"),
+            "comes from another resource",
+        ),
+    ] {
+        let f = Fixture::new().await;
+        let fake = Fake::with(&[]);
+        let deployment = f
+            .accept_set(Some(WORKER), with_lambda_account(account))
+            .await
+            .unwrap();
+        let e = planner(&f, &fake, fast())
+            .pin_artifacts(&deployment, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, PinError::Refused(m) if m.contains(expected) && m.contains("?versionId=")),
+            "{e:?}"
+        );
+        assert!(fake.artifact_pins.lock().unwrap().is_empty());
+    }
+}
