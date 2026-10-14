@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
-use openporch_client::{Method, segment};
+use openporch_client::{Method, segment, with_query};
 use serde_json::{Value, json};
 
 use crate::output::{self, Format};
@@ -64,6 +64,12 @@ pub struct GetArgs {
     /// The output format. Sets default to YAML, everything else to a table.
     #[arg(short, long, value_enum)]
     pub output: Option<Format>,
+    /// For deploys: at most this many.
+    #[arg(long)]
+    pub limit: Option<u32>,
+    /// For deploys: those older than this sequence number, to page back.
+    #[arg(long, value_name = "SEQ")]
+    pub before: Option<i64>,
 }
 
 /// `porch create`.
@@ -112,19 +118,10 @@ pub struct FileArg {
     pub file: PathBuf,
 }
 
-/// `porch delete`.
+/// `porch delete`. Applications and environments are deleted with their resources,
+/// which needs a preview and permits: that comes with the deployment commands.
 #[derive(Debug, Subcommand)]
 pub enum Delete {
-    /// An application, deleting every environment and its resources.
-    App {
-        /// The application ID.
-        id: String,
-    },
-    /// An environment of the application (`--app`) and its resources.
-    Env {
-        /// The environment ID.
-        id: String,
-    },
     /// An unused environment type.
     EnvType {
         /// The environment type ID.
@@ -257,7 +254,19 @@ fn path(session: &Session, kind: Kind, id: Option<&str>) -> Result<String, Strin
 /// `porch get`.
 pub(crate) async fn get(session: &Session, args: GetArgs, io: &mut Io<'_>) -> Result<(), String> {
     let client = session.client()?;
-    let path = path(session, args.kind, args.id.as_deref())?;
+    let mut path = path(session, args.kind, args.id.as_deref())?;
+    if args.limit.is_some() || args.before.is_some() {
+        if args.kind != Kind::Deploys || args.id.is_some() {
+            return Err("--limit and --before page the list of deploys".into());
+        }
+        path = with_query(
+            &path,
+            &[
+                ("limit", args.limit.map(|v| v.to_string())),
+                ("before", args.before.map(|v| v.to_string())),
+            ],
+        );
+    }
     let value = client
         .request(Method::GET, &path, None)
         .await
@@ -271,11 +280,7 @@ pub(crate) async fn get(session: &Session, args: GetArgs, io: &mut Io<'_>) -> Re
     if format == Format::Table
         && let Some(next) = value.get("next").filter(|n| !n.is_null())
     {
-        writeln!(
-            io.err,
-            "More results: use `porch api get '{path}?before={next}'`"
-        )
-        .map_err(|e| e.to_string())?;
+        writeln!(io.err, "More results: add `--before {next}`").map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -352,7 +357,10 @@ pub fn document_body(doc: &Value, kind: &str) -> Result<Value, String> {
         return Err("set the ID in `metadata.id`, not in `entity`".into());
     }
     body.insert("id".into(), json!(id));
-    if let Some(name) = doc.pointer("/metadata/name").and_then(Value::as_str) {
+    // Kinds whose API objects have a display name take `metadata.name` as default.
+    if matches!(kind, "Definition" | "ResourceType" | "CloudAccount")
+        && let Some(name) = doc.pointer("/metadata/name").and_then(Value::as_str)
+    {
         body.entry("name").or_insert_with(|| json!(name));
     }
     Ok(Value::Object(body))
@@ -424,26 +432,6 @@ pub(crate) async fn delete(session: &Session, what: Delete, io: &mut Io<'_>) -> 
     let client = session.client()?;
     let org = format!("/orgs/{}", segment(session.org()?));
     let (path, body, noun, id) = match what {
-        Delete::App { id } => (
-            format!("{org}/apps/{}", segment(&id)),
-            None,
-            "application",
-            id,
-        ),
-        Delete::Env { id } => {
-            let path = format!(
-                "{org}/apps/{}/envs/{}",
-                segment(session.app()?),
-                segment(&id)
-            );
-            // The deletion is checked against the generation just read.
-            let env = client
-                .request(Method::GET, &path, None)
-                .await
-                .map_err(api)?;
-            let body = json!({"expected_generation": env["generation"]});
-            (path, Some(body), "environment", id)
-        }
         Delete::EnvType { id } => (
             format!("{org}/env-types/{}", segment(&id)),
             None,

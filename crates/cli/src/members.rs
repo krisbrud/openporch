@@ -430,30 +430,25 @@ pub(crate) async fn apps(session: &Session, cmd: Apps, io: &mut Io<'_>) -> Resul
             )
         }
         AppUsers::Grant { user, role } => {
-            let path = format!("{base}/{}", segment(&user));
-            // A user with a role on the application changes role; others are added.
-            let existing = client
-                .send(Method::GET, &base, None, &[])
-                .await
-                .map_err(api)?
-                .1;
-            let has_role = existing
-                .as_array()
-                .is_some_and(|a| a.iter().any(|u| u["user"] == json!(user)));
-            if has_role {
-                client
-                    .request(Method::PATCH, &path, Some(&json!({"role": role})))
-                    .await
-                    .map_err(api)?;
-            } else {
-                client
-                    .request(
-                        Method::POST,
-                        &base,
-                        Some(&json!({"id": user, "role": role})),
-                    )
-                    .await
-                    .map_err(api)?;
+            // A new user is added; one who already has a role changes it.
+            let added = client
+                .request(
+                    Method::POST,
+                    &base,
+                    Some(&json!({"id": user, "role": role})),
+                )
+                .await;
+            match added {
+                Err(e) if e.status() == Some(409) => {
+                    let path = format!("{base}/{}", segment(&user));
+                    client
+                        .request(Method::PATCH, &path, Some(&json!({"role": role})))
+                        .await
+                        .map_err(api)?;
+                }
+                other => {
+                    other.map_err(api)?;
+                }
             }
             say(io, &format!("{user} is {role} on {app}."))
         }

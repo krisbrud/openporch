@@ -334,18 +334,37 @@ async fn objects_have_the_lifecycle_verbs_of_the_api() {
         assert_eq!(r.code, 2, "{kind}: {r:?}");
     }
 
-    let r = m.porch(&["delete", "env", "stg"], "").await;
+    // Applications and environments go with their resources, which needs a
+    // preview and permits: no plain delete verb for them yet.
+    for kind in ["app", "env"] {
+        let r = m.porch(&["delete", kind, "x"], "").await;
+        assert_eq!(r.code, 2, "{kind}: {r:?}");
+    }
+    let r = m
+        .porch(&["get", "deploys", "--env", "stg", "--limit", "5"], "")
+        .await;
     assert_eq!(r.code, 0, "{r:?}");
-    let r = m.porch(&["get", "env", "stg"], "").await;
-    assert!(r.err.contains("API-001"), "{r:?}");
+    let r = m.porch(&["get", "apps", "--limit", "5"], "").await;
+    assert!(r.err.contains("page the list of deploys"), "{r:?}");
+
+    let client = admin_client(&server);
+    let path = "/orgs/acme/apps/shop/envs/stg";
+    let env = client
+        .request(openporch_client::Method::GET, path, None)
+        .await
+        .unwrap();
+    client
+        .request(
+            openporch_client::Method::DELETE,
+            path,
+            Some(&json!({"expected_generation": env["generation"]})),
+        )
+        .await
+        .unwrap();
     let r = m.porch(&["delete", "env-type", "staging"], "").await;
     assert_eq!(r.code, 0, "{r:?}");
-    let r = m.porch(&["delete", "app", "shop"], "").await;
-    assert_eq!(r.code, 0, "{r:?}");
-    assert!(
-        r.out.contains("accepted") || r.out.contains("Deleted"),
-        "{r:?}"
-    );
+    let r = m.porch(&["get", "env-type", "staging"], "").await;
+    assert!(r.err.contains("API-001"), "{r:?}");
 }
 
 #[tokio::test]
@@ -461,6 +480,13 @@ async fn members_roles_secret_stores_and_audit_logs() {
     assert_eq!(r.out.lines().count(), 3, "{r:?}");
     assert!(r.err.contains("--before"), "{r:?}");
     assert_no_secret(&r, &server.admin);
+
+    // An ID of `..` cannot redirect a request to another route.
+    let r = m.porch(&["apps", "users", "..", "revoke", "dev"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("`..`"), "{r:?}");
+    let r = m.porch(&["users", "list"], "").await;
+    assert!(r.out.lines().any(|l| l.starts_with("dev ")), "{r:?}");
 
     let r = m.porch(&["users", "remove", "dev"], "").await;
     assert_eq!(r.code, 0, "{r:?}");

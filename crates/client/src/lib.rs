@@ -326,11 +326,7 @@ impl Client {
         body: Option<&Value>,
         headers: &[(&str, &str)],
     ) -> Result<(StatusCode, Value), Error> {
-        if !path.starts_with('/') {
-            return Err(Error::InvalidUrl(format!(
-                "path `{path}` must start with `/`"
-            )));
-        }
+        check_path(path)?;
         let url = Url::parse(&format!("{}{path}", url_key(&self.base)))
             .map_err(|e| Error::InvalidUrl(format!("{path}: {e}")))?;
         let mut req = self.http.request(method, url);
@@ -439,6 +435,27 @@ impl Client {
             .map(DevicePoll::Session)
             .map_err(|e| Error::Decode(e.to_string()))
     }
+}
+
+/// Refuses a path the URL parser would rewrite: an empty, `.` or `..` segment
+/// (also percent-encoded) would send the request to another route, such as an
+/// ID `..` turning `/apps/../users/ci` into `/users/ci`.
+fn check_path(path: &str) -> Result<(), Error> {
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(Error::InvalidUrl(format!(
+            "path `{path}` must start with `/`"
+        )));
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    for seg in rest.split('/') {
+        let decoded = seg.replace("%2e", ".").replace("%2E", ".");
+        if seg.is_empty() || decoded == "." || decoded == ".." {
+            return Err(Error::InvalidUrl(format!(
+                "path `{path}` has an empty, `.` or `..` segment; IDs cannot be empty, `.` or `..`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn api_error(status: StatusCode, body: &Value) -> Error {

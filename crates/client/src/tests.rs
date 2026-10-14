@@ -175,3 +175,31 @@ fn paths_are_encoded() {
     );
     assert_eq!(with_query("/x", &[("a", Some(String::new()))]), "/x");
 }
+
+#[tokio::test]
+async fn dot_segments_are_refused_before_sending() {
+    let client = Client::new("http://127.0.0.1:1", "acme", Some(token())).unwrap();
+    for id in ["..", ".", ""] {
+        let path = format!("/orgs/acme/apps/{}/users/ci", segment(id));
+        let err = client
+            .request(Method::DELETE, &path, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)), "{id:?}: {err}");
+    }
+    for path in [
+        "/orgs/acme/apps/%2e%2E/users",
+        "/orgs//apps",
+        "orgs/acme",
+        "/orgs/acme/",
+    ] {
+        let err = client.request(Method::GET, path, None).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)), "{path}: {err}");
+    }
+    // `.` inside an ID is fine.
+    let err = client
+        .request(Method::GET, "/orgs/acme/apps/a.b", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err}");
+}
