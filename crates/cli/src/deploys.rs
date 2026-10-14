@@ -3,12 +3,13 @@
 //! graph` and `porch api`.
 //!
 //! Every deployment request carries the environment generation it was based on
-//! and an idempotency key. A request whose response is lost is sent again with
+//! and an idempotency key. A deployment that deletes or replaces resources runs
+//! only as a preview's acknowledged changes (see [`crate::plans`]). A request whose response is lost is sent again with
 //! the same key and content, so the server returns the deployment it already
 //! accepted instead of starting another.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
 use openporch_client::{Client, Error as ApiError, Method, segment, with_query};
@@ -18,6 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::objects::read_text;
 use crate::output::{self, Format, timestamp};
+use crate::plans::{self, Acknowledged, Confirm};
 use crate::{Io, Session, api};
 
 /// The `apiVersion` of Score files.
@@ -29,6 +31,11 @@ pub enum WorkloadCmd {
     /// Converts a workload document or Score file into a delta for the
     /// environment (`--app`, `--env`) and deploys it.
     Deploy(WorkloadDeployArgs),
+    /// Converts a workload document or Score file into a delta and previews
+    /// deploying it, without deploying: each resource's change, what is not
+    /// known until the drivers run, and the permits it needs. The same as
+    /// `workload deploy --preview`.
+    Plan(WorkloadSource),
 }
 
 /// `porch score`.
@@ -41,6 +48,15 @@ pub enum ScoreCmd {
 /// `porch workload deploy`.
 #[derive(Debug, Args)]
 pub struct WorkloadDeployArgs {
+    #[command(flatten)]
+    pub source: WorkloadSource,
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+/// A workload document and its deploy-time overrides.
+#[derive(Debug, Args)]
+pub struct WorkloadSource {
     /// The workload document or Score file, or `-` for standard input.
     #[arg(short, long, value_name = "FILE")]
     pub file: PathBuf,
@@ -57,8 +73,6 @@ pub struct WorkloadDeployArgs {
     /// replaces a string.
     #[arg(long = "property", value_name = "PATH=VALUE", value_parser = pair)]
     pub properties: Vec<(String, String)>,
-    #[command(flatten)]
-    pub run: RunArgs,
 }
 
 /// How a deployment runs.
@@ -68,8 +82,32 @@ pub struct RunArgs {
     #[arg(long, default_value = "")]
     pub comment: String,
     /// Follow the deployment until it finishes, and fail if it does.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "preview")]
     pub wait: bool,
+    /// Stop following after this long (such as `90s`, `20m` or `1h`) and
+    /// fail; the deployment carries on.
+    #[arg(long, value_name = "DURATION", value_parser = duration, requires = "wait")]
+    pub timeout: Option<Duration>,
+    #[command(flatten)]
+    pub confirm: Confirm,
+}
+
+/// `90s`, `20m`, `1h`, or seconds.
+fn duration(s: &str) -> Result<Duration, String> {
+    let (n, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: u64 = n
+        .parse()
+        .map_err(|_| "expected a duration such as 90s, 20m or 1h")?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.saturating_mul(60),
+        "h" => n.saturating_mul(3600),
+        _ => return Err("expected a duration such as 90s, 20m or 1h".into()),
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 /// `porch deploy`.
@@ -146,6 +184,18 @@ pub enum ResourcesCmd {
         #[arg(short, long, value_enum, default_value_t = Format::Yaml)]
         output: Format,
     },
+    /// Observes a resource of the environment whose last operation has an
+    /// unknown outcome, and records what the observation establishes.
+    Recover {
+        /// The resource type.
+        #[arg(value_name = "TYPE")]
+        ty: String,
+        /// The resource ID, such as `modules.web.externals.db`.
+        res_id: String,
+        /// The output format.
+        #[arg(short, long, value_enum, default_value_t = Format::Yaml)]
+        output: Format,
+    },
 }
 
 /// `porch api`.
@@ -194,7 +244,7 @@ fn write(io: &mut Io<'_>, text: std::fmt::Arguments<'_>) -> Result<(), String> {
 }
 
 /// `/orgs/{org}/apps/{app}` followed by `suffix`.
-fn app_path(session: &Session, suffix: &str) -> Result<String, String> {
+pub(crate) fn app_path(session: &Session, suffix: &str) -> Result<String, String> {
     Ok(format!(
         "/orgs/{}/apps/{}{suffix}",
         segment(session.org()?),
@@ -203,7 +253,7 @@ fn app_path(session: &Session, suffix: &str) -> Result<String, String> {
 }
 
 /// `.../envs/{env}` followed by `suffix`.
-fn env_path(session: &Session, env: &str, suffix: &str) -> Result<String, String> {
+pub(crate) fn env_path(session: &Session, env: &str, suffix: &str) -> Result<String, String> {
     app_path(session, &format!("/envs/{}{suffix}", segment(env)))
 }
 
@@ -212,8 +262,21 @@ pub(crate) async fn workload(
     cmd: WorkloadCmd,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let WorkloadCmd::Deploy(args) = cmd;
-    workload_deploy(session, args, false, io).await
+    match cmd {
+        WorkloadCmd::Deploy(args) => workload_deploy(session, args, false, io).await,
+        WorkloadCmd::Plan(source) => {
+            let run = RunArgs {
+                comment: String::new(),
+                wait: false,
+                timeout: None,
+                confirm: Confirm {
+                    preview: true,
+                    ..Confirm::default()
+                },
+            };
+            workload_deploy(session, WorkloadDeployArgs { source, run }, false, io).await
+        }
+    }
 }
 
 pub(crate) async fn score(session: &Session, cmd: ScoreCmd, io: &mut Io<'_>) -> Result<(), String> {
@@ -223,7 +286,7 @@ pub(crate) async fn score(session: &Session, cmd: ScoreCmd, io: &mut Io<'_>) -> 
 
 async fn workload_deploy(
     session: &Session,
-    args: WorkloadDeployArgs,
+    WorkloadDeployArgs { source: args, run }: WorkloadDeployArgs,
     score_only: bool,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
@@ -273,9 +336,33 @@ async fn workload_deploy(
     let body = json!({
         "delta_id": id,
         "expected_generation": generation,
-        "comment": args.run.comment,
+        "comment": run.comment,
     });
-    start(session, &client, &env, body, args.run.wait, io).await
+    // The delta is stored, so its preview is carried out by deploying it; a
+    // stale preview needs a new delta, converted at the new generation.
+    let commands = Commands {
+        carry_out: format!("porch deploy delta {id} {env} --app {}", session.app()?),
+        preview: "porch workload plan, with the same arguments".into(),
+    };
+    start(session, &client, &env, body, &run, &commands, io).await
+}
+
+/// What a deployment's preview and refusal messages suggest running.
+struct Commands {
+    /// The command that carries out a preview, before `--plan` and `--ack`.
+    carry_out: String,
+    /// The command that previews the deployment again.
+    preview: String,
+}
+
+impl Commands {
+    /// A stored command, run again with `--preview` to preview it.
+    fn rerun(command: String) -> Self {
+        Self {
+            preview: format!("{command} --preview"),
+            carry_out: command,
+        }
+    }
 }
 
 pub(crate) async fn deploy(
@@ -296,7 +383,11 @@ pub(crate) async fn deploy(
                 "expected_generation": generation,
                 "comment": run.comment,
             });
-            start(session, &client, &env, body, run.wait, io).await
+            let commands = Commands::rerun(format!(
+                "porch deploy delta {id} {env} --app {}",
+                session.app()?
+            ));
+            start(session, &client, &env, body, &run, &commands, io).await
         }
         DeployCmd::Deploy {
             reference,
@@ -305,22 +396,31 @@ pub(crate) async fn deploy(
         } => {
             let env = session.env()?.to_owned();
             let generation = generation(session, &client, &env).await?;
+            let replay = match replay {
+                Replay::Snapshot => "snapshot",
+                Replay::Current => "current",
+            };
             let body = json!({
                 "deploy_id": reference,
-                "replay": match replay {
-                    Replay::Snapshot => "snapshot",
-                    Replay::Current => "current",
-                },
+                "replay": replay,
                 "expected_generation": generation,
                 "comment": run.comment,
             });
-            start(session, &client, &env, body, run.wait, io).await
+            let commands = Commands::rerun(format!(
+                "porch deploy deploy {reference} --replay {replay} --app {} --env {env}",
+                session.app()?
+            ));
+            start(session, &client, &env, body, &run, &commands, io).await
         }
     }
 }
 
 /// The environment's current generation.
-async fn generation(session: &Session, client: &Client, env: &str) -> Result<i64, String> {
+pub(crate) async fn generation(
+    session: &Session,
+    client: &Client,
+    env: &str,
+) -> Result<i64, String> {
     let record = client
         .request(Method::GET, &env_path(session, env, "")?, None)
         .await
@@ -334,16 +434,47 @@ async fn generation(session: &Session, client: &Client, env: &str) -> Result<i64
 const RETRIES: u32 = 3;
 
 /// Requests a deployment, retrying with the same key and body when the
-/// response is lost, prints its ID and, with `wait`, follows it.
+/// response is lost, prints its ID and, with `wait`, follows it. With
+/// `--preview` it previews the deployment instead, and with `--plan` it runs
+/// at the preview's generation with the permits `--ack` asks for.
 async fn start(
     session: &Session,
     client: &Client,
     env: &str,
-    body: Value,
-    wait: bool,
+    mut body: Value,
+    run: &RunArgs,
+    commands: &Commands,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let path = env_path(session, env, "/deploys")?;
+    let base = env_path(session, env, "")?;
+    let scope = format!("{}/{env}", session.app()?);
+    if run.confirm.preview {
+        if let Some(b) = body.as_object_mut() {
+            b.remove("comment");
+        }
+        let plan = plans::create(client, &base, &body).await?;
+        return plans::print(io, &plan, &scope, Some(&commands.carry_out));
+    }
+    let acknowledged = match &run.confirm.plan {
+        Some(plan) => {
+            let acks: Vec<_> = run.confirm.acks.iter().collect();
+            let a = plans::acknowledge(
+                client,
+                &base,
+                plan,
+                "deploy",
+                &acks,
+                &commands.carry_out,
+                &commands.preview,
+            )
+            .await?;
+            body["expected_generation"] = json!(a.base_generation);
+            body["permits"] = json!(a.permits);
+            Some(a)
+        }
+        None => None,
+    };
+    let path = format!("{base}/deploys");
     let key: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(32)
@@ -362,7 +493,17 @@ async fn start(
                 let _ = writeln!(io.err, "warning: {e}; sending the same request again");
                 tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
             }
-            Err(e) => return Err(api(e)),
+            Err(e) => {
+                return Err(refusal(
+                    session,
+                    client,
+                    env,
+                    e,
+                    acknowledged.as_ref(),
+                    &commands.preview,
+                )
+                .await);
+            }
         }
     };
     let id = deployment["id"]
@@ -370,12 +511,29 @@ async fn start(
         .ok_or("unexpected response from the server: no deployment ID")?
         .to_owned();
     write(io, format_args!("Deployment {id} started.\n"))?;
-    if wait {
-        follow(session, client, env, &id, io).await?;
-        finished(session, client, env, &id, io).await
+    if run.wait {
+        let deadline = run.timeout.map(|t| (Instant::now() + t, t));
+        follow(session, client, env, &id, deadline, io).await?;
+        finished(session, client, env, &id, &commands.preview, io).await
     } else {
         Ok(())
     }
+}
+
+/// The message for a refused deployment request.
+async fn refusal(
+    session: &Session,
+    client: &Client,
+    env: &str,
+    e: ApiError,
+    acknowledged: Option<&Acknowledged>,
+    preview: &str,
+) -> String {
+    let current = match acknowledged {
+        Some(_) => generation(session, client, env).await.ok(),
+        None => None,
+    };
+    plans::refused(e, acknowledged, current, preview)
 }
 
 /// Lines asked for per page of a log.
@@ -390,6 +548,7 @@ async fn follow(
     client: &Client,
     env: &str,
     id: &str,
+    deadline: Option<(Instant, Duration)>,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
     let path = env_path(session, env, &format!("/deploys/{}/logs", segment(id)))?;
@@ -429,6 +588,14 @@ async fn follow(
         if page["finished"].as_bool() == Some(true) {
             return Ok(());
         }
+        if let Some((at, timeout)) = deadline
+            && Instant::now() >= at
+        {
+            return Err(format!(
+                "deployment {id} is still running after {}s; it carries on: follow it with `porch logs deploy {id}`",
+                timeout.as_secs()
+            ));
+        }
         let next = page["next"].as_i64().unwrap_or(after);
         if lines.is_empty() || next == after {
             tokio::time::sleep(LOG_POLL).await;
@@ -448,12 +615,14 @@ fn log_line(line: &Value) -> String {
     }
 }
 
-/// Reports how a deployment ended; a failure is an error.
+/// Reports how a deployment ended. A failure is an error that says whether
+/// the next step is recovery, a preview to approve a replacement, or a retry.
 async fn finished(
     session: &Session,
     client: &Client,
     env: &str,
     id: &str,
+    preview: &str,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
     let d = client
@@ -464,17 +633,67 @@ async fn finished(
         )
         .await
         .map_err(api)?;
+    let error = d["error"].as_str().unwrap_or("no reason recorded");
     match d["status"].as_str() {
-        Some("succeeded") => write(io, format_args!("Deployment {id} succeeded.\n")),
-        Some("failed") => Err(format!(
-            "deployment {id} failed: {}",
-            d["error"].as_str().unwrap_or("no reason recorded")
-        )),
-        other => Err(format!(
-            "deployment {id} ended as {}",
-            other.unwrap_or("unknown")
-        )),
+        Some("succeeded") => return write(io, format_args!("Deployment {id} succeeded.\n")),
+        Some("failed") => {}
+        other => {
+            return Err(format!(
+                "deployment {id} ended as {}",
+                other.unwrap_or("unknown")
+            ));
+        }
     }
+    let resources = client
+        .request(Method::GET, &env_path(session, env, "/resources")?, None)
+        .await
+        .map_err(api)?;
+    let uncertain = recovery_steps(&resources);
+    if !uncertain.is_empty() {
+        return Err(format!(
+            "deployment {id} failed: {error}\nrecovery required: deploying again does not repeat an operation whose outcome is unknown.\n{}",
+            uncertain.join("\n")
+        ));
+    }
+    if error.contains("approval_required") {
+        return Err(format!(
+            "deployment {id} failed: {error}\napproval required: preview again and acknowledge the replacement it shows:\n  {preview}"
+        ));
+    }
+    Err(format!(
+        "deployment {id} failed: {error}\nfix the cause and deploy again; resources that provisioned are kept"
+    ))
+}
+
+/// A line per resource of `list` (`GET .../resources`) whose last operation
+/// has an unknown outcome, naming it and its recovery.
+fn recovery_steps(list: &Value) -> Vec<String> {
+    let resources = list["resources"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    resources
+        .iter()
+        .filter_map(|r| {
+            let status = r["status"].as_str()?;
+            let descriptor = r["descriptor"].as_str()?;
+            let (ty, res_id) = plans::type_and_id(descriptor)?;
+            let operation = r["unknown_operation"]
+                .as_str()
+                .map(|o| format!(" (operation {o})"))
+                .unwrap_or_default();
+            let guresid = r["guresid"].as_str().unwrap_or_default();
+            match status {
+                "unknown" => Some(format!(
+                    "  {descriptor}{operation}, GUResID {guresid}: outcome unknown; observe it with `porch resources recover {ty} {res_id}`"
+                )),
+                "recovery_required" => Some(format!(
+                    "  {descriptor}{operation}, GUResID {guresid}: the driver cannot tell what happened; an administrator checks the cloud and resolves it with `porch api post <environment>/resources/{ty}/{res_id}/resolve -d '{{\"reason\": \"...\"}}'`"
+                )),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 pub(crate) async fn logs(session: &Session, cmd: LogsCmd, io: &mut Io<'_>) -> Result<(), String> {
@@ -494,7 +713,7 @@ pub(crate) async fn logs(session: &Session, cmd: LogsCmd, io: &mut Io<'_>) -> Re
     let id = d["id"]
         .as_str()
         .ok_or("unexpected response from the server: no deployment ID")?;
-    follow(session, &client, &env, id, io).await
+    follow(session, &client, &env, id, None, io).await
 }
 
 /// The set ID a `diff sets` argument names.
@@ -550,18 +769,21 @@ pub(crate) async fn resources(
     cmd: ResourcesCmd,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let ResourcesCmd::Graph { output } = cmd;
     let client = session.client()?;
     let env = session.env()?.to_owned();
-    let graph = client
-        .request(
-            Method::GET,
-            &env_path(session, &env, "/resources/graph")?,
-            None,
-        )
+    let (method, path, output) = match cmd {
+        ResourcesCmd::Graph { output } => (Method::GET, "/resources/graph".to_owned(), output),
+        ResourcesCmd::Recover { ty, res_id, output } => (
+            Method::POST,
+            format!("/resources/{}/{}/recover", segment(&ty), segment(&res_id)),
+            output,
+        ),
+    };
+    let value = client
+        .request(method, &env_path(session, &env, &path)?, None)
         .await
         .map_err(api)?;
-    output::print(io.out, structured(output), &graph, &[])
+    output::print(io.out, structured(output), &value, &[])
 }
 
 pub(crate) async fn raw(session: &Session, args: ApiArgs, io: &mut Io<'_>) -> Result<(), String> {

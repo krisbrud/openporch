@@ -45,6 +45,10 @@ pub struct ResourceView {
     pub driver_account: Option<String>,
     /// Status.
     pub status: String,
+    /// The operation whose outcome is unknown, while the status is `unknown`
+    /// or `recovery_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_operation: Option<String>,
     /// `owned`, `adopted` or `external`.
     pub ownership: String,
     /// Non-secret outputs.
@@ -155,6 +159,7 @@ impl EnvUsage {
             driver_type: r.driver_type,
             driver_account: r.driver_account,
             status: r.status,
+            unknown_operation: None,
             ownership: r.ownership,
             outputs: r.outputs,
             secret_outputs: r.secret_outputs.into_keys().collect(),
@@ -177,9 +182,24 @@ pub async fn list(
         .active_resources(state.org(), &env.app, &env.id)
         .await?;
     let usage = EnvUsage::load(&state, &env.app, &env.id, &resources).await?;
-    Ok(Json(ResourceList {
-        resources: resources.into_iter().map(|r| usage.view(r)).collect(),
-    }))
+    let mut views = Vec::with_capacity(resources.len());
+    for r in resources {
+        views.push(with_operation(&state, usage.view(r)).await?);
+    }
+    Ok(Json(ResourceList { resources: views }))
+}
+
+/// `view` with the operation whose outcome is unknown, if its status says
+/// there is one.
+async fn with_operation(state: &AppState, mut view: ResourceView) -> ApiResult<ResourceView> {
+    if view.status == "unknown" || view.status == "recovery_required" {
+        view.unknown_operation = state
+            .store
+            .unknown_operation(state.org(), &view.app, &view.env, &view.descriptor)
+            .await?
+            .map(|op| op.operation_id);
+    }
+    Ok(view)
 }
 
 /// `GET /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}`.
@@ -190,7 +210,7 @@ pub async fn get(
     let env = env_or_404(&state, &app, &env).await?;
     let resource = resource_or_404(&state, &env, &ty, &res_id).await?;
     let usage = EnvUsage::load(&state, &env.app, &env.id, std::slice::from_ref(&resource)).await?;
-    Ok(Json(usage.view(resource)))
+    Ok(Json(with_operation(&state, usage.view(resource)).await?))
 }
 
 /// `DELETE /orgs/{org}/apps/{app}/envs/{env}/resources/{type}/{res_id}`:

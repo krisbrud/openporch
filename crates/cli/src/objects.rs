@@ -9,7 +9,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use openporch_client::{Method, segment, with_query};
 use serde_json::{Value, json};
 
+use crate::deploys::{env_path, generation};
 use crate::output::{self, Format};
+use crate::plans::{self, Ack, Acknowledged, Confirm};
 use crate::{Io, Session, api};
 
 /// The `apiVersion` of openporch documents.
@@ -118,10 +120,41 @@ pub struct FileArg {
     pub file: PathBuf,
 }
 
-/// `porch delete`. Applications and environments are deleted with their resources,
-/// which needs a preview and permits: that comes with the deployment commands.
+/// `porch delete`. Applications and environments are deleted with their
+/// resources: each deletion is previewed, and the resources it deletes need
+/// acknowledging one by one with `--plan` and `--ack`.
 #[derive(Debug, Subcommand)]
 pub enum Delete {
+    /// An application, with every environment and its resources.
+    App {
+        /// The application ID.
+        id: String,
+        /// A comment recorded with each environment's deletion.
+        #[arg(long, default_value = "")]
+        comment: String,
+        /// Preview each environment's deletion and print it, without
+        /// deleting anything.
+        #[arg(long)]
+        preview: bool,
+        /// The deletion preview of an environment: ENV=PLAN. Environments
+        /// without one are previewed again.
+        #[arg(long = "plan", value_name = "ENV=PLAN", value_parser = env_pair, conflicts_with = "preview")]
+        plans: Vec<(String, String)>,
+        /// Acknowledges a resource an environment's preview deletes:
+        /// ENV:DESCRIPTOR=ACTION.
+        #[arg(long = "ack", value_name = "ENV:DESCRIPTOR=ACTION", value_parser = env_ack, requires = "plans")]
+        acks: Vec<(String, Ack)>,
+    },
+    /// An environment of the application (`--app`), with its resources.
+    Env {
+        /// The environment ID.
+        id: String,
+        /// A comment recorded with the deletion.
+        #[arg(long, default_value = "")]
+        comment: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
     /// An unused environment type.
     EnvType {
         /// The environment type ID.
@@ -432,8 +465,228 @@ pub(crate) async fn create(session: &Session, what: Create, io: &mut Io<'_>) -> 
     writeln!(io.out, "Created {noun} {id}.").map_err(|e| e.to_string())
 }
 
+fn env_pair(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((e, p)) if !e.is_empty() && !p.is_empty() => Ok((e.to_owned(), p.to_owned())),
+        _ => Err("expected ENV=PLAN".into()),
+    }
+}
+
+fn env_ack(s: &str) -> Result<(String, Ack), String> {
+    match s.split_once(':') {
+        Some((e, a)) if !e.is_empty() => Ok((e.to_owned(), plans::ack(a)?)),
+        _ => Err("expected ENV:DESCRIPTOR=ACTION".into()),
+    }
+}
+
+/// `porch delete env`: previews the deletion, unless `--plan` names a
+/// preview, and deletes once every resource it deletes is acknowledged.
+async fn delete_env(
+    session: &Session,
+    id: &str,
+    comment: &str,
+    confirm: &Confirm,
+    io: &mut Io<'_>,
+) -> Result<Value, String> {
+    let client = session.client()?;
+    let app = session.app()?;
+    let base = env_path(session, id, "")?;
+    let command = format!("porch delete env {id} --app {app}");
+    let acknowledged = match &confirm.plan {
+        Some(plan) => {
+            let acks: Vec<_> = confirm.acks.iter().collect();
+            plans::acknowledge(
+                &client,
+                &base,
+                plan,
+                "delete_env",
+                &acks,
+                &command,
+                &format!("{command} --preview"),
+            )
+            .await?
+        }
+        None => {
+            let generation = generation(session, &client, id).await?;
+            let body = json!({"kind": "delete_env", "expected_generation": generation});
+            let plan = plans::create(&client, &base, &body).await?;
+            plans::print(io, &plan, &format!("{app}/{id}"), Some(&command))?;
+            if confirm.preview {
+                return Ok(Value::Null);
+            }
+            if !plans::required(&plan).is_empty() {
+                return Err(format!(
+                    "deleting environment {id} deletes the resources marked above; nothing was deleted"
+                ));
+            }
+            Acknowledged {
+                id: plan["id"].as_str().unwrap_or_default().to_owned(),
+                base_generation: generation,
+                permits: Vec::new(),
+            }
+        }
+    };
+    let body = json!({
+        "expected_generation": acknowledged.base_generation,
+        "permits": acknowledged.permits,
+        "comment": comment,
+    });
+    match client.send(Method::DELETE, &base, Some(&body), &[]).await {
+        Ok((_, value)) => Ok(value),
+        Err(e) => {
+            let current = generation(session, &client, id).await.ok();
+            Err(plans::refused(
+                e,
+                Some(&acknowledged),
+                current,
+                &format!("{command} --preview"),
+            ))
+        }
+    }
+}
+
+/// `porch delete app`: previews every environment's deletion, unless
+/// `--plan` names its preview, and deletes the application once every
+/// resource they delete is acknowledged.
+async fn delete_app(
+    session: &Session,
+    id: &str,
+    comment: &str,
+    preview: bool,
+    given: &[(String, String)],
+    acks: &[(String, Ack)],
+    io: &mut Io<'_>,
+) -> Result<Value, String> {
+    let client = session.client()?;
+    let org = session.org()?;
+    let app_base = format!("/orgs/{}/apps/{}", segment(org), segment(id));
+    let envs = client
+        .request(Method::GET, &format!("{app_base}/envs"), None)
+        .await
+        .map_err(api)?;
+    // An environment already being deleted needs nothing more.
+    let envs: Vec<String> = envs
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e["state"] != "deleting")
+        .filter_map(|e| e["id"].as_str().map(str::to_owned))
+        .collect();
+    if let Some((env, _)) = given.iter().find(|(e, _)| !envs.contains(e)) {
+        return Err(format!("application {id} has no environment `{env}`"));
+    }
+    let command = format!("porch delete app {id}");
+    let mut permits = Vec::new();
+    // What the full command needs: every environment's preview and acks.
+    let mut flags = String::new();
+    let mut unacknowledged = false;
+    for env in &envs {
+        let base = format!("{app_base}/envs/{}", segment(env));
+        let env_acks: Vec<&Ack> = acks
+            .iter()
+            .filter(|(e, _)| e == env)
+            .map(|(_, a)| a)
+            .collect();
+        if let Some((_, plan)) = given.iter().find(|(e, _)| e == env) {
+            let a = plans::acknowledge(
+                &client,
+                &base,
+                plan,
+                "delete_env",
+                &env_acks,
+                &command,
+                &format!("{command} --preview"),
+            )
+            .await
+            .map_err(|e| format!("environment {env}: {e}"))?;
+            permits.extend(a.permits);
+            flags.push_str(&format!(" --plan {env}={plan}"));
+            for a in env_acks {
+                let fingerprint = a.fingerprint.as_deref().map(|f| format!("@{f}"));
+                flags.push_str(&format!(
+                    " --ack '{env}:{}={}{}'",
+                    a.descriptor,
+                    a.action,
+                    fingerprint.unwrap_or_default()
+                ));
+            }
+            continue;
+        }
+        let record = client
+            .request(Method::GET, &base, None)
+            .await
+            .map_err(api)?;
+        let generation = record["generation"]
+            .as_i64()
+            .ok_or("unexpected response from the server: no environment generation")?;
+        let body = json!({"kind": "delete_env", "expected_generation": generation});
+        let plan = plans::create(&client, &base, &body).await?;
+        plans::print(io, &plan, &format!("{id}/{env}"), None)?;
+        let required = plans::required(&plan);
+        if !required.is_empty() {
+            unacknowledged = true;
+            let plan_id = plan["id"].as_str().unwrap_or_default();
+            flags.push_str(&format!(" --plan {env}={plan_id}"));
+            let prefixed: Vec<String> = required.iter().map(|r| format!("{env}:{r}")).collect();
+            flags.push_str(&plans::ack_args(&prefixed));
+        }
+    }
+    if preview {
+        if unacknowledged {
+            writeln!(io.out, "Delete it with:\n  {command}{flags}").map_err(|e| e.to_string())?;
+        }
+        return Ok(Value::Null);
+    }
+    if unacknowledged {
+        return Err(format!(
+            "deleting application {id} deletes the resources marked above; nothing was deleted. Acknowledge them one by one:\n  {command}{flags}"
+        ));
+    }
+    let body = json!({"permits": permits, "comment": comment});
+    client
+        .send(Method::DELETE, &app_base, Some(&body), &[])
+        .await
+        .map(|(_, v)| v)
+        .map_err(|e| plans::refused(e, None, None, &format!("{command} --preview")))
+}
+
 /// `porch delete`.
 pub(crate) async fn delete(session: &Session, what: Delete, io: &mut Io<'_>) -> Result<(), String> {
+    let (noun, id, value) = match what {
+        Delete::App {
+            id,
+            comment,
+            preview,
+            plans,
+            acks,
+        } => {
+            let value = delete_app(session, &id, &comment, preview, &plans, &acks, io).await?;
+            ("application", id, value)
+        }
+        Delete::Env {
+            id,
+            comment,
+            confirm,
+        } => {
+            let value = delete_env(session, &id, &comment, &confirm, io).await?;
+            ("environment", id, value)
+        }
+        other => return delete_object(session, other, io).await,
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    writeln!(
+        io.out,
+        "Deletion of {noun} {id} accepted; its resources are being deprovisioned."
+    )
+    .map_err(|e| e.to_string())?;
+    output::print(io.out, Format::Yaml, &value, &[])
+}
+
+/// `porch delete` for objects without resources.
+async fn delete_object(session: &Session, what: Delete, io: &mut Io<'_>) -> Result<(), String> {
     let client = session.client()?;
     let org = format!("/orgs/{}", segment(session.org()?));
     let (path, body, noun, id) = match what {
@@ -461,6 +714,9 @@ pub(crate) async fn delete(session: &Session, what: Delete, io: &mut Io<'_>) -> 
             "cloud account",
             id,
         ),
+        Delete::App { .. } | Delete::Env { .. } => {
+            return Err("applications and environments are deleted with a preview".into());
+        }
     };
     let (status, value) = client
         .send(Method::DELETE, &path, body.as_ref(), &[])
