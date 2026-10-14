@@ -137,6 +137,9 @@ struct Fake {
     /// The artifact checks asked for, and the artifacts that are gone.
     artifact_checks: Mutex<Vec<ArtifactCheck>>,
     gone: Mutex<BTreeSet<String>>,
+    /// How many artifact checks fail in a way that may pass before one
+    /// answers.
+    artifact_flakes: Mutex<usize>,
     jobs: Mutex<Vec<ProvisionJob>>,
     running: AtomicUsize,
     most: AtomicUsize,
@@ -297,6 +300,16 @@ fn none_outputs(
 impl Executor for Fake {
     async fn check_artifacts(&self, check: ArtifactCheck) -> Result<(), ExecFailure> {
         self.artifact_checks.lock().unwrap().push(check.clone());
+        {
+            let mut flakes = self.artifact_flakes.lock().unwrap();
+            if *flakes > 0 {
+                *flakes -= 1;
+                return Err(ExecFailure::Retryable {
+                    error: "S3 is slow down".into(),
+                    retry_after: None,
+                });
+            }
+        }
         let gone = self.gone.lock().unwrap();
         match check.artifacts.iter().find(|a| gone.contains(*a)) {
             Some(a) => Err(ExecFailure::Permanent(format!(

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openporch_core::criteria::definition_weight;
-use openporch_core::ids::AccountId;
+use openporch_core::ids::{AccountId, DefinitionId, Descriptor};
 use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
@@ -225,16 +225,26 @@ where
     /// definition's own secrets are read only for deployments its criteria
     /// match.
     async fn check_criteria(&self, job: &ProvisionJob) -> Result<(), ExecFailure> {
-        let c = &job.context;
+        self.definition_matches(&job.context, &job.definition_id, &job.descriptor)
+            .await
+    }
+
+    /// Succeeds when definition `definition_id` still matches `descriptor` in
+    /// `c`'s application and environment.
+    async fn definition_matches(
+        &self,
+        c: &JobContext,
+        definition_id: &DefinitionId,
+        descriptor: &Descriptor,
+    ) -> Result<(), ExecFailure> {
         let record = self
             .store
-            .definition(c.org.as_str(), job.definition_id.as_str())
+            .definition(c.org.as_str(), definition_id.as_str())
             .await
             .map_err(|e| store_failure(e, "the resource definition could not be read"))?
             .ok_or_else(|| {
                 ExecFailure::Permanent(format!(
-                    "definition `{}` no longer exists, so its secrets are not read",
-                    job.definition_id
+                    "definition `{definition_id}` no longer exists, so its secrets are not read"
                 ))
             })?;
         let ctx = ResourceContext {
@@ -242,12 +252,13 @@ where
             app: c.app.clone(),
             env: c.env.clone(),
             env_type: c.env_type.clone(),
-            res: job.descriptor.clone(),
+            res: descriptor.clone(),
         };
         if definition_weight(&record.definition, &ctx).is_none() {
             return Err(ExecFailure::Permanent(format!(
-                "definition `{}` no longer matches `{}` in `{}/{}`, so its secrets are not read",
-                job.definition_id, job.descriptor, c.app, c.env
+                "definition `{definition_id}` no longer matches `{descriptor}` in `{}/{}`, so \
+                 its secrets are not read",
+                c.app, c.env
             )));
         }
         Ok(())
@@ -717,20 +728,14 @@ where
             return Ok(());
         }
         let mut log = JobLog::discard().redacting();
-        let credentials = match &check.account {
-            Some(id) => Some(
-                self.account_credentials(&check.context, id, CHECK_WINDOW, &mut log)
-                    .await
-                    .map_err(|f| log.failure(f))?,
-            ),
-            None => None,
-        };
+        self.definition_matches(&check.context, &check.definition_id, &check.descriptor)
+            .await?;
+        let credentials = self
+            .account_credentials(&check.context, &check.account, CHECK_WINDOW, &mut log)
+            .await
+            .map_err(|f| log.failure(f))?;
         for version in &versions {
-            match self
-                .cloud
-                .object_exists(credentials.as_ref(), version)
-                .await
-            {
+            match self.cloud.object_exists(Some(&credentials), version).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(ExecFailure::Permanent(format!(

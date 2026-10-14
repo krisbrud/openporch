@@ -158,23 +158,47 @@ pub struct S3Version {
 }
 
 impl S3Version {
-    /// `uri` as an S3 object version; `None` for anything else, such as an
-    /// object named without a version.
+    /// `uri` as an S3 object version, with its key and version ID
+    /// percent-decoded; `None` for anything else, such as an object named
+    /// without a version.
     pub fn parse(uri: &str) -> Option<Self> {
         let (path, query) = uri.strip_prefix("s3://")?.split_once('?')?;
         let (bucket, key) = path.split_once('/')?;
         let version = query
             .split('&')
             .find_map(|p| p.strip_prefix("versionId="))?;
-        if bucket.is_empty() || key.is_empty() || version.is_empty() {
+        let (key, version) = (percent_decode(key)?, percent_decode(version)?);
+        if bucket.is_empty() || key.is_empty() || version.is_empty() || uri.contains('#') {
             return None;
         }
         Some(Self {
             bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            version: version.to_owned(),
+            key,
+            version,
         })
     }
+}
+
+/// `s` with `%XX` escapes decoded; `None` when an escape is malformed or the
+/// result is not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 impl fmt::Display for S3Version {

@@ -180,35 +180,66 @@ impl Sts for AwsSts {
         object: &'a S3Version,
     ) -> BoxFuture<'a, Result<bool, CloudError>> {
         Box::pin(async move {
-            let client = self
-                .s3(
-                    credentials.and_then(|c| c.region.as_deref()),
-                    credentials.map(provider),
-                )
-                .await;
-            let out = client
-                .head_object()
-                .bucket(&object.bucket)
-                .key(&object.key)
-                .version_id(&object.version)
-                .send()
-                .await;
-            match out {
-                Ok(_) => Ok(true),
-                Err(SdkError::ServiceError(s)) if s.raw().status().as_u16() == 404 => Ok(false),
-                // A version ID S3 cannot read names no version it has.
-                Err(SdkError::ServiceError(s)) if s.raw().status().as_u16() == 400 => Ok(false),
-                Err(SdkError::ServiceError(s)) if s.raw().status().as_u16() == 403 => {
-                    Err(CloudError::Rejected(format!(
-                        "S3 HeadObject on `{object}` was denied; without `s3:ListBucket` \
-                         S3 also denies reading an object that does not exist"
-                    )))
+            let mut region = credentials.and_then(|c| c.region.clone());
+            // A bucket in another region than the one asked answers with its
+            // own, and is asked again there once.
+            for _ in 0..2 {
+                let client = self.s3(region.as_deref(), credentials.map(provider)).await;
+                let out = client
+                    .head_object()
+                    .bucket(&object.bucket)
+                    .key(&object.key)
+                    .version_id(&object.version)
+                    .send()
+                    .await;
+                let s = match out {
+                    Ok(_) => return Ok(true),
+                    Err(SdkError::ServiceError(s)) => s,
+                    Err(e) => {
+                        return Err(CloudError::Unavailable(format!(
+                            "S3 HeadObject on `{object}` failed: {}",
+                            DisplayErrorContext(&e)
+                        )));
+                    }
+                };
+                let status = s.raw().status().as_u16();
+                let bucket_region = s
+                    .raw()
+                    .headers()
+                    .get("x-amz-bucket-region")
+                    .map(str::to_owned);
+                match status {
+                    // No such object or version; 405 is a version that is a
+                    // delete marker.
+                    404 | 405 => return Ok(false),
+                    301 | 400 if bucket_region.is_some() && bucket_region != region => {
+                        region = bucket_region;
+                    }
+                    403 => {
+                        return Err(CloudError::Rejected(format!(
+                            "S3 HeadObject on `{object}` was denied; without `s3:ListBucket` \
+                             S3 also denies reading an object that does not exist"
+                        )));
+                    }
+                    500.. => {
+                        return Err(CloudError::Unavailable(format!(
+                            "S3 HeadObject on `{object}` failed with status {status}"
+                        )));
+                    }
+                    _ => {
+                        return Err(CloudError::Rejected(format!(
+                            "S3 HeadObject on `{object}` failed with status {status}{}; check \
+                             the version ID and the account's region",
+                            bucket_region
+                                .map(|r| format!(" (the bucket is in {r})"))
+                                .unwrap_or_default()
+                        )));
+                    }
                 }
-                Err(e) => Err(CloudError::Unavailable(format!(
-                    "S3 HeadObject on `{object}` failed: {}",
-                    DisplayErrorContext(&e)
-                ))),
             }
+            Err(CloudError::Rejected(format!(
+                "S3 HeadObject on `{object}` was redirected more than once"
+            )))
         })
     }
 }

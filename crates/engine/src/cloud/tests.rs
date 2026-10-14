@@ -507,6 +507,12 @@ fn only_an_s3_object_with_a_version_is_an_s3_version() {
         v.to_string(),
         "s3://artifacts/order-worker/abc.zip?versionId=3HL4kqtJ"
     );
+    // Keys are percent-decoded, as S3 names the object.
+    let v = S3Version::parse("s3://artifacts/my%20worker.zip?versionId=a%2Bb").unwrap();
+    assert_eq!(
+        (v.key.as_str(), v.version.as_str()),
+        ("my worker.zip", "a+b")
+    );
     for uri in [
         "s3://artifacts/latest.zip",
         "s3://artifacts/latest.zip?versionId=",
@@ -514,6 +520,9 @@ fn only_an_s3_object_with_a_version_is_an_s3_version() {
         "s3://artifacts?versionId=v",
         "https://artifacts.s3.amazonaws.com/k?versionId=v",
         ".",
+        "s3://artifacts/k%zz?versionId=v",
+        "s3://artifacts/k%+1?versionId=v",
+        "s3://artifacts/k?versionId=v#fragment",
     ] {
         assert_eq!(S3Version::parse(uri), None, "{uri}");
     }

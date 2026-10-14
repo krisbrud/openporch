@@ -35,6 +35,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::cloud::S3Version;
+
 mod deprovision;
 mod log;
 mod recover;
@@ -370,8 +372,11 @@ pub struct ArtifactCheck {
     pub context: JobContext,
     /// The workload.
     pub descriptor: Descriptor,
-    /// The cloud account the workload's driver gets credentials for.
-    pub account: Option<AccountId>,
+    /// The definition it matched.
+    pub definition_id: DefinitionId,
+    /// The cloud account the workload's driver gets credentials for, which
+    /// reads the artifacts.
+    pub account: AccountId,
     /// The artifact URIs, such as `s3://bucket/key?versionId=v`.
     pub artifacts: Vec<String>,
 }
@@ -505,43 +510,77 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         self
     }
 
-    /// Checks every artifact the deployment's workloads name; why each
-    /// workload with a missing one cannot deploy.
-    async fn check_artifacts(&self, deployment: &Deployment) -> BTreeMap<Descriptor, String> {
+    /// Checks every artifact the deployment's workloads name as an S3 object
+    /// version, with their definitions' cloud accounts; why each workload
+    /// with a missing one cannot deploy. A workload whose definition has no
+    /// cloud account, or one that comes from resources not yet provisioned,
+    /// is left to its driver.
+    async fn check_artifacts(
+        &self,
+        deployment: &Deployment,
+        deadline: Instant,
+    ) -> BTreeMap<Descriptor, String> {
         let mut missing = BTreeMap::new();
         for node in deployment.graph.nodes.values() {
-            let artifacts = artifacts(node);
+            let artifacts: Vec<String> = artifacts(node)
+                .into_iter()
+                .filter(|a| S3Version::parse(a).is_some())
+                .collect();
             if artifacts.is_empty() {
                 continue;
             }
             let Some((_, def)) = deployment.definitions.get(&node.definition) else {
                 continue;
             };
-            let account = match driver_account(def, &scope_for(deployment, node, &BTreeMap::new()))
-            {
-                Ok(account) => account,
-                Err(e) => {
-                    missing.insert(node.descriptor.clone(), e);
-                    continue;
-                }
+            let Ok(Some(account)) =
+                driver_account(def, &scope_for(deployment, node, &BTreeMap::new()))
+            else {
+                continue;
             };
             let check = ArtifactCheck {
                 context: JobContext::of(deployment),
                 descriptor: node.descriptor.clone(),
+                definition_id: def.id.clone(),
                 account,
                 artifacts,
             };
-            if let Err(failure) = self.executor.check_artifacts(check).await {
-                let reason = match failure {
-                    ExecFailure::Permanent(e) | ExecFailure::Uncertain(e) => e,
-                    ExecFailure::Retryable { error, .. } => {
-                        format!("{error}; nothing changed, deploy again")
-                    }
-                };
+            if let Err(reason) = self.check_with_retries(check, deadline).await {
                 missing.insert(node.descriptor.clone(), reason);
             }
         }
         missing
+    }
+
+    /// Runs `check`, retrying failures that may pass with backoff, within the
+    /// deployment's attempts and deadline.
+    async fn check_with_retries(
+        &self,
+        check: ArtifactCheck,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let checked =
+                tokio::time::timeout_at(deadline, self.executor.check_artifacts(check.clone()))
+                    .await;
+            let (error, retry_after) = match checked {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => return Err(e),
+                Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
+                Err(_) => {
+                    return Err(format!(
+                        "the deployment ran out of time checking the artifacts of `{}`",
+                        check.descriptor
+                    ));
+                }
+            };
+            let delay = retry_after.unwrap_or_else(|| backoff(&self.limits, attempt));
+            if attempt >= self.limits.attempts || Instant::now() + delay >= deadline {
+                return Err(format!("{error} (after {attempt} attempts)"));
+            }
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Runs `deployment` to the end and finishes its record: succeeded when
@@ -562,7 +601,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut running = JoinSet::new();
         let mut tasks: BTreeMap<tokio::task::Id, Descriptor> = BTreeMap::new();
         // Nothing runs unless every artifact the deployment names exists.
-        let missing = self.check_artifacts(&deployment).await;
+        let missing = self.check_artifacts(&deployment, deadline).await;
         for (d, reason) in &missing {
             outcomes.insert(d.clone(), Outcome::Failed(reason.clone()));
         }

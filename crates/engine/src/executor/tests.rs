@@ -1149,8 +1149,11 @@ async fn a_pin_reaches_the_driver_and_the_version_it_ran_comes_back() {
 async fn pinned_artifacts_are_checked_with_the_workloads_account() {
     let f = Fixture::new().await;
     f.account().await;
+    let mut pg = plain_pg();
+    pg.driver_account = Some("aws-main".into());
+    f.define(pg, "openporch/none").await;
     let executor = f.executor(Arc::new(NoPermits));
-    let check = |account: Option<&str>, artifacts: &[&str]| crate::planner::ArtifactCheck {
+    let check = |artifacts: &[&str]| crate::planner::ArtifactCheck {
         context: crate::planner::JobContext {
             org: ORG.parse().unwrap(),
             app: "shop".parse().unwrap(),
@@ -1159,50 +1162,39 @@ async fn pinned_artifacts_are_checked_with_the_workloads_account() {
             deployment_id: "d-test".into(),
             permits: Vec::new(),
         },
-        descriptor: Descriptor::parse("workload.default#modules.web").unwrap(),
-        account: account.map(|a| a.parse().unwrap()),
+        descriptor: Descriptor::parse(DB).unwrap(),
+        definition_id: "pg".parse().unwrap(),
+        account: "aws-main".parse().unwrap(),
         artifacts: artifacts.iter().map(|a| (*a).to_owned()).collect(),
     };
+    let checked = || f.sts.objects.lock().unwrap().clone();
 
     // An object named without a version is not checked.
     executor
-        .check_artifacts(check(Some("aws-main"), &["s3://artifacts/latest.zip", "."]))
+        .check_artifacts(check(&["s3://artifacts/latest.zip", "."]))
         .await
         .unwrap();
-    assert!(f.sts.objects.lock().unwrap().is_empty());
+    assert!(checked().is_empty());
 
-    // A version is read with the account's credentials, or the host's.
+    // A version is read with the account's credentials.
     executor
-        .check_artifacts(check(
-            Some("aws-main"),
-            &["s3://artifacts/w.zip?versionId=v1"],
-        ))
-        .await
-        .unwrap();
-    executor
-        .check_artifacts(check(None, &["s3://artifacts/w.zip?versionId=v1"]))
+        .check_artifacts(check(&["s3://artifacts/w.zip?versionId=v1"]))
         .await
         .unwrap();
     assert_eq!(
-        *f.sts.objects.lock().unwrap(),
-        [
-            (
-                Some("AKIATEST".to_owned()),
-                "s3://artifacts/w.zip?versionId=v1".to_owned()
-            ),
-            (None, "s3://artifacts/w.zip?versionId=v1".to_owned()),
-        ]
+        checked(),
+        [(
+            Some("AKIATEST".to_owned()),
+            "s3://artifacts/w.zip?versionId=v1".to_owned()
+        )]
     );
 
-    // A version that is gone is named, and nothing else is checked after it.
+    // A version that is gone is named, and nothing is checked after it.
     let failure = executor
-        .check_artifacts(check(
-            None,
-            &[
-                "s3://artifacts/w.zip?versionId=gone",
-                "s3://artifacts/x.zip?versionId=v2",
-            ],
-        ))
+        .check_artifacts(check(&[
+            "s3://artifacts/w.zip?versionId=gone",
+            "s3://artifacts/x.zip?versionId=v2",
+        ]))
         .await
         .unwrap_err();
     assert!(
@@ -1211,5 +1203,20 @@ async fn pinned_artifacts_are_checked_with_the_workloads_account() {
                 && e.contains("no longer exists")),
         "{failure:?}"
     );
-    assert_eq!(f.sts.objects.lock().unwrap().len(), 3);
+    assert_eq!(checked().len(), 2);
+
+    // A definition that no longer matches does not get its account.
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let failure = executor
+        .check_artifacts(check(&["s3://artifacts/w.zip?versionId=v1"]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e) if e.contains("no longer matches")),
+        "{failure:?}"
+    );
+    assert_eq!(checked().len(), 2);
 }

@@ -1519,12 +1519,15 @@ later edits do not affect it. The deployment is returned at once with status
 the environment's last successful deployment and set.
 
 Before a deployment changes anything, it checks that every function artifact
-its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`,
-still exists, reading it with the workload definition's cloud account or, without
-one, the server's own AWS identity. If one is gone, as when a replay names a
-version that was deleted, the workload fails naming the artifact, every other
-resource is left `pending`, and the deployment fails with nothing changed. An
-artifact named without a version is not checked.
+its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`
+(key percent-encoded), still exists, reading it with the workload definition's
+cloud account, which needs `s3:GetObjectVersion` on it. If one is gone, as when
+a replay names a version that was deleted, the workload fails naming the
+artifact, every other resource is left `pending`, and the deployment fails with
+nothing changed. Checks that fail in a way that may pass are retried like
+provisioning. An artifact named without a version, or by a workload whose
+definition has no cloud account or one that comes from another resource's
+outputs, is not checked; its driver reports a missing artifact when it runs.
 
 ```http
 POST /orgs/acme/apps

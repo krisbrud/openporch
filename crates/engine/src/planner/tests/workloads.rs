@@ -231,16 +231,35 @@ resources:
     assert_eq!(files["/etc/app/db"]["content"], "host=postgres.internal");
 }
 
+/// The worker with its artifact pinned to a version.
+fn pinned_worker() -> String {
+    WORKER.replace(
+        "s3://artifacts/worker.zip",
+        "s3://artifacts/worker.zip?versionId=v1",
+    )
+}
+
+/// [`with_workloads`] with the lambda definition reading artifacts with
+/// `account`.
+fn with_lambda_account(account: Option<&str>) -> Vec<ResourceDefinition> {
+    let mut defs = with_workloads("openporch/echo");
+    for def in &mut defs {
+        if def.id.as_str() == "lambda" {
+            def.driver_account = account.map(str::to_owned);
+        }
+    }
+    defs
+}
+
 #[tokio::test]
 async fn a_missing_artifact_stops_the_deployment_before_anything_runs() {
+    const PINNED: &str = "s3://artifacts/worker.zip?versionId=v1";
     let f = Fixture::new().await;
     let fake = Fake::with(&[]);
-    fake.gone
-        .lock()
-        .unwrap()
-        .insert("s3://artifacts/worker.zip".into());
+    fake.gone.lock().unwrap().insert(PINNED.into());
+    let worker = pinned_worker();
     let deployment = f
-        .accept_set(Some(WORKER), with_workloads("openporch/echo"))
+        .accept_set(Some(&worker), with_lambda_account(Some("aws-lambda")))
         .await
         .unwrap();
     let outcomes = planner(&f, &fake, fast()).run(deployment.clone()).await;
@@ -248,7 +267,7 @@ async fn a_missing_artifact_stops_the_deployment_before_anything_runs() {
     // The workload names the artifact; nothing else started.
     assert!(
         matches!(&outcomes[&d(WORKER_WORKLOAD)], Outcome::Failed(e)
-            if e.contains("artifact `s3://artifacts/worker.zip` no longer exists")),
+            if e.contains(&format!("artifact `{PINNED}` no longer exists"))),
         "{outcomes:?}"
     );
     for (descriptor, outcome) in &outcomes {
@@ -268,14 +287,15 @@ async fn a_missing_artifact_stops_the_deployment_before_anything_runs() {
     let checks = fake.artifact_checks.lock().unwrap().clone();
     assert_eq!(checks.len(), 1, "{checks:?}");
     assert_eq!(checks[0].descriptor.to_string(), WORKER_WORKLOAD);
-    assert_eq!(checks[0].artifacts, ["s3://artifacts/worker.zip"]);
-    assert_eq!(checks[0].account, None);
+    assert_eq!(checks[0].definition_id.as_str(), "lambda");
+    assert_eq!(checks[0].artifacts, [PINNED]);
+    assert_eq!(checks[0].account.as_str(), "aws-lambda");
     assert_eq!(checks[0].context.deployment_id, deployment.id);
 
     // Once it exists again, the deployment runs.
     fake.gone.lock().unwrap().clear();
     let deployment = f
-        .accept_set(Some(WORKER), with_workloads("openporch/echo"))
+        .accept_set(Some(&worker), with_lambda_account(Some("aws-lambda")))
         .await
         .unwrap();
     let outcomes = planner(&f, &fake, fast()).run(deployment).await;
@@ -283,4 +303,58 @@ async fn a_missing_artifact_stops_the_deployment_before_anything_runs() {
         outcomes.values().all(|o| *o == Outcome::Provisioned),
         "{outcomes:?}"
     );
+}
+
+#[tokio::test]
+async fn artifacts_without_a_version_or_an_account_known_up_front_are_left_to_the_driver() {
+    let worker = pinned_worker();
+    for (workload, account) in [
+        // Named without a version.
+        (WORKER, Some("aws-lambda")),
+        // No account to read it with.
+        (worker.as_str(), None),
+        // An account that comes from a resource not yet provisioned.
+        (
+            worker.as_str(),
+            Some("${resources['postgres.default#modules.worker.externals.db'].account}"),
+        ),
+    ] {
+        let f = Fixture::new().await;
+        let fake = Fake::with(&[]);
+        fake.gone.lock().unwrap().extend([
+            "s3://artifacts/worker.zip".to_owned(),
+            "s3://artifacts/worker.zip?versionId=v1".to_owned(),
+        ]);
+        let deployment = f
+            .accept_set(Some(workload), with_lambda_account(account))
+            .await
+            .unwrap();
+        let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+        assert!(
+            fake.artifact_checks.lock().unwrap().is_empty(),
+            "{account:?}"
+        );
+        // The rest of the deployment ran.
+        assert_eq!(outcomes[&d(WORKER_DB)], Outcome::Provisioned, "{account:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_check_that_may_pass_is_retried() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    *fake.artifact_flakes.lock().unwrap() = 2;
+    let deployment = f
+        .accept_set(
+            Some(&pinned_worker()),
+            with_lambda_account(Some("aws-lambda")),
+        )
+        .await
+        .unwrap();
+    let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+    assert!(
+        outcomes.values().all(|o| *o == Outcome::Provisioned),
+        "{outcomes:?}"
+    );
+    assert_eq!(fake.artifact_checks.lock().unwrap().len(), 3);
 }
