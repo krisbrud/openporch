@@ -4,6 +4,8 @@
 //! run commands in-process against a dev server.
 
 pub mod config;
+pub mod members;
+pub mod objects;
 pub mod output;
 
 use std::ffi::OsString;
@@ -15,7 +17,6 @@ use clap::{Args, Parser, Subcommand};
 use openporch_client::{Client, DevicePoll, Error as ApiError, Token, server_url, url_key};
 
 use crate::config::{Credential, Env, Flags, Paths, Settings, TokenSource, resolve};
-use crate::output::Format;
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +31,12 @@ pub struct Cli {
     /// The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file.
     #[arg(long, global = true, value_name = "ORG")]
     pub org: Option<String>,
+    /// The application. Defaults to `OPENPORCH_APP`, then `app` in the config file.
+    #[arg(long, global = true, value_name = "APP")]
+    pub app: Option<String>,
+    /// The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file.
+    #[arg(long, global = true, value_name = "ENV")]
+    pub env: Option<String>,
     /// The config file. Defaults to `OPENPORCH_CONFIG`, then
     /// `~/.config/openporch/config.toml`; the credentials file sits next to it.
     #[arg(long, global = true, value_name = "FILE")]
@@ -52,9 +59,28 @@ pub enum Command {
     Login(LoginArgs),
     /// Ends the session and forgets the stored token for the server.
     Logout,
-    /// Lists objects.
+    /// Lists objects, or shows one.
+    Get(objects::GetArgs),
+    /// Creates an object.
     #[command(subcommand)]
-    Get(Get),
+    Create(objects::Create),
+    /// Deletes an object. Sets and deployment records are kept for good.
+    #[command(subcommand)]
+    Delete(objects::Delete),
+    /// Manages the organization's members and their tokens.
+    #[command(subcommand)]
+    Users(members::Users),
+    /// Manages application users.
+    #[command(subcommand)]
+    Apps(members::Apps),
+    /// Manages environment type deployers.
+    #[command(subcommand)]
+    EnvTypes(members::EnvTypes),
+    /// Manages secret stores.
+    #[command(subcommand)]
+    Secretstores(members::SecretStores),
+    /// Queries the audit log, newest first.
+    AuditLogs(members::AuditLogs),
 }
 
 /// `porch login`.
@@ -66,17 +92,6 @@ pub struct LoginArgs {
     /// The invitation code, on a first GitHub login.
     #[arg(long, value_name = "CODE", conflicts_with = "token")]
     pub invitation: Option<String>,
-}
-
-/// `porch get`.
-#[derive(Debug, Subcommand)]
-pub enum Get {
-    /// The applications you can see.
-    Apps {
-        /// The output format.
-        #[arg(short, long, value_enum, default_value_t)]
-        output: Format,
-    },
 }
 
 /// The process environment of a command.
@@ -159,6 +174,20 @@ impl Session {
         })
     }
 
+    fn app(&self) -> Result<&str, String> {
+        self.settings.app.as_deref().ok_or_else(|| {
+            "no application: pass --app, set OPENPORCH_APP or set `app` in the config file"
+                .to_owned()
+        })
+    }
+
+    fn env(&self) -> Result<&str, String> {
+        self.settings.env.as_deref().ok_or_else(|| {
+            "no environment: pass --env, set OPENPORCH_ENV or set `env` in the config file"
+                .to_owned()
+        })
+    }
+
     /// A client sending the resolved token.
     fn client(&self) -> Result<Client, String> {
         let (url, org) = (self.url()?, self.org()?);
@@ -193,6 +222,8 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
     let flags = Flags {
         url: cli.url,
         org: cli.org,
+        app: cli.app,
+        env: cli.env,
         token: cli.token.and_then(Token::new),
     };
     let session = Session {
@@ -203,16 +234,14 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
         Command::Login(args) if args.token => login_token(&session, io).await,
         Command::Login(args) => login_device(&session, args.invitation.as_deref(), io).await,
         Command::Logout => logout(&session, io).await,
-        Command::Get(Get::Apps { output }) => {
-            let apps = session.client()?.apps().await.map_err(api)?;
-            let value = serde_json::to_value(apps).map_err(|e| e.to_string())?;
-            output::print(
-                io.out,
-                output,
-                &value,
-                &[("ID", "id"), ("NAME", "name"), ("STATE", "state")],
-            )
-        }
+        Command::Get(args) => objects::get(&session, args, io).await,
+        Command::Create(what) => objects::create(&session, what, io).await,
+        Command::Delete(what) => objects::delete(&session, what, io).await,
+        Command::Users(cmd) => members::users(&session, cmd, io).await,
+        Command::Apps(cmd) => members::apps(&session, cmd, io).await,
+        Command::EnvTypes(cmd) => members::env_types(&session, cmd, io).await,
+        Command::Secretstores(cmd) => members::secret_stores(&session, cmd, io).await,
+        Command::AuditLogs(args) => members::audit_logs(&session, args, io).await,
     }
 }
 

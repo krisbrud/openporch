@@ -155,6 +155,36 @@ pub fn url_key(url: &Url) -> String {
     url.as_str().trim_end_matches('/').to_owned()
 }
 
+/// `value` encoded for use as one path segment.
+pub fn segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `path` with `params` appended as a query string; empty values are left out.
+pub fn with_query(path: &str, params: &[(&str, Option<String>)]) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let mut any = false;
+    for (key, value) in params {
+        if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
+            query.append_pair(key, value);
+            any = true;
+        }
+    }
+    if any {
+        format!("{path}?{}", query.finish())
+    } else {
+        path.to_owned()
+    }
+}
+
 /// An application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct App {
@@ -296,11 +326,7 @@ impl Client {
         body: Option<&Value>,
         headers: &[(&str, &str)],
     ) -> Result<(StatusCode, Value), Error> {
-        if !path.starts_with('/') {
-            return Err(Error::InvalidUrl(format!(
-                "path `{path}` must start with `/`"
-            )));
-        }
+        check_path(path)?;
         let url = Url::parse(&format!("{}{path}", url_key(&self.base)))
             .map_err(|e| Error::InvalidUrl(format!("{path}: {e}")))?;
         let mut req = self.http.request(method, url);
@@ -409,6 +435,27 @@ impl Client {
             .map(DevicePoll::Session)
             .map_err(|e| Error::Decode(e.to_string()))
     }
+}
+
+/// Refuses a path the URL parser would rewrite: an empty, `.` or `..` segment
+/// (also percent-encoded) would send the request to another route, such as an
+/// ID `..` turning `/apps/../users/ci` into `/users/ci`.
+fn check_path(path: &str) -> Result<(), Error> {
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(Error::InvalidUrl(format!(
+            "path `{path}` must start with `/`"
+        )));
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    for seg in rest.split('/') {
+        let decoded = seg.replace("%2e", ".").replace("%2E", ".");
+        if seg.is_empty() || decoded == "." || decoded == ".." {
+            return Err(Error::InvalidUrl(format!(
+                "path `{path}` has an empty, `.` or `..` segment; IDs cannot be empty, `.` or `..`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn api_error(status: StatusCode, body: &Value) -> Error {

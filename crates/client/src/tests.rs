@@ -156,3 +156,50 @@ async fn untrusted_certificate_is_rejected_before_the_token_is_sent() {
         Ok(n) => panic!("the handshake succeeded and the client sent {n} bytes"),
     }
 }
+
+#[test]
+fn paths_are_encoded() {
+    assert_eq!(segment("acme/redis"), "acme%2Fredis");
+    assert_eq!(segment("stg-redis_1.x~"), "stg-redis_1.x~");
+    assert_eq!(segment("a b?#"), "a%20b%3F%23");
+    assert_eq!(
+        with_query(
+            "/x",
+            &[
+                ("user_id", Some("ci".into())),
+                ("method", None),
+                ("path_prefix", Some("/a b".into()))
+            ]
+        ),
+        "/x?user_id=ci&path_prefix=%2Fa+b"
+    );
+    assert_eq!(with_query("/x", &[("a", Some(String::new()))]), "/x");
+}
+
+#[tokio::test]
+async fn dot_segments_are_refused_before_sending() {
+    let client = Client::new("http://127.0.0.1:1", "acme", Some(token())).unwrap();
+    for id in ["..", ".", ""] {
+        let path = format!("/orgs/acme/apps/{}/users/ci", segment(id));
+        let err = client
+            .request(Method::DELETE, &path, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)), "{id:?}: {err}");
+    }
+    for path in [
+        "/orgs/acme/apps/%2e%2E/users",
+        "/orgs//apps",
+        "orgs/acme",
+        "/orgs/acme/",
+    ] {
+        let err = client.request(Method::GET, path, None).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)), "{path}: {err}");
+    }
+    // `.` inside an ID is fine.
+    let err = client
+        .request(Method::GET, "/orgs/acme/apps/a.b", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err}");
+}
