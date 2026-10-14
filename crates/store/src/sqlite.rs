@@ -2154,8 +2154,8 @@ impl SqliteStore {
                 if let Some(pin) = pin {
                     sqlx::query(
                         "UPDATE deployments SET snapshot = json_set(snapshot, '$.pins', \
-                         json_patch(COALESCE(json_extract(snapshot, '$.pins'), '{}'), \
-                         json_object(?, json(?)))) \
+                         json_set(COALESCE(json_extract(snapshot, '$.pins'), '{}'), \
+                         '$.' || json_quote(?), json(?))) \
                          WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
                     )
                     .bind(&descriptor)

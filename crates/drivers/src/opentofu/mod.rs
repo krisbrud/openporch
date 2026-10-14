@@ -769,7 +769,18 @@ impl OpenTofu {
                     &checkout,
                     &home,
                 )
-                .await?;
+                .await
+                .map_err(|e| match (&pinned, e) {
+                    // A replay cannot run another commit in its place.
+                    (Some(_), Failure::Command { stderr, .. }) => input(format!(
+                        "the pinned commit `{}` of `{}` can no longer be fetched; deploy the \
+                         current configuration instead: {}",
+                        s.rev,
+                        s.url,
+                        stderr.lines().last().unwrap_or_default()
+                    )),
+                    (_, e) => e,
+                })?;
                 run.module = match path {
                     Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
                     None => checkout.canonicalize().map_err(Failure::io)?,
@@ -1481,6 +1492,18 @@ impl OpenTofu {
             .map_err(|_| DriverError::Uncertain("the resource's cookie is not readable".into()))
     }
 
+    /// The version the last apply ran, from what it retained; none when it
+    /// cannot be read.
+    fn retained_pin(&self, req: &DriverRequest) -> Option<Value> {
+        let retained = self.retained(req).ok()?;
+        let lock = fs::read_to_string(self.state_dir(req).join(LOCK_FILE)).ok();
+        serde_json::to_value(Pinned {
+            source: retained.source,
+            lock,
+        })
+        .ok()
+    }
+
     fn append_logs(req: &DriverRequest) -> bool {
         req.values
             .get("append_logs_to_error")
@@ -1660,6 +1683,9 @@ impl Driver for OpenTofu {
             let outputs = state["outputs"].as_object().cloned().unwrap_or_default();
             let mut outputs = split_outputs(outputs, &mut RunLog::default());
             outputs.footprint.backend = Some(self.config.state.id().to_string());
+            // What the last apply started with, so a recovered resource
+            // replays at the version it applied.
+            outputs.footprint.pin = self.retained_pin(req);
             Ok(Observation::Ready {
                 outputs,
                 cookie: None,

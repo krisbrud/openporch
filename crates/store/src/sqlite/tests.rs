@@ -920,3 +920,43 @@ async fn concurrent_acceptances_admit_one() {
     assert_eq!(ra.is_ok() as u8 + rb.is_ok() as u8, 1, "{ra:?} {rb:?}");
     assert_eq!(f.generation().await, 1);
 }
+
+#[tokio::test]
+async fn a_checkpoint_replaces_the_resources_pin_in_its_deployment() {
+    let f = Fixture::new().await;
+    let d1 = f.deploy("nginx:1").await;
+    // As a replay copies them: a pin for this resource and for another.
+    sqlx::query(
+        "UPDATE deployments SET snapshot = json_set(snapshot, '$.pins', json(?)) WHERE id = ?",
+    )
+    .bind(json!({DB: {"commit": "a", "modules": {"x": "1"}}, "other": {"commit": "o"}}).to_string())
+    .bind(&d1.id)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let before = f
+        .store
+        .deployment_snapshot(ORG, "shop", "development", &d1.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let op = f.start(&d1.id, DB).await.unwrap();
+    let CheckpointResult::Provisioned(mut p) = provisioned("db1") else {
+        unreachable!()
+    };
+    p.pin = Some(json!({"commit": "b", "modules": {}, "lock": null}));
+    f.store
+        .checkpoint_operation(&op.operation_id, CheckpointResult::Provisioned(p))
+        .await
+        .unwrap();
+    let after = f
+        .store
+        .deployment_snapshot(ORG, "shop", "development", &d1.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The new pin replaces the old one whole; nothing else changes.
+    let mut expected = before;
+    expected["pins"][DB] = json!({"commit": "b", "modules": {}, "lock": null});
+    assert_eq!(after, expected);
+}

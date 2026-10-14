@@ -1192,6 +1192,13 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     );
     assert!(init.contains("-lockfile=readonly"), "{init}");
     assert_eq!(repinned, pin);
+    // An observation reports the version the last apply ran.
+    let Observation::Ready { outputs, .. } =
+        d.get(&request(values.clone(), json!({}))).await.unwrap()
+    else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.footprint.pin, Some(pin.clone()));
 
     // A pin from another source, or with no commit, is refused.
     for (edit, want) in [
@@ -1203,6 +1210,10 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
         (
             json!({"source": {"commit": "--upload-pack=x"}}),
             "names no commit",
+        ),
+        (
+            json!({"source": {"commit": "0".repeat(40)}}),
+            "can no longer be fetched",
         ),
     ] {
         let mut bad = pin.clone();

@@ -215,7 +215,12 @@ deployment replayed from that snapshot fetches the recorded commit rather than
 `source.rev`, and runs `tofu init -lockfile=readonly` with the recorded lock
 file, so it applies the same module with the same provider versions. A replay
 whose definition names another `source.url` or `source.path` than the recorded
-one fails with `TOFU-003`, as does one whose commit can no longer be fetched.
+one fails with `TOFU-003`, as does one whose commit can no longer be fetched;
+that failure comes when the resource's turn comes, so resources before it in
+the graph have already been applied. A resource recovered after a restart
+records the commit and lock file its interrupted apply started with. Replaying
+a deployment that is still running copies only the pins recorded so far; the
+rest resolve `source.rev`.
 
 ## Credentials
 
