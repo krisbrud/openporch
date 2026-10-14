@@ -1239,5 +1239,8 @@ pub fn is_cron(s: &str) -> bool {
         })
 }
 
+mod overrides;
+pub use overrides::{FUNCTION_NAME, Overrides};
+
 #[cfg(test)]
 mod tests;

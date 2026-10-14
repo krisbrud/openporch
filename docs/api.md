@@ -773,6 +773,40 @@ Authorization: Bearer $CI_TOKEN
 }
 ```
 
+A `POST` with a `workload` instead converts a workload document: an
+openporch `Workload` or a Score file (with an optional `overlay`, a
+`WorkloadOverlay` document), as YAML or JSON text. `overrides` supplies
+deploy-time values: `images` by container ID (or `main` for an image
+function), `artifacts` by function name (`main`), and `properties` by dotted
+path into the document. A property value is read as YAML, except that it stays
+a string where it replaces one. An image or artifact left as `.` must be
+supplied. The delta adds the workload to the environment's desired set, as
+here, or updates it there (an empty update when nothing changed, so redeploying the
+same document yields the same set). `base_generation` is the environment
+generation it was drafted against: deploying it requires that generation, so
+a deployment accepted in between makes it stale (`409`) instead of being
+overwritten.
+
+```http
+POST /orgs/acme/apps/shop/deltas
+Authorization: Bearer $CI_TOKEN
+
+{"env": "development", "workload": "apiVersion: openporch.dev/v1\nkind: Workload\nmetadata: {name: web}\ncontainers: {web: {image: .}}\n", "overrides": {"images": {"web": "ghcr.io/acme/web:abc123"}}}
+```
+
+```http-response
+201 Created
+
+{
+  "id": "$WORKLOAD_DELTA",
+  "env": "development",
+  "base_generation": "…",
+  "frozen": false,
+  "created_by": "ci",
+  "modules": {"add": {"web": {"class": "default", "spec": {"containers": {"web": {"image": "ghcr.io/acme/web:abc123"}}}}}}
+}
+```
+
 ```http
 PUT /orgs/acme/apps/shop/deltas/$DELTA
 Authorization: Bearer $CI_TOKEN
@@ -805,7 +839,7 @@ Authorization: Bearer $CI_TOKEN
 ```http-response
 200 OK
 
-[{"id": "$DELTA"}]
+[{"id": "…", "frozen": false}, {"id": "…", "frozen": false}]
 ```
 
 ## Shared values

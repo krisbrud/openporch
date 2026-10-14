@@ -62,6 +62,9 @@ pub struct DeltaRecord {
     pub id: String,
     /// The environment it was created for, if any.
     pub env: Option<String>,
+    /// The environment generation it was drafted against; deploying it
+    /// requires that generation.
+    pub base_generation: Option<i64>,
     /// The delta.
     pub content: Value,
     /// Whether a deployment froze it.

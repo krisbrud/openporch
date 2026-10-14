@@ -557,3 +557,137 @@ fn json_schema_rejects_unknown_fields_and_requires_core_fields() {
         json!({"properties": {"containers": {"type": "null"}}})
     );
 }
+
+fn overrides(
+    images: &[(&str, &str)],
+    artifacts: &[(&str, &str)],
+    props: &[(&str, &str)],
+) -> Overrides {
+    let map = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    Overrides {
+        images: map(images),
+        artifacts: map(artifacts),
+        properties: map(props),
+    }
+}
+
+const WEB: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web:
+    image: ghcr.io/acme/web:latest
+    variables: {PAGE_SIZE: "10"}
+"#;
+
+/// `Override image from CI` in `workload-spec`.
+#[test]
+fn image_override_wins_over_the_file() {
+    let w = parse(WEB)
+        .unwrap()
+        .with_overrides(&overrides(&[("web", "ghcr.io/acme/web:abc123")], &[], &[]))
+        .unwrap();
+    assert_eq!(
+        w.containers.unwrap()["web"].image,
+        "ghcr.io/acme/web:abc123"
+    );
+}
+
+/// `Zip function` in `workload-spec`: deploying needs the artifact.
+#[test]
+fn deploy_time_artifact_is_required_and_supplied_by_name() {
+    let e = parse(FUNCTION)
+        .unwrap()
+        .with_overrides(&Overrides::default())
+        .unwrap_err();
+    assert_eq!(e.path, "function.package.artifact");
+    assert!(e.message.contains("--artifact main="), "{e}");
+
+    let w = parse(FUNCTION)
+        .unwrap()
+        .with_overrides(&overrides(&[], &[("main", "s3://acme/w.zip")], &[]))
+        .unwrap();
+    assert!(
+        matches!(&w.function.unwrap().package, Package::Zip { artifact, .. } if artifact == "s3://acme/w.zip")
+    );
+
+    let e = parse(FUNCTION)
+        .unwrap()
+        .with_overrides(&overrides(&[("main", "img")], &[], &[]))
+        .unwrap_err();
+    assert_eq!(e.path, "images.main");
+}
+
+#[test]
+fn deploy_time_image_is_required() {
+    let doc = WEB.replace("ghcr.io/acme/web:latest", ".");
+    let e = parse(&doc)
+        .unwrap()
+        .with_overrides(&Overrides::default())
+        .unwrap_err();
+    assert_eq!(e.path, "containers.web.image");
+    let e = parse(&doc)
+        .unwrap()
+        .with_overrides(&overrides(&[("api", "x")], &[], &[]))
+        .unwrap_err();
+    assert_eq!(e.path, "images.api");
+}
+
+#[test]
+fn properties_keep_strings_and_read_new_values_as_yaml() {
+    let w = parse(WEB)
+        .unwrap()
+        .with_overrides(&overrides(
+            &[],
+            &[],
+            &[
+                ("containers.web.variables.PAGE_SIZE", "20"),
+                ("containers.web.variables.RETRIES", "3"),
+                ("containers.web.resources.limits.cpu", "2"),
+                ("containers.web.args", "[serve, --fast]"),
+                ("deploy.timeout", "10m"),
+            ],
+        ))
+        .unwrap();
+    let c = &w.containers.as_ref().unwrap()["web"];
+    assert_eq!(c.variables["PAGE_SIZE"], "20");
+    assert_eq!(c.variables["RETRIES"], "3");
+    assert_eq!(c.args.as_deref().unwrap(), ["serve", "--fast"]);
+    assert_eq!(w.deploy.unwrap().timeout.as_deref(), Some("10m"));
+
+    for (path, value) in [
+        ("containers..image", "x"),
+        ("volumes", "{}"),
+        ("containers.web.args.0", "x"),
+    ] {
+        let e = parse(WEB)
+            .unwrap()
+            .with_overrides(&overrides(&[], &[], &[(path, value)]))
+            .unwrap_err();
+        assert!(e.path.starts_with("properties"), "{path}: {e}");
+    }
+}
+
+#[test]
+fn property_scalars_keep_the_type_the_document_needs() {
+    let w = parse(FUNCTION)
+        .unwrap()
+        .with_overrides(&overrides(
+            &[],
+            &[("main", "s3://acme/w.zip")],
+            &[
+                ("function.concurrency.reserved", "5"),
+                ("function.variables.DEBUG", "true"),
+            ],
+        ))
+        .unwrap();
+    let f = w.function.unwrap();
+    assert_eq!(f.concurrency.unwrap().reserved, Some(5));
+    assert_eq!(f.variables["DEBUG"], "true");
+}

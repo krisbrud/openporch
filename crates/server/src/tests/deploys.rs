@@ -1021,3 +1021,147 @@ async fn deployments_are_recorded_with_their_correlated_outcome() {
         );
     }
 }
+
+// --- workload deltas --------------------------------------------------------------
+
+const WEB_WORKLOAD: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web: {image: ., variables: {PAGE_SIZE: "10"}}
+"#;
+
+impl Server {
+    /// Drafts a delta for `development` from a workload request.
+    async fn workload_delta(&self, body: Value) -> (StatusCode, Value) {
+        self.post("/orgs/acme/apps/shop/deltas", &self.admin, body)
+            .await
+    }
+
+    /// Deploys a drafted delta at its base generation and waits for it.
+    async fn deploy_drafted(&self, gate: &Semaphore, delta: &Value) -> Value {
+        let (status, d) = self
+            .deploy(
+                &self.admin,
+                json!({"delta_id": delta["id"], "expected_generation": delta["base_generation"]}),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+        gate.add_permits(1);
+        self.finished(d["id"].as_str().unwrap()).await
+    }
+}
+
+fn web_request(image: &str) -> Value {
+    json!({"env": "development", "workload": WEB_WORKLOAD,
+           "overrides": {"images": {"web": image}}})
+}
+
+/// `Add to an empty environment` and `Redeploy unchanged workload` in
+/// `deployment-sets-and-deltas`, through workload conversion requests.
+#[tokio::test]
+async fn workload_document_becomes_a_delta_against_the_desired_set() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let generation = s.generation("development").await;
+
+    let (status, first) = s.workload_delta(web_request("web:1")).await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["env"], "development");
+    assert_eq!(first["base_generation"], generation);
+    assert_eq!(
+        first["modules"]["add"]["web"]["spec"]["containers"]["web"]["image"],
+        "web:1"
+    );
+    let d1 = s.deploy_drafted(&gate, &first).await;
+    let (_, set) = s
+        .get(
+            &format!(
+                "/orgs/acme/apps/shop/sets/{}",
+                d1["set_id"].as_str().unwrap()
+            ),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(set["modules"].as_object().unwrap().len(), 1);
+
+    // The same document again is an update that changes nothing.
+    let (status, second) = s.workload_delta(web_request("web:1")).await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(second["modules"]["update"]["web"], json!([]));
+    assert_eq!(second["base_generation"], generation + 1);
+    let d2 = s.deploy_drafted(&gate, &second).await;
+    assert_eq!(d2["set_id"], d1["set_id"]);
+
+    // A changed image is a patch of the deployed workload.
+    let (_, third) = s.workload_delta(web_request("web:2")).await;
+    assert_eq!(
+        third["modules"]["update"]["web"],
+        json!([{"op": "replace", "path": "/spec/containers/web/image", "value": "web:2"}])
+    );
+}
+
+/// A drafted delta cannot overwrite a change made after it was drafted.
+#[tokio::test]
+async fn drafted_delta_is_stale_after_another_deployment() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let (_, stale) = s.workload_delta(web_request("web:1")).await;
+    let (_, other) = s.workload_delta(web_request("web:2")).await;
+    s.deploy_drafted(&gate, &other).await;
+
+    // Even at the environment's current generation, the delta's base decides.
+    let current = s.generation("development").await;
+    let (status, body) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": stale["id"], "expected_generation": current}),
+            None,
+        )
+        .await;
+    assert_error(status, &body, StatusCode::CONFLICT, "API-004");
+    assert!(
+        body["message"].as_str().unwrap().contains("generation"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn workload_requests_are_checked() {
+    let s = server().await;
+    s.deployable().await;
+    // A value left for deploy time must be supplied.
+    let (status, body) = s
+        .workload_delta(json!({"env": "development", "workload": WEB_WORKLOAD}))
+        .await;
+    assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        body["message"].as_str().unwrap().contains("--image web="),
+        "{body}"
+    );
+
+    let mut unknown = web_request("web:1");
+    unknown["env"] = json!("nowhere");
+    let (status, _) = s.workload_delta(unknown).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let mut extra = web_request("web:1");
+    extra["shared"] = json!([]);
+    let (status, body) = s.workload_delta(extra).await;
+    assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");
+
+    // A Score file takes an overlay with the class.
+    let score = r#"
+apiVersion: score.dev/v1b1
+metadata: {name: web}
+containers: {web: {image: nginx}}
+"#;
+    let overlay = "apiVersion: openporch.dev/v1\nkind: WorkloadOverlay\nmetadata: {class: edge}\n";
+    let (status, body) = s
+        .workload_delta(json!({"env": "development", "workload": score, "overlay": overlay}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["modules"]["add"]["web"]["class"], "edge");
+}

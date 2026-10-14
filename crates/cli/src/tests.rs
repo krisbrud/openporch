@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::config::{Credentials, FileConfig};
 
+mod deploys;
 mod objects;
 
 /// A dev server on a loopback port.

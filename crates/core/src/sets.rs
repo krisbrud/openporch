@@ -189,6 +189,25 @@ pub fn apply_delta(set: &DeploymentSet, delta: &Delta) -> Result<DeploymentSet, 
     Ok(out)
 }
 
+/// The delta that brings workload `id` in `set` to `module`: an addition when
+/// the set lacks it, otherwise an update (empty when nothing changes).
+pub fn workload_delta(set: &DeploymentSet, id: &WorkloadId, module: &Module) -> Delta {
+    let mut delta = Delta::default();
+    match set.modules.get(id) {
+        None => {
+            delta.modules.add.insert(id.clone(), module.clone());
+        }
+        Some(old) => {
+            let ops = json_patch::diff(
+                &serde_json::to_value(old).expect("modules serialize"),
+                &serde_json::to_value(module).expect("modules serialize"),
+            );
+            delta.modules.update.insert(id.clone(), ops.0);
+        }
+    }
+    delta
+}
+
 /// The delta that transforms `a` into `b`.
 pub fn diff_sets(a: &DeploymentSet, b: &DeploymentSet) -> Delta {
     let mut delta = Delta::default();
@@ -445,5 +464,24 @@ mod tests {
             let reparsed: DeploymentSet = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
             prop_assert_eq!(a.id(), reparsed.id());
         }
+    }
+
+    /// `Redeploy unchanged workload` and `Add to an empty environment`.
+    #[test]
+    fn workload_delta_adds_updates_or_changes_nothing() {
+        let id: WorkloadId = "products".parse().unwrap();
+        let web = products().modules[&id].clone();
+        let empty = DeploymentSet::default();
+        let added = apply_delta(&empty, &workload_delta(&empty, &id, &web)).unwrap();
+        assert_eq!(added.modules.keys().collect::<Vec<_>>(), [&id]);
+
+        let same = workload_delta(&added, &id, &web);
+        assert_eq!(same.modules.update[&id], vec![]);
+        assert_eq!(apply_delta(&added, &same).unwrap().id(), added.id());
+
+        let mut changed = web.clone();
+        changed.spec["containers"]["web"]["variables"]["PAGE_SIZE"] = json!("20");
+        let next = apply_delta(&added, &workload_delta(&added, &id, &changed)).unwrap();
+        assert_eq!(next.modules[&id], changed);
     }
 }

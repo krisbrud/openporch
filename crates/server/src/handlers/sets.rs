@@ -6,9 +6,11 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use openporch_core::sets::{Delta, DeploymentSet, apply_delta, diff_sets};
-use openporch_store::{DeltaRecord, Store};
-use serde::Serialize;
+use openporch_core::catalog::builtin_types;
+use openporch_core::sets::{Delta, DeploymentSet, apply_delta, diff_sets, workload_delta};
+use openporch_core::workload::{Overrides, Workload};
+use openporch_store::{CatalogStore, DeltaRecord, Store};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{Ctx, JsonBody};
@@ -84,6 +86,8 @@ pub async fn diff(
 pub struct DeltaView {
     id: String,
     env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_generation: Option<i64>,
     frozen: bool,
     created_by: Option<String>,
     #[serde(flatten)]
@@ -95,6 +99,7 @@ impl From<DeltaRecord> for DeltaView {
         Self {
             id: d.id,
             env: d.env,
+            base_generation: d.base_generation,
             frozen: d.frozen,
             created_by: d.created_by,
             content: d.content,
@@ -129,27 +134,89 @@ pub async fn get_delta(
     Ok(Json(delta_or_404(&state, &app, &id).await?.into()))
 }
 
-/// Creates a delta from a raw delta document. The server picks the ID.
+/// A request to draft a delta from a workload document.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadRequest {
+    /// The environment whose desired set the delta changes.
+    env: String,
+    /// An openporch workload document or a Score file, as YAML or JSON text.
+    workload: String,
+    /// A `WorkloadOverlay` document for a Score file.
+    #[serde(default)]
+    overlay: Option<String>,
+    /// Images, artifacts and properties supplied at deploy time.
+    #[serde(default)]
+    overrides: Overrides,
+}
+
+/// Creates a delta, either from a raw delta document or, when the body has a
+/// `workload`, by converting a workload document: the delta brings that
+/// workload to the document's content relative to the environment's desired
+/// set, and deploying it requires the environment generation it was drafted
+/// against. The server picks the ID.
 pub async fn create_delta(
     State(state): State<AppState>,
     ctx: Ctx,
     Path((_, app)): Path<(String, String)>,
-    JsonBody(delta): JsonBody<Delta>,
+    JsonBody(body): JsonBody<Value>,
 ) -> ApiResult<(StatusCode, Json<DeltaView>)> {
     let org = state.org();
     let id = auth::random_id(10);
-    state
-        .store
-        .put_delta(
-            org,
-            &app,
-            &id,
-            &content(&delta)?,
-            ctx.audit(org, "delta.create", format!("{app}/{id}")),
-        )
-        .await?;
+    let audit = ctx.audit(org, "delta.create", format!("{app}/{id}"));
+    if body.get("workload").is_some() {
+        let req: WorkloadRequest =
+            serde_json::from_value(body).map_err(|e| ApiError::invalid(e.to_string()))?;
+        let (delta, generation) = convert(&state, &app, &req).await?;
+        state
+            .store
+            .put_env_delta(
+                org,
+                &app,
+                &id,
+                (&req.env, generation),
+                &content(&delta)?,
+                audit,
+            )
+            .await?;
+    } else {
+        let delta: Delta =
+            serde_json::from_value(body).map_err(|e| ApiError::invalid(e.to_string()))?;
+        state
+            .store
+            .put_delta(org, &app, &id, &content(&delta)?, audit)
+            .await?;
+    }
     let created = delta_or_404(&state, &app, &id).await?;
     Ok((StatusCode::CREATED, Json(created.into())))
+}
+
+/// The delta a workload request makes against the environment's desired set,
+/// and the generation that set belongs to.
+async fn convert(state: &AppState, app: &str, req: &WorkloadRequest) -> ApiResult<(Delta, i64)> {
+    let env = super::deploys::env_or_404(state, app, &req.env).await?;
+    if env.state != "active" {
+        return Err(ApiError::conflict(format!(
+            "environment `{app}/{}` is {}",
+            env.id, env.state
+        )));
+    }
+    let invalid = |e: openporch_core::workload::WorkloadError| ApiError::invalid(e.to_string());
+    let workload = Workload::parse(&req.workload, req.overlay.as_deref())
+        .map_err(invalid)?
+        .with_overrides(&req.overrides)
+        .map_err(invalid)?;
+    let mut types = builtin_types();
+    types.extend(state.store.custom_types(state.org()).await?);
+    let converted = workload.to_module(&types).map_err(invalid)?;
+    let base = match &env.desired_set_id {
+        Some(desired) => set_or_404(state, app, desired).await?,
+        None => DeploymentSet::default(),
+    };
+    Ok((
+        workload_delta(&base, &converted.id, &converted.module),
+        env.generation,
+    ))
 }
 
 /// Replaces a delta's content. A delta frozen by a deployment cannot change.

@@ -293,10 +293,20 @@ fn new_guresid() -> Guresid {
     Guresid::from_bytes(bytes)
 }
 
-type DeltaRow = (String, Option<String>, String, Option<i64>, Option<String>);
+type DeltaRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<i64>,
+    Option<String>,
+);
 
-fn delta_record((id, env, content, frozen_at, created_by): DeltaRow) -> Result<DeltaRecord> {
+fn delta_record(
+    (id, env, base_generation, content, frozen_at, created_by): DeltaRow,
+) -> Result<DeltaRecord> {
     Ok(DeltaRecord {
+        base_generation,
         content: serde_json::from_str(&content)
             .map_err(|e| StoreError::Corrupt(format!("delta `{id}`: {e}")))?,
         id,
@@ -304,6 +314,76 @@ fn delta_record((id, env, content, frozen_at, created_by): DeltaRow) -> Result<D
         frozen: frozen_at.is_some(),
         created_by,
     })
+}
+
+impl SqliteStore {
+    /// Stores or replaces a delta; `draft` names the environment and
+    /// generation a new delta is drafted against. A replaced delta keeps both.
+    async fn write_delta(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+        draft: Option<(&str, i64)>,
+        content: &serde_json::Value,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let now = now_ms();
+        let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
+        if let Some((env, base)) = draft {
+            let generation: Option<i64> = sqlx::query_scalar(
+                "SELECT generation FROM envs WHERE org_id = ? AND app_id = ? AND id = ?",
+            )
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let generation = generation
+                .ok_or_else(|| StoreError::NotFound(format!("environment `{app}/{env}`")))?;
+            if generation != base {
+                return Err(StoreError::StaleGeneration {
+                    expected: base,
+                    actual: generation,
+                });
+            }
+        }
+        let frozen: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT frozen_at FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(Some(_)) = frozen {
+            return Err(StoreError::Conflict(format!(
+                "delta `{id}` has been deployed and can no longer change"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO deltas (org_id, app_id, id, env_id, base_generation, content, \
+             created_at, created_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (org_id, app_id, id) \
+             DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(id)
+        .bind(draft.map(|(env, _)| env))
+        .bind(draft.map(|(_, base)| base))
+        .bind(serde_json::to_string(content)?)
+        .bind(now)
+        .bind(&audit.actor)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 impl Store for SqliteStore {
@@ -765,7 +845,7 @@ impl Store for SqliteStore {
     async fn delta(&self, org: &str, app: &str, id: &str) -> Result<Option<DeltaRecord>> {
         self.check_org(org)?;
         let row: Option<DeltaRow> = sqlx::query_as(
-            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+            "SELECT id, env_id, base_generation, content, frozen_at, created_by FROM deltas \
                  WHERE org_id = ? AND app_id = ? AND id = ?",
         )
         .bind(org)
@@ -779,7 +859,7 @@ impl Store for SqliteStore {
     async fn deltas(&self, org: &str, app: &str) -> Result<Vec<DeltaRecord>> {
         self.check_org(org)?;
         let rows: Vec<DeltaRow> = sqlx::query_as(
-            "SELECT id, env_id, content, frozen_at, created_by FROM deltas \
+            "SELECT id, env_id, base_generation, content, frozen_at, created_by FROM deltas \
                  WHERE org_id = ? AND app_id = ? ORDER BY created_at DESC, id",
         )
         .bind(org)
@@ -874,40 +954,20 @@ impl Store for SqliteStore {
         content: &serde_json::Value,
         audit: AuditIntent,
     ) -> Result<()> {
-        self.check_org(org)?;
-        let now = now_ms();
-        let mut tx = self.begin().await?;
-        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
-        let frozen: Option<Option<i64>> = sqlx::query_scalar(
-            "SELECT frozen_at FROM deltas WHERE org_id = ? AND app_id = ? AND id = ?",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(Some(_)) = frozen {
-            return Err(StoreError::Conflict(format!(
-                "delta `{id}` has been deployed and can no longer change"
-            )));
-        }
-        sqlx::query(
-            "INSERT INTO deltas (org_id, app_id, id, content, created_at, created_by, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, app_id, id) \
-             DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-        )
-        .bind(org)
-        .bind(app)
-        .bind(id)
-        .bind(serde_json::to_string(content)?)
-        .bind(now)
-        .bind(&audit.actor)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        audit::insert(&mut tx, &audit, None, None).await?;
-        tx.commit().await?;
-        Ok(())
+        self.write_delta(org, app, id, None, content, audit).await
+    }
+
+    async fn put_env_delta(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+        draft: (&str, i64),
+        content: &serde_json::Value,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.write_delta(org, app, id, Some(draft), content, audit)
+            .await
     }
 
     async fn accept_deployment(&self, req: DeploymentRequest) -> Result<Acceptance> {
