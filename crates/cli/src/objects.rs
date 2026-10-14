@@ -285,16 +285,21 @@ pub(crate) async fn get(session: &Session, args: GetArgs, io: &mut Io<'_>) -> Re
     Ok(())
 }
 
-/// Reads a YAML or JSON document from `file` (`-` for standard input).
-pub fn read_document(file: &Path, io: &mut Io<'_>) -> Result<Value, String> {
-    let text = if file == Path::new("-") {
+/// Reads `file` (`-` for standard input) as text.
+pub fn read_text(file: &Path, io: &mut Io<'_>) -> Result<String, String> {
+    if file == Path::new("-") {
         let mut text = String::new();
         std::io::Read::read_to_string(io.stdin, &mut text)
             .map_err(|e| format!("reading standard input: {e}"))?;
-        text
+        Ok(text)
     } else {
-        std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))?
-    };
+        std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))
+    }
+}
+
+/// Reads a YAML or JSON document from `file` (`-` for standard input).
+pub fn read_document(file: &Path, io: &mut Io<'_>) -> Result<Value, String> {
+    let text = read_text(file, io)?;
     // A document can hold secret inputs, so parser errors give only a location.
     serde_yaml_ng::from_str(&text).map_err(|e| match e.location() {
         Some(l) => format!(

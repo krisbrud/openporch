@@ -229,6 +229,19 @@ pub trait Store: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Creates a delta drafted for an environment against its desired set at a
+    /// base generation (`draft`); deploying it requires that generation. Fails
+    /// with [`StoreError::StaleGeneration`] when the environment has moved on.
+    fn put_env_delta(
+        &self,
+        org: &str,
+        app: &str,
+        id: &str,
+        draft: (&str, i64),
+        content: &serde_json::Value,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Atomically accepts a deployment: checks idempotency, generation and running
     /// work, freezes the delta, records the job, desired set and audit intent, and
     /// increments the environment generation.

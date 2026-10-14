@@ -9,7 +9,7 @@ use crate::objects::document_body;
 use openporch_client::Client;
 
 /// A machine logged in to `server` as its administrator, through the environment.
-fn admin_machine(server: &DevServer) -> Machine {
+pub(super) fn admin_machine(server: &DevServer) -> Machine {
     let mut m = Machine::new();
     m.set("OPENPORCH_URL", &server.url)
         .set("OPENPORCH_ORG", "acme")
@@ -17,7 +17,7 @@ fn admin_machine(server: &DevServer) -> Machine {
     m
 }
 
-fn admin_client(server: &DevServer) -> Client {
+pub(super) fn admin_client(server: &DevServer) -> Client {
     Client::new(&server.url, "acme", Token::new(server.admin.clone())).unwrap()
 }
 

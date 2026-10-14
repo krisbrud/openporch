@@ -4,6 +4,7 @@
 //! run commands in-process against a dev server.
 
 pub mod config;
+pub mod deploys;
 pub mod members;
 pub mod objects;
 pub mod output;
@@ -81,6 +82,26 @@ pub enum Command {
     Secretstores(members::SecretStores),
     /// Queries the audit log, newest first.
     AuditLogs(members::AuditLogs),
+    /// Deploys workload documents.
+    #[command(subcommand)]
+    Workload(deploys::WorkloadCmd),
+    /// Deploys Score files.
+    #[command(subcommand)]
+    Score(deploys::ScoreCmd),
+    /// Deploys a delta, or an earlier deployment again.
+    #[command(subcommand)]
+    Deploy(deploys::DeployCmd),
+    /// Prints logs.
+    #[command(subcommand)]
+    Logs(deploys::LogsCmd),
+    /// Compares deployment sets.
+    #[command(subcommand)]
+    Diff(deploys::DiffCmd),
+    /// Shows an environment's resources.
+    #[command(subcommand)]
+    Resources(deploys::ResourcesCmd),
+    /// Sends an authenticated request to the API and prints the JSON response.
+    Api(deploys::ApiArgs),
 }
 
 /// `porch login`.
@@ -242,6 +263,13 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
         Command::EnvTypes(cmd) => members::env_types(&session, cmd, io).await,
         Command::Secretstores(cmd) => members::secret_stores(&session, cmd, io).await,
         Command::AuditLogs(args) => members::audit_logs(&session, args, io).await,
+        Command::Workload(cmd) => deploys::workload(&session, cmd, io).await,
+        Command::Score(cmd) => deploys::score(&session, cmd, io).await,
+        Command::Deploy(cmd) => deploys::deploy(&session, cmd, io).await,
+        Command::Logs(cmd) => deploys::logs(&session, cmd, io).await,
+        Command::Diff(cmd) => deploys::diff(&session, cmd, io).await,
+        Command::Resources(cmd) => deploys::resources(&session, cmd, io).await,
+        Command::Api(args) => deploys::raw(&session, args, io).await,
     }
 }
 

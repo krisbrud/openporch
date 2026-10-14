@@ -285,6 +285,17 @@ pub(super) async fn resolve(
                 env.id
             )));
         }
+        // A delta drafted from a workload is relative to the desired set at
+        // its base generation; any later change makes it stale.
+        if let Some(base) = record.base_generation
+            && base != env.generation
+        {
+            return Err(StoreError::StaleGeneration {
+                expected: base,
+                actual: env.generation,
+            }
+            .into());
+        }
         let delta: Delta = serde_json::from_value(record.content.clone())
             .map_err(|e| ApiError::internal(format!("stored delta `{id}`: {e}")))?;
         // Deltas apply to the desired set, which starts empty.

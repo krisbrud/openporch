@@ -1973,6 +1973,7 @@ dependencies = [
  "clap",
  "openporch-client",
  "openporch-server",
+ "rand 0.8.8",
  "rpassword",
  "serde",
  "serde_json",

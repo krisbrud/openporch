@@ -224,6 +224,11 @@ impl Runners {
         *current = runner;
     }
 
+    /// The runner for deployments accepted now.
+    pub fn current(&self) -> Arc<dyn Runner> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Recovers a resource with the current runner.
     pub fn recover(&self, recovery: Recovery) -> RecoverFuture {
         let runner = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
