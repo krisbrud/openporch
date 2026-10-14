@@ -146,7 +146,73 @@ pub struct AssumeRole {
     pub region: Option<String>,
 }
 
-/// The AWS Security Token Service.
+/// An S3 object version, named as `s3://<bucket>/<key>?versionId=<version>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Version {
+    /// The bucket.
+    pub bucket: String,
+    /// The object key.
+    pub key: String,
+    /// The version ID.
+    pub version: String,
+}
+
+impl S3Version {
+    /// `uri` as an S3 object version, with its key and version ID
+    /// percent-decoded; `None` for anything else, such as an object named
+    /// without a version.
+    pub fn parse(uri: &str) -> Option<Self> {
+        let (path, query) = uri.strip_prefix("s3://")?.split_once('?')?;
+        let (bucket, key) = path.split_once('/')?;
+        let version = query
+            .split('&')
+            .find_map(|p| p.strip_prefix("versionId="))?;
+        let (key, version) = (percent_decode(key)?, percent_decode(version)?);
+        if bucket.is_empty() || key.is_empty() || version.is_empty() || uri.contains('#') {
+            return None;
+        }
+        Some(Self {
+            bucket: bucket.to_owned(),
+            key,
+            version,
+        })
+    }
+}
+
+/// `s` with `%XX` escapes decoded; `None` when an escape is malformed or the
+/// result is not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+impl fmt::Display for S3Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "s3://{}/{}?versionId={}",
+            self.bucket, self.key, self.version
+        )
+    }
+}
+
+/// The AWS calls the executor makes: the Security Token Service, and S3 to
+/// check that the artifacts a deployment names exist.
 pub trait Sts: Send + Sync {
     /// Assumes a role from the host's own identity.
     fn assume_role(&self, request: AssumeRole)
@@ -157,6 +223,17 @@ pub trait Sts: Send + Sync {
         &'a self,
         credentials: &'a AwsCredentials,
     ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>>;
+
+    /// Whether `object` exists, read with `credentials` or, without them, the
+    /// host's own identity.
+    fn object_exists<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Version,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        let _ = (credentials, object);
+        Box::pin(async { Err(CloudError::Unavailable("S3 cannot be reached".into())) })
+    }
 }
 
 /// When an account was read, relative to [`CredentialResolver::forget`] calls.
@@ -238,6 +315,20 @@ impl CredentialResolver {
             .resolve(account, read_at, secrets, CHECK_WINDOW)
             .await?;
         self.identity(&credentials).await
+    }
+
+    /// Whether `object` exists, read with `credentials` or the host's own
+    /// identity.
+    pub async fn object_exists(
+        &self,
+        credentials: Option<&AwsCredentials>,
+        object: &S3Version,
+    ) -> Result<bool, CloudError> {
+        let exists = self.sts.object_exists(credentials, object).await;
+        match credentials {
+            Some(c) => exists.map_err(|e| redacted(e, c)),
+            None => exists,
+        }
     }
 
     /// Asks STS who `credentials` belong to.

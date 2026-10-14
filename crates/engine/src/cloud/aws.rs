@@ -12,7 +12,7 @@ use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
-use super::{AssumeRole, AwsCredentials, CallerIdentity, CloudError, Sts};
+use super::{AssumeRole, AwsCredentials, CallerIdentity, CloudError, S3Version, Sts};
 
 /// The region STS is called in when neither the account nor the host names one.
 const FALLBACK_REGION: &str = "us-east-1";
@@ -64,6 +64,43 @@ impl AwsSts {
         }
         Client::from_conf(config.build())
     }
+}
+
+impl AwsSts {
+    /// An S3 client in `region`, with the host identity or `credentials`.
+    /// An endpoint set for the host, as for an emulator, is addressed by path.
+    async fn s3(
+        &self,
+        region: Option<&str>,
+        credentials: Option<Credentials>,
+    ) -> aws_sdk_s3::Client {
+        let host = self.host().await;
+        let region = region
+            .map(|r| Region::new(r.to_owned()))
+            .or_else(|| host.region().cloned())
+            .unwrap_or_else(|| Region::from_static(FALLBACK_REGION));
+        let mut config = aws_sdk_s3::config::Builder::from(host)
+            .region(region)
+            .force_path_style(host.endpoint_url().is_some());
+        if let Some(c) = credentials {
+            config = config.credentials_provider(c);
+        }
+        aws_sdk_s3::Client::from_conf(config.build())
+    }
+}
+
+/// The SDK's credentials for `credentials`.
+fn provider(credentials: &AwsCredentials) -> Credentials {
+    Credentials::new(
+        credentials.access_key_id.clone(),
+        credentials.secret_access_key.expose().to_owned(),
+        credentials
+            .session_token
+            .as_ref()
+            .map(|t| t.expose().to_owned()),
+        credentials.expires_at,
+        "openporch",
+    )
 }
 
 /// Maps an SDK failure: a service error carries AWS's code and message, anything
@@ -121,18 +158,8 @@ impl Sts for AwsSts {
         credentials: &'a AwsCredentials,
     ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>> {
         Box::pin(async move {
-            let provider = Credentials::new(
-                credentials.access_key_id.clone(),
-                credentials.secret_access_key.expose().to_owned(),
-                credentials
-                    .session_token
-                    .as_ref()
-                    .map(|t| t.expose().to_owned()),
-                credentials.expires_at,
-                "openporch",
-            );
             let client = self
-                .client(credentials.region.as_deref(), Some(provider))
+                .client(credentials.region.as_deref(), Some(provider(credentials)))
                 .await;
             let out = client
                 .get_caller_identity()
@@ -144,6 +171,75 @@ impl Sts for AwsSts {
                 account: out.account().unwrap_or_default().to_owned(),
                 user_id: out.user_id().unwrap_or_default().to_owned(),
             })
+        })
+    }
+
+    fn object_exists<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Version,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        Box::pin(async move {
+            let mut region = credentials.and_then(|c| c.region.clone());
+            // A bucket in another region than the one asked answers with its
+            // own, and is asked again there once.
+            for _ in 0..2 {
+                let client = self.s3(region.as_deref(), credentials.map(provider)).await;
+                let out = client
+                    .head_object()
+                    .bucket(&object.bucket)
+                    .key(&object.key)
+                    .version_id(&object.version)
+                    .send()
+                    .await;
+                let s = match out {
+                    Ok(_) => return Ok(true),
+                    Err(SdkError::ServiceError(s)) => s,
+                    Err(e) => {
+                        return Err(CloudError::Unavailable(format!(
+                            "S3 HeadObject on `{object}` failed: {}",
+                            DisplayErrorContext(&e)
+                        )));
+                    }
+                };
+                let status = s.raw().status().as_u16();
+                let bucket_region = s
+                    .raw()
+                    .headers()
+                    .get("x-amz-bucket-region")
+                    .map(str::to_owned);
+                match status {
+                    // No such object or version; 405 is a version that is a
+                    // delete marker.
+                    404 | 405 => return Ok(false),
+                    301 | 400 if bucket_region.is_some() && bucket_region != region => {
+                        region = bucket_region;
+                    }
+                    403 => {
+                        return Err(CloudError::Rejected(format!(
+                            "S3 HeadObject on `{object}` was denied; without `s3:ListBucket` \
+                             S3 also denies reading an object that does not exist"
+                        )));
+                    }
+                    500.. => {
+                        return Err(CloudError::Unavailable(format!(
+                            "S3 HeadObject on `{object}` failed with status {status}"
+                        )));
+                    }
+                    _ => {
+                        return Err(CloudError::Rejected(format!(
+                            "S3 HeadObject on `{object}` failed with status {status}{}; check \
+                             the version ID and the account's region",
+                            bucket_region
+                                .map(|r| format!(" (the bucket is in {r})"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+            Err(CloudError::Rejected(format!(
+                "S3 HeadObject on `{object}` was redirected more than once"
+            )))
         })
     }
 }

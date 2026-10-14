@@ -35,6 +35,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::cloud::S3Version;
+
 mod deprovision;
 mod log;
 mod recover;
@@ -349,6 +351,34 @@ pub trait Executor: Send + Sync + 'static {
             ))
         }
     }
+
+    /// Checks that the artifacts a workload deploys still exist, before the
+    /// deployment changes anything. An executor that cannot check accepts
+    /// them, and a missing artifact fails when the workload deploys.
+    fn check_artifacts(
+        &self,
+        check: ArtifactCheck,
+    ) -> impl Future<Output = Result<(), ExecFailure>> + Send {
+        let _ = check;
+        async { Ok(()) }
+    }
+}
+
+/// The artifacts a workload deploys, checked before its deployment changes
+/// anything.
+#[derive(Debug, Clone)]
+pub struct ArtifactCheck {
+    /// The deployment the workload belongs to.
+    pub context: JobContext,
+    /// The workload.
+    pub descriptor: Descriptor,
+    /// The definition it matched.
+    pub definition_id: DefinitionId,
+    /// The cloud account the workload's driver gets credentials for, which
+    /// reads the artifacts.
+    pub account: AccountId,
+    /// The artifact URIs, such as `s3://bucket/key?versionId=v`.
+    pub artifacts: Vec<String>,
 }
 
 /// What observing a resource found.
@@ -480,6 +510,79 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         self
     }
 
+    /// Checks every artifact the deployment's workloads name as an S3 object
+    /// version, with their definitions' cloud accounts; why each workload
+    /// with a missing one cannot deploy. A workload whose definition has no
+    /// cloud account, or one that comes from resources not yet provisioned,
+    /// is left to its driver.
+    async fn check_artifacts(
+        &self,
+        deployment: &Deployment,
+        deadline: Instant,
+    ) -> BTreeMap<Descriptor, String> {
+        let mut missing = BTreeMap::new();
+        for node in deployment.graph.nodes.values() {
+            let artifacts: Vec<String> = artifacts(node)
+                .into_iter()
+                .filter(|a| S3Version::parse(a).is_some())
+                .collect();
+            if artifacts.is_empty() {
+                continue;
+            }
+            let Some((_, def)) = deployment.definitions.get(&node.definition) else {
+                continue;
+            };
+            let Ok(Some(account)) =
+                driver_account(def, &scope_for(deployment, node, &BTreeMap::new()))
+            else {
+                continue;
+            };
+            let check = ArtifactCheck {
+                context: JobContext::of(deployment),
+                descriptor: node.descriptor.clone(),
+                definition_id: def.id.clone(),
+                account,
+                artifacts,
+            };
+            if let Err(reason) = self.check_with_retries(check, deadline).await {
+                missing.insert(node.descriptor.clone(), reason);
+            }
+        }
+        missing
+    }
+
+    /// Runs `check`, retrying failures that may pass with backoff, within the
+    /// deployment's attempts and deadline.
+    async fn check_with_retries(
+        &self,
+        check: ArtifactCheck,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let checked =
+                tokio::time::timeout_at(deadline, self.executor.check_artifacts(check.clone()))
+                    .await;
+            let (error, retry_after) = match checked {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => return Err(e),
+                Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
+                Err(_) => {
+                    return Err(format!(
+                        "the deployment ran out of time checking the artifacts of `{}`",
+                        check.descriptor
+                    ));
+                }
+            };
+            let delay = retry_after.unwrap_or_else(|| backoff(&self.limits, attempt));
+            if attempt >= self.limits.attempts || Instant::now() + delay >= deadline {
+                return Err(format!("{error} (after {attempt} attempts)"));
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Runs `deployment` to the end and finishes its record: succeeded when
     /// every resource provisioned, failed otherwise. Returns each resource's
     /// outcome.
@@ -497,7 +600,22 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
         let mut tasks: BTreeMap<tokio::task::Id, Descriptor> = BTreeMap::new();
-        loop {
+        // Nothing runs unless every artifact the deployment names exists.
+        let missing = self.check_artifacts(&deployment, deadline).await;
+        for (d, reason) in &missing {
+            outcomes.insert(d.clone(), Outcome::Failed(reason.clone()));
+        }
+        for node in deployment.graph.nodes.values() {
+            if !missing.is_empty() && !missing.contains_key(&node.descriptor) {
+                outcomes.insert(
+                    node.descriptor.clone(),
+                    Outcome::Pending(
+                        "not started: an artifact the deployment needs is missing".into(),
+                    ),
+                );
+            }
+        }
+        while missing.is_empty() {
             // Start every node whose dependencies provisioned, unless time is up.
             for node in deployment.graph.nodes.values() {
                 if started.contains(&node.descriptor)
@@ -726,6 +844,42 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
 
 /// The placeholder scope of `node`: context, the outputs of finished
 /// resources, its workload's dependencies and shared resources, and values.
+/// The cloud account `def` gets credentials for, resolved in `scope`.
+fn driver_account(def: &ResourceDefinition, scope: &MapScope) -> Result<Option<AccountId>, String> {
+    let at = |what: &str| format!("definition `{}`: {what}", def.id);
+    let Some(account) = &def.driver_account else {
+        return Ok(None);
+    };
+    resolve_value(
+        &json!(account),
+        Dialect::DriverAccount,
+        scope,
+        Sink::Plain,
+        "driver_account",
+    )
+    .map_err(|e| at(&e.to_string()))?
+    .as_plain()
+    .and_then(Value::as_str)
+    .ok_or_else(|| at("driver_account must resolve to a string"))?
+    .parse::<AccountId>()
+    .map(Some)
+    .map_err(|e| at(&format!("driver_account: {e}")))
+}
+
+/// The artifacts a workload node deploys, as its function package names them.
+fn artifacts(node: &Node) -> Vec<String> {
+    if node.descriptor.ty.as_str() != "workload" {
+        return Vec::new();
+    }
+    node.params
+        .as_ref()
+        .and_then(|p| p.pointer("/spec/function/package/artifact"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
+}
+
 fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, Done>) -> MapScope {
     let mut scope = MapScope {
         referrer: Some(node.descriptor.clone()),
@@ -1137,24 +1291,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         )
         .map_err(|e| at(&e.to_string()))?;
         let secret_refs = references(&Value::Object(def.driver_inputs.secret_refs.clone()));
-        let driver_account = match &def.driver_account {
-            Some(account) => Some(
-                resolve_value(
-                    &json!(account),
-                    Dialect::DriverAccount,
-                    scope,
-                    Sink::Plain,
-                    "driver_account",
-                )
-                .map_err(|e| at(&e.to_string()))?
-                .as_plain()
-                .and_then(Value::as_str)
-                .ok_or_else(|| at("driver_account must resolve to a string"))?
-                .parse::<AccountId>()
-                .map_err(|e| at(&format!("driver_account: {e}")))?,
-            ),
-            None => None,
-        };
+        let driver_account = driver_account(def, scope)?;
         // Params from a set use the set's placeholders; co-provisioning params
         // use the definition's.
         let dialect = if node.requests.iter().any(|r| {

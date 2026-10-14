@@ -71,6 +71,18 @@ jobs:
           }"
       - name: Account check
         run: cargo test -p openporch-engine real_account_check -- --ignored
+      - name: Artifact check
+        run: |
+          aws s3api create-bucket --bucket openporch-artifacts
+          aws s3api put-bucket-versioning --bucket openporch-artifacts \
+            --versioning-configuration Status=Enabled
+          echo worker > worker.zip
+          export OPENPORCH_TEST_ARTIFACT_BUCKET=openporch-artifacts
+          export OPENPORCH_TEST_ARTIFACT_KEY=order-worker/worker.zip
+          export OPENPORCH_TEST_ARTIFACT_VERSION=$(aws s3api put-object \
+            --bucket openporch-artifacts --key "$OPENPORCH_TEST_ARTIFACT_KEY" \
+            --body worker.zip --query VersionId --output text)
+          cargo test -p openporch-engine real_artifact_check -- --ignored
 
   opentofu:
     name: OpenTofu driver

@@ -23,7 +23,7 @@ use openporch_store::{
 use serde_json::json;
 
 use super::*;
-use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, Sts};
+use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, S3Version, Sts};
 use crate::planner::{
     Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
 };
@@ -198,6 +198,9 @@ impl Driver for FakeDriver {
 /// An STS whose caller identity reports `account`.
 struct FakeSts {
     account: Mutex<String>,
+    /// The objects checked, with the access key they were checked with. A
+    /// version named `gone` does not exist.
+    objects: Mutex<Vec<(Option<String>, String)>>,
 }
 
 impl Sts for FakeSts {
@@ -220,6 +223,19 @@ impl Sts for FakeSts {
                 user_id: "AIDATEST".into(),
             })
         })
+    }
+
+    fn object_exists<'a>(
+        &'a self,
+        credentials: Option<&'a AwsCredentials>,
+        object: &'a S3Version,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        self.objects.lock().unwrap().push((
+            credentials.map(|c| c.access_key_id.clone()),
+            object.to_string(),
+        ));
+        let exists = object.version != "gone";
+        Box::pin(async move { Ok(exists) })
     }
 }
 
@@ -328,6 +344,7 @@ impl Fixture {
         drivers.register(driver.clone()).unwrap();
         let sts = Arc::new(FakeSts {
             account: Mutex::new("111122223333".into()),
+            objects: Mutex::new(Vec::new()),
         });
         let cloud = Arc::new(CredentialResolver::new(sts.clone()));
         Self {
@@ -1126,4 +1143,80 @@ async fn a_pin_reaches_the_driver_and_the_version_it_ran_comes_back() {
         Some(json!({"commit": "recorded"}))
     );
     assert_eq!(result.pin, Some(json!({"commit": "recorded"})));
+}
+
+#[tokio::test]
+async fn pinned_artifacts_are_checked_with_the_workloads_account() {
+    let f = Fixture::new().await;
+    f.account().await;
+    let mut pg = plain_pg();
+    pg.driver_account = Some("aws-main".into());
+    f.define(pg, "openporch/none").await;
+    let executor = f.executor(Arc::new(NoPermits));
+    let check = |artifacts: &[&str]| crate::planner::ArtifactCheck {
+        context: crate::planner::JobContext {
+            org: ORG.parse().unwrap(),
+            app: "shop".parse().unwrap(),
+            env: "development".parse().unwrap(),
+            env_type: "development".parse().unwrap(),
+            deployment_id: "d-test".into(),
+            permits: Vec::new(),
+        },
+        descriptor: Descriptor::parse(DB).unwrap(),
+        definition_id: "pg".parse().unwrap(),
+        account: "aws-main".parse().unwrap(),
+        artifacts: artifacts.iter().map(|a| (*a).to_owned()).collect(),
+    };
+    let checked = || f.sts.objects.lock().unwrap().clone();
+
+    // An object named without a version is not checked.
+    executor
+        .check_artifacts(check(&["s3://artifacts/latest.zip", "."]))
+        .await
+        .unwrap();
+    assert!(checked().is_empty());
+
+    // A version is read with the account's credentials.
+    executor
+        .check_artifacts(check(&["s3://artifacts/w.zip?versionId=v1"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        checked(),
+        [(
+            Some("AKIATEST".to_owned()),
+            "s3://artifacts/w.zip?versionId=v1".to_owned()
+        )]
+    );
+
+    // A version that is gone is named, and nothing is checked after it.
+    let failure = executor
+        .check_artifacts(check(&[
+            "s3://artifacts/w.zip?versionId=gone",
+            "s3://artifacts/x.zip?versionId=v2",
+        ]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e)
+            if e.contains("artifact `s3://artifacts/w.zip?versionId=gone`")
+                && e.contains("no longer exists")),
+        "{failure:?}"
+    );
+    assert_eq!(checked().len(), 2);
+
+    // A definition that no longer matches does not get its account.
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let failure = executor
+        .check_artifacts(check(&["s3://artifacts/w.zip?versionId=v1"]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e) if e.contains("no longer matches")),
+        "{failure:?}"
+    );
+    assert_eq!(checked().len(), 2);
 }
