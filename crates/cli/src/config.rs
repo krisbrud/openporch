@@ -243,6 +243,10 @@ pub struct Flags {
     pub url: Option<String>,
     /// `--org`.
     pub org: Option<String>,
+    /// `--app`.
+    pub app: Option<String>,
+    /// `--env`.
+    pub env: Option<String>,
     /// `--token`.
     pub token: Option<Token>,
 }
@@ -303,7 +307,11 @@ pub fn resolve(flags: &Flags, env: Env<'_>, file: &FileConfig, creds: &Credentia
         url,
         org,
         token,
-        app: non_empty(file.app.clone()),
-        env: non_empty(file.env.clone()),
+        app: non_empty(flags.app.clone())
+            .or_else(|| non_empty(env("OPENPORCH_APP")))
+            .or_else(|| non_empty(file.app.clone())),
+        env: non_empty(flags.env.clone())
+            .or_else(|| non_empty(env("OPENPORCH_ENV")))
+            .or_else(|| non_empty(file.env.clone())),
     }
 }

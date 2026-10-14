@@ -155,6 +155,36 @@ pub fn url_key(url: &Url) -> String {
     url.as_str().trim_end_matches('/').to_owned()
 }
 
+/// `value` encoded for use as one path segment.
+pub fn segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `path` with `params` appended as a query string; empty values are left out.
+pub fn with_query(path: &str, params: &[(&str, Option<String>)]) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let mut any = false;
+    for (key, value) in params {
+        if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
+            query.append_pair(key, value);
+            any = true;
+        }
+    }
+    if any {
+        format!("{path}?{}", query.finish())
+    } else {
+        path.to_owned()
+    }
+}
+
 /// An application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct App {

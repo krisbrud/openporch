@@ -17,6 +17,8 @@ use tempfile::TempDir;
 use super::*;
 use crate::config::{Credentials, FileConfig};
 
+mod objects;
+
 /// A dev server on a loopback port.
 struct DevServer {
     url: String,
@@ -163,6 +165,7 @@ fn flags_win_over_environment_variables_over_the_config_file() {
         url: Some("https://flag.example.com".into()),
         org: Some("flag-org".into()),
         token: Token::new("flag-token"),
+        ..Flags::default()
     };
 
     let s = resolve(&flags, &all, &file, &creds);
@@ -499,7 +502,7 @@ async fn mistyped_and_malformed_input_does_not_echo_tokens() {
     for args in [
         &["login", "--token", "opt_SECRET123"][..],
         &["login", "--token=opt_SECRET123"][..],
-        &["get", "apps", "opt_SECRET123"][..],
+        &["get", "apps", "x", "opt_SECRET123"][..],
     ] {
         let r = m.porch(args, "").await;
         assert_eq!(r.code, 2, "{r:?}");

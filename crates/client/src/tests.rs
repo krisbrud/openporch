@@ -156,3 +156,22 @@ async fn untrusted_certificate_is_rejected_before_the_token_is_sent() {
         Ok(n) => panic!("the handshake succeeded and the client sent {n} bytes"),
     }
 }
+
+#[test]
+fn paths_are_encoded() {
+    assert_eq!(segment("acme/redis"), "acme%2Fredis");
+    assert_eq!(segment("stg-redis_1.x~"), "stg-redis_1.x~");
+    assert_eq!(segment("a b?#"), "a%20b%3F%23");
+    assert_eq!(
+        with_query(
+            "/x",
+            &[
+                ("user_id", Some("ci".into())),
+                ("method", None),
+                ("path_prefix", Some("/a b".into()))
+            ]
+        ),
+        "/x?user_id=ci&path_prefix=%2Fa+b"
+    );
+    assert_eq!(with_query("/x", &[("a", Some(String::new()))]), "/x");
+}
