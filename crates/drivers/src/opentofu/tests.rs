@@ -36,6 +36,7 @@ fn request(values: Value, secrets: Value) -> DriverRequest {
         context: DriverContext::default(),
         cookie: None,
         permit: None,
+        pin: None,
         log: LogSink::default(),
     }
 }
@@ -560,6 +561,19 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     // that was applied.
     std::fs::write(repo.join("modules/pw/main.tf"), "this is not HCL {").unwrap();
     git(&repo, &["commit", "-q", "-am", "break"]);
+    // A replay pinned to what was applied still applies, with the lock file
+    // read-only.
+    let pin = outputs.footprint.pin.clone().unwrap();
+    assert!(
+        pin["lock"].as_str().unwrap().contains("hashicorp/random"),
+        "{pin}"
+    );
+    let mut replay = req(cookie.clone());
+    replay.pin = Some(pin.clone());
+    let PutOutcome::Ready { outputs, cookie } = d.put(&replay).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.footprint.pin, Some(pin));
     let mut del = req(cookie);
     let Plan::Actions { fingerprint, .. } = d.plan_delete(&del).await.unwrap() else {
         panic!("no destroy actions");
@@ -1096,4 +1110,126 @@ async fn a_process_left_holding_the_output_does_not_hold_up_the_run() {
         .unwrap();
     let pid = std::fs::read_to_string(pid).unwrap();
     assert!(!alive(&pid), "{pid} still runs");
+}
+
+#[tokio::test]
+async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join("modules/pw")).unwrap();
+    std::fs::write(repo.join("modules/pw/main.tf"), "# first\n").unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "first"]);
+    // `init` writes a lock file when the module has none and records the lock
+    // file and module it ran with.
+    let record = root.path().join("record.log");
+    let d = fake_driver(root.path(), |script| {
+        let log = format!("'{}'", record.display());
+        script.replace(
+            "  init) ",
+            &format!(
+                "  init) [ -f .terraform.lock.hcl ] || echo 'generated lock' > .terraform.lock.hcl; \
+                 echo \"LOCK $(cat .terraform.lock.hcl)\" >> {log}; \
+                 echo \"MAIN $(head -1 main.tf)\" >> {log}; "
+            ),
+        )
+    });
+    let url = format!("file://{}", repo.display());
+    let values = json!({"source": {"url": url, "rev": "main", "path": "modules/pw"}});
+    let state = root.path().join("state/0123456789abcdef0123456789abcdef");
+    let put = async |pin: Option<Value>| {
+        std::fs::write(&record, "").unwrap();
+        let mut req = request(values.clone(), json!({}));
+        req.pin = pin;
+        let PutOutcome::Ready { outputs, .. } = d.put(&req).await.unwrap() else {
+            panic!("not ready");
+        };
+        let log = std::fs::read_to_string(&record).unwrap();
+        let line = |prefix: &str| {
+            log.lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap()
+                .to_owned()
+        };
+        // The fake applies nothing; the state shows an applied resource.
+        std::fs::write(state.join("terraform.tfstate"), r#"{"resources":[]}"#).unwrap();
+        (
+            outputs.footprint.pin.unwrap(),
+            line("ARGS init"),
+            line("LOCK "),
+            line("MAIN "),
+        )
+    };
+
+    let (pin, init, lock, main) = put(None).await;
+    assert_eq!(pin["source"]["url"], url.as_str());
+    assert_eq!(pin["source"]["path"], "modules/pw");
+    assert_eq!(pin["source"]["commit"].as_str().unwrap().len(), 40);
+    assert_eq!(pin["lock"], "generated lock\n");
+    assert!(!init.contains("-lockfile"), "{init}");
+    assert_eq!(
+        (lock.as_str(), main.as_str()),
+        ("generated lock", "# first")
+    );
+
+    // The branch moves on and the resource's providers are upgraded.
+    std::fs::write(repo.join("modules/pw/main.tf"), "# second\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "second"]);
+    std::fs::write(state.join(LOCK_FILE), "upgraded lock\n").unwrap();
+    let (_, _, lock, main) = put(None).await;
+    assert_eq!(
+        (lock.as_str(), main.as_str()),
+        ("upgraded lock", "# second")
+    );
+
+    // Pinned, the run uses the first commit and its lock file, read-only.
+    let (repinned, init, lock, main) = put(Some(pin.clone())).await;
+    assert_eq!(
+        (lock.as_str(), main.as_str()),
+        ("generated lock", "# first")
+    );
+    assert!(init.contains("-lockfile=readonly"), "{init}");
+    assert_eq!(repinned, pin);
+    // An observation reports the version the last apply ran.
+    let Observation::Ready { outputs, .. } =
+        d.get(&request(values.clone(), json!({}))).await.unwrap()
+    else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.footprint.pin, Some(pin.clone()));
+
+    // A pin from another source, or with no commit, is refused.
+    for (edit, want) in [
+        (
+            json!({"source": {"url": "file:///elsewhere", "path": "modules/pw"}}),
+            "not the one",
+        ),
+        (json!({"source": null}), "not the one"),
+        (
+            json!({"source": {"commit": "--upload-pack=x"}}),
+            "names no commit",
+        ),
+        (
+            json!({"source": {"commit": "0".repeat(40)}}),
+            "can no longer be fetched",
+        ),
+    ] {
+        let mut bad = pin.clone();
+        for (k, v) in edit.as_object().unwrap() {
+            if v.is_object() {
+                for (field, value) in v.as_object().unwrap() {
+                    bad[k][field] = value.clone();
+                }
+            } else {
+                bad[k] = v.clone();
+            }
+        }
+        let mut req = request(values.clone(), json!({}));
+        req.pin = Some(bad);
+        let (code, message) = invalid(d.put(&req).await.unwrap_err());
+        assert_eq!(code, "TOFU-003", "{message}");
+        assert!(message.contains(want), "{message}");
+    }
 }

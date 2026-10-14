@@ -72,6 +72,9 @@ pub struct Deployment {
     pub values: BTreeMap<String, SharedValue>,
     /// The destructive-action permits the deployment was submitted with.
     pub permits: Vec<String>,
+    /// The version of the drivers' code each resource ran, by descriptor, as
+    /// recorded when it provisioned: a replay runs the same versions.
+    pub pins: BTreeMap<String, Value>,
     /// Whether this deletes the environment: the graph is empty, and every
     /// owned resource is deleted rather than only removed workloads and those
     /// scheduled for deletion.
@@ -134,6 +137,10 @@ impl Deployment {
                 .flatten()
                 .filter_map(|p| p.as_str().map(str::to_owned))
                 .collect(),
+            pins: snapshot["pins"]
+                .as_object()
+                .map(|pins| pins.clone().into_iter().collect())
+                .unwrap_or_default(),
             teardown: false,
         })
     }
@@ -173,6 +180,9 @@ pub struct ProvisionJob {
     /// refuses the job with a permanent failure if the account now resolves to
     /// another target: moving a resource is an explicit migration.
     pub target: Option<String>,
+    /// The version of the driver's code to run, as the deployment this one
+    /// replays recorded it; none to resolve the definition's version.
+    pub pin: Option<Value>,
     /// Whether the resource provisioned before. A change to an existing
     /// resource whose impact the driver cannot preview needs a permit; a
     /// first creation destroys nothing and does not.
@@ -282,6 +292,8 @@ pub struct ProvisionResult {
     pub backend: Option<String>,
     /// The cloud objects the resource consists of, such as ARNs.
     pub external_ids: Vec<String>,
+    /// The version of the code the driver ran, which a replay runs again.
+    pub pin: Option<Value>,
 }
 
 /// Why provisioning failed. Messages are already redacted.
@@ -1015,6 +1027,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                                 target: provisioned.target,
                                 backend: provisioned.backend,
                                 external_ids: provisioned.external_ids,
+                                pin: provisioned.pin,
                                 snapshot: json!({
                                     "deployment_id": deployment.id,
                                     "definition_version": version,
@@ -1193,6 +1206,11 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             input_fingerprint: fingerprint.to_owned(),
             cookie: None,
             target: None,
+            pin: self
+                .deployment
+                .pins
+                .get(&node.descriptor.to_string())
+                .cloned(),
             existing: false,
             deadline: self.deadline,
             log: log.clone(),

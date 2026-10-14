@@ -2114,6 +2114,7 @@ impl SqliteStore {
                     target,
                     backend,
                     external_ids,
+                    pin,
                 } = &**p;
                 sqlx::query(
                     "UPDATE active_resources SET status = 'provisioned', outputs = ?, \
@@ -2148,6 +2149,24 @@ impl SqliteStore {
                 .bind(&guresid)
                 .execute(&mut **tx)
                 .await?;
+                // The deployment's snapshot keeps the version the driver ran,
+                // so a replay of it runs the same one.
+                if let Some(pin) = pin {
+                    sqlx::query(
+                        "UPDATE deployments SET snapshot = json_set(snapshot, '$.pins', \
+                         json_set(COALESCE(json_extract(snapshot, '$.pins'), '{}'), \
+                         '$.' || json_quote(?), json(?))) \
+                         WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
+                    )
+                    .bind(&descriptor)
+                    .bind(serde_json::to_string(pin)?)
+                    .bind(&org)
+                    .bind(&app)
+                    .bind(&env)
+                    .bind(&deployment_id)
+                    .execute(&mut **tx)
+                    .await?;
+                }
                 (
                     "succeeded",
                     None,

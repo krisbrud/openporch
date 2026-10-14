@@ -1484,7 +1484,9 @@ of:
   works in the same environment and while what it used still exists: the
   definitions, the drivers at the same protocol version, and the pinned secret
   versions; otherwise the request is `400`, naming what is missing, before
-  anything runs. Cloud-account credentials are not pinned; every
+  anything runs. A driver that reports the version of the code it ran, such
+  as the OpenTofu driver's commit and lock file, gets that version back for
+  each resource the earlier deployment provisioned. Cloud-account credentials are not pinned; every
   deployment gets fresh ones. Since a preview covers the pinned secret
   versions too, writing a new version of a secret a resource reads makes the
   permits issued for it stale (`DPL-003`); preview again. `"replay": "current"` matches definitions and reads

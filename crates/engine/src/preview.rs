@@ -151,6 +151,8 @@ pub fn preview(
             "node": node,
             "definition": deployment.definitions.get(&node.definition),
             "values": referenced_values(deployment, node),
+            // A replay runs the version of the driver's code it recorded.
+            "pin": deployment.pins.get(&descriptor),
         }));
         let entry = |action, known, reason: &str, permit_required, plan| Entry {
             descriptor: descriptor.clone(),

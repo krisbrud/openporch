@@ -246,6 +246,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             input_fingerprint: op.input_fingerprint.clone(),
             cookie: r.cookie.clone(),
             target: r.target.clone(),
+            pin: None,
             existing: r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some(),
             deadline: Instant::now() + OBSERVE_TIMEOUT,
             log: JobLog::discard(),
@@ -305,5 +306,6 @@ fn provisioned(
         target: result.target,
         backend: result.backend,
         external_ids: result.external_ids,
+        pin: result.pin,
     }
 }

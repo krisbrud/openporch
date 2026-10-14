@@ -209,6 +209,19 @@ even if the branch has moved on or the definition has changed. Variables, files
 and credentials come from the current definition. The resource's cookie carries
 the source commit and the backend.
 
+After an apply, the driver reports the commit and the dependency lock file it
+applied, and the deployment's snapshot records them for the resource. A
+deployment replayed from that snapshot fetches the recorded commit rather than
+`source.rev`, and runs `tofu init -lockfile=readonly` with the recorded lock
+file, so it applies the same module with the same provider versions. A replay
+whose definition names another `source.url` or `source.path` than the recorded
+one fails with `TOFU-003`, as does one whose commit can no longer be fetched;
+that failure comes when the resource's turn comes, so resources before it in
+the graph have already been applied. A resource recovered after a restart
+records the commit and lock file its interrupted apply started with. Replaying
+a deployment that is still running copies only the pins recorded so far; the
+rest resolve `source.rev`.
+
 ## Credentials
 
 Without `credentials_config`, and with a `driver_account` of type `aws` or
@@ -363,9 +376,10 @@ logged, since it holds every value.
 
 ## Git sources
 
-Modules are fetched with a shallow fetch of exactly `source.rev`. A deployment replayed from its snapshot fetches `source.rev` again, so a
-branch can resolve to a newer commit than the one first applied; name a commit
-or tag for replays that apply the same code. `https`
+Modules are fetched with a shallow fetch of exactly `source.rev`, or of the
+recorded commit when a deployment is replayed from its snapshot. The repository
+must keep that commit fetchable: a force-push that drops it makes the replay
+fail. `https`
 repositories authenticate with `source.username` and `source.password`, which
 travel in the environment, not the URL. `ssh` repositories authenticate with
 `source.ssh_key`. Host keys are checked against the known hosts configured for

@@ -507,8 +507,21 @@ async fn an_interrupted_update_is_repeated_rather_than_recorded() {
         .lock()
         .unwrap()
         .insert("postgres".into(), Behavior::Crash);
-    crash(&f, &planner, f.accept().await, || async {
-        fake.attempts(DB) == 2
+    // The other branches finish first, so only the database is left with an
+    // unknown outcome.
+    let update = f.accept().await;
+    let id = update.id.clone();
+    crash(&f, &planner, update, || async {
+        if fake.attempts(DB) != 2 {
+            return false;
+        }
+        for descriptor in [BASE, DNS, ROUTE] {
+            match f.active(descriptor).await {
+                Some(r) if r.status == "provisioned" && r.last_deploy_id.as_ref() == Some(&id) => {}
+                _ => return false,
+            }
+        }
+        true
     })
     .await;
     // The resource exists, which says nothing about whether the update

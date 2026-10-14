@@ -186,6 +186,10 @@ pub struct DriverRequest {
     /// replace infrastructure. A driver that previews refuses destructive
     /// changes whose fingerprint does not match.
     pub permit: Option<String>,
+    /// The version of the code to run, as an earlier call's
+    /// [`Footprint::pin`] reported it, when the deployment replays one that
+    /// ran it. Without it the driver resolves the definition's version.
+    pub pin: Option<Value>,
     /// Where the driver writes its run log, already redacted.
     pub log: LogSink,
 }
@@ -253,7 +257,7 @@ pub struct DriverOutputs {
     pub secrets: SecretMap,
     pub manifests: Vec<Manifest>,
     /// Where the resource lives, kept so a detached resource can be adopted.
-    pub footprint: Footprint,
+    pub footprint: Box<Footprint>,
 }
 
 /// Where a resource lives outside openporch: what a detached resource's
@@ -264,6 +268,10 @@ pub struct Footprint {
     pub backend: Option<String>,
     /// The cloud objects the resource consists of, such as ARNs.
     pub external_ids: Vec<String>,
+    /// The exact version of the code the driver ran, such as a resolved
+    /// commit and dependency lock file. A later call given it as
+    /// [`DriverRequest::pin`] runs the same version. Never secret.
+    pub pin: Option<Value>,
 }
 
 /// The result of `put`.
