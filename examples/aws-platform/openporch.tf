@@ -31,10 +31,10 @@ locals {
     "openporch:env"      = "$${context.env.id}"
     "openporch:resource" = "$${context.res.id}"
   }
-  # A name for AWS from the application, environment and resource ID. Resource
-  # IDs such as `modules.api.externals.orders` have dots, which tables and
-  # policies accept.
-  readable_name = "$${context.app.id}-$${context.env.id}-$${context.res.id}"
+  # A table's name from the application, environment and resource ID, such
+  # as `shop.dev.modules.api.externals.orders`. Application and environment IDs
+  # have no dots, so the name is unique.
+  table_name = "$${context.app.id}.$${context.env.id}.$${context.res.id}"
 }
 
 # --- Environments and workloads ---------------------------------------------
@@ -65,9 +65,11 @@ resource "openporch_resource_definition" "lambda" {
   driver_inputs = {
     source = merge(local.module, { path = "examples/modules/aws-lambda-workload" })
     variables = {
-      app  = "$${context.app.id}"
-      env  = "$${context.env.id}"
-      tags = local.tags
+      app                  = "$${context.app.id}"
+      env                  = "$${context.env.id}"
+      iam_path             = local.iam_path
+      permissions_boundary = aws_iam_policy.boundary.arn
+      tags                 = local.tags
     }
   }
 }
@@ -105,25 +107,26 @@ resource "openporch_resource_class" "policy" {
 locals {
   dependencies = {
     dynamodb-table = {
-      name   = "DynamoDB table"
-      module = "examples/modules/dynamodb-table"
-      # Tables accept dots.
-      resource_name = local.readable_name
-      policy_arn    = { table_arn = "$${resources.dynamodb-table.outputs.arn}" }
+      name          = "DynamoDB table"
+      module        = "examples/modules/dynamodb-table"
+      resource_name = local.table_name
+      # The class is named, since a reference without one means the policy's
+      # own class. These definitions provision the `default` class.
+      policy_arn = { table_arn = "$${resources.dynamodb-table.default.outputs.arn}" }
     }
     sqs = {
       name   = "SQS queue"
       module = "examples/modules/sqs"
       # Queue names take no dots, and the readable name may be too long.
       resource_name = "${var.name_prefix}-$${context.res.guresid}"
-      policy_arn    = { queue_arn = "$${resources.sqs.outputs.arn}" }
+      policy_arn    = { queue_arn = "$${resources.sqs.default.outputs.arn}" }
     }
     s3 = {
       name   = "S3 bucket"
       module = "examples/modules/s3"
       # Bucket names are unique across AWS.
       resource_name = "${var.name_prefix}-$${context.res.guresid}"
-      policy_arn    = { bucket_arn = "$${resources.s3.outputs.arn}" }
+      policy_arn    = { bucket_arn = "$${resources.s3.default.outputs.arn}" }
     }
   }
 }
@@ -163,9 +166,9 @@ resource "openporch_resource_definition" "policy" {
   driver_inputs = {
     source = merge(local.module, { path = "${each.value.module}/policy" })
     variables = merge(each.value.policy_arn, {
-      # IAM policy names accept dots, up to 128 characters.
-      name = "${local.readable_name}-${each.key}"
-      tags = local.tags
+      name     = "${var.name_prefix}-$${context.res.guresid}"
+      iam_path = local.iam_path
+      tags     = local.tags
     })
   }
 }

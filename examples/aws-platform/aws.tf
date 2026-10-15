@@ -10,6 +10,10 @@ locals {
   partition = data.aws_partition.current.partition
   arn       = "arn:${local.partition}"
   buckets   = "${var.name_prefix}-${join("", [for i in range(32) : "?"])}"
+  # Where the roles and policies openporch creates live.
+  iam_path = "/openporch/"
+  roles    = "${local.arn}:iam::${local.account}:role${local.iam_path}*"
+  policies = "${local.arn}:iam::${local.account}:policy${local.iam_path}*"
 }
 
 # --- The role openporch assumes ---------------------------------------------
@@ -35,9 +39,15 @@ resource "aws_iam_role" "openporch" {
   max_session_duration = 3600
 }
 
-# What the modules in `examples/modules` create and change. The role creates
-# the execution roles of functions and the policies attached to them, so it
-# can grant those roles anything; give it to openporch alone.
+# What the modules in `examples/modules` create and change. The account
+# should hold openporch's resources alone: the role may change every function,
+# table, queue and log group of a function in it.
+#
+# IAM is fenced in: the roles and policies openporch creates live under the
+# path `/openporch/`, each role must carry the `boundary` policy below, which
+# caps what any of them may do, and only policies under that path may be
+# attached. So openporch can give a function access to data, but not to IAM
+# or to roles and policies it did not create.
 data "aws_iam_policy_document" "openporch" {
   statement {
     sid       = "Functions"
@@ -102,44 +112,84 @@ data "aws_iam_policy_document" "openporch" {
     resources = [aws_s3_bucket.artifacts.arn, "${aws_s3_bucket.artifacts.arn}/*"]
   }
   statement {
+    # Lambda adds its own pull permission to a repository's policy when it
+    # creates an image function.
     sid       = "Images"
-    actions   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:GetDownloadUrlForLayer"]
+    actions   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:GetDownloadUrlForLayer", "ecr:GetRepositoryPolicy", "ecr:SetRepositoryPolicy"]
     resources = ["${local.arn}:ecr:*:${local.account}:repository/*"]
   }
   statement {
-    sid = "IdentityRoles"
-    actions = [
-      "iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
-      "iam:TagRole", "iam:UntagRole", "iam:ListRoleTags", "iam:ListInstanceProfilesForRole",
-      "iam:PutRolePolicy", "iam:GetRolePolicy", "iam:DeleteRolePolicy", "iam:ListRolePolicies",
-      "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:ListAttachedRolePolicies",
-    ]
-    resources = ["${local.arn}:iam::${local.account}:role/*"]
+    sid       = "CreateBoundedRoles"
+    actions   = ["iam:CreateRole", "iam:PutRolePolicy"]
+    resources = [local.roles]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.boundary.arn]
+    }
   }
   statement {
-    sid = "IdentityPolicies"
+    sid       = "AttachOwnPolicies"
+    actions   = ["iam:AttachRolePolicy"]
+    resources = [local.roles]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.boundary.arn]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "iam:PolicyARN"
+      values   = [local.policies]
+    }
+  }
+  statement {
+    sid = "ManageRoles"
+    actions = [
+      "iam:DeleteRole", "iam:GetRole", "iam:TagRole", "iam:UntagRole", "iam:ListRoleTags",
+      "iam:ListInstanceProfilesForRole", "iam:GetRolePolicy", "iam:DeleteRolePolicy", "iam:ListRolePolicies",
+      "iam:DetachRolePolicy", "iam:ListAttachedRolePolicies",
+    ]
+    resources = [local.roles]
+  }
+  statement {
+    sid = "ManagePolicies"
     actions = [
       "iam:CreatePolicy", "iam:DeletePolicy", "iam:GetPolicy", "iam:CreatePolicyVersion", "iam:DeletePolicyVersion",
       "iam:GetPolicyVersion", "iam:ListPolicyVersions", "iam:TagPolicy", "iam:UntagPolicy", "iam:ListPolicyTags",
     ]
-    resources = ["${local.arn}:iam::${local.account}:policy/*"]
+    resources = [local.policies]
   }
   statement {
     sid       = "PassRolesToFunctionsAndSchedules"
     actions   = ["iam:PassRole"]
-    resources = ["${local.arn}:iam::${local.account}:role/*"]
+    resources = [local.roles]
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
       values   = ["lambda.amazonaws.com", "scheduler.amazonaws.com"]
     }
   }
+}
+
+# The most any role openporch creates may do: use data and invoke functions,
+# never IAM. The policies openporch attaches grant the actual access.
+data "aws_iam_policy_document" "boundary" {
   statement {
-    sid       = "NotItsOwnRole"
-    effect    = "Deny"
-    actions   = ["iam:*"]
-    resources = [aws_iam_role.openporch.arn]
+    sid = "Data"
+    actions = [
+      "dynamodb:*", "sqs:*", "s3:*", "logs:CreateLogStream", "logs:PutLogEvents", "lambda:InvokeFunction",
+      "ssm:GetParameter", "ssm:GetParameters", "secretsmanager:GetSecretValue", "kms:Decrypt",
+      "xray:PutTraceSegments", "xray:PutTelemetryRecords",
+    ]
+    resources = ["*"]
   }
+}
+
+resource "aws_iam_policy" "boundary" {
+  name        = "${var.name_prefix}-boundary"
+  description = "The most a role openporch creates may do."
+  policy      = data.aws_iam_policy_document.boundary.json
 }
 
 resource "aws_iam_role_policy" "openporch" {
@@ -150,9 +200,9 @@ resource "aws_iam_role_policy" "openporch" {
 
 # --- Function artifacts -----------------------------------------------------
 
-# CI uploads zips here; deployments pin each to its object version, so a
-# version stays usable for rollbacks and replays until the lifecycle rule
-# below expires it after it stops being current.
+# CI uploads zips here; deployments pin each to its object version, which
+# stays usable for rollbacks and replays: replaced and deleted versions are
+# kept unless `artifact_noncurrent_days` says otherwise.
 resource "aws_s3_bucket" "artifacts" {
   bucket = "${var.name_prefix}-artifacts-${local.account}"
 }
@@ -176,14 +226,23 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
 
   rule {
-    id     = "expire-replaced-versions"
+    id     = "abort-incomplete-uploads"
     status = "Enabled"
     filter {}
-    noncurrent_version_expiration {
-      noncurrent_days = var.artifact_noncurrent_days
-    }
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
+    }
+  }
+
+  dynamic "rule" {
+    for_each = var.artifact_noncurrent_days == null ? [] : [var.artifact_noncurrent_days]
+    content {
+      id     = "expire-replaced-versions"
+      status = "Enabled"
+      filter {}
+      noncurrent_version_expiration {
+        noncurrent_days = rule.value
+      }
     }
   }
 

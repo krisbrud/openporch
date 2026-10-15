@@ -10,6 +10,8 @@ It creates, with the [openporch provider](../../provider) and the AWS provider:
 - In AWS:
   - the role openporch assumes, `<prefix>-platform`, which only
     `trusted_principal_arn` may assume, with the external ID;
+  - `<prefix>-boundary`, the permissions boundary of every role openporch
+    creates;
   - the versioned artifact bucket `<prefix>-artifacts-<account>`.
 - In openporch:
   - the `production` environment type (`development` always exists);
@@ -31,13 +33,16 @@ A workload of class `aws-lambda` that declares a table, queue or bucket gets
 it, a policy for it, and an execution role with that policy attached. The
 policy is created after the resource and before the function.
 
-AWS names come from the application, environment and resource ID where AWS
-accepts them: tables are `<app>-<env>-<resource ID>`, such as
-`shop-development-modules.order-worker.externals.orders`, and policies the same
-with the type appended. Queue and bucket names take no dots and buckets are
-unique across AWS, so those are `<prefix>-<guresid>`, from the resource's
-permanent ID. Everything is tagged with `openporch:app`, `openporch:env` and
-`openporch:resource`.
+Tables are named `<app>.<env>.<resource ID>`, such as
+`shop.development.modules.order-worker.externals.orders`. Queue names take no
+dots, bucket names are unique across AWS, and both, like policy names, have
+length limits, so queues, buckets and policies are `<prefix>-<guresid>`, from
+the resource's permanent ID. Everything is tagged with `openporch:app`,
+`openporch:env` and `openporch:resource`.
+
+The dependency definitions match only the `default` class, and their policies
+refer to `resources.<type>.default`; a definition for another class needs a
+policy definition that refers to that class.
 
 ## Apply it
 
@@ -52,7 +57,8 @@ tofu apply \
   -var external_id="$(openssl rand -hex 24)"
 ```
 
-`trusted_principal_arn` is the identity the openporch server runs as. Keep the
+Add `-var modules_rev=<tag or commit>` to pin the modules; the default, `main`,
+changes under you. `trusted_principal_arn` is the identity the openporch server runs as. Keep the
 external ID; changing it updates the role and the cloud account together. Then
 check that openporch can assume the role:
 
@@ -61,12 +67,20 @@ curl -X POST -H "Authorization: Bearer $OPENPORCH_TOKEN" \
   "$OPENPORCH_URL/orgs/$OPENPORCH_ORG/resources/accounts/aws/check"
 ```
 
-The role may create and delete Lambda functions, their logs, schedules and
-secret parameters under `/openporch/`, DynamoDB tables, SQS queues, buckets
-named `<prefix>-<guresid>`, IAM roles and policies, and read the artifact
-bucket and ECR images. Since it creates execution roles and the policies
-attached to them, it can grant those roles anything, though not change its
-own; let only openporch assume it.
+Give the platform an AWS account of its own. The role may change every Lambda
+function, DynamoDB table, SQS queue and function log group in the account, as
+well as schedules, secret parameters under `/openporch/`, buckets named
+`<prefix>-<guresid>`, and the repository policies of ECR repositories, and
+read the artifact bucket and ECR images.
+
+In IAM it is fenced in. It creates roles and policies only under the path
+`/openporch/`, each role it creates must carry the `<prefix>-boundary`
+permissions boundary, and it may attach only policies under that path. The
+boundary allows data access (DynamoDB, SQS, S3, reading secret parameters,
+writing logs, invoking functions) and nothing in IAM. So a function can be
+given access to data, but neither openporch nor a function it creates can
+change roles or policies it did not create, including its own role and the
+boundary.
 
 `examples/aws-platform/test.sh` applies the configuration against a dev server,
 checks what the server holds, plans again to see that nothing changes, and
@@ -88,11 +102,12 @@ aws s3 cp build/order-worker.zip "s3://$bucket/$key"
 porch workload deploy -f workload.yaml --artifact "main=s3://$bucket/$key" --wait
 ```
 
-A version that stops being current, because the key was overwritten or the
-object deleted, is kept for `artifact_noncurrent_days` (365 by default) and then
-expired; current versions are never expired. Keep that longer than you may want
-to roll back or replay a deployment: a deployment whose artifact version is gone
-fails before it changes anything. Incomplete uploads are removed after 7 days.
+Every version is kept, also after the key is overwritten or the object
+deleted, so every deployment can be rolled back to and replayed. Setting
+`artifact_noncurrent_days` deletes a version that many days after it stops
+being current, which saves storage but makes the deployments that ran it fail
+on replay, before they change anything. Incomplete uploads are removed after 7
+days.
 
 ## Cost
 
@@ -101,7 +116,8 @@ parameters cost nothing while idle beyond small per-request and storage
 charges, and the free tiers often cover a hobby project's traffic. What keeps
 costing:
 
-- artifact versions in the bucket, until they expire;
+- artifact versions in the bucket, all of which are kept unless
+  `artifact_noncurrent_days` is set;
 - data in tables and buckets, which deleting an environment removes only with
   a permit;
 - CloudWatch logs, kept for 14 days by the Lambda module;
@@ -110,6 +126,9 @@ costing:
 - provisioned concurrency, if a workload sets it;
 - the openporch server itself, and the OpenTofu state if kept in S3.
 
-Destroying this configuration removes the definitions, the cloud account, the
-role and the artifact bucket; the bucket must be empty first. It does not
-remove what deployments created: delete the environments first.
+**Delete every environment before destroying this configuration.** It does not
+remove what deployments created, and while environments still have resources
+the server refuses to delete the definitions, after the criteria are already
+gone. Destroying removes the definitions, the cloud account, the role, the
+boundary and the artifact bucket, which must first be emptied of every object
+version and delete marker.

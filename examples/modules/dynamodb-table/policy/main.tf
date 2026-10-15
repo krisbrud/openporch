@@ -12,6 +12,11 @@ terraform {
 variable "name" {
   type        = string
   description = "The policy name, unique in the account."
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9+=,.@_-]{1,128}$", var.name))
+    error_message = "A policy name has 1 to 128 letters, digits and `+=,.@_-`."
+  }
 }
 
 variable "table_arn" {
@@ -28,6 +33,17 @@ variable "read_only" {
   type        = bool
   default     = false
   description = "Grant only reads."
+}
+
+variable "iam_path" {
+  type        = string
+  default     = "/"
+  description = "The policy's IAM path, such as `/openporch/`, which lets a platform's role manage only what openporch creates."
+
+  validation {
+    condition     = can(regex("^/([A-Za-z0-9+=,.@_-]+/)*$", var.iam_path))
+    error_message = "An IAM path starts and ends with `/`."
+  }
 }
 
 variable "tags" {
@@ -73,6 +89,7 @@ data "aws_iam_policy_document" "this" {
 
 resource "aws_iam_policy" "this" {
   name        = var.name
+  path        = var.iam_path
   description = "Access to the DynamoDB table ${var.table_arn}"
   policy      = data.aws_iam_policy_document.this.json
   tags        = var.tags

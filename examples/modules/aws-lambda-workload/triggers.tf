@@ -187,10 +187,12 @@ data "aws_iam_policy_document" "scheduler_assume" {
 }
 
 resource "aws_iam_role" "scheduler" {
-  count              = length(local.schedules) > 0 ? 1 : 0
-  name               = length("${local.name}-scheduler") <= 64 ? "${local.name}-scheduler" : "${substr(local.name, 0, 44)}-${substr(sha1(local.name), 0, 8)}-scheduler"
-  assume_role_policy = data.aws_iam_policy_document.scheduler_assume.json
-  tags               = var.tags
+  count                = length(local.schedules) > 0 ? 1 : 0
+  name                 = length("${local.name}-scheduler") <= 64 ? "${local.name}-scheduler" : "${substr(local.name, 0, 44)}-${substr(sha1(local.name), 0, 8)}-scheduler"
+  assume_role_policy   = data.aws_iam_policy_document.scheduler_assume.json
+  path                 = var.iam_path
+  permissions_boundary = var.permissions_boundary
+  tags                 = var.tags
 }
 
 resource "aws_iam_role_policy" "scheduler" {

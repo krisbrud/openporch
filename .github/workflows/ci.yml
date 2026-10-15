@@ -180,6 +180,7 @@ jobs:
           AWS_REGION: us-east-1
         run: |
           for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:4566/ && break; sleep 1; done
+          curl -s -o /dev/null http://localhost:4566/ || { echo "Floci did not start" >&2; exit 1; }
           # S3 Control calls go to ACCOUNT.localhost.
           echo "127.0.0.1 000000000000.localhost" | sudo tee -a /etc/hosts
           examples/aws-platform/test.sh target/debug/openporch

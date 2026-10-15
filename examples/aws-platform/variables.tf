@@ -32,8 +32,13 @@ variable "name_prefix" {
 
 variable "artifact_noncurrent_days" {
   type        = number
-  default     = 365
-  description = "How long the artifact bucket keeps a version after a newer one replaces it or it is deleted. Keep it longer than you keep deployments you may roll back to."
+  default     = null
+  description = "Unset, the artifact bucket keeps every version, so every deployment can be rolled back to and replayed. Set, a version is deleted this many days after a newer one replaces it or it is deleted, and deployments that ran it can no longer be replayed."
+
+  validation {
+    condition     = var.artifact_noncurrent_days == null || try(var.artifact_noncurrent_days >= 1, false)
+    error_message = "Keep replaced versions for at least a day, or leave this unset to keep them."
+  }
 }
 
 variable "modules_source" {
