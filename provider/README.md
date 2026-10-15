@@ -15,11 +15,33 @@ importable, and the `openporch_current_user` data source; more follow in tasks
 | `openporch_application` | `APP` |
 | `openporch_environment_type` | `TYPE` |
 | `openporch_environment` | `APP/ENV` |
+| `openporch_resource_class` | `TYPE/CLASS` |
+| `openporch_value` | `APP/KEY` or `APP/ENV/KEY` |
+| `openporch_cloud_account` | `ACCOUNT` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
 lives only in the configuration, so the first apply after an import that sets
 it records it as an in-place update that changes nothing on the server.
+
+## Secrets
+
+`openporch_value` and `openporch_cloud_account` take secrets in two ways. A
+secret value (`secret_value`, or an entry of `secrets`) is written to the
+built-in store, and the server keeps only a reference to it, which the provider
+records in `written_secret_ref(s)`. A reference (`secret_ref`, or an entry of
+`secret_refs`) points at a secret already in a store.
+
+The server never returns a secret value, so the provider cannot compare one
+with the configuration. It writes a secret again only when the configured value
+changes, or when the version on the server is no longer the one it wrote, as
+happens when someone writes the secret outside OpenTofu. An imported secret is
+imported as its reference.
+
+Secret values are kept in the OpenTofu state, as with any provider. Keep the
+state in an encrypted backend that only platform administrators can read, or
+use OpenTofu's state encryption, and prefer references where a secret already
+lives in a store.
 
 ## Deleting applications and environments
 

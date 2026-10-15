@@ -212,7 +212,10 @@ func (c *Client) DoWithHeaders(ctx context.Context, method, path string, headers
 	if len(data) == 0 {
 		return fmt.Errorf("%s %s: the response is empty", method, path)
 	}
-	if err := json.Unmarshal(data, out); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// Numbers in free-form JSON keep their exact text.
+	dec.UseNumber()
+	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("%s %s: decoding the response: %w", method, path, err)
 	}
 	return nil
