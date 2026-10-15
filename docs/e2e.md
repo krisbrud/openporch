@@ -13,8 +13,9 @@ these steps:
 
 1. It applies `examples/aws-platform` with a fresh name prefix (`ope2e-<hex>`)
    and checks that openporch can assume the platform's role.
-2. It creates the application `shop`, the environment `e2e` and the secret
-   shared value `ORDER_SIGNING_KEY`.
+2. It creates the application `shop<hex>`, the environment `e2e` and the secret
+   shared value `ORDER_SIGNING_KEY`. The application has the run's hex, so the
+   AWS names (`shop<hex>-e2e-...`) of two runs never collide.
 3. It uploads the order worker's zip to the artifact bucket, and pushes the
    API's image to a new ECR repository.
 4. It deploys [`examples/lambda-order-worker`](../examples/lambda-order-worker)
@@ -27,15 +28,16 @@ these steps:
    - the table, the queue, and the queue's enabled event source mapping;
    - the nightly schedule, `cron(0 3 * * ? *)` in `Europe/Oslo`.
 
-   It also checks that the signing key is not in the server's log.
+   It also checks that the signing key is not in the server's log, the
+   deployment log or the active resources.
 6. It sends a signed order to the queue and waits for the worker to store it.
 7. It calls the API's function URL at `/`, `/health` and an unknown path.
 8. It uploads a second build of the worker under the same key and deploys it,
    then checks that the function runs the second zip and still stores orders.
-9. It replays the first deployment's snapshot with `porch deploy deploy ID
-   --replay snapshot`, then checks that the function runs the first zip again.
-   S3 keeps both versions, and the deployment pinned the first one. It also
-   checks that orders are still stored.
+9. It replays the snapshot of the API's deployment, the last one with the first
+   zip, with `porch deploy deploy ID --replay snapshot`. Then it checks that the
+   function runs the first zip again: S3 keeps both versions, and the deployment
+   pinned the first one. It also checks that orders are still stored.
 10. It deletes the environment with `porch delete env`, acknowledging each
     deletion the preview marks for a permit. It waits until the environment is
     gone, then checks that none of these is left:
@@ -65,12 +67,14 @@ The results are printed and written to `target/e2e-aws-results.md`, or to
   runs with the same credentials and assumes the platform's role with them, so
   the role trusts that identity:
   - for an IAM user, its ARN;
-  - for a role session (SSO, `assume-role`), the role. If that role has a path,
-    set `OPENPORCH_E2E_TRUSTED_PRINCIPAL` to its ARN, because the session ARN
-    leaves the path out.
+  - for a role session (SSO, `assume-role`), the role, whose ARN with its path
+    the script reads with `iam:GetRole`. Without that permission, set
+    `OPENPORCH_E2E_TRUSTED_PRINCIPAL` to the role's ARN.
 - **The commit pushed to GitHub.** The definitions fetch the modules from
-  `https://github.com/krisbrud/openporch` at the commit being tested.
-  `OPENPORCH_E2E_MODULES_REV` picks another commit, branch or tag.
+  `https://github.com/krisbrud/openporch` at the commit being tested, and the
+  script checks that the commit is there. `OPENPORCH_E2E_MODULES_REV` picks
+  another commit, branch or tag. The platform itself is applied from the
+  working tree, so the script warns when `examples/` has uncommitted changes.
 - **Tools:** `go`, `tofu`, AWS CLI v2, `docker` (with `buildx`), `git`, `zip`,
   `openssl`, `curl` and `jq`.
 
@@ -103,8 +107,8 @@ until they are deleted.
 
 The script deletes what it can before it exits:
 
-- the environment, through openporch, when the failure came after the first
-  deployment;
+- the environment, through openporch, once the first deployment has started,
+  after waiting for a deployment that is still running;
 - the application and the ECR repository;
 - the platform, after emptying the artifact bucket.
 
@@ -116,22 +120,33 @@ keeps its working directory and prints the path. The directory holds:
 - `platform/`: the platform's OpenTofu state;
 - the server log and the deletion preview.
 
+The directory holds the server's master key, an admin token, and OpenTofu
+state with the signing key in plain text. Keep it private, and delete it once
+the cleanup is done.
+
 To finish the cleanup by hand:
 
-1. Start a server on `data/`, with `OPENPORCH_DATA_DIR` and the same AWS
-   credentials.
-2. Delete the environment with `porch delete env e2e --app shop`, using the
-   `--plan` and `--ack` arguments its `--preview` prints.
-3. Empty the artifact bucket.
-4. Run `tofu destroy` in `platform/`. The variables, apart from `external_id`,
-   are in `platform/vars.txt`, and any value of at least 16 characters works
-   for `external_id` when destroying.
+1. Start a server on the directory with the same AWS credentials:
+   `OPENPORCH_ORG=acme OPENPORCH_DATA_DIR=<dir>/data openporch serve`.
+2. Use the admin token in `data/bootstrap-token`; it expires 24 hours after the
+   run started. Set `OPENPORCH_URL`, `OPENPORCH_ORG=acme` and `OPENPORCH_TOKEN`.
+3. Delete the environment with `porch delete env e2e --app shop<hex>`. Use the
+   `--plan` and `--ack` arguments that its `--preview` prints.
+4. Delete the application with `porch delete app shop<hex>`.
+5. Empty the artifact bucket, every version included.
+6. Run `TF_CLI_CONFIG_FILE=<dir>/tofurc tofu destroy -var external_id=<any 16
+   characters>` in `platform/`, with the same `OPENPORCH_*` variables. Its other
+   variables are in `platform/e2e.auto.tfvars.json`, and the provider is in
+   `<dir>/mirror`.
 
 Resources that the state no longer covers can be found by name:
 
-- functions, roles and the schedule start with `shop-e2e-`;
-- policies and buckets start with the run's prefix;
-- the ECR repository is `<prefix>-lambda-api`.
+- functions, roles, schedules and log groups start with `shop<hex>-e2e-` (log
+  groups under `/aws/lambda/`);
+- SSM parameters are under `/openporch/shop<hex>-e2e-`;
+- the table is `shop<hex>.e2e.modules.order-worker.externals.orders`;
+- policies, queues and buckets start with the run's prefix `ope2e-<hex>`;
+- the ECR repository is `ope2e-<hex>-lambda-api`.
 
 ## Results
 

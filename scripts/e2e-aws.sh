@@ -3,7 +3,7 @@
 #
 # It applies examples/aws-platform with a fresh name prefix, deploys
 # examples/lambda-order-worker (a zip) and examples/lambda-api (an image) to the
-# environment `e2e` of the application `shop`, checks what exists in AWS, sends
+# environment `e2e` of a new application `shop<hex>`, checks what exists in AWS, sends
 # a signed order and waits for it to be stored, calls the API's URL, deploys a
 # second artifact under the same key, replays the first deployment's snapshot
 # and checks it runs the first artifact again, deletes the environment with a
@@ -30,8 +30,8 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 
 # --- Guards -------------------------------------------------------------------
 
-if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
-  echo "AWS_ENDPOINT_URL is set; this test runs against real AWS only (examples/aws-platform/test.sh runs against an emulator)" >&2
+if env | grep -q '^AWS_ENDPOINT_URL'; then
+  echo "an AWS_ENDPOINT_URL variable is set; this test runs against real AWS only (examples/aws-platform/test.sh runs against an emulator)" >&2
   exit 2
 fi
 : "${OPENPORCH_E2E_AWS_ACCOUNT:?set OPENPORCH_E2E_AWS_ACCOUNT to the AWS account ID this test may create billed resources in}"
@@ -45,22 +45,38 @@ if [ "$account" != "$OPENPORCH_E2E_AWS_ACCOUNT" ]; then
   exit 2
 fi
 # The server runs with these credentials, so the platform's role trusts their
-# identity. A role session is trusted through its role; a role with a path
-# needs OPENPORCH_E2E_TRUSTED_PRINCIPAL, since the session ARN drops the path.
-principal=${OPENPORCH_E2E_TRUSTED_PRINCIPAL:-$(jq -r .Arn <<<"$caller" |
-  sed -E 's#^arn:([^:]+):sts::([0-9]+):assumed-role/([^/]+)/.*#arn:\1:iam::\2:role/\3#')}
+# identity. A role session (SSO, assume-role) is trusted through its role, whose
+# ARN, with its path, comes from IAM; OPENPORCH_E2E_TRUSTED_PRINCIPAL overrides.
+principal=${OPENPORCH_E2E_TRUSTED_PRINCIPAL:-}
+if [ -z "$principal" ]; then
+  principal=$(jq -r .Arn <<<"$caller")
+  if [[ $principal =~ ^arn:[^:]+:sts::[0-9]+:assumed-role/([^/]+)/ ]]; then
+    principal=$(aws iam get-role --role-name "${BASH_REMATCH[1]}" --query Role.Arn --output text) || {
+      echo "could not read the role of $(jq -r .Arn <<<"$caller"); set OPENPORCH_E2E_TRUSTED_PRINCIPAL to its ARN" >&2
+      exit 2
+    }
+  fi
+fi
 
+# The definitions fetch the modules from the platform's `modules_source`, so the
+# revision must be there.
+modules_source=https://github.com/krisbrud/openporch
 rev=${OPENPORCH_E2E_MODULES_REV:-$(git -C "$repo" rev-parse HEAD)}
-if [ -z "${OPENPORCH_E2E_MODULES_REV:-}" ] && [ -z "$(git -C "$repo" branch -r --contains "$rev" 2>/dev/null)" ]; then
-  echo "commit $rev is not on any remote branch, and the definitions fetch the modules from GitHub; push it or set OPENPORCH_E2E_MODULES_REV" >&2
+if ! git -C "$repo" fetch -q --depth=1 "$modules_source" "$rev" 2>/dev/null; then
+  echo "$modules_source has no $rev, and the definitions fetch the modules from there; push it or set OPENPORCH_E2E_MODULES_REV" >&2
   exit 2
+fi
+if [ -n "$(git -C "$repo" status --porcelain -- examples)" ]; then
+  echo "warning: examples/ has uncommitted changes; the platform comes from the working tree but the modules from $rev" >&2
 fi
 
 # --- Working directory, cleanup and logging ----------------------------------
 
 work=$(mktemp -d)
-prefix="ope2e-$(openssl rand -hex 3)"
-app=shop
+run=$(openssl rand -hex 3)
+prefix="ope2e-$run"
+# AWS names start with `<app>-<env>-`, so each run has its own application.
+app="shop$run"
 env=e2e
 repository="$prefix-lambda-api"
 results="$work/results.md"
@@ -77,6 +93,78 @@ fail() {
   exit 1
 }
 
+porch() { "$porch_bin" "$@"; }
+active() { porch get active-resources "$1" -o json; }
+
+# Signs a body with the signing key, which is passed in the environment rather
+# than on a command line.
+sign() {
+  KEY="$key" python3 -c 'import hashlib, hmac, os, sys
+print(hmac.new(os.environ["KEY"].encode(), sys.stdin.buffer.read(), hashlib.sha256).hexdigest())'
+}
+send_order() {
+  local body="{\"id\": \"$1\", \"total\": 30.5}" signature
+  signature=$(printf %s "$body" | sign)
+  aws sqs send-message --queue-url "$queue_url" --message-body "$body" \
+    --message-attributes "signature={DataType=String,StringValue=$signature}" >/dev/null
+}
+await_order() {
+  for _ in $(seq 1 60); do
+    [ "$(aws dynamodb get-item --table-name "$table" --key "{\"id\": {\"S\": \"$1\"}}" --query Item.total.N --output text)" = 30.5 ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+# Deletes the environment with a permit for every deletion its preview marks.
+delete_env() {
+  local preview plan code status args=()
+  # A deployment that is still running, after a timeout or an interrupt, has to
+  # finish first: deleting during one is refused.
+  for _ in $(seq 1 180); do
+    status=$(porch get deploys +0 -o json 2>/dev/null | jq -r .status) || status=
+    case "$status" in pending | in_progress) sleep 10 ;; *) break ;; esac
+  done
+  preview=$(porch delete env "$env" --preview) || return 1
+  echo "$preview" >"$work/delete-preview.txt"
+  # With changes that need permits, the preview ends with the command that
+  # carries it out: `--plan ID` and one `--ack '...'` per deletion.
+  plan=$(grep -o -- '--plan [^ ]*' <<<"$preview" | head -1 | cut -d' ' -f2)
+  [ -z "$plan" ] || args+=(--plan "$plan")
+  while read -r ack; do
+    [ -z "$ack" ] || args+=(--ack "$ack")
+  done < <(grep -o -- "--ack '[^']*'" <<<"$preview" | sed -E "s/^--ack '(.*)'$/\\1/")
+  porch delete env "$env" "${args[@]}" --comment "e2e cleanup" >/dev/null || return 1
+  # The deletion runs like a deployment; the environment is gone (404) once it
+  # has deleted every resource, and stays `deletion_failed` if one fails.
+  for _ in $(seq 1 180); do
+    code=$(curl -s -o "$work/env.json" -w '%{http_code}' -H @"$work/auth" "$OPENPORCH_URL/orgs/acme/apps/$app/envs/$env")
+    [ "$code" != 404 ] || { env_deployed=; return 0; }
+    [ "$(jq -r .state "$work/env.json" 2>/dev/null)" != deletion_failed ] || { cat "$work/env.json"; return 1; }
+    sleep 5
+  done
+  return 1
+}
+
+tofu_platform() { (cd "$work/platform" && TF_CLI_CONFIG_FILE="$work/tofurc" tofu "$@" -no-color -input=false -var "external_id=$external_id"); }
+destroy_platform() {
+  # Every version of every artifact goes first, or the bucket cannot be deleted.
+  # An apply that failed early may not have created the bucket.
+  if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+    empty_bucket "$bucket" || return 1
+  fi
+  tofu_platform destroy -auto-approve >"$work/destroy.log" 2>&1
+}
+empty_bucket() {
+  local objects
+  while :; do
+    objects=$(aws s3api list-object-versions --bucket "$1" --max-items 500 --output json |
+      jq -c '[(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}]') || return 1
+    [ "$(jq length <<<"$objects")" -gt 0 ] || return 0
+    aws s3api delete-objects --bucket "$1" --delete "{\"Objects\": $objects, \"Quiet\": true}" >/dev/null || return 1
+  done
+}
+
 # What is still to delete if the test stops early.
 env_deployed=
 platform_applied=
@@ -89,7 +177,7 @@ cleanup() {
     delete_env >&2 || left+=" the environment $app/$env (its OpenTofu state is under $work/data);"
   fi
   if [ -n "$app_created" ] && [ -z "$left" ]; then
-    "$porch_bin" delete app "$app" >/dev/null 2>&1
+    porch delete app "$app" >/dev/null 2>&1 || echo "could not delete the application $app; the platform's destroy may fail on its definitions" >&2
   fi
   if [ -n "$repository_created" ]; then
     aws ecr delete-repository --repository-name "$repository" --force >/dev/null ||
@@ -115,8 +203,9 @@ cleanup() {
   fi
   exit "$status"
 }
-trap cleanup EXIT
 app_created=
+bucket=
+trap cleanup EXIT
 
 # --- Server, CLI and provider -------------------------------------------------
 
@@ -154,35 +243,18 @@ OPENPORCH_TOKEN=$(cat "$work/data/bootstrap-token")
 export OPENPORCH_TOKEN TF_IN_AUTOMATION=1
 # The token goes to curl in a file, not on its command line.
 (umask 077 && printf 'Authorization: Bearer %s\n' "$OPENPORCH_TOKEN" >"$work/auth")
-porch() { "$porch_bin" "$@"; }
-active() { porch get active-resources "$1" -o json; }
 
 # --- Platform ------------------------------------------------------------------
 
 mkdir "$work/platform"
 cp "$repo"/examples/aws-platform/*.tf "$work/platform/"
-vars=(
-  -var "aws_region=$region"
-  -var "trusted_principal_arn=$principal"
-  -var "external_id=$(openssl rand -hex 16)"
-  -var "name_prefix=$prefix"
-  -var "modules_rev=$rev"
-)
-printf '%s\n' "${vars[@]}" | grep -v external_id >"$work/platform/vars.txt"
-tofu_platform() { (cd "$work/platform" && TF_CLI_CONFIG_FILE="$work/tofurc" tofu "$@" -no-color -input=false "${vars[@]}"); }
-destroy_platform() {
-  # Every version of every artifact goes first, or the bucket cannot be deleted.
-  empty_bucket "$bucket" && tofu_platform destroy -auto-approve >"$work/destroy.log" 2>&1
-}
-empty_bucket() {
-  local objects
-  while :; do
-    objects=$(aws s3api list-object-versions --bucket "$1" --max-items 500 --output json |
-      jq -c '[(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}]') || return 1
-    [ "$(jq length <<<"$objects")" -gt 0 ] || return 0
-    aws s3api delete-objects --bucket "$1" --delete "{\"Objects\": $objects, \"Quiet\": true}" >/dev/null || return 1
-  done
-}
+# Every variable but the external ID is in a file, so a destroy by hand needs
+# only `-var external_id=<any 16 characters>`.
+jq -n --arg region "$region" --arg principal "$principal" --arg prefix "$prefix" \
+  --arg source "$modules_source" --arg rev "$rev" \
+  '{aws_region: $region, trusted_principal_arn: $principal, name_prefix: $prefix, modules_source: $source, modules_rev: $rev}' \
+  >"$work/platform/e2e.auto.tfvars.json"
+external_id=$(openssl rand -hex 16)
 
 {
   echo "# openporch e2e against AWS"
@@ -222,7 +294,6 @@ worker_zip() {
   mkdir -p "$work/build-$1"
   cp "$repo"/examples/lambda-order-worker/app/{app.py,secret_refs.py} "$work/build-$1/"
   printf '\n# e2e build %s\n' "$1" >>"$work/build-$1/app.py"
-  touch -d @315532800 "$work/build-$1"/*.py
   (cd "$work/build-$1" && zip -X -q "$out" app.py secret_refs.py)
   echo "$out"
 }
@@ -249,10 +320,12 @@ env_deployed=1
 porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
   --artifact "main=s3://$bucket/order-worker/e2e.zip" --comment "e2e build 1" --wait --timeout 30m ||
   fail "the order worker did not deploy"
-first_deploy=$(porch get deploys +0 -o json | jq -r .id)
 porch workload deploy -f "$repo/examples/lambda-api/workload.yaml" \
   --image "main=$registry/$repository:1" --comment "e2e api" --wait --timeout 30m ||
   fail "the API did not deploy"
+# The deployment that is replayed later: both workloads, with the first zip.
+# Replaying one without the API would delete it, which needs a permit.
+first_deploy=$(porch get deploys +0 -o json | jq -r .id)
 
 worker=$(active workload/modules.order-worker) || fail "no active order worker"
 api=$(active workload/modules.lambda-api) || fail "no active API"
@@ -272,7 +345,10 @@ step "Check that the functions, table, queue, schedule and event source mapping 
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >"$work/worker-env.json"
 jq -e --arg t "$table" '.TABLE == $t and (.SIGNING_KEY_SECRET_REF | startswith("/openporch/")) and (has("SIGNING_KEY") | not)' "$work/worker-env.json" >/dev/null ||
   fail "the worker's environment is not as expected: $(jq -c 'del(.SIGNING_KEY)' "$work/worker-env.json")"
-grep -q "$key" "$work/worker-env.json" "$work/server.log" && fail "the signing key reached the function's environment or the server log"
+porch logs deploy +0 >"$work/deploy.log" 2>&1
+porch get active-resources -o json >"$work/active.json"
+grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/server.log" "$work/deploy.log" "$work/active.json" &&
+  fail "the signing key reached the function's environment, the server log, the deployment log or the active resources"
 [ "$(aws dynamodb describe-table --table-name "$table" --query Table.TableStatus --output text)" = ACTIVE ] || fail "the table is not active"
 aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names QueueArn >/dev/null || fail "the queue does not exist"
 mapping=$(aws lambda list-event-source-mappings --function-name "$worker_fn" --event-source-arn "$queue_arn" --query 'EventSourceMappings[0]' --output json)
@@ -283,27 +359,15 @@ schedule=$(aws scheduler get-schedule --name "$(jq -r '.[0]' <<<"$schedules")" -
 [ "$(jq -r '.ScheduleExpression + " " + .ScheduleExpressionTimezone' <<<"$schedule")" = "cron(0 3 * * ? *) Europe/Oslo" ] ||
   fail "the schedule is not as expected: $(jq -c '{ScheduleExpression, ScheduleExpressionTimezone}' <<<"$schedule")"
 
-send_order() {
-  local body="{\"id\": \"$1\", \"total\": 30.5}" signature
-  signature=$(printf %s "$body" | openssl dgst -sha256 -hmac "$key" -r | cut -d' ' -f1)
-  aws sqs send-message --queue-url "$queue_url" --message-body "$body" \
-    --message-attributes "signature={DataType=String,StringValue=$signature}" >/dev/null
-}
-await_order() {
-  for _ in $(seq 1 60); do
-    [ "$(aws dynamodb get-item --table-name "$table" --key "{\"id\": {\"S\": \"$1\"}}" --query Item.total.N --output text)" = 30.5 ] && return 0
-    sleep 5
-  done
-  return 1
-}
-
 step "Send a signed order and see the worker store it"
 send_order e2e-1
 await_order e2e-1 || fail "the order was not stored within 5 minutes"
 
 step "Call the API's URL"
-[ "$(curl -sf "$url" | jq -r .message)" = "Hello from openporch" ] || fail "the API did not greet at $url"
-[ "$(curl -sf "${url%/}/health" | jq -r .status)" = ok ] || fail "the API's /health did not answer"
+# A new function URL's permission can take a few seconds to apply.
+get() { curl -s --retry 6 --retry-all-errors --retry-delay 5 -f "$1"; }
+[ "$(get "$url" | jq -r .message)" = "Hello from openporch" ] || fail "the API did not greet at $url"
+[ "$(get "${url%/}/health" | jq -r .status)" = ok ] || fail "the API's /health did not answer"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "${url%/}/nope")" = 404 ] || fail "the API did not answer 404 for an unknown path"
 
 # --- Second artifact and replay --------------------------------------------------
@@ -330,30 +394,6 @@ await_order e2e-3 || fail "the replayed build did not store an order"
 
 # --- Deletion ------------------------------------------------------------------
 
-delete_env() {
-  # The preview names a permit for every deletion; the test acknowledges each.
-  local preview plan code args=()
-  preview=$(porch delete env "$env" --preview) || return 1
-  echo "$preview" >"$work/delete-preview.txt"
-  # With changes that need permits, the preview ends with the command that
-  # carries it out: `--plan ID` and one `--ack '...'` per deletion.
-  plan=$(grep -o -- '--plan [^ ]*' <<<"$preview" | head -1 | cut -d' ' -f2)
-  [ -z "$plan" ] || args+=(--plan "$plan")
-  while read -r ack; do
-    [ -z "$ack" ] || args+=(--ack "$ack")
-  done < <(grep -o -- "--ack '[^']*'" <<<"$preview" | sed -E "s/^--ack '(.*)'$/\1/")
-  porch delete env "$env" "${args[@]}" --comment "e2e cleanup" >/dev/null || return 1
-  # The deletion runs like a deployment; the environment is gone (404) once it
-  # has deleted every resource, and stays `deletion_failed` if one fails.
-  for _ in $(seq 1 180); do
-    code=$(curl -s -o "$work/env.json" -w '%{http_code}' -H @"$work/auth" "$OPENPORCH_URL/orgs/acme/apps/$app/envs/$env")
-    [ "$code" != 404 ] || { env_deployed=; return 0; }
-    [ "$(jq -r .state "$work/env.json" 2>/dev/null)" != deletion_failed ] || { cat "$work/env.json"; return 1; }
-    sleep 5
-  done
-  return 1
-}
-
 step "Delete the environment with a permit for each deletion"
 delete_env || fail "the environment was not deleted; see $work/delete-preview.txt"
 echo "  ($(grep -o -- "--ack '" "$work/delete-preview.txt" | wc -l) permits)" >>"$results"
@@ -363,6 +403,11 @@ left=()
 aws lambda get-function --function-name "$worker_fn" >/dev/null 2>&1 && left+=("function $worker_fn")
 aws lambda get-function --function-name "$api_fn" >/dev/null 2>&1 && left+=("function $api_fn")
 aws dynamodb describe-table --table-name "$table" >/dev/null 2>&1 && left+=("table $table")
+# SQS can answer for a deleted queue for up to a minute.
+for _ in $(seq 1 12); do
+  aws sqs get-queue-attributes --queue-url "$queue_url" >/dev/null 2>&1 || break
+  sleep 10
+done
 aws sqs get-queue-attributes --queue-url "$queue_url" >/dev/null 2>&1 && left+=("queue $queue_url")
 for name in $(jq -r '.[]' <<<"$schedules"); do
   aws scheduler get-schedule --name "$name" >/dev/null 2>&1 && left+=("schedule $name")
@@ -410,5 +455,7 @@ platform_applied=
 echo >>"$results"
 echo "Finished $(date -u +%Y-%m-%dT%H:%M:%SZ): passed." >>"$results"
 cat "$results"
-cp "$results" "${OPENPORCH_E2E_RESULTS:-$repo/target/e2e-aws-results.md}"
+out=${OPENPORCH_E2E_RESULTS:-$repo/target/e2e-aws-results.md}
+mkdir -p "$(dirname "$out")"
+cp "$results" "$out"
 echo "== ok"
