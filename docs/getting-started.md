@@ -393,8 +393,19 @@ preview it, then run the command the preview prints, with its `--plan` and
 porch delete app shop --preview
 ```
 
-Once the application is gone, delete the platform. Empty the artifact bucket
-first, every version included, then destroy:
+The deletion runs in the background, like a deployment. `porch get apps` shows
+the application as `deleting` until every resource is gone, and then no longer
+lists it. If it shows `deletion_failed`, something could not be deleted; `porch
+get envs` and `porch get active-resources` show what is left, and running the
+deletion again retries it. Wait until `shop` is gone from the list:
+
+```sh
+porch get apps
+```
+
+Only then delete the platform, whose role openporch needs to delete the
+application's resources. Empty the artifact bucket first, every version
+included, then destroy:
 
 ```sh
 cd ~/porch/platform
