@@ -1,6 +1,6 @@
 # The `aws-policy` an `sqs` definition co-provisions: a managed policy that
-# sends to and consumes one queue, which is also what a Lambda event source
-# mapping needs.
+# sends to or consumes one queue, or both. Consuming is also what a Lambda
+# event source mapping needs.
 
 terraform {
   required_version = ">= 1.8"
@@ -24,22 +24,36 @@ variable "queue_arn" {
   }
 }
 
+variable "access" {
+  type        = string
+  default     = "send-and-consume"
+  description = "What the policy grants: `send`, `consume` or `send-and-consume`."
+
+  validation {
+    condition     = contains(["send", "consume", "send-and-consume"], var.access)
+    error_message = "`access` is `send`, `consume` or `send-and-consume`."
+  }
+}
+
 variable "tags" {
   type    = map(string)
   default = {}
 }
 
+locals {
+  send    = ["sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:SendMessage"]
+  consume = ["sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:ReceiveMessage"]
+  actions = {
+    send               = local.send
+    consume            = local.consume
+    "send-and-consume" = sort(distinct(concat(local.send, local.consume)))
+  }
+}
+
 data "aws_iam_policy_document" "this" {
   statement {
-    sid = "Queue"
-    actions = [
-      "sqs:ChangeMessageVisibility",
-      "sqs:DeleteMessage",
-      "sqs:GetQueueAttributes",
-      "sqs:GetQueueUrl",
-      "sqs:ReceiveMessage",
-      "sqs:SendMessage",
-    ]
+    sid       = "Queue"
+    actions   = local.actions[var.access]
     resources = [var.queue_arn]
   }
 }

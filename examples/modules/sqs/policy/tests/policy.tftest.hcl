@@ -18,6 +18,42 @@ run "send_and_consume" {
   }
 }
 
+run "send_only" {
+  command = plan
+
+  variables {
+    name      = "openporch-test-inbox-send"
+    queue_arn = "arn:aws:sqs:us-east-1:000000000000:inbox"
+    access    = "send"
+  }
+
+  assert {
+    condition = (
+      contains(jsondecode(data.aws_iam_policy_document.this.json).Statement[0].Action, "sqs:SendMessage") &&
+      !contains(jsondecode(data.aws_iam_policy_document.this.json).Statement[0].Action, "sqs:ReceiveMessage")
+    )
+    error_message = "A send-only policy does not consume."
+  }
+}
+
+run "consume_only" {
+  command = plan
+
+  variables {
+    name      = "openporch-test-inbox-consume"
+    queue_arn = "arn:aws:sqs:us-east-1:000000000000:inbox"
+    access    = "consume"
+  }
+
+  assert {
+    condition = (
+      contains(jsondecode(data.aws_iam_policy_document.this.json).Statement[0].Action, "sqs:DeleteMessage") &&
+      !contains(jsondecode(data.aws_iam_policy_document.this.json).Statement[0].Action, "sqs:SendMessage")
+    )
+    error_message = "A consume-only policy does not send."
+  }
+}
+
 run "not_a_queue" {
   command = plan
 

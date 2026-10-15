@@ -12,6 +12,10 @@ run "read_write" {
     error_message = "The policy writes the table and reads its indexes."
   }
   assert {
+    condition     = jsondecode(output.document).Statement[1].Resource == "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/*"
+    error_message = "The policy reads the table's stream."
+  }
+  assert {
     condition     = startswith(output.arn, "arn:aws:iam::")
     error_message = "The output is the policy's ARN."
   }

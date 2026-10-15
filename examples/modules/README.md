@@ -19,7 +19,8 @@ execution role attaches.
 Each module's header describes its params. The resource modules take the
 resource's name as the variable `name`; the policy modules take `name` and the
 resource's ARN (`table_arn`, `queue_arn` or `bucket_arn`), and `read_only` for
-tables and buckets. Every module also takes `tags`. The modules use the
+tables and buckets or `access` (`send`, `consume` or `send-and-consume`) for
+queues. The table policy also reads the table's stream. Every module also takes `tags`. The modules use the
 `hashicorp/aws` provider 6.x with the credentials the driver exports for the
 definition's cloud account. Deleting an `s3` resource deletes its objects too,
 so, like every deletion the driver plans, it needs an acknowledgement.

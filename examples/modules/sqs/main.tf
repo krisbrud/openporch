@@ -22,11 +22,11 @@ terraform {
 
 variable "name" {
   type        = string
-  description = "The queue name, unique in the account and region; `.fifo` is added for a FIFO queue."
+  description = "The queue name, unique in the account and region; `.fifo` is added for a FIFO queue, and `-dlq` for its dead-letter queue."
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9_-]{1,75}$", var.name))
-    error_message = "A queue name has 1 to 75 letters, digits, `_` and `-`."
+    condition     = can(regex("^[A-Za-z0-9_-]{1,71}$", var.name))
+    error_message = "A queue name has 1 to 71 letters, digits, `_` and `-`, which leaves room for `-dlq.fifo`."
   }
 }
 

@@ -58,6 +58,17 @@ data "aws_iam_policy_document" "this" {
     actions   = var.read_only ? local.read : concat(local.read, local.write)
     resources = [var.table_arn, "${var.table_arn}/index/*"]
   }
+  # Reading the table's stream, if it has one.
+  statement {
+    sid = "Stream"
+    actions = [
+      "dynamodb:DescribeStream",
+      "dynamodb:GetRecords",
+      "dynamodb:GetShardIterator",
+      "dynamodb:ListStreams",
+    ]
+    resources = ["${var.table_arn}/stream/*"]
+  }
 }
 
 resource "aws_iam_policy" "this" {

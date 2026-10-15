@@ -41,6 +41,16 @@ run "fifo_with_dead_letters" {
   }
 }
 
+run "name_too_long" {
+  command = plan
+
+  variables {
+    name = "a23456789012345678901234567890123456789012345678901234567890123456789012"
+  }
+
+  expect_failures = [var.name]
+}
+
 run "retention_out_of_range" {
   command = plan
 
