@@ -59,6 +59,9 @@ async fn main() -> ExitCode {
     }
 }
 
+/// How long open connections may take to close once shutdown has drained.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(config.as_deref(), |k| std::env::var(k).ok())?;
     let env_key = std::env::var("OPENPORCH_MASTER_KEY").ok();
@@ -68,7 +71,8 @@ async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>
     let (router, specs) = openporch_server::router(state.clone());
     tracing::info!(routes = specs.len(), %listen, ready = state.ready(), "listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(
+    let (drained, closing) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
@@ -78,8 +82,21 @@ async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>
         state
             .drain(std::time::Duration::from_secs(grace_seconds))
             .await;
-    })
-    .await?;
+        let _ = drained.send(());
+    });
+    // Once drained, open connections get a little longer to close; a request
+    // that outlives that does not hold the process up.
+    let deadline = async {
+        if closing.await.is_ok() {
+            tokio::time::sleep(CLOSE_GRACE).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        served = server => served?,
+        () = deadline => tracing::warn!("closing connections that were still open after shutdown"),
+    }
     Ok(())
 }
 

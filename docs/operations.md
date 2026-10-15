@@ -49,7 +49,8 @@ On `SIGTERM` or Ctrl-C the server:
    status requests keep working;
 2. waits up to `shutdown_grace_seconds` (default `60`) for the changes it had
    already accepted, and for running deployments, to finish;
-3. logs the deployments still running when the wait ends, then exits.
+3. logs the deployments still running when the wait ends, gives open
+   connections 5 more seconds to close, then exits.
 
 When the server exits, it stops the OpenTofu processes of the deployments
 still running, so the resources they were changing may be partly changed.
