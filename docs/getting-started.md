@@ -336,7 +336,12 @@ ARTIFACT_BUCKET=$(tofu -chdir="$HOME/porch/platform" output -raw artifact_bucket
 mkdir -p build && rm -f build/order-worker.zip
 (cd app && zip -X -q ../build/order-worker.zip app.py secret_refs.py)
 key="order-worker/$(openssl dgst -sha256 -r build/order-worker.zip | cut -c1-64).zip"
-aws s3 cp build/order-worker.zip "s3://$ARTIFACT_BUCKET/$key"
+# On a new bucket, versioning can take up to 15 minutes to apply. Until then an
+# upload may get no version, which openporch needs to pin, so repeat it.
+until aws s3api put-object --bucket "$ARTIFACT_BUCKET" --key "$key" --body build/order-worker.zip \
+    --query VersionId --output text | grep -qv '^None$'; do
+  sleep 30
+done
 ```
 
 Deploy [`workload.yaml`](../examples/lambda-order-worker/workload.yaml) with
@@ -345,6 +350,10 @@ that artifact:
 ```sh
 porch workload deploy -f workload.yaml --artifact "main=s3://$ARTIFACT_BUCKET/$key" --wait --timeout 30m
 ```
+
+openporch pins the object's version when it accepts the deployment. If it
+cannot read the version yet, it refuses the deployment before changing
+anything; wait a minute and run the command again.
 
 `--wait` follows the deployment's log until it finishes. openporch resolves the
 workload's resources, creates the table, the queue and a policy for each, then
