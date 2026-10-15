@@ -57,6 +57,7 @@ def _store(record, table, key):
         log.warning("dropped message %s: not an order", record.get("messageId"))
         return 0
     table.put_item(Item={**order, "id": order_id})
+    log.info("stored order %s", order_id)
     return 1
 
 

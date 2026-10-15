@@ -65,8 +65,10 @@ class WorkerTest(unittest.TestCase):
             message("not json", key),
             message(json.dumps({"total": 5}), key),
         ]}
-        self.assertEqual(app.handler(event, None, table=table, signing_key=key), {"stored": 1})
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(app.handler(event, None, table=table, signing_key=key), {"stored": 1})
         self.assertEqual(table.items, {"1": {"id": "1", "total": 30}})
+        self.assertIn("INFO:root:stored order 1", logs.output)
 
     def test_decimal_totals_are_stored_as_decimals(self):
         table = FakeTable()

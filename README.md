@@ -41,6 +41,7 @@ just dev    # run the server locally
 just docs   # run the documented examples and the quickstart against a dev server
 just provider  # test the OpenTofu provider and load it into OpenTofu (needs Go and tofu)
 just example-platform  # apply examples/aws-platform against a dev server and AWS or Floci, then destroy it
+just e2e-aws  # opt-in: deploy the Lambda examples to a real AWS account and delete them (docs/e2e.md)
 ```
 
 ## License

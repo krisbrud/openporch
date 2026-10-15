@@ -41,3 +41,9 @@ deny:
 example-platform:
     cargo build -p openporch-server --bin openporch
     examples/aws-platform/test.sh target/debug/openporch
+
+# The opt-in end-to-end test against a real AWS account, which creates billed
+# resources and deletes them again. See docs/e2e.md for what it needs.
+e2e-aws:
+    cargo build -p openporch-server --bin openporch -p openporch-cli --bin porch
+    scripts/e2e-aws.sh target/debug/openporch target/debug/porch
