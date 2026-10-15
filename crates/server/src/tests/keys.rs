@@ -8,6 +8,7 @@ use openporch_store::secrets::{MasterKey, SecretStore as _};
 use serde_json::json;
 
 use super::{Server, assert_error, server, server_in};
+use crate::Config;
 
 fn write_keys(path: &std::path::Path, keys: &[&str]) {
     use std::io::Write as _;
@@ -93,4 +94,24 @@ async fn rotate_the_master_key() {
         std::fs::read_to_string(&path).unwrap().trim(),
         new_key.to_base64().as_str()
     );
+}
+
+#[tokio::test]
+async fn a_second_server_on_the_same_installation_exits_before_any_work() {
+    let s = server().await;
+    let token = std::fs::read_to_string(s.dir.path().join("bootstrap-token")).unwrap();
+    let e = crate::start(Config::new("acme", s.dir.path()), None)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("owned by another openporch process"),
+        "{e}"
+    );
+    // The first server keeps serving, and nothing of its installation changed.
+    assert_eq!(
+        std::fs::read_to_string(s.dir.path().join("bootstrap-token")).unwrap(),
+        token
+    );
+    let (status, apps) = s.get("/orgs/acme/apps", &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{apps}");
 }

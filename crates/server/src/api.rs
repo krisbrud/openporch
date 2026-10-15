@@ -341,11 +341,14 @@ async fn check(
         .await?
         .ok_or_else(ApiError::unauthenticated)?;
     let mutating = !matches!(parts.method, Method::GET | Method::HEAD);
-    if mutating && !state.ready() {
-        return Err(ApiError::not_ready(format!(
-            "the server is not ready: {}",
-            state.not_ready.join(", ")
-        )));
+    if mutating {
+        let reasons = state.not_ready_reasons();
+        if !reasons.is_empty() {
+            return Err(ApiError::not_ready(format!(
+                "the server is not ready: {}",
+                reasons.join(", ")
+            )));
+        }
     }
     let roles = state.store.roles(state.org(), &principal.id).await?;
     let request_id = parts

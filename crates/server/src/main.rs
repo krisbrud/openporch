@@ -63,6 +63,7 @@ async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>
     let config = Config::load(config.as_deref(), |k| std::env::var(k).ok())?;
     let env_key = std::env::var("OPENPORCH_MASTER_KEY").ok();
     let listen = config.listen;
+    let grace_seconds = config.shutdown_grace_seconds;
     let state = openporch_server::start(config, env_key).await?;
     let (router, specs) = openporch_server::router(state.clone());
     tracing::info!(routes = specs.len(), %listen, ready = state.ready(), "listening");
@@ -71,7 +72,13 @@ async fn serve(config: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
+    .with_graceful_shutdown(async move {
+        shutdown().await;
+        // Status requests keep working while running deployments finish.
+        state
+            .drain(std::time::Duration::from_secs(grace_seconds))
+            .await;
+    })
     .await?;
     Ok(())
 }

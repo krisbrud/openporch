@@ -51,6 +51,8 @@ pub struct Inner {
     pub runners: crate::deploy::Runners,
     /// What previews know about the drivers.
     pub drivers: crate::deploy::Drivers,
+    /// Set once shutdown begins: no new changes are accepted.
+    pub draining: std::sync::atomic::AtomicBool,
 }
 
 impl std::ops::Deref for AppState {
@@ -66,9 +68,51 @@ impl AppState {
         &self.config.org
     }
 
-    /// Whether the server can accept changes.
+    /// Whether the server started with its keys. [`Self::not_ready_reasons`]
+    /// also covers the executor and shutdown.
     pub fn ready(&self) -> bool {
         self.not_ready.is_empty()
+    }
+
+    /// Why the server cannot accept changes now, as reason codes that name key
+    /// IDs only; empty when it can.
+    pub fn not_ready_reasons(&self) -> Vec<String> {
+        let mut reasons = self.not_ready.clone();
+        if reasons.is_empty() && !self.runners.has_executor() {
+            reasons.push("executor_unavailable".to_owned());
+        }
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            reasons.push("shutting_down".to_owned());
+        }
+        reasons
+    }
+
+    /// Begins shutdown: refuses new changes, then waits up to `grace` for the
+    /// running deployments, and returns those still running. Their operations
+    /// are already recorded, so a restart marks them interrupted and observes
+    /// each resource whose outcome is unknown before anything changes it again.
+    pub async fn drain(&self, grace: std::time::Duration) -> Vec<String> {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let running = self.runners.running();
+        if !running.is_empty() {
+            tracing::info!(
+                deployments = ?running,
+                grace_seconds = grace.as_secs(),
+                "shutting down: refusing changes and waiting for running deployments"
+            );
+        }
+        let left = self.runners.wait_idle(grace).await;
+        if !left.is_empty() {
+            tracing::warn!(
+                deployments = ?left,
+                "shutting down with deployments still running: the resources they were \
+                 changing may have changed, and OpenTofu processes they started may still \
+                 finish; on restart the deployments are marked failed and resources with an \
+                 unknown outcome are observed before any deployment changes them"
+            );
+        }
+        left
     }
 }
 
@@ -219,6 +263,7 @@ pub async fn start_with(
         token_limit,
         runners: crate::deploy::Runners::default(),
         drivers: crate::deploy::Drivers::default(),
+        draining: Default::default(),
     }));
     prune_sessions(&state);
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {

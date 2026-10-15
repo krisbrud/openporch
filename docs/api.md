@@ -96,8 +96,10 @@ The **Permission** column in each table below means:
 | GET | `/version` | public |
 
 `/livez` answers while the process runs. `/readyz` returns `503` with the reasons,
-such as a missing master key or an unreachable database, while the server cannot
-serve requests.
+such as a missing master key, an unreachable database, no executor or a shutdown
+in progress, while the server cannot accept changes; changes then get `503`
+`SRV-002` and reads keep working. [Operating openporch](operations.md) lists the
+reasons.
 
 ```http
 GET /livez

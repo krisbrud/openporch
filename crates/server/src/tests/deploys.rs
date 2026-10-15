@@ -32,6 +32,18 @@ impl Runner for Held {
     }
 }
 
+/// Fails each deployment as a cloud operation would.
+#[derive(Debug)]
+struct Failing;
+
+impl Runner for Failing {
+    fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            deploy::finish(&state, &job, Some("the cloud refused the change".into())).await;
+        })
+    }
+}
+
 const DEPLOYS: &str = "/orgs/acme/apps/shop/envs/development/deploys";
 
 impl Server {
@@ -543,10 +555,13 @@ async fn redeploys_replay_the_recorded_snapshot_unless_asked_for_current() {
 }
 
 #[tokio::test]
-async fn without_the_engine_deployments_fail_and_free_the_environment() {
+async fn without_an_executor_deployments_are_refused() {
     let s = server().await;
     s.deployable().await;
     s.state.runners.set(Arc::new(deploy::Unimplemented));
+    let (status, ready) = s.call(Method::GET, "/readyz", None, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+    assert_eq!(ready["reasons"], json!(["executor_unavailable"]));
     let (status, d) = s
         .deploy(
             &s.admin,
@@ -554,18 +569,18 @@ async fn without_the_engine_deployments_fail_and_free_the_environment() {
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
-    let done = s.finished(d["id"].as_str().unwrap()).await;
-    assert_eq!(done["status"], "failed");
+    assert_error(status, &d, StatusCode::SERVICE_UNAVAILABLE, "SRV-002");
     assert!(
-        done["error"].as_str().unwrap().contains("not implemented"),
-        "{done}"
+        d["message"]
+            .as_str()
+            .unwrap()
+            .contains("executor_unavailable"),
+        "{d}"
     );
-    let (_, env) = s
-        .get("/orgs/acme/apps/shop/envs/development", &s.admin)
-        .await;
-    assert_eq!(env["convergence"], "partial");
-    assert_eq!(env["last_successful_set_id"], Value::Null);
+    // Nothing was accepted, and reads still work.
+    let (status, page) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["deployments"], json!([]), "{page}");
 }
 
 #[tokio::test]
@@ -962,7 +977,7 @@ async fn deployments_are_recorded_with_their_correlated_outcome() {
     s.grant_app("shop", "ci", "developer").await;
     s.grant_deployer("development", "ci").await;
     // The request is accepted, but its cloud operation fails.
-    s.state.runners.set(Arc::new(deploy::Unimplemented));
+    s.state.runners.set(Arc::new(Failing));
     let (status, d) = s
         .deploy(&ci, json!({"set_id": "0", "expected_generation": 0}), None)
         .await;
@@ -1164,4 +1179,45 @@ containers: {web: {image: nginx}}
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["modules"]["add"]["web"]["class"], "edge");
+}
+
+#[tokio::test]
+async fn shutdown_refuses_changes_and_waits_for_running_deployments() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let (status, d) = s
+        .deploy(
+            &s.admin,
+            json!({"set_id": "0", "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let running = format!("shop/development/{id}");
+
+    // The grace period passes with the deployment still running: it is reported.
+    let left = s.state.drain(std::time::Duration::from_millis(100)).await;
+    assert_eq!(left, vec![running.clone()]);
+
+    // While draining, changes are refused, and status stays available.
+    let (status, ready) = s.call(Method::GET, "/readyz", None, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+    assert_eq!(ready["reasons"], json!(["shutting_down"]));
+    let (status, b) = s
+        .post("/orgs/acme/apps", &s.admin, json!({"id": "late"}))
+        .await;
+    assert_error(status, &b, StatusCode::SERVICE_UNAVAILABLE, "SRV-002");
+    let (status, b) = s.get(&format!("{DEPLOYS}/{id}"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["status"], "in_progress", "{b}");
+
+    // A deployment that finishes within the grace period ends the wait.
+    let drain = tokio::spawn({
+        let state = s.state.clone();
+        async move { state.drain(std::time::Duration::from_secs(30)).await }
+    });
+    gate.add_permits(1);
+    assert_eq!(drain.await.unwrap(), Vec::<String>::new());
+    assert_eq!(s.finished(&id).await["status"], "succeeded");
 }
