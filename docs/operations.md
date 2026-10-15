@@ -114,12 +114,21 @@ find "$OPENTOFU_ROOT" -name retained.json \
     done
 ```
 
+openporch fetches a retained commit from the URL it recorded, so a mirror is
+restored by serving it there again: recreate the repository at that URL and
+push the mirror into it with `git push --mirror`. openporch cannot yet be
+pointed at a different URL for resources it already applied; the
+backup and restore drill in task 14.1 covers that.
+
 With the `s3` backend the state lives in the bucket, and later applies
 overwrite it. Keep the bucket versioned and record, while the server is
-stopped, the version ID of every state object under the key prefix:
+stopped, the version ID of every state object under the key prefix. Use the
+region and credentials the server uses, and, when `[opentofu.state]` sets
+`endpoint`, pass it as `--endpoint-url`:
 
 ```sh
-aws s3api list-object-versions --bucket "$BUCKET" --prefix "$PREFIX/" \
+aws s3api list-object-versions --region "$REGION" ${ENDPOINT:+--endpoint-url "$ENDPOINT"} \
+  --bucket "$BUCKET" --prefix "$PREFIX/" \
   --query 'Versions[?IsLatest].[Key,VersionId]' --output text > backup/state-versions.txt
 ```
 
