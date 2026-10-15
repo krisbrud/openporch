@@ -412,10 +412,19 @@ await_order e2e-1 || fail "the order was not stored within 5 minutes"
 
 step "Call the API's URL"
 # A new function URL's permission can take a few seconds to apply.
-get() { curl -s --retry 6 --retry-all-errors --retry-delay 5 -f "$1"; }
+# Each answer's request ID, which is the invocation's, goes to api-requests.txt,
+# so that the leak check can wait for exactly these invocations' logs.
+get() {
+  local headers="$work/api-headers.txt"
+  rm -f "$headers"
+  curl -s --retry 6 --retry-all-errors --retry-delay 5 -f -D "$headers" "$1" || return 1
+  tr -d '\r' <"$headers" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"$work/api-requests.txt"
+}
 [ "$(get "$url" | jq -r .message)" = "Hello from openporch" ] || fail "the API did not greet at $url"
 [ "$(get "${url%/}/health" | jq -r .status)" = ok ] || fail "the API's /health did not answer"
-[ "$(curl -s -o /dev/null -w '%{http_code}' "${url%/}/nope")" = 404 ] || fail "the API did not answer 404 for an unknown path"
+[ "$(curl -s -o /dev/null -D "$work/api-headers.txt" -w '%{http_code}' "${url%/}/nope")" = 404 ] || fail "the API did not answer 404 for an unknown path"
+tr -d '\r' <"$work/api-headers.txt" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"$work/api-requests.txt"
+[ "$(grep -c . "$work/api-requests.txt")" = 3 ] || fail "the API's answers did not all carry a request ID"
 
 # --- Second artifact and replay --------------------------------------------------
 
@@ -449,22 +458,40 @@ porch get active-resources -o json >"$work/active.json"
 aws lambda get-function-configuration --function-name "$api_fn" --query 'Environment.Variables' --output json >"$work/api-env.json"
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >>"$work/worker-env.json"
 # What the functions logged while they ran: the worker read the key at runtime.
-# Lambda logs can take minutes to arrive, so each log is read once it has a
-# REPORT line for every invocation the test is sure of: three orders for the
-# worker and three requests for the API.
+# Lambda logs can take minutes to arrive, so each log is read until it has the
+# REPORT line, the last line, of every invocation the test made: the worker's
+# that stored the three orders, which it logs with their request IDs, and the
+# API's three, whose request IDs came back with the answers. Other invocations,
+# such as a retry or the nightly schedule, can neither stand in for these nor
+# hold the check up.
+# Usage: runtime_log FUNCTION REQUEST_IDS_FILE, or `-` to take the worker's
+# request IDs from its log.
 runtime_log() {
-  local reports
+  local fn=$1 log="$work/$1.runtime.json" ids missing
   for _ in $(seq 1 60); do
-    aws logs filter-log-events --log-group-name "/aws/lambda/$1" --query 'events[].message' --output json \
-      >"$work/$1.runtime.json" || fail "could not read the log of $1"
-    reports=$(jq '[.[] | select(startswith("REPORT RequestId"))] | length' "$work/$1.runtime.json")
-    [ "$reports" -lt "$2" ] || return 0
+    aws logs filter-log-events --log-group-name "/aws/lambda/$fn" --query 'events[].message' --output json >"$log" ||
+      fail "could not read the log of $fn"
+    if [ "$2" = - ]; then
+      # The Python runtime's log lines are LEVEL, time, request ID and message.
+      # An order stored twice, after a retry, counts with both invocations.
+      ids=$(jq -r '.[] | split("\t") | select(length >= 4 and (.[3] | test("^stored order e2e-[123]\\s*$"))) | .[2]' "$log" | sort -u)
+      if ! jq -e '[.[] | capture("\tstored order (?<order>e2e-[123])\\s*$").order] | unique | length == 3' "$log" >/dev/null; then
+        sleep 10
+        continue
+      fi
+    else
+      ids=$(cat "$2")
+    fi
+    missing=$(while read -r id; do
+      jq -e --arg id "$id" 'any(.[]; startswith("REPORT RequestId: " + $id))' "$log" >/dev/null || echo "$id"
+    done <<<"$ids")
+    [ -n "$missing" ] || return 0
     sleep 10
   done
-  fail "the log of $1 has $reports invocation reports after 10 minutes, fewer than $2"
+  fail "the log of $fn lacks the invocations the test made after 10 minutes"
 }
-runtime_log "$worker_fn" 3
-runtime_log "$api_fn" 3
+runtime_log "$worker_fn" -
+runtime_log "$api_fn" "$work/api-requests.txt"
 grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" \
   "$work/active.json" "$work"/*.out "$work/$worker_fn.runtime.json" "$work/$api_fn.runtime.json" &&
   fail "the signing key reached a function's environment or log, the server log, a deployment log or the active resources"
