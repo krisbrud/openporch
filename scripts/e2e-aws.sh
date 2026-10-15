@@ -87,15 +87,30 @@ results="$work/results.md"
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 echo "== working in $work, name prefix $prefix, account $account, region $region"
 
+# Copies standard input to standard output, leaving out any line with the
+# signing key, which a regression could log. The key comes from the
+# environment, not from a command line.
+redact() {
+  KEY="${key:-}" awk '
+    ENVIRON["KEY"] != "" && index($0, ENVIRON["KEY"]) { print "[a line with the signing key, left out]"; next }
+    { print }'
+}
+# Runs a deployment command with its output in the working directory, and
+# prints that output redacted. Usage: logged NAME COMMAND...
+logged() {
+  local name=$1 status=0
+  shift
+  "$@" >"$work/$name.out" 2>&1 || status=$?
+  redact <"$work/$name.out"
+  return "$status"
+}
 step() { echo "== $*"; printf -- '- %s\n' "$*" >>"$results"; }
 fail() {
   echo "FAILED: $1" >&2
   if [ -f "$work/server.log" ]; then
     echo "== server log" >&2
     # A line with the signing key, which a regression could log, is left out.
-    tail -80 "$work/server.log" | KEY="${key:-}" awk '
-      ENVIRON["KEY"] != "" && index($0, ENVIRON["KEY"]) { print "[a line with the signing key, left out]"; next }
-      { print }' >&2
+    tail -80 "$work/server.log" | redact >&2
   fi
   exit 1
 }
@@ -348,10 +363,10 @@ docker push -q "$registry/$repository:1" >/dev/null
 
 step "Deploy the order worker and the API with porch workload deploy --wait"
 env_deployed=1
-porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
+logged deploy-worker-1 porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
   --artifact "main=s3://$bucket/order-worker/e2e.zip" --comment "e2e build 1" --wait --timeout 30m ||
   fail "the order worker did not deploy"
-porch workload deploy -f "$repo/examples/lambda-api/workload.yaml" \
+logged deploy-api porch workload deploy -f "$repo/examples/lambda-api/workload.yaml" \
   --image "main=$registry/$repository:1" --comment "e2e api" --wait --timeout 30m ||
   fail "the API did not deploy"
 # The deployment that is replayed later: both workloads, with the first zip.
@@ -403,7 +418,7 @@ step "Deploy a second artifact under the same key"
 zip2=$(worker_zip 2)
 version2=$(upload "$zip2") || fail "the artifact bucket did not keep a version of the second upload"
 [ "$version1" != "$version2" ] || fail "the bucket did not keep a new version"
-porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
+logged deploy-worker-2 porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
   --artifact "main=s3://$bucket/order-worker/e2e.zip" --comment "e2e build 2" --wait --timeout 30m ||
   fail "the second artifact did not deploy"
 [ "$(aws lambda get-function --function-name "$worker_fn" --query Configuration.CodeSha256 --output text)" = "$(code_sha "$zip2")" ] ||
@@ -412,7 +427,7 @@ send_order e2e-2
 await_order e2e-2 || fail "the second build did not store an order"
 
 step "Replay the first deployment's snapshot and check it runs the first artifact"
-porch deploy deploy "$first_deploy" --replay snapshot --comment "e2e replay" --wait --timeout 30m ||
+logged replay porch deploy deploy "$first_deploy" --replay snapshot --comment "e2e replay" --wait --timeout 30m ||
   fail "the replay did not deploy"
 [ "$(aws lambda get-function --function-name "$worker_fn" --query Configuration.CodeSha256 --output text)" = "$(code_sha "$zip1")" ] ||
   fail "the replay does not run the first artifact (version $version1)"
@@ -428,8 +443,14 @@ done
 porch get active-resources -o json >"$work/active.json"
 aws lambda get-function-configuration --function-name "$api_fn" --query 'Environment.Variables' --output json >"$work/api-env.json"
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >>"$work/worker-env.json"
-grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" "$work/active.json" &&
-  fail "the signing key reached a function's environment, the server log, a deployment log or the active resources"
+# What the functions logged while they ran: the worker read the key at runtime.
+for fn in "$worker_fn" "$api_fn"; do
+  aws logs filter-log-events --log-group-name "/aws/lambda/$fn" --query 'events[].message' --output json \
+    >"$work/$fn.runtime.json" || fail "could not read the log of $fn"
+done
+grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" \
+  "$work/active.json" "$work"/*.out "$work/$worker_fn.runtime.json" "$work/$api_fn.runtime.json" &&
+  fail "the signing key reached a function's environment or log, the server log, a deployment log or the active resources"
 
 # --- Deletion ------------------------------------------------------------------
 
