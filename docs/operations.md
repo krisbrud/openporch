@@ -106,13 +106,20 @@ branches and tags still reach:
 ```sh
 find "$OPENTOFU_ROOT" -name retained.json \
   -exec jq -r 'select(.source) | "\(.source.url) \(.source.commit)"' {} + \
-  | sort -u | while read -r url commit; do
-      dir="backup/sources/$(echo "$url" | tr -c 'A-Za-z0-9.-' _).git"
+  | sort -u | { status=0; while read -r url commit; do
+      dir="backup/sources/$(printf %s "$url" | tr -c 'A-Za-z0-9.-' _).git"
       [ -d "$dir" ] || git init -q --bare "$dir"
-      git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit"
-      git -C "$dir" cat-file -e "$commit^{commit}" || echo "missing $commit from $url"
-    done
+      if ! git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit" ||
+         ! git -C "$dir" cat-file -e "$commit^{commit}"; then
+        echo "missing $commit from $url" >&2
+        status=1
+      fi
+    done; exit "$status"; }
 ```
+
+It exits non-zero when any commit could not be kept, so the backup is
+incomplete. Fetching a private repository needs the same credentials the
+definition uses.
 
 openporch fetches a retained commit from the URL it recorded, so a mirror is
 restored by serving it there again: recreate the repository at that URL and
@@ -123,11 +130,14 @@ backup and restore drill in task 14.1 covers that.
 With the `s3` backend the state lives in the bucket, and later applies
 overwrite it. Keep the bucket versioned and record, while the server is
 stopped, the version ID of every state object under the key prefix. Use the
-region and credentials the server uses, and, when `[opentofu.state]` sets
-`endpoint`, pass it as `--endpoint-url`:
+region and credentials the server uses. When `[opentofu.state]` sets
+`role_arn`, use an AWS CLI profile that assumes that role (`role_arn` and
+`source_profile` in `~/.aws/config`) and pass it as `PROFILE`; when it sets
+`endpoint`, pass that as `ENDPOINT`:
 
 ```sh
-aws s3api list-object-versions --region "$REGION" ${ENDPOINT:+--endpoint-url "$ENDPOINT"} \
+aws s3api list-object-versions --region "$REGION" ${PROFILE:+--profile "$PROFILE"} \
+  ${ENDPOINT:+--endpoint-url "$ENDPOINT"} \
   --bucket "$BUCKET" --prefix "$PREFIX/" \
   --query 'Versions[?IsLatest].[Key,VersionId]' --output text > backup/state-versions.txt
 ```
