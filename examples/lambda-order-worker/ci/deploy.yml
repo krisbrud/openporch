@@ -5,9 +5,10 @@
 # It needs the repository variables ARTIFACT_BUCKET (the platform's
 # `artifact_bucket` output), AWS_REGION, AWS_UPLOAD_ROLE_ARN (a role CI may
 # assume through GitHub's OIDC provider, allowed `s3:PutObject` on
-# `order-worker/*` in that bucket) and OPENPORCH_URL, and the secret
-# OPENPORCH_TOKEN, a service user's token with the deployer role in the
-# target environment.
+# `order-worker/*` in that bucket), OPENPORCH_URL and PORCH_REV (the openporch
+# commit whose CLI to install), and the secret OPENPORCH_TOKEN, a service user's
+# token with the deployer role in the target environment. Only the Deploy step
+# sees the token.
 name: Deploy the order worker
 
 on:
@@ -21,19 +22,16 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      OPENPORCH_URL: ${{ vars.OPENPORCH_URL }}
-      OPENPORCH_ORG: acme
-      OPENPORCH_APP: shop
-      OPENPORCH_ENV: development
-      OPENPORCH_TOKEN: ${{ secrets.OPENPORCH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: Test
         run: python3 -m unittest discover app
       - name: Build
         run: |
-          mkdir -p build
+          # Fixed timestamps keep the zip, and so its key, the same for the
+          # same code.
+          mkdir -p build && rm -f build/order-worker.zip
+          touch -d @315532800 app/app.py app/secret_refs.py
           (cd app && zip -X -q ../build/order-worker.zip app.py secret_refs.py)
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -45,8 +43,14 @@ jobs:
           key="order-worker/$(sha256sum build/order-worker.zip | cut -c1-64).zip"
           aws s3 cp build/order-worker.zip "s3://${{ vars.ARTIFACT_BUCKET }}/$key"
           echo "uri=s3://${{ vars.ARTIFACT_BUCKET }}/$key" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/porch
+          key: porch-${{ vars.PORCH_REV }}
       - name: Install porch
-        run: cargo install --locked --git https://github.com/krisbrud/openporch openporch-cli
+        run: |
+          command -v porch || cargo install --locked \
+            --git https://github.com/krisbrud/openporch --rev "${{ vars.PORCH_REV }}" openporch-cli
       - name: Deploy
         # openporch pins the object's current version when it accepts the
         # deployment, so rollbacks and replays run this exact zip.

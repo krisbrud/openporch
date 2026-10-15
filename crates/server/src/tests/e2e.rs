@@ -880,8 +880,8 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
                 .await,
         );
     }
-    let first = deploys.pop().unwrap();
-    let set_id = first["set_id"].as_str().unwrap().to_owned();
+    let last = deploys.pop().unwrap();
+    let set_id = last["set_id"].as_str().unwrap().to_owned();
     let dev = s.active("development").await;
     assert_eq!(
         dev.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -914,6 +914,11 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
     assert_eq!(
         worker["triggers"]["inbox"]["queue"]["outputs"]["url"],
         "https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-1"
+    );
+    // The module subscribes the function by the queue's ARN.
+    assert_eq!(
+        worker["triggers"]["inbox"]["queue"]["outputs"]["arn"],
+        dev[INBOX]["outputs"]["arn"]
     );
     assert_eq!(
         worker["triggers"]["nightly"]["schedule"],
@@ -986,7 +991,7 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
     // Replaying the snapshot runs what it recorded.
     s.deploy_to(
         "development",
-        json!({"deploy_id": first["id"], "replay": "snapshot"}),
+        json!({"deploy_id": last["id"], "replay": "snapshot"}),
     )
     .await;
     let old = inputs(&s, "development").await;
@@ -1002,7 +1007,7 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
     // With the current configuration, the new queue URL and upload.
     s.deploy_to(
         "development",
-        json!({"deploy_id": first["id"], "replay": "current"}),
+        json!({"deploy_id": last["id"], "replay": "current"}),
     )
     .await;
     let resolved = inputs(&s, "development").await;

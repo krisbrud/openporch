@@ -3,6 +3,7 @@
 Run with `python3 -m unittest discover examples/lambda-order-worker/app`.
 """
 
+import decimal
 import hashlib
 import hmac
 import json
@@ -21,9 +22,16 @@ class FakeTable:
     def put_item(self, Item):
         self.items[Item["id"]] = Item
 
-    def scan(self, Select):
+    def scan(self, Select, ExclusiveStartKey=None):
+        # Pages of two items, like a scan that stops at 1 MB.
         assert Select == "COUNT"
-        return {"Count": len(self.items)}
+        ids = sorted(self.items)
+        start = ids.index(ExclusiveStartKey["id"]) + 1 if ExclusiveStartKey else 0
+        page = ids[start:start + 2]
+        result = {"Count": len(page)}
+        if start + 2 < len(ids):
+            result["LastEvaluatedKey"] = {"id": page[-1]}
+        return result
 
 
 class FakeSsm:
@@ -60,10 +68,24 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(app.handler(event, None, table=table, signing_key=key), {"stored": 1})
         self.assertEqual(table.items, {"1": {"id": "1", "total": 30}})
 
-    def test_the_nightly_report_counts_orders(self):
+    def test_decimal_totals_are_stored_as_decimals(self):
         table = FakeTable()
-        table.put_item(Item={"id": "1"})
-        self.assertEqual(app.handler({"task": "report"}, None, table=table), {"orders": 1})
+        key = b"signing-key"
+        event = {"Records": [message(json.dumps({"id": "9", "total": 30.5}), key)]}
+        self.assertEqual(app.handler(event, None, table=table, signing_key=key), {"stored": 1})
+        self.assertEqual(table.items["9"]["total"], decimal.Decimal("30.5"))
+
+    def test_a_signature_that_is_not_ascii_is_dropped(self):
+        record = message(json.dumps({"id": 3}), b"signing-key")
+        record["messageAttributes"]["signature"]["stringValue"] = "\u00e9"
+        event = {"Records": [record]}
+        self.assertEqual(app.handler(event, None, table=FakeTable(), signing_key=b"signing-key"), {"stored": 0})
+
+    def test_the_nightly_report_counts_every_page(self):
+        table = FakeTable()
+        for i in range(5):
+            table.put_item(Item={"id": str(i)})
+        self.assertEqual(app.handler({"task": "report"}, None, table=table), {"orders": 5})
 
     def test_the_signing_key_is_read_through_its_reference(self):
         ref = "/openporch/shop-dev-order-worker/SIGNING_KEY"

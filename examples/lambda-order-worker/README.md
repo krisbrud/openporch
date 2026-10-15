@@ -18,7 +18,7 @@ receive and delete the queue's messages without any IAM change by hand.
 
 openporch never puts a secret into the function's environment. `SIGNING_KEY`
 arrives as `SIGNING_KEY_SECRET_REF`, the name of an SSM SecureString parameter
-only the function's role may read, and
+that the function's role may read, and
 [`app/secret_refs.py`](app/secret_refs.py) reads it at runtime:
 
 ```python
@@ -27,28 +27,28 @@ import secret_refs
 key = secret_refs.secret("SIGNING_KEY")
 ```
 
-A value is read once and kept for five minutes, so a changed secret reaches
-running functions within that time after the next deployment writes it to the
-parameter. Plain variables, such as `TABLE`, are ordinary environment
+A value is read once and kept for five minutes. A changed shared value reaches
+the parameter with the next deployment, and running functions see it within
+five minutes after that. Plain variables, such as `TABLE`, are ordinary environment
 variables.
 
 ## Deploy
 
 Create the secret shared value once per application; the value is written to
-openporch's secret store:
+openporch's secret store. Keep `KEY`, since senders sign orders with it:
 
 ```sh
-curl -X POST -H "Authorization: Bearer $OPENPORCH_TOKEN" -H 'Content-Type: application/json' \
-  "$OPENPORCH_URL/orgs/$OPENPORCH_ORG/apps/shop/values" \
-  -d '{"key": "ORDER_SIGNING_KEY", "description": "Signs orders on the inbox queue",
-       "secret_ref": {"value": "'"$(openssl rand -hex 32)"'"}}'
+KEY=$(openssl rand -hex 32)
+printf '{"key": "ORDER_SIGNING_KEY", "description": "Signs orders on the inbox queue", "secret_ref": {"value": "%s"}}' "$KEY" |
+  curl -X POST -H "Authorization: Bearer $OPENPORCH_TOKEN" -H 'Content-Type: application/json' \
+    "$OPENPORCH_URL/orgs/$OPENPORCH_ORG/apps/shop/values" -d @-
 ```
 
 Then build the zip, upload it under a key that names its content, and deploy
 it with that artifact:
 
 ```sh
-mkdir -p build
+mkdir -p build && rm -f build/order-worker.zip
 (cd app && zip -X -q ../build/order-worker.zip app.py secret_refs.py)
 key="order-worker/$(sha256sum build/order-worker.zip | cut -c1-64).zip"
 aws s3 cp build/order-worker.zip "s3://$ARTIFACT_BUCKET/$key"
@@ -59,7 +59,7 @@ openporch pins the object's current version when it accepts the deployment.
 [`ci/deploy.yml`](ci/deploy.yml) does the same from GitHub Actions on every push
 to `main`.
 
-To send an order, sign its body with the key:
+To send an order, sign its body with `KEY`:
 
 ```sh
 body='{"id": "1001", "total": 30}'
@@ -67,6 +67,10 @@ signature=$(printf %s "$body" | openssl dgst -sha256 -hmac "$KEY" -r | cut -d' '
 aws sqs send-message --queue-url "$QUEUE_URL" --message-body "$body" \
   --message-attributes "signature={DataType=String,StringValue=$signature}"
 ```
+
+A message that is not a signed order is logged and dropped. If storing an
+order fails, the function raises and SQS retries the whole batch; orders are
+written by `id`, so storing one again is harmless.
 
 ## Test
 

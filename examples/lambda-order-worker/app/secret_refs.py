@@ -4,8 +4,9 @@ openporch never puts a secret into a function's environment. A variable NAME
 that resolved from a secret arrives as NAME_SECRET_REF instead: the name of an
 SSM SecureString parameter (it starts with `/`) or of a Secrets Manager secret.
 `secret("NAME")` reads it with the function's own role and keeps it for
-`TTL_SECONDS`, so a rotated secret is picked up within that time without a
-redeploy.
+`TTL_SECONDS`. A changed openporch value reaches the parameter with the next
+deployment, and running functions see it within `TTL_SECONDS` after that; a
+change made to the parameter directly needs no redeploy.
 """
 
 import os

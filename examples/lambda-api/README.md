@@ -14,20 +14,23 @@ container, see the Lambda Web Adapter in
 ## Deploy
 
 Push the image to an ECR repository in the platform's region, then deploy it by
-tag; openporch pins the tag to its digest when it accepts the deployment:
+tag; openporch pins the tag to its digest when it accepts the deployment.
+Lambda accepts only a single-platform image manifest, so build without
+provenance attestations:
 
 ```sh
 registry=111122223333.dkr.ecr.eu-north-1.amazonaws.com
 aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
-docker build --platform linux/amd64 -t "$registry/lambda-api:1" app
+docker build --platform linux/amd64 --provenance=false -t "$registry/lambda-api:1" app
 docker push "$registry/lambda-api:1"
 porch workload deploy -f workload.yaml --image "main=$registry/lambda-api:1" --wait
 ```
 
-The function's URL is the workload's `url` output:
+With `OPENPORCH_APP` and `OPENPORCH_ENV` set, the function's URL is the
+workload's `url` output:
 
 ```sh
-porch get active-resources workload/modules.lambda-api -o json
+URL=$(porch get active-resources workload/modules.lambda-api -o json | jq -r .outputs.url)
 curl "$URL"         # {"message": "Hello from openporch"}
 curl "$URL/health"  # {"status": "ok"}
 ```
