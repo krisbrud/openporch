@@ -663,17 +663,25 @@ impl Store for SqliteStore {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
-        let env_type: Option<String> =
-            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
-                .bind(org)
-                .bind(app)
-                .bind(env)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(env_type) = env_type else {
+        let found: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT e.type, e.state, a.state FROM envs e JOIN apps a \
+             ON a.org_id = e.org_id AND a.id = e.app_id \
+             WHERE e.org_id = ? AND e.app_id = ? AND e.id = ?",
+        )
+        .bind(org)
+        .bind(app)
+        .bind(env)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((env_type, env_state, app_state)) = found else {
             return Err(StoreError::NotFound(format!("environment `{app}/{env}`")));
         };
         check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
+        if app_state != "active" || env_state != "active" {
+            return Err(StoreError::Conflict(format!(
+                "environment `{app}/{env}` is being deleted"
+            )));
+        }
         sqlx::query("UPDATE envs SET name = ? WHERE org_id = ? AND app_id = ? AND id = ?")
             .bind(name)
             .bind(org)

@@ -175,6 +175,10 @@ pub async fn create(
     JsonBody(body): JsonBody<CreateEnv>,
 ) -> ApiResult<(StatusCode, Json<EnvView>)> {
     check_id("environment", &body.id)?;
+    let name = match &body.name {
+        Some(name) => super::apps::display_name("environment", name)?.to_owned(),
+        None => body.id.clone(),
+    };
     let org = state.org();
     if state.store.env_type(org, &body.env_type).await?.is_none() {
         return Err(ApiError::invalid(format!(
@@ -224,7 +228,7 @@ pub async fn create(
             &app,
             NewEnv {
                 id: body.id.clone(),
-                name: body.name.clone().unwrap_or_else(|| body.id.clone()),
+                name,
                 env_type: body.env_type.clone(),
                 draft,
             },

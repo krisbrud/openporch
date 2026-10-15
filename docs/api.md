@@ -535,7 +535,9 @@ Authorization: Bearer $ADMIN_TOKEN
 {"id": "shop", "name": "Shop"}
 ```
 
-`PATCH` renames an application; the ID stays:
+`PATCH` renames an application; the ID stays. Names are trimmed and 1 to 100
+characters long, on creation too. Renaming an application, or an environment, that
+is being deleted is `409`:
 
 ```http
 PATCH /orgs/acme/apps/shop

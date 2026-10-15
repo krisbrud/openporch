@@ -125,7 +125,8 @@ pub trait Store: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Renames an application. The actor must hold `owner` on it.
+    /// Renames an application. The actor must be an administrator or hold `owner`
+    /// on it, and the application must not be being deleted.
     fn update_app(
         &self,
         org: &str,
@@ -134,8 +135,9 @@ pub trait Store: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Renames an environment. The actor must hold `developer` or `owner` on the
-    /// application and `deployer` on the environment's type.
+    /// Renames an environment. The actor must be an administrator, or hold
+    /// `developer` or `owner` on the application and `deployer` on the
+    /// environment's type; neither may be being deleted.
     fn update_env(
         &self,
         org: &str,

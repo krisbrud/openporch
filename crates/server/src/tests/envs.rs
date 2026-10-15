@@ -457,6 +457,25 @@ async fn renaming_needs_the_same_roles_as_creating() {
     .await;
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 
+    // Creation checks names the same way.
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps",
+            &s.admin,
+            json!({"id": "blog", "name": ""}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "staging", "name": " Staging ", "type": "production"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    assert_eq!(b["name"], "Staging");
+
     // Each change is audited.
     let (_, log) = s.get("/orgs/acme/audit-logs", &s.admin).await;
     for action in ["app.update", "env.update", "env_type.update"] {

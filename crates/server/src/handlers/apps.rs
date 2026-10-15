@@ -59,7 +59,10 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<AppRecord>)> {
     check_id("application", &body.id)?;
     let org = state.org();
-    let name = body.name.unwrap_or_else(|| body.id.clone());
+    let name = match &body.name {
+        Some(name) => display_name("application", name)?.to_owned(),
+        None => body.id.clone(),
+    };
     state
         .store
         .create_app(
