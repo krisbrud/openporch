@@ -27,9 +27,6 @@ these steps:
      `SIGNING_KEY_SECRET_REF` without the key itself;
    - the table, the queue, and the queue's enabled event source mapping;
    - the nightly schedule, `cron(0 3 * * ? *)` in `Europe/Oslo`.
-
-   It also checks that the signing key is not in the server's log, the
-   deployment log or the active resources.
 6. It sends a signed order to the queue and waits for the worker to store it.
 7. It calls the API's function URL at `/`, `/health` and an unknown path.
 8. It uploads a second build of the worker under the same key and deploys it,
@@ -38,9 +35,12 @@ these steps:
    zip, with `porch deploy deploy ID --replay snapshot`. Then it checks that the
    function runs the first zip again: S3 keeps both versions, and the deployment
    pinned the first one. It also checks that orders are still stored.
+   Then it checks that the signing key is in neither function's environment,
+   the server's log, any deployment's log or the active resources.
 10. It deletes the environment with `porch delete env`, acknowledging each
     deletion the preview marks for a permit. It waits until the environment is
-    gone, then checks that none of these is left:
+    gone, then checks that none of these is left. A resource counts as gone
+    only on its service's not-found error; any other error fails the run:
     - the functions, the table, the queue, the schedule and the event source
       mappings;
     - the log groups, the SSM parameters, and the IAM roles and policies.

@@ -370,10 +370,6 @@ step "Check that the functions, table, queue, schedule and event source mapping 
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >"$work/worker-env.json"
 jq -e --arg t "$table" '.TABLE == $t and (.SIGNING_KEY_SECRET_REF | startswith("/openporch/")) and (has("SIGNING_KEY") | not)' "$work/worker-env.json" >/dev/null ||
   fail "the worker's environment is not as expected: $(jq -c 'del(.SIGNING_KEY)' "$work/worker-env.json")"
-porch logs deploy +0 >"$work/deploy.log" 2>&1
-porch get active-resources -o json >"$work/active.json"
-grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/server.log" "$work/deploy.log" "$work/active.json" &&
-  fail "the signing key reached the function's environment, the server log, the deployment log or the active resources"
 [ "$(aws dynamodb describe-table --table-name "$table" --query Table.TableStatus --output text)" = ACTIVE ] || fail "the table is not active"
 aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names QueueArn >/dev/null || fail "the queue does not exist"
 mapping=$(aws lambda list-event-source-mappings --function-name "$worker_fn" --event-source-arn "$queue_arn" --query 'EventSourceMappings[0]' --output json)
@@ -417,6 +413,18 @@ porch deploy deploy "$first_deploy" --replay snapshot --comment "e2e replay" --w
 send_order e2e-3
 await_order e2e-3 || fail "the replayed build did not store an order"
 
+step "Check that the signing key is in no log, output or function environment"
+# Every deployment's log, the active resources and both functions' environments,
+# after the last deployment and before the deletion removes the deployments.
+for id in $(porch get deploys -o json | jq -r '.deployments[].id'); do
+  porch logs deploy "$id" >>"$work/deploy.log" 2>&1 || fail "could not read the log of deployment $id"
+done
+porch get active-resources -o json >"$work/active.json"
+aws lambda get-function-configuration --function-name "$api_fn" --query 'Environment.Variables' --output json >"$work/api-env.json"
+aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >>"$work/worker-env.json"
+grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" "$work/active.json" &&
+  fail "the signing key reached a function's environment, the server log, a deployment log or the active resources"
+
 # --- Deletion ------------------------------------------------------------------
 
 step "Delete the environment with a permit for each deletion"
@@ -425,29 +433,49 @@ echo "  ($(grep -o -- "--ack '" "$work/delete-preview.txt" | wc -l) permits)" >>
 
 step "Check that nothing the environment owned is left"
 left=()
-aws lambda get-function --function-name "$worker_fn" >/dev/null 2>&1 && left+=("function $worker_fn")
-aws lambda get-function --function-name "$api_fn" >/dev/null 2>&1 && left+=("function $api_fn")
-aws dynamodb describe-table --table-name "$table" >/dev/null 2>&1 && left+=("table $table")
+# A probe counts a resource as gone only on the service's own not-found error;
+# any other error (throttling, expired credentials, access denied) is a failure.
+# Usage: gone NOT_FOUND_PATTERN AWS_ARGS...
+gone() {
+  local pattern=$1 err
+  shift
+  if err=$(aws "$@" 2>&1 >/dev/null); then
+    return 1
+  fi
+  grep -qE "$pattern" <<<"$err" && return 0
+  fail "could not check whether it is gone: aws $*: $err"
+}
+# Counts what a list call returns, failing on any error.
+count() { aws "$@" --output text || fail "could not list: aws $*"; }
+gone ResourceNotFoundException lambda get-function --function-name "$worker_fn" || left+=("function $worker_fn")
+gone ResourceNotFoundException lambda get-function --function-name "$api_fn" || left+=("function $api_fn")
+gone ResourceNotFoundException dynamodb describe-table --table-name "$table" || left+=("table $table")
 # SQS can answer for a deleted queue for up to a minute.
+queue_gone=
 for _ in $(seq 1 12); do
-  aws sqs get-queue-attributes --queue-url "$queue_url" >/dev/null 2>&1 || break
+  if gone 'NonExistentQueue|QueueDoesNotExist' sqs get-queue-attributes --queue-url "$queue_url"; then
+    queue_gone=1
+    break
+  fi
   sleep 10
 done
-aws sqs get-queue-attributes --queue-url "$queue_url" >/dev/null 2>&1 && left+=("queue $queue_url")
+[ -n "$queue_gone" ] || left+=("queue $queue_url")
 for name in $(jq -r '.[]' <<<"$schedules"); do
-  aws scheduler get-schedule --name "$name" >/dev/null 2>&1 && left+=("schedule $name")
+  gone ResourceNotFoundException scheduler get-schedule --name "$name" || left+=("schedule $name")
 done
+mappings=$(count lambda list-event-source-mappings --event-source-arn "$queue_arn" --query 'length(EventSourceMappings)')
+[ "$mappings" = 0 ] || left+=("event source mappings of $queue_arn")
 for fn in "$worker_fn" "$api_fn"; do
-  [ "$(aws lambda list-event-source-mappings --function-name "$fn" --query 'length(EventSourceMappings)' --output text 2>/dev/null || echo 0)" = 0 ] ||
-    left+=("event source mappings of $fn")
-  [ "$(aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/$fn" --query 'length(logGroups)' --output text)" = 0 ] ||
+  [ "$(count logs describe-log-groups --log-group-name-prefix "/aws/lambda/$fn" --query 'length(logGroups)')" = 0 ] ||
     left+=("log group /aws/lambda/$fn")
-  [ "$(aws ssm get-parameters-by-path --path "/openporch/$fn" --recursive --query 'length(Parameters)' --output text)" = 0 ] ||
+  [ "$(count ssm get-parameters-by-path --path "/openporch/$fn" --recursive --query 'length(Parameters)')" = 0 ] ||
     left+=("parameters under /openporch/$fn")
 done
-roles=$(aws iam list-roles --path-prefix /openporch/ --query "Roles[?starts_with(RoleName, '$app-$env-')].RoleName" --output json)
+roles=$(aws iam list-roles --path-prefix /openporch/ --query "Roles[?starts_with(RoleName, '$app-$env-')].RoleName" --output json) ||
+  fail "could not list roles"
 [ "$(jq length <<<"$roles")" = 0 ] || left+=("roles $(jq -c . <<<"$roles")")
-policies=$(aws iam list-policies --scope Local --path-prefix /openporch/ --query "Policies[?starts_with(PolicyName, '$prefix-')].PolicyName" --output json)
+policies=$(aws iam list-policies --scope Local --path-prefix /openporch/ --query "Policies[?starts_with(PolicyName, '$prefix-')].PolicyName" --output json) ||
+  fail "could not list policies"
 [ "$(jq length <<<"$policies")" = 0 ] || left+=("policies $(jq -c . <<<"$policies")")
 tagged=$(aws resourcegroupstaggingapi get-resources --tag-filters "Key=openporch:app,Values=$app" "Key=openporch:env,Values=$env" \
   --query 'ResourceTagMappingList[].ResourceARN' --output json)
