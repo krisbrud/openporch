@@ -107,11 +107,27 @@ impl AppState {
     /// Admits a change, or returns why the server cannot accept one. Shutdown
     /// waits for each admission to be dropped.
     pub fn admit_change(&self) -> Result<Admission, Vec<String>> {
+        self.admit(Self::not_ready_reasons)
+    }
+
+    /// Admits a login, which needs no executor, or returns why the server
+    /// cannot accept one. Logins check the keys they need themselves.
+    pub fn admit_login(&self) -> Result<Admission, Vec<String>> {
+        self.admit(|state| {
+            if state.draining.load(Ordering::SeqCst) {
+                vec!["shutting_down".to_owned()]
+            } else {
+                Vec::new()
+            }
+        })
+    }
+
+    fn admit(&self, reasons: impl Fn(&Self) -> Vec<String>) -> Result<Admission, Vec<String>> {
         // Counted before the check, so a shutdown that begins in between
         // either is seen here or waits for this change.
         self.changes.fetch_add(1, Ordering::SeqCst);
         let admission = Admission(self.clone());
-        let reasons = self.not_ready_reasons();
+        let reasons = reasons(self);
         if reasons.is_empty() {
             Ok(admission)
         } else {

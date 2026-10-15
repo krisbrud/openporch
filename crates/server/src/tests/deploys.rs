@@ -1211,6 +1211,13 @@ async fn shutdown_refuses_changes_and_waits_for_running_deployments() {
     let (status, b) = s.get(&format!("{DEPLOYS}/{id}"), &s.admin).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["status"], "in_progress", "{b}");
+    // Login changes state too; health and version stay available.
+    let (status, b) = s
+        .call(Method::POST, "/auth/github/device", None, Some(json!({})))
+        .await;
+    assert_error(status, &b, StatusCode::SERVICE_UNAVAILABLE, "SRV-002");
+    let (status, b) = s.call(Method::GET, "/version", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
 
     // A deployment that finishes within the grace period ends the wait.
     let drain = tokio::spawn({

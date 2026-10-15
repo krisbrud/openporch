@@ -45,8 +45,8 @@ server.
 
 On `SIGTERM` or Ctrl-C the server:
 
-1. refuses new changes with `503` and `shutting_down`, while status requests
-   keep working;
+1. refuses new changes and logins with `503` and `shutting_down`, while
+   status requests keep working;
 2. waits up to `shutdown_grace_seconds` (default `60`) for the changes it had
    already accepted, and for running deployments, to finish;
 3. logs the deployments still running when the wait ends, then exits.

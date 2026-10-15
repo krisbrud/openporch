@@ -336,7 +336,16 @@ async fn check(
         )));
     }
     if permission == Permission::Public {
-        return Ok((Request::from_parts(parts, body), None));
+        // Login creates sessions and login state, so shutdown refuses and waits
+        // for it like any change. Health and version stay available.
+        let admitted = if parts.uri.path().starts_with("/auth/") {
+            Some(state.admit_login().map_err(|reasons| {
+                ApiError::not_ready(format!("the server is not ready: {}", reasons.join(", ")))
+            })?)
+        } else {
+            None
+        };
+        return Ok((Request::from_parts(parts, body), admitted));
     }
     let token = bearer(&parts).ok_or_else(ApiError::unauthenticated)?;
     let (principal, session) = authenticate(state, token)
