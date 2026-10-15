@@ -1,0 +1,44 @@
+# A worker that stores signed orders from a queue in a DynamoDB table and
+# reports on them every night. Deploy it with the artifact CI uploaded:
+#
+#   porch workload deploy -f workload.yaml \
+#     --artifact main=s3://<artifact bucket>/order-worker/<sha256>.zip --wait
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata:
+  name: order-worker
+  class: aws-lambda
+function:
+  package:
+    type: zip
+    artifact: .
+    runtime: python3.12
+    handler: app.handler
+  variables:
+    TABLE: ${resources.orders.name}
+    # A secret shared value: the function gets SIGNING_KEY_SECRET_REF, the
+    # name of the parameter that holds it, and reads it at runtime.
+    SIGNING_KEY: ${values.ORDER_SIGNING_KEY}
+    LOG_LEVEL: info
+  memory: 256Mi
+  timeout: 30s
+triggers:
+  inbox:
+    queue:
+      resource: inbox
+      batchSize: 10
+  nightly:
+    schedule:
+      cron: "0 3 * * *"
+      timezone: Europe/Oslo
+      input:
+        task: report
+resources:
+  orders:
+    type: dynamodb-table
+    params:
+      primaryKey:
+        name: id
+        type: S
+  inbox:
+    type: sqs
