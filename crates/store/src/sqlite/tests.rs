@@ -231,6 +231,20 @@ async fn newer_schema_is_refused_without_changes() {
     .unwrap();
     let Fixture { dir, store } = f.close().await;
     drop(store);
+    let files = |dir: &std::path::Path| {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&p).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = files(dir.path());
     let ownership = Ownership::acquire(dir.path()).unwrap();
     let e = SqliteStore::open(ownership, ORG).await.unwrap_err();
     assert!(
@@ -242,6 +256,26 @@ async fn newer_schema_is_refused_without_changes() {
             }
         ),
         "{e}"
+    );
+    // The message names the way out.
+    assert!(e.to_string().contains("restore a compatible backup"), "{e}");
+    // Nothing was migrated or written: the database is byte for byte the same.
+    let after = files(dir.path());
+    let names = |f: &[(String, Vec<u8>)]| f.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    let db = |f: &[(String, Vec<u8>)]| {
+        f.iter()
+            .find(|(n, _)| n == "openporch.db")
+            .map(|(_, b)| b.clone())
+            .unwrap()
+    };
+    assert_eq!(db(&after), db(&before));
+    assert!(
+        names(&after)
+            .iter()
+            .all(|n| names(&before).contains(n) || n.starts_with("openporch.db-")),
+        "{:?} -> {:?}",
+        names(&before),
+        names(&after)
     );
 }
 

@@ -1,7 +1,8 @@
 # Operating openporch
 
 This page covers running one openporch server: who owns an installation, how
-to tell whether the server can accept changes, and what happens when it stops.
+to tell whether the server can accept changes, what happens when it stops, and
+how to back up, upgrade and uninstall it.
 
 ## One server per installation
 
@@ -67,3 +68,66 @@ shutdown_grace_seconds = 600
 
 A service manager should allow at least that long before it kills the
 process, for example `TimeoutStopSec=` in a systemd unit.
+
+## What the data directory holds
+
+| Path | Holds |
+| --- | --- |
+| `openporch.db` (with `-wal` and `-shm` while running) | Configuration, deployments, resource records, recovery records, audit log, sealed secrets |
+| `openporch.lock` | The ownership lock |
+| `master.key` | The master keys, unless `master_key_file` or `OPENPORCH_MASTER_KEY` names them elsewhere |
+| `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state |
+| `bootstrap-token` | The first administrator token, until it is used |
+
+Treat the whole directory, and the master key wherever it lives, as secret.
+With the `s3` state backend, resources' state is in the bucket instead of
+`opentofu/`.
+
+To back up, stop the server and copy the data directory and the master key.
+Copying while the server runs can capture a database that does not match the
+state files. Keep the master key apart from the copy: a backup is only useful
+with it, and anyone holding both can read every stored secret.
+
+## Upgrades and the schema version
+
+Each release knows the database schema versions up to its newest migration. On
+start, a newer release migrates an older database forward. An older release
+started on a database a newer release has migrated refuses to start, before it
+writes anything:
+
+```text
+database schema version <found> is newer than this binary supports (up to <supported>);
+run a compatible openporch version or restore a compatible backup
+```
+
+So downgrading means either going back to the newer release, or restoring a
+backup taken before the upgrade and running the release that made it. Take a
+backup before every upgrade.
+
+## Uninstalling
+
+Stopping the server or removing the `openporch` binary never deletes cloud
+resources: openporch changes infrastructure only when a deployment or a
+deletion you requested runs. Uninstalling is three separate decisions.
+
+1. **Stop managing.** Stop the server and remove the binary. Every resource
+   keeps running and keeps costing what it costs. Keep the data directory and
+   the master key: starting the same or a newer release on them later resumes
+   management where it stopped.
+2. **Tear down infrastructure**, if you want it gone. Do this while the server
+   still runs, with deletions you preview and confirm, for example `porch
+   delete app <app> --preview` and then the command it prints (see [Clean
+   up](getting-started.md#clean-up)). Wait until `porch get apps` no longer
+   lists the application.
+3. **Remove the data.** Delete the data directory, the master key and, with
+   the `s3` backend, the state objects. Without them openporch cannot manage
+   or delete what is left, so do this last, and only for resources you have
+   torn down or will manage another way. To keep the option of resuming,
+   keep a backup instead.
+
+## Retention
+
+Nothing in the data directory expires on its own. The audit log is kept
+indefinitely, even for deleted applications. Recovery records and resource
+state are kept for as long as their resources exist. The database grows with
+the number of deployments; a backup copies all of it.

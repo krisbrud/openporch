@@ -115,3 +115,34 @@ async fn a_second_server_on_the_same_installation_exits_before_any_work() {
     let (status, apps) = s.get("/orgs/acme/apps", &s.admin).await;
     assert_eq!(status, StatusCode::OK, "{apps}");
 }
+
+#[tokio::test]
+async fn an_older_binary_refuses_a_newer_schema_and_names_the_way_out() {
+    let s = server().await;
+    // A newer release has migrated the database past what this binary knows.
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, \
+         execution_time) VALUES (99990101000000, 'future', CURRENT_TIMESTAMP, 1, x'00', 0)",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let Server {
+        dir, state, router, ..
+    } = s;
+    state.store.pool().close().await;
+    drop((state, router));
+
+    let e = crate::start(Config::new("acme", dir.path()), None)
+        .await
+        .unwrap_err();
+    let message = e.to_string();
+    assert!(
+        message.contains("schema version 99990101000000"),
+        "{message}"
+    );
+    assert!(
+        message.contains("run a compatible openporch version or restore a compatible backup"),
+        "{message}"
+    );
+}
