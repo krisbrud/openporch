@@ -998,6 +998,18 @@ async fn delete_a_deployed_application() {
         )
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    // Neither the application nor an environment being deleted can be renamed.
+    for path in [APP.to_owned(), format!("{APP}/envs/pr-42")] {
+        let (status, b) = s
+            .call(
+                Method::PATCH,
+                &path,
+                Some(&s.admin),
+                Some(json!({"name": "x"})),
+            )
+            .await;
+        assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    }
 
     // The database cannot be deleted, so its environment and the application
     // stay.

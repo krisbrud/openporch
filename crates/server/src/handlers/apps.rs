@@ -59,7 +59,10 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<AppRecord>)> {
     check_id("application", &body.id)?;
     let org = state.org();
-    let name = body.name.unwrap_or_else(|| body.id.clone());
+    let name = match &body.name {
+        Some(name) => display_name("application", name)?.to_owned(),
+        None => body.id.clone(),
+    };
     state
         .store
         .create_app(
@@ -81,6 +84,39 @@ pub async fn get(
     Path((_, app)): Path<(String, String)>,
 ) -> ApiResult<Json<AppRecord>> {
     Ok(Json(app_or_404(&state, &app).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateApp {
+    name: String,
+}
+
+/// `PATCH /orgs/{org}/apps/{app}`: renames an application. Needs `owner`.
+pub async fn update(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app)): Path<(String, String)>,
+    JsonBody(body): JsonBody<UpdateApp>,
+) -> ApiResult<Json<AppRecord>> {
+    let name = display_name("application", &body.name)?;
+    let org = state.org();
+    state
+        .store
+        .update_app(org, &app, name, ctx.audit(org, "app.update", &app))
+        .await?;
+    Ok(Json(app_or_404(&state, &app).await?))
+}
+
+/// A display name, trimmed: not empty and at most 100 characters.
+pub(crate) fn display_name<'a>(what: &str, name: &'a str) -> ApiResult<&'a str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err(ApiError::invalid(format!(
+            "the {what} name must be 1 to 100 characters"
+        )));
+    }
+    Ok(name)
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -352,6 +388,32 @@ pub async fn create_env_type(
         StatusCode::CREATED,
         Json(env_type_or_404(&state, &body.id).await?),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateEnvType {
+    description: String,
+}
+
+/// `PATCH /orgs/{org}/env-types/{type}`: changes the description.
+pub async fn update_env_type(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, id)): Path<(String, String)>,
+    JsonBody(body): JsonBody<UpdateEnvType>,
+) -> ApiResult<Json<EnvTypeRecord>> {
+    let org = state.org();
+    state
+        .store
+        .update_env_type(
+            org,
+            &id,
+            &body.description,
+            ctx.audit(org, "env_type.update", &id),
+        )
+        .await?;
+    Ok(Json(env_type_or_404(&state, &id).await?))
 }
 
 /// Deletes an environment type no environment uses.

@@ -366,6 +366,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/env-types` | org read |
 | POST | `/orgs/{org}/env-types` | administer |
 | GET | `/orgs/{org}/env-types/{type}` | org read |
+| PATCH | `/orgs/{org}/env-types/{type}` | administer |
 | DELETE | `/orgs/{org}/env-types/{type}` | administer |
 | GET | `/orgs/{org}/env-types/{type}/users` | org read |
 | POST | `/orgs/{org}/env-types/{type}/users` | administer |
@@ -413,6 +414,21 @@ Authorization: Bearer $ADMIN_TOKEN
 {"id": "production", "description": "Live traffic"}
 ```
 
+`PATCH` changes a type's description:
+
+```http
+PATCH /orgs/acme/env-types/production
+Authorization: Bearer $ADMIN_TOKEN
+
+{"description": "Live customer traffic"}
+```
+
+```http-response
+200 OK
+
+{"id": "production", "description": "Live customer traffic"}
+```
+
 ```http
 POST /orgs/acme/env-types/production/users
 Authorization: Bearer $ADMIN_TOKEN
@@ -457,6 +473,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/apps` | org read |
 | POST | `/orgs/{org}/apps` | create apps |
 | GET | `/orgs/{org}/apps/{app}` | app read |
+| PATCH | `/orgs/{org}/apps/{app}` | app manage |
 | DELETE | `/orgs/{org}/apps/{app}` | app manage |
 | GET | `/orgs/{org}/apps/{app}/users` | app read |
 | POST | `/orgs/{org}/apps/{app}/users` | app manage |
@@ -518,6 +535,23 @@ Authorization: Bearer $ADMIN_TOKEN
 {"id": "shop", "name": "Shop"}
 ```
 
+`PATCH` renames an application; the ID stays. Names are trimmed and 1 to 100
+characters long, on creation too. Renaming an application, or an environment, that
+is being deleted is `409`:
+
+```http
+PATCH /orgs/acme/apps/shop
+Authorization: Bearer $ADMIN_TOKEN
+
+{"name": "Web shop"}
+```
+
+```http-response
+200 OK
+
+{"id": "shop", "name": "Web shop"}
+```
+
 ```http
 POST /orgs/acme/apps/shop/users
 Authorization: Bearer $ADMIN_TOKEN
@@ -562,6 +596,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/apps/{app}/envs` | app read |
 | POST | `/orgs/{org}/apps/{app}/envs` | app configure, and `deployer` on the type |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}` | app read |
+| PATCH | `/orgs/{org}/apps/{app}/envs/{env}` | app configure, and `deployer` on the type |
 | DELETE | `/orgs/{org}/apps/{app}/envs/{env}` | app deploy |
 
 An environment shows its runtime summary: the desired and last successful sets,
@@ -639,6 +674,21 @@ Authorization: Bearer $CI_TOKEN
 200 OK
 
 {"id": "production", "generation": 0, "convergence": "never_deployed"}
+```
+
+`PATCH` renames an environment; its ID and type stay:
+
+```http
+PATCH /orgs/acme/apps/shop/envs/production
+Authorization: Bearer $CI_TOKEN
+
+{"name": "Production (EU)"}
+```
+
+```http-response
+200 OK
+
+{"id": "production", "name": "Production (EU)", "type": "production"}
 ```
 
 ## Deployment sets and deltas

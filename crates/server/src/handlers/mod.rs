@@ -142,6 +142,12 @@ pub fn api(state: AppState) -> Api {
             apps::get,
         )
         .route(
+            patch(),
+            "/orgs/{org}/apps/{app}",
+            App(AppPerm::Manage),
+            apps::update,
+        )
+        .route(
             delete(),
             "/orgs/{org}/apps/{app}",
             App(AppPerm::Manage),
@@ -189,6 +195,12 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/apps/{app}/envs/{env}",
             App(AppPerm::Read),
             envs::get,
+        )
+        .route(
+            patch(),
+            "/orgs/{org}/apps/{app}/envs/{env}",
+            App(AppPerm::Configure),
+            envs::update,
         )
         .route(
             delete(),
@@ -423,6 +435,12 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/env-types/{type}",
             Org(OrgPerm::ReadMembers),
             apps::env_type,
+        )
+        .route(
+            patch(),
+            "/orgs/{org}/env-types/{type}",
+            Org(OrgPerm::Administer),
+            apps::update_env_type,
         )
         .route(
             delete(),
