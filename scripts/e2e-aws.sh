@@ -92,7 +92,10 @@ fail() {
   echo "FAILED: $1" >&2
   if [ -f "$work/server.log" ]; then
     echo "== server log" >&2
-    tail -80 "$work/server.log" >&2
+    # A line with the signing key, which a regression could log, is left out.
+    tail -80 "$work/server.log" | KEY="${key:-}" awk '
+      ENVIRON["KEY"] != "" && index($0, ENVIRON["KEY"]) { print "[a line with the signing key, left out]"; next }
+      { print }' >&2
   fi
   exit 1
 }
@@ -173,8 +176,11 @@ empty_bucket() {
 env_deployed=
 platform_applied=
 repository_created=
+# What a check found left after the environment's deletion; the platform stays
+# so that its role can still reach those resources.
+leftovers=
 cleanup() {
-  local status=$? left=
+  local status=$? left=$leftovers
   set +e
   if [ -n "$env_deployed" ]; then
     echo "== cleanup: deleting the environment" >&2
@@ -481,7 +487,10 @@ tagged=$(aws resourcegroupstaggingapi get-resources --tag-filters "Key=openporch
   --query 'ResourceTagMappingList[].ResourceARN' --output json)
 # The tagging API lists deleted resources for a while; anything it names is checked above.
 echo "  tagging API still lists: $(jq -c . <<<"$tagged")" >>"$results"
-[ "${#left[@]}" = 0 ] || fail "left after the environment was deleted: ${left[*]}"
+if [ "${#left[@]}" != 0 ]; then
+  leftovers=" ${left[*]} (owned by the deleted environment; delete them by hand);"
+  fail "left after the environment was deleted: ${left[*]}"
+fi
 
 step "List what is kept, and what it costs"
 {
