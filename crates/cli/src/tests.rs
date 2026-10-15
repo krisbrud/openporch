@@ -20,6 +20,8 @@ use crate::config::{Credentials, FileConfig};
 mod deploys;
 mod objects;
 mod plans;
+mod quickstart;
+mod reference;
 
 /// A dev server on a loopback port.
 struct DevServer {

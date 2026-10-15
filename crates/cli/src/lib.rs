@@ -83,7 +83,7 @@ pub enum Command {
     Secretstores(members::SecretStores),
     /// Queries the audit log, newest first.
     AuditLogs(members::AuditLogs),
-    /// Deploys workload documents.
+    /// Deploys or previews workload documents.
     #[command(subcommand)]
     Workload(deploys::WorkloadCmd),
     /// Deploys Score files.
@@ -98,7 +98,7 @@ pub enum Command {
     /// Compares deployment sets.
     #[command(subcommand)]
     Diff(deploys::DiffCmd),
-    /// Shows an environment's resources.
+    /// Shows and recovers an environment's resources.
     #[command(subcommand)]
     Resources(deploys::ResourcesCmd),
     /// Sends an authenticated request to the API and prints the JSON response.
