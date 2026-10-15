@@ -38,6 +38,7 @@ impl DevServer {
             client_id: "Iv1.cli-test".into(),
             api_url: base.to_owned(),
             web_url: base.to_owned(),
+            browser: None,
         });
         let state = openporch_server::start(config, None).await.unwrap();
         let (router, _) = openporch_server::router(state);

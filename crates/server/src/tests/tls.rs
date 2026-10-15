@@ -46,6 +46,7 @@ async fn untrusted_certificate_is_rejected_before_any_request() {
         client_id: "Iv1.test-client".into(),
         api_url: base.clone(),
         web_url: base,
+        browser: None,
     })
     .unwrap();
     let limit = std::time::Duration::from_secs(20);

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -15,6 +15,9 @@ use crate::Config;
 use crate::config::GithubConfig;
 
 const CLIENT_ID: &str = "Iv1.test";
+const CLIENT_SECRET: &str = "oauth-client-secret";
+const CALLBACK_URL: &str = "http://127.0.0.1:8080/auth/github/callback";
+const PORTAL: &str = "http://localhost:3000/login/done";
 
 #[derive(Clone)]
 struct Account {
@@ -35,6 +38,8 @@ enum Device {
 struct Mock {
     accounts: Vec<Account>,
     devices: HashMap<String, Device>,
+    /// Authorization codes of browser logins, by the account that signed in.
+    codes: HashMap<String, u64>,
     tokens: HashMap<String, u64>,
     next: u64,
 }
@@ -84,13 +89,25 @@ async fn access_token(
     Form(form): Form<HashMap<String, String>>,
 ) -> Json<Value> {
     assert_eq!(form["client_id"], CLIENT_ID);
+    let mut m = m.lock().unwrap();
+    m.next += 1;
+    let token = format!("gho_secret{}", m.next);
+    if let Some(code) = form.get("code") {
+        // The authorization-code flow: the secret and the registered callback.
+        assert_eq!(form["client_secret"], CLIENT_SECRET);
+        assert_eq!(form["redirect_uri"], CALLBACK_URL);
+        return Json(match m.codes.remove(code) {
+            Some(id) => {
+                m.tokens.insert(token.clone(), id);
+                json!({"access_token": token, "token_type": "bearer"})
+            }
+            None => json!({"error": "bad_verification_code"}),
+        });
+    }
     assert_eq!(
         form["grant_type"],
         "urn:ietf:params:oauth:grant-type:device_code"
     );
-    let mut m = m.lock().unwrap();
-    m.next += 1;
-    let token = format!("gho_secret{}", m.next);
     let reply = match m.devices.get_mut(&form["device_code"]) {
         None => json!({"error": "incorrect_device_code"}),
         Some(Device::Pending) => json!({"error": "authorization_pending", "interval": 5}),
@@ -204,6 +221,7 @@ impl Github {
             client_id: CLIENT_ID.into(),
             api_url: self.base.clone(),
             web_url: self.base.clone(),
+            browser: None,
         });
         server_with(dir, config).await
     }
@@ -501,4 +519,338 @@ async fn github_login_is_optional_and_failures_are_reported() {
         b["message"],
         "the identity provider is unavailable; try again"
     );
+}
+
+impl Github {
+    /// GitHub approves a browser login by account `id`: an authorization code.
+    fn authorization_code(&self, id: u64) -> String {
+        let mut m = self.mock.lock().unwrap();
+        m.next += 1;
+        let code = format!("code{}", m.next);
+        m.codes.insert(code.clone(), id);
+        code
+    }
+
+    /// A server with browser login, its client secret in an owner-only file.
+    async fn browser_server(&self) -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("github-client-secret");
+        std::fs::write(&secret, format!("{CLIENT_SECRET}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = Config::new("acme", dir.path());
+        config.github = Some(GithubConfig {
+            client_id: CLIENT_ID.into(),
+            api_url: self.base.clone(),
+            web_url: self.base.clone(),
+            browser: Some(crate::config::GithubBrowserConfig {
+                client_secret_file: secret,
+                callback_url: CALLBACK_URL.into(),
+                return_urls: vec![PORTAL.into(), "https://portal.example.com/done".into()],
+            }),
+        });
+        server_with(dir, config).await
+    }
+}
+
+/// A browser request: the status, the `Location` and the `Set-Cookie` headers.
+async fn navigate(s: &Server, path: &str, cookie: Option<&str>) -> (StatusCode, String, String) {
+    use tower::ServiceExt as _;
+    let mut req = axum::http::Request::builder().uri(path);
+    if let Some(c) = cookie {
+        req = req.header("cookie", c);
+    }
+    let res = s
+        .router
+        .clone()
+        .oneshot(req.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let header = |name| {
+        res.headers()
+            .get(name)
+            .map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_owned())
+            .unwrap_or_default()
+    };
+    (res.status(), header("location"), header("set-cookie"))
+}
+
+fn query(url: &str) -> HashMap<String, String> {
+    reqwest::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// Starts a browser login: the `state` GitHub is sent and the cookie that binds it.
+async fn start_browser(s: &Server, return_to: &str) -> (String, String) {
+    let path = format!("/auth/github/authorize?return_to={}", url_escape(return_to));
+    let (status, location, cookie) = navigate(s, &path, None).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(location.contains("login/oauth/authorize?"), "{location}");
+    let q = query(&location);
+    assert_eq!(q["client_id"], CLIENT_ID);
+    assert_eq!(q["redirect_uri"], CALLBACK_URL);
+    assert_eq!(q["scope"], "read:user user:email");
+    assert!(!location.contains(CLIENT_SECRET));
+    for attr in [
+        "HttpOnly",
+        "SameSite=Lax",
+        "Path=/auth/github/callback",
+        "Max-Age=600",
+    ] {
+        assert!(cookie.contains(attr), "{cookie}");
+    }
+    let binding = cookie.split(';').next().unwrap().to_owned();
+    (q["state"].clone(), binding)
+}
+
+fn url_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn browser_login_returns_a_one_time_code_for_a_session() {
+    let gh = Github::start().await;
+    gh.account(583231, "octocat", &[("octo@example.com", true, true)]);
+    let s = gh.browser_server().await;
+    let (_, invitation) = s
+        .post(
+            "/orgs/acme/invitations",
+            &s.admin,
+            json!({"role": "member", "provider": "github", "login": "octocat"}),
+        )
+        .await;
+    let invitation = invitation["code"].as_str().unwrap().to_owned();
+
+    // GitHub sends the browser back with the state and a code.
+    let (state, cookie) = start_browser(&s, PORTAL).await;
+    let code = gh.authorization_code(583231);
+    let (status, location, cleared) = navigate(
+        &s,
+        &format!("/auth/github/callback?code={code}&state={state}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(location.starts_with(PORTAL), "{location}");
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    let login_code = query(&location)["login_code"].clone();
+    assert!(!location.contains("gho_"));
+
+    // The portal exchanges the code once, with the invitation on a first login.
+    let (status, session) = s
+        .public_post(
+            "/auth/github/session",
+            json!({"login_code": login_code, "invitation_code": invitation}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert_eq!(session["user"], "octocat");
+    assert!(!session.to_string().contains("gho_"));
+    let token = session["token"].as_str().unwrap();
+    let (status, me) = s.get("/orgs/acme/current-user", token).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], "octocat");
+    let (status, b) = s
+        .public_post("/auth/github/session", json!({"login_code": login_code}))
+        .await;
+    assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
+
+    // The state was spent with the callback.
+    let (status, _, _) = navigate(
+        &s,
+        &format!(
+            "/auth/github/callback?code={}&state={state}",
+            gh.authorization_code(583231)
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Later logins of the same account need no invitation.
+    let (state, cookie) = start_browser(&s, "https://portal.example.com/done").await;
+    let (_, location, _) = navigate(
+        &s,
+        &format!(
+            "/auth/github/callback?code={}&state={state}",
+            gh.authorization_code(583231)
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert!(location.starts_with("https://portal.example.com/done?login_code="));
+    let (status, session) = s
+        .public_post(
+            "/auth/github/session",
+            json!({"login_code": query(&location)["login_code"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert!(
+        s.audit_actions()
+            .await
+            .iter()
+            .any(|e| e["action"] == "session.create" && e["path"] == "/auth/github/session")
+    );
+}
+
+#[tokio::test]
+async fn browser_login_refuses_forged_callbacks_and_unknown_return_urls() {
+    let gh = Github::start().await;
+    gh.account(583231, "octocat", &[]);
+    gh.account(1, "mallory", &[]);
+    let s = gh.browser_server().await;
+
+    // Only the configured return pages, named exactly.
+    for bad in [
+        "https://evil.example.com/",
+        "http://localhost:3000/login/done/x",
+        "http://localhost:3000/login/done?next=https://evil.example.com",
+    ] {
+        let path = format!("/auth/github/authorize?return_to={}", url_escape(bad));
+        let (status, location, _) = navigate(&s, &path, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(location.is_empty());
+    }
+    // With two configured, one must be named.
+    let (status, _, _) = navigate(&s, "/auth/github/authorize", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A malformed query gets the usual JSON error.
+    for path in [
+        "/auth/github/authorize?return_to=a&return_to=b",
+        "/auth/github/callback?state=a&state=b",
+    ] {
+        let (status, body) = s.call(Method::GET, path, None, None).await;
+        assert_error(
+            status,
+            &body,
+            StatusCode::BAD_REQUEST,
+            crate::error::code::INVALID_REQUEST,
+        );
+    }
+
+    // Login CSRF: Mallory starts a login and sends the victim the callback with
+    // her own code. The victim's browser lacks her cookie, so it is refused.
+    let (state, _mallory_cookie) = start_browser(&s, PORTAL).await;
+    let (victim_state, victim_cookie) = start_browser(&s, PORTAL).await;
+    let forged = format!(
+        "/auth/github/callback?code={}&state={state}",
+        gh.authorization_code(1)
+    );
+    for cookie in [None, Some(victim_cookie.as_str())] {
+        let (status, location, _) = navigate(&s, &forged, cookie).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(location.is_empty());
+    }
+    // An unknown state is refused too.
+    let (status, _, _) = navigate(
+        &s,
+        &format!("/auth/github/callback?code=x&state={}", "0".repeat(64)),
+        Some(&victim_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A declined login, and a code GitHub does not confirm, return with an error.
+    let (status, location, _) = navigate(
+        &s,
+        &format!("/auth/github/callback?error=access_denied&state={victim_state}"),
+        Some(&victim_cookie),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(query(&location)["error"], "access_denied");
+    let (state, cookie) = start_browser(&s, PORTAL).await;
+    let (_, location, _) = navigate(
+        &s,
+        &format!("/auth/github/callback?code=unknown&state={state}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(query(&location)["error"], "login_failed");
+
+    // An unknown GitHub account still needs an invitation.
+    let (state, cookie) = start_browser(&s, PORTAL).await;
+    let (_, location, _) = navigate(
+        &s,
+        &format!(
+            "/auth/github/callback?code={}&state={state}",
+            gh.authorization_code(583231)
+        ),
+        Some(&cookie),
+    )
+    .await;
+    let (status, b) = s
+        .public_post(
+            "/auth/github/session",
+            json!({"login_code": query(&location)["login_code"]}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
+    assert!(b["message"].as_str().unwrap().contains("invitation"), "{b}");
+}
+
+#[tokio::test]
+async fn browser_login_needs_its_configuration() {
+    let gh = Github::start().await;
+    // Device login only: the browser routes do not exist.
+    let s = gh.server().await;
+    let (status, _, _) = navigate(&s, "/auth/github/authorize", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, b) = s
+        .public_post("/auth/github/session", json!({"login_code": "x"}))
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let (_, version) = s
+        .call(axum::http::Method::GET, "/version", None, None)
+        .await;
+    assert_eq!(
+        version["capabilities"]["identity_providers"],
+        json!([{"id": "github", "flows": ["device"]}])
+    );
+    let s = gh.browser_server().await;
+    let (_, version) = s
+        .call(axum::http::Method::GET, "/version", None, None)
+        .await;
+    assert_eq!(
+        version["capabilities"]["identity_providers"],
+        json!([{"id": "github", "flows": ["device", "browser"]}])
+    );
+
+    // A client secret others may read stops the server from starting.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, CLIENT_SECRET).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut config = Config::new("acme", dir.path());
+        config.github = Some(GithubConfig {
+            client_id: CLIENT_ID.into(),
+            api_url: gh.base.clone(),
+            web_url: gh.base.clone(),
+            browser: Some(crate::config::GithubBrowserConfig {
+                client_secret_file: secret,
+                callback_url: CALLBACK_URL.into(),
+                return_urls: vec![PORTAL.into()],
+            }),
+        });
+        let err = crate::start(config, None).await.unwrap_err();
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+        assert!(!err.to_string().contains(CLIENT_SECRET));
+    }
 }
