@@ -94,9 +94,33 @@ To back up, stop the server and copy:
   one;
 - the configuration file, or the environment it is set through.
 
-With the `s3` backend, also note the bucket, key prefix and region from
-`[opentofu.state]`, and keep the bucket versioned: the database records which
-resources exist, and the bucket holds their state.
+The OpenTofu root keeps, for each resource, the lock file, an inline script
+and `retained.json`, which records the Git source URL, path and commit the
+last apply used. Replays and deletions fetch that commit again, so a backup
+of an installation that uses Git sources also needs the commits themselves,
+in case a repository is deleted or rewritten later. Mirror each repository
+`retained.json` names alongside the copy:
+
+```sh
+find "$OPENTOFU_ROOT" -name retained.json -exec jq -r '.source.url // empty' {} + \
+  | sort -u | while read -r url; do
+      git clone --mirror "$url" "backup/sources/$(echo "$url" | tr -c 'A-Za-z0-9.-' _)"
+    done
+```
+
+With the `s3` backend the state lives in the bucket, and later applies
+overwrite it. Keep the bucket versioned and record, while the server is
+stopped, the version ID of every state object under the key prefix:
+
+```sh
+aws s3api list-object-versions --bucket "$BUCKET" --prefix "$PREFIX/" \
+  --query 'Versions[?IsLatest].[Key,VersionId]' --output text > backup/state-versions.txt
+```
+
+A restore puts those versions back as the current ones (or copies the
+objects into the backup instead), so the database and the state it restores
+match. Secret stores outside openporch keep their own history; record the
+versions you rely on where your store has them.
 
 Copying while the server runs can capture a database that does not match the
 state files. Keep the master key apart from the copy: a backup is only useful
