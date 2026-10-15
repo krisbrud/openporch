@@ -44,6 +44,27 @@ Human members cannot be created directly; they join through an
 The server refuses to listen on a non-loopback address over plain HTTP unless
 `tls_terminated_by_proxy = true` says a reverse proxy terminates TLS in front of it.
 
+### GitHub sign-in
+
+Members sign in with GitHub's device flow. Register a GitHub OAuth app (or a
+GitHub App) with device flow enabled, and give its client ID to the server in the
+configuration file that `openporch serve --config FILE` (or `OPENPORCH_CONFIG`)
+names:
+
+```toml
+org = "acme"
+data_dir = "/var/lib/openporch"
+
+[github]
+client_id = "Iv1.0123456789abcdef"
+# For GitHub Enterprise Server, also set:
+# api_url = "https://github.example.com/api/v3/"
+# web_url = "https://github.example.com/"
+```
+
+No client secret is needed. Without a `[github]` table, the server accepts only
+API tokens.
+
 ## Roles
 
 | Scope | Role | Grants |

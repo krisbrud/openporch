@@ -1,5 +1,7 @@
 //! Runs `docs/quickstart.md` as written against a dev server: every `sh` block,
-//! line by line, in document order.
+//! line by line, in document order. The `bash` block that starts the server is
+//! not run; its environment goes through the server's own configuration loader,
+//! and the dev server must match what it yields.
 //!
 //! A block may hold `export NAME=value`, `cat > FILE <<'EOF'` with the file's
 //! lines up to `EOF`, and `porch` commands, optionally reading standard input
@@ -15,12 +17,26 @@ use serde_json::Value;
 use super::deploys::deploys;
 use super::{DevServer, Machine};
 
-/// The `sh` blocks of `text`, as lines with their line numbers.
-fn blocks(text: &str) -> Vec<Vec<(usize, String)>> {
+/// The blocks of `text` fenced as `lang`, as lines with their line numbers.
+fn blocks(text: &str, lang: &str) -> Vec<Vec<(usize, String)>> {
     let mut out = Vec::new();
     let mut lines = text.lines().enumerate();
-    while let Some((_, line)) = lines.next() {
-        if line.trim() != "```sh" {
+    while let Some((n, line)) = lines.next() {
+        let Some(label) = line.trim().strip_prefix("```") else {
+            continue;
+        };
+        assert!(
+            !["shell", "console", "zsh"].contains(&label),
+            "line {}: fence shell commands as `sh` so they run, or `bash` for the server",
+            n + 1
+        );
+        if label != lang {
+            // Skip the block's body, so its closing fence is not read as an opening one.
+            for (_, l) in lines.by_ref() {
+                if l.trim_start().starts_with("```") {
+                    break;
+                }
+            }
             continue;
         }
         let mut block = Vec::new();
@@ -68,14 +84,38 @@ fn words(line: &str) -> Vec<String> {
     out
 }
 
+/// The server configuration the documented `openporch serve` line yields, through
+/// the server's own loader.
+fn documented_server(text: &str) -> openporch_server::Config {
+    let serve = blocks(text, "bash")
+        .into_iter()
+        .flatten()
+        .map(|(_, l)| l)
+        .find(|l| l.trim_end().ends_with("openporch serve"))
+        .expect("a `bash` block starts the server with `openporch serve`");
+    let vars: BTreeMap<String, String> = words(&serve)
+        .iter()
+        .map_while(|w| w.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    openporch_server::Config::load(None, |k| vars.get(k).cloned())
+        .unwrap_or_else(|e| panic!("`{serve}`: {e}"))
+}
+
 #[tokio::test]
 async fn the_quickstart_runs_as_written() {
-    let server = DevServer::start(None).await;
-    let mut m = Machine::new();
     let text = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/quickstart.md"),
     )
     .unwrap();
+    let documented = documented_server(&text);
+    // The dev server is organization `acme` with its data in a temporary directory
+    // that `.openporch/` maps to below.
+    assert_eq!(documented.org, "acme");
+    assert_eq!(documented.data_dir, PathBuf::from(".openporch"));
+    let documented_url = format!("http://{}", documented.listen);
+    let server = DevServer::start(None).await;
+    let mut m = Machine::new();
     let (data, home) = (server._data.path().to_owned(), m.home.path().to_owned());
     let path = |name: &str| -> PathBuf {
         match name.strip_prefix(".openporch/") {
@@ -85,7 +125,7 @@ async fn the_quickstart_runs_as_written() {
     };
     let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut ran = 0;
-    for block in blocks(&text) {
+    for block in blocks(&text, "sh") {
         let mut lines = block.into_iter();
         while let Some((n, line)) = lines.next() {
             let line = line.trim();
@@ -97,6 +137,7 @@ async fn the_quickstart_runs_as_written() {
                     .split_once('=')
                     .unwrap_or_else(|| panic!("line {n}: `{line}`"));
                 let value = if name == "OPENPORCH_URL" {
+                    assert_eq!(value, documented_url, "line {n}: the server's address");
                     server.url.clone()
                 } else {
                     value.to_owned()
@@ -154,7 +195,11 @@ async fn the_quickstart_runs_as_written() {
     let list: Vec<Value> = deploys(&server).await;
     assert_eq!(list.len(), 3, "{list:?}");
     assert!(list.iter().all(|d| d["status"] == "succeeded"), "{list:?}");
-    assert_eq!(list[0]["set_id"], list[2]["set_id"]);
+    assert_ne!(
+        list[1]["set_id"], list[2]["set_id"],
+        "the change made a new set"
+    );
+    assert_eq!(list[0]["set_id"], list[2]["set_id"], "the rollback");
 }
 
 #[test]

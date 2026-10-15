@@ -15,7 +15,9 @@ with `OPENPORCH_UPDATE_DOCS=1 cargo test -p openporch-cli cli_reference`. The
 [quickstart](quickstart.md) shows the commands in use.
 ";
 
-/// Every command's long help, depth first, under a heading per command.
+/// Every command's long help, depth first, under a heading per command. The help is
+/// not wrapped to the terminal only because clap's `wrap_help` feature is off; if it
+/// is ever enabled in the workspace, set a fixed width with `Command::term_width`.
 fn reference() -> String {
     let mut cmd = Cli::command();
     cmd.build();
@@ -46,14 +48,24 @@ fn reference() -> String {
 fn cli_reference_is_current() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli.md");
     let expected = reference();
-    if std::env::var_os("OPENPORCH_UPDATE_DOCS").is_some() {
+    if std::env::var("OPENPORCH_UPDATE_DOCS").as_deref() == Ok("1") {
         std::fs::write(&path, &expected).unwrap();
         return;
     }
     let actual = std::fs::read_to_string(&path).unwrap_or_default();
-    assert!(
-        actual == expected,
-        "docs/cli.md is out of date: regenerate it with \
-         `OPENPORCH_UPDATE_DOCS=1 cargo test -p openporch-cli cli_reference`"
-    );
+    if actual != expected {
+        let (n, (want, have)) = expected
+            .lines()
+            .chain(std::iter::repeat(""))
+            .zip(actual.lines().chain(std::iter::repeat("")))
+            .take(expected.lines().count().max(actual.lines().count()) + 1)
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .unwrap_or((0, ("", "")));
+        panic!(
+            "docs/cli.md is out of date from line {}: expected `{want}`, found `{have}`. \
+             Regenerate it with `OPENPORCH_UPDATE_DOCS=1 cargo test -p openporch-cli cli_reference`",
+            n + 1
+        );
+    }
 }

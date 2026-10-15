@@ -8,21 +8,24 @@ in the `sh` blocks below runs as written in this repository's tests
 
 ## Start a server
 
-Build the two binaries and start the server with a data directory of its own.
-It listens on `127.0.0.1:8080`, creates organization `acme`, and writes a
-one-time bootstrap administrator token to `.openporch/bootstrap-token`:
+Build the two binaries from this repository, then start the server in a
+directory of its own, outside the checkout, so its data stays out of git. The
+server listens on `127.0.0.1:8080`, creates organization `acme`, and keeps its
+database, master key and a bootstrap administrator token in `.openporch/`:
 
 ```bash
 cargo install --path crates/server
 cargo install --path crates/cli
+mkdir -p ~/porch-demo && cd ~/porch-demo
 OPENPORCH_ORG=acme OPENPORCH_DATA_DIR=.openporch openporch serve
 ```
 
 ## Log in
 
-In another terminal, point `porch` at the server and store the bootstrap token.
-`porch login --token` reads the token from standard input and keeps it in an
-owner-only credentials file next to `~/.config/openporch/config.toml`:
+In another terminal, in the same `~/porch-demo` directory, point `porch` at the
+server and store the bootstrap token. `porch login --token` reads the token from
+standard input and keeps it in an owner-only credentials file next to
+`~/.config/openporch/config.toml`:
 
 ```sh
 export OPENPORCH_URL=http://127.0.0.1:8080
@@ -30,8 +33,12 @@ export OPENPORCH_ORG=acme
 porch login --token < .openporch/bootstrap-token
 ```
 
-For an interactive login with GitHub, configure GitHub sign-in on the server
-and run `porch login` instead; see [security](security.md).
+The bootstrap token expires after 24 hours. For a lasting credential, create a
+service user with `porch users create-service` and a token for it with
+`porch users tokens create`; see the [command reference](cli.md). For an
+interactive login with GitHub, configure
+[GitHub sign-in](security.md#github-sign-in) on the server and run
+`porch login` instead.
 
 ## Create an application
 
