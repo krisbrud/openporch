@@ -33,6 +33,15 @@ func TestServerURLsNeedHTTPSExceptOnLoopback(t *testing.T) {
 			t.Errorf("ServerURL(%q) was accepted", bad)
 		}
 	}
+	for _, withSecret := range []string{
+		"http://user:s3cret@porch.example.com",
+		"https://user:s3cret@porch.example.com/%zz",
+	} {
+		_, err := ServerURL(withSecret)
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("ServerURL(%q): %v", withSecret, err)
+		}
+	}
 	u, err := ServerURL("https://porch.example.com/base/")
 	if err != nil || u.String() != "https://porch.example.com/base" {
 		t.Errorf("ServerURL kept a trailing slash: %v, %v", u, err)
@@ -102,8 +111,8 @@ func TestRedirectsAreNotFollowed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.CurrentUser(context.Background()); err == nil {
-		t.Fatal("a redirect was treated as success")
+	if _, err := c.CurrentUser(context.Background()); err == nil || !strings.Contains(err.Error(), "redirects are not followed") {
+		t.Fatalf("expected a redirect error, got %v", err)
 	}
 	if leaked {
 		t.Fatal("the token followed a redirect")

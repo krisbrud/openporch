@@ -27,7 +27,7 @@ cli-docs:
 # Test the OpenTofu provider, then check that OpenTofu loads a local build of it
 # against a dev server. Needs `go` and `tofu`.
 provider:
-    cd provider && test -z "$(gofmt -l .)" && go vet ./... && go test ./...
+    cd provider && { test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }; } && go vet ./... && go test ./...
     cargo build -p openporch-server --bin openporch
     provider/scripts/smoke.sh target/debug/openporch
 

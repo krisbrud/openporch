@@ -3,6 +3,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 
@@ -79,15 +80,16 @@ func (p *openporchProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 }
 
 // setting is a configured value, or the environment variable when the
-// configuration leaves it out. Unknown values are reported as unknown.
+// configuration leaves it out or sets it to an empty string. Unknown values are
+// reported as unknown.
 func (p *openporchProvider) setting(v types.String, env string) (string, bool) {
 	if v.IsUnknown() {
 		return "", false
 	}
-	if !v.IsNull() {
-		return v.ValueString(), true
+	if value := strings.TrimSpace(v.ValueString()); value != "" {
+		return value, true
 	}
-	return p.getenv(env), true
+	return strings.TrimSpace(p.getenv(env)), true
 }
 
 func (p *openporchProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
@@ -114,7 +116,6 @@ func (p *openporchProvider) Configure(ctx context.Context, req provider.Configur
 					"or leave it out and set `"+s.env+"`.")
 			continue
 		}
-		value = strings.TrimSpace(value)
 		if value == "" {
 			resp.Diagnostics.AddAttributeError(path.Root(s.attr), "Missing openporch "+s.attr,
 				"Set the provider's `"+s.attr+"` argument or the `"+s.env+"` environment variable.")
@@ -126,6 +127,10 @@ func (p *openporchProvider) Configure(ctx context.Context, req provider.Configur
 		return
 	}
 	c, err := client.New(values["url"], values["org_id"], values["token"], "openporch-provider/"+p.version)
+	if errors.Is(err, client.ErrInvalidToken) {
+		resp.Diagnostics.AddAttributeError(path.Root("token"), "Invalid openporch token", err.Error())
+		return
+	}
 	if err != nil {
 		resp.Diagnostics.AddAttributeError(path.Root("url"), "Invalid openporch url", err.Error())
 		return

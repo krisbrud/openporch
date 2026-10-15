@@ -2,6 +2,8 @@ module github.com/krisbrud/openporch/provider
 
 go 1.25.0
 
+toolchain go1.25.3
+
 require (
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 	github.com/hashicorp/terraform-plugin-go v0.31.0

@@ -115,6 +115,17 @@ func TestMissingSettingsNameTheirVariables(t *testing.T) {
 	}
 }
 
+func TestEmptyArgumentsFallBackToTheEnvironment(t *testing.T) {
+	srv := server(t)
+	diags := configure(t,
+		map[string]any{"url": "", "org_id": "", "token": ""},
+		map[string]string{EnvURL: srv.URL, EnvOrg: "acme", EnvToken: goodToken},
+	)
+	if e := errorText(diags); e != "" {
+		t.Fatalf("empty arguments did not fall back to the environment:\n%s", e)
+	}
+}
+
 func TestUnknownSettingsAreRefused(t *testing.T) {
 	srv := server(t)
 	diags := configure(t, map[string]any{"url": srv.URL, "org_id": "acme", "token": tftypes.UnknownValue}, nil)

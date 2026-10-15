@@ -23,15 +23,17 @@ mkdir -p "$mirror" "$work/dev" "$work/data" "$work/init" "$work/override"
 (cd "$provider_dir" && go build -ldflags "-X main.version=$version" -o "$mirror/terraform-provider-openporch_v$version" .)
 cp "$mirror/terraform-provider-openporch_v$version" "$work/dev/terraform-provider-openporch"
 
-port=$((20000 + RANDOM % 20000))
+# Below Linux's ephemeral port range, so the port is rarely taken.
+port=$((20000 + RANDOM % 12000))
 OPENPORCH_ORG=acme OPENPORCH_DATA_DIR="$work/data" OPENPORCH_LISTEN="127.0.0.1:$port" \
   "$server_bin" serve >"$work/server.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 100); do
-  [ -s "$work/data/bootstrap-token" ] && curl -sf "http://127.0.0.1:$port/healthz" >/dev/null && break
+  curl -sf "http://127.0.0.1:$port/healthz" >/dev/null && break
+  kill -0 "$server_pid" 2>/dev/null || break
   sleep 0.2
 done
-if ! [ -s "$work/data/bootstrap-token" ]; then
+if ! curl -sf "http://127.0.0.1:$port/healthz" >/dev/null; then
   echo "the server did not start:" >&2
   cat "$work/server.log" >&2
   exit 1
@@ -76,8 +78,8 @@ RC
 (
   cd "$work/init"
   export TF_CLI_CONFIG_FILE="$work/mirror.tofurc"
-  tofu init -no-color -input=false
-  tofu apply -no-color -input=false -auto-approve
+  tofu init -no-color -input=false | tee "$work/out.log"
+  tofu apply -no-color -input=false -auto-approve | tee -a "$work/out.log"
   user=$(tofu output -raw user)
   if [ "$user" != bootstrap ]; then
     echo "expected the bootstrap user, got '$user'" >&2
@@ -98,16 +100,25 @@ RC
 (
   cd "$work/override"
   export TF_CLI_CONFIG_FILE="$work/override.tofurc"
-  tofu plan -no-color -input=false
+  TF_LOG=TRACE TF_LOG_PATH="$work/trace.log" tofu plan -no-color -input=false | tee -a "$work/out.log"
   echo "== a wrong token fails the plan"
   if OPENPORCH_TOKEN=opt_wrong tofu plan -no-color -input=false >"$work/wrong.log" 2>&1; then
     echo "a wrong token was accepted" >&2
     exit 1
   fi
-  grep -q "AUTH-001" "$work/wrong.log"
+  if ! grep -q "AUTH-001" "$work/wrong.log"; then
+    echo "expected an authentication error:" >&2
+    cat "$work/wrong.log" >&2
+    exit 1
+  fi
   if grep -q "opt_wrong" "$work/wrong.log"; then
     echo "the plan output shows the token" >&2
     exit 1
   fi
 )
+echo "== no output, trace or server log shows the token"
+if grep -qF "$OPENPORCH_TOKEN" "$work/out.log" "$work/trace.log" "$work/server.log"; then
+  echo "the token appears in the output, the trace log or the server log" >&2
+  exit 1
+fi
 echo "== ok"

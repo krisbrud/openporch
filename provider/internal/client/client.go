@@ -23,6 +23,9 @@ import (
 // maxBody is the largest response body the client reads.
 const maxBody = 16 << 20
 
+// ErrInvalidToken is returned by New for a token that cannot be sent in a header.
+var ErrInvalidToken = errors.New("the token contains invalid characters")
+
 // Client sends authenticated requests to one server and organization.
 type Client struct {
 	base      *url.URL
@@ -55,25 +58,26 @@ func IsNotFound(err error) bool {
 func ServerURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		// url.Error repeats the input; it holds no token, so it is safe to show.
-		return nil, fmt.Errorf("server URL: %w", err)
-	}
-	switch {
-	case u.Scheme == "https":
-	case u.Scheme == "http" && IsLoopback(u):
-	case u.Scheme == "http":
-		return nil, fmt.Errorf("%s: plain HTTP is only allowed for loopback addresses; use https", raw)
-	default:
-		return nil, fmt.Errorf("%s: unsupported scheme %q", raw, u.Scheme)
-	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("%s: no host", raw)
+		// The parse error repeats the input, which may hold credentials.
+		return nil, errors.New("the server URL is not a valid URL")
 	}
 	if u.User != nil {
 		return nil, errors.New("the server URL must not contain credentials")
 	}
+	shown := u.Redacted()
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && IsLoopback(u):
+	case u.Scheme == "http":
+		return nil, fmt.Errorf("%s: plain HTTP is only allowed for loopback addresses; use https", shown)
+	default:
+		return nil, fmt.Errorf("%s: unsupported scheme %q", shown, u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("%s: no host", shown)
+	}
 	if u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("%s: the server URL must not have a query or fragment", raw)
+		return nil, fmt.Errorf("%s: the server URL must not have a query or fragment", shown)
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	u.RawPath = ""
@@ -97,8 +101,9 @@ func New(rawURL, org, token, userAgent string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	token = strings.TrimSpace(token)
 	if strings.ContainsAny(token, "\r\n") {
-		return nil, errors.New("the token contains invalid characters")
+		return nil, ErrInvalidToken
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if base.Scheme == "http" {
@@ -108,7 +113,7 @@ func New(rawURL, org, token, userAgent string) (*Client, error) {
 	return &Client{
 		base:      base,
 		org:       org,
-		token:     strings.TrimSpace(token),
+		token:     token,
 		userAgent: userAgent,
 		http: &http.Client{
 			Transport: transport,
@@ -178,11 +183,26 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 	if len(data) > maxBody {
 		return fmt.Errorf("%s %s: the response is larger than %d bytes", method, path, maxBody)
 	}
+	if res.StatusCode >= 300 && res.StatusCode <= 399 {
+		where := "elsewhere"
+		if loc, err := res.Location(); err == nil {
+			where = "to " + loc.Scheme + "://" + loc.Host
+		}
+		return &Error{
+			Status: res.StatusCode,
+			Code:   "HTTP",
+			Message: "the server redirected " + where + ", and redirects are not followed; " +
+				"check the scheme and path of the server URL",
+		}
+	}
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		return apiError(res.StatusCode, data)
 	}
-	if out == nil || len(data) == 0 {
+	if out == nil {
 		return nil
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("%s %s: the response is empty", method, path)
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("%s %s: decoding the response: %w", method, path, err)

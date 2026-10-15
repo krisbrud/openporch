@@ -60,6 +60,15 @@ provider_installation {
 still looks the provider up in the registry. To run `tofu init`, install the
 build into a `filesystem_mirror` instead, as `scripts/smoke.sh` does.
 
+## Licenses
+
+`deny.toml` governs the Rust workspace only. The provider additionally depends,
+unmodified, on HashiCorp's MPL-2.0 plugin libraries (`terraform-plugin-framework`,
+`terraform-plugin-go`, `terraform-plugin-log`, `go-plugin`, `yamux` and their
+registry helpers), which every OpenTofu provider in Go needs (design D11).
+MPL-2.0 is accepted for `provider/` only; check new Go dependencies by hand
+with `go list -m all` until a license check runs in CI.
+
 ## Compatibility
 
 Tested with OpenTofu 1.11.5 in CI.
