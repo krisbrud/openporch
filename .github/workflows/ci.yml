@@ -131,6 +131,11 @@ jobs:
   provider:
     name: OpenTofu provider
     runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:2.2.0
+        ports:
+          - 4566:4566
     defaults:
       run:
         working-directory: provider
@@ -166,3 +171,15 @@ jobs:
         run: scripts/smoke.sh ../target/debug/openporch
       - name: Acceptance tests
         run: scripts/acceptance.sh ../target/debug/openporch
+      - name: Example platform against a dev server and Floci
+        working-directory: .
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+        run: |
+          for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:4566/ && break; sleep 1; done
+          # S3 Control calls go to ACCOUNT.localhost.
+          echo "127.0.0.1 000000000000.localhost" | sudo tee -a /etc/hosts
+          examples/aws-platform/test.sh target/debug/openporch
