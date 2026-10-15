@@ -6,9 +6,9 @@
 # `artifact_bucket` output), AWS_REGION, AWS_UPLOAD_ROLE_ARN (a role CI may
 # assume through GitHub's OIDC provider, allowed `s3:PutObject` on
 # `order-worker/*` in that bucket), OPENPORCH_URL and PORCH_REV (the openporch
-# commit whose CLI to install), and the secret OPENPORCH_TOKEN, a service user's
-# token with the deployer role in the target environment. Only the Deploy step
-# sees the token.
+# commit whose CLI to install), and the secret OPENPORCH_TOKEN, the token of a
+# service user that is a `developer` of the application and a `deployer` of the
+# target environment's type. Only the Deploy step sees the token.
 name: Deploy the order worker
 
 on:
