@@ -146,6 +146,11 @@ jobs:
         with:
           tofu_version: 1.11.5
           tofu_wrapper: false
+      - name: Docs are generated from the current schema and examples
+        run: |
+          scripts/docs.sh
+          git diff --exit-code -- docs
+          test -z "$(git status --porcelain -- docs)" || { git status --porcelain -- docs; exit 1; }
       - name: Build the server
         working-directory: .
         run: cargo build -p openporch-server --bin openporch

@@ -39,9 +39,9 @@ func (r *definitionCriterion) Metadata(_ context.Context, req resource.MetadataR
 
 func (r *definitionCriterion) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	replace := []planmodifier.String{stringplanmodifier.RequiresReplace()}
-	match := func(what string) schema.StringAttribute {
+	match := func(what, unset string) schema.StringAttribute {
 		return schema.StringAttribute{Optional: true, PlanModifiers: replace,
-			Validators: []validator.String{notEmpty{}}, MarkdownDescription: "Matches " + what + "; unset matches any."}
+			Validators: []validator.String{notEmpty{}}, MarkdownDescription: "Matches " + what + "; unset matches " + unset + "."}
 	}
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "One matching criterion of a resource definition. A definition matches a " +
@@ -57,11 +57,11 @@ func (r *definitionCriterion) Schema(_ context.Context, _ resource.SchemaRequest
 			"id": schema.StringAttribute{Computed: true,
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 				MarkdownDescription: "The criterion ID the server generates."},
-			"env_type": match("the environment type"),
-			"app_id":   match("the application"),
-			"env_id":   match("the environment ID"),
-			"res_id":   match("the resource ID, such as `modules.web.externals.db`"),
-			"class":    match("the resource class; unset matches only `default`"),
+			"env_type": match("the environment type", "any"),
+			"app_id":   match("the application", "any"),
+			"env_id":   match("the environment ID", "any"),
+			"res_id":   match("the resource ID, such as `modules.web.externals.db`", "any"),
+			"class":    match("the resource class", "only `default`"),
 		},
 	}
 }
