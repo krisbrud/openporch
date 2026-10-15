@@ -124,6 +124,16 @@ async fn inputs_are_checked_before_anything_runs() {
             "is not a host name",
         ),
         (
+            json!({"script": "", "variables": {"resource": {}}}),
+            json!({}),
+            "the variable `resource` is reserved",
+        ),
+        (
+            json!({"script": ""}),
+            json!({"variables": {"resource_secrets": "x"}}),
+            "the variable `resource_secrets` is reserved",
+        ),
+        (
             json!({"script": "", "files": {"z_override.tf": "terraform {}"}}),
             json!({}),
             "would replace the script, the backend",
@@ -188,6 +198,9 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
         "AccessKeyId": "AKIAFAKE",
         "SecretAccessKey": "aws-secret-1",
     }))));
+    // The resource's inputs reach the module as two variables.
+    req.resource = object(json!({"primaryKey": {"name": "id", "type": "S"}}));
+    req.resource_secrets = SecretMap::new(object(json!({"spec": {"KEY": "resource-secret-1"}})));
     let lines = capture(&mut req);
     let PutOutcome::Ready { outputs, cookie } = d.put(&req).await.unwrap() else {
         panic!("not ready");
@@ -199,7 +212,12 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
     let record = std::fs::read_to_string(&record).unwrap();
     // Secrets travel in variable files and environment entries, never arguments.
     for line in record.lines().filter(|l| l.starts_with("ARGS ")) {
-        for secret in ["hunter2-token", "aws-secret-1", "tfc-token-1"] {
+        for secret in [
+            "hunter2-token",
+            "aws-secret-1",
+            "tfc-token-1",
+            "resource-secret-1",
+        ] {
             assert!(!line.contains(secret), "{line}");
         }
     }
@@ -209,7 +227,8 @@ async fn fake_run_passes_credentials_through_files_and_environment_only() {
     assert!(record.contains("AWS_EC2_METADATA_DISABLED=true"));
     assert!(record.contains(r#""api_token":"hunter2-token""#));
     assert!(record.contains(r#""secret_key":"aws-secret-1""#));
-    assert!(record.contains(r#"{"length":12}"#));
+    assert!(record.contains(r#"{"length":12,"resource":{"primaryKey":{"name":"id","type":"S"}}}"#));
+    assert!(record.contains(r#""resource_secrets":{"spec":{"KEY":"resource-secret-1"}}"#));
     // The server's own environment stays out: cargo sets these for the tests.
     assert!(std::env::var("CARGO_PKG_NAME").is_ok());
     assert!(!record.contains("CARGO_"));
@@ -358,6 +377,61 @@ output "password" {
 output "length" { value = var.length }
 output "label_length" { value = length(nonsensitive(var.label)) }
 "#;
+
+/// A module that reads the resource's inputs and creates nothing.
+const RESOURCE_MODULE: &str = r#"
+variable "resource" {
+  type     = any
+  default  = {}
+  nullable = false
+}
+variable "resource_secrets" {
+  type      = any
+  default   = {}
+  nullable  = false
+  sensitive = true
+}
+output "key" { value = try(var.resource.primaryKey.name, "id") }
+output "token" {
+  value     = try(var.resource_secrets.token, null)
+  sensitive = true
+}
+"#;
+
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_modules_read_the_resource_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let d = driver(root.path());
+    let mut req = request(json!({"script": RESOURCE_MODULE}), json!({}));
+    req.resource = object(json!({"primaryKey": {"name": "orderId", "type": "S"}}));
+    req.resource_secrets = SecretMap::new(object(json!({"token": "resource-secret-1"})));
+    let lines = capture(&mut req);
+    let PutOutcome::Ready { outputs, cookie } = d.put(&req).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["key"], "orderId");
+    assert_eq!(outputs.secrets.expose()["token"], "resource-secret-1");
+    let log = lines.lock().unwrap().join("\n");
+    assert!(!log.contains("resource-secret-1"), "{log}");
+
+    // A resource without inputs leaves the variables at their defaults, and a
+    // module that declares neither variable still runs with inputs given.
+    let mut bare = request(json!({"script": RESOURCE_MODULE}), json!({}));
+    bare.cookie = cookie;
+    let PutOutcome::Ready { outputs, .. } = d.put(&bare).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["key"], "id");
+    assert!(!outputs.secrets.expose().contains_key("token"));
+    let mut other = request(json!({"script": "output \"n\" { value = 1 }"}), json!({}));
+    other.guresid = Guresid::new("fedcba9876543210fedcba9876543210").unwrap();
+    other.resource = object(json!({"primaryKey": {"name": "orderId"}}));
+    let PutOutcome::Ready { outputs, .. } = d.put(&other).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["n"], 1);
+}
 
 /// Planned actions on resources, leaving out outputs.
 fn resources(actions: &[(Action, String)]) -> Vec<(Action, String)> {

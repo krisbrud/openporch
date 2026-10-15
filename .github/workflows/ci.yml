@@ -119,6 +119,14 @@ jobs:
         run: cargo test -p openporch-drivers opentofu -- --ignored
       - name: OpenTofu behind the local executor
         run: cargo test -p openporch-engine opentofu -- --ignored
+      - name: Example modules against Floci
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-east-1
+        run: |
+          # S3 Control calls go to ACCOUNT.localhost.
+          echo "127.0.0.1 000000000000.localhost" | sudo tee -a /etc/hosts
+          examples/modules/test.sh
 
   provider:
     name: OpenTofu provider

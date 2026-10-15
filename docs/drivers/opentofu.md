@@ -44,6 +44,31 @@ with the same structure:
 | `source.ssh_key` | A private key for an `ssh` repository. |
 | `tokens` | Tokens for private module and provider registries, as a map from host name to token. |
 
+The resource's own inputs, the `params` a workload gives the resource (or a
+`workload` resource's `id`, `class`, `spec` and `dependencies`), reach the
+module as two variables, set only when the resource has such inputs: `resource`
+holds the inputs that are plain, and `resource_secrets` the top-level inputs
+that hold a secret, written to the secret variable file. A module that reads
+them declares them with defaults, so it also runs for a resource without
+inputs:
+
+```hcl
+variable "resource" {
+  type     = any
+  default  = {}
+  nullable = false
+}
+
+locals {
+  key = try(var.resource.primaryKey.name, "id")
+}
+```
+
+A definition cannot set variables with these names. A module that declares
+neither variable still runs, with a warning in the log about the undeclared
+values. The modules under [`examples/modules`](../../examples/modules) read
+`var.resource` this way.
+
 Placeholders such as `${resources.queue.outputs.arn}` work in any input, like in
 any other driver. Placeholders in `source` are checked at deployment, not when the
 definition is written.
