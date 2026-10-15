@@ -286,6 +286,12 @@ async fn newer_schema_is_refused_without_changes() {
     .execute(f.store.pool())
     .await
     .unwrap();
+    // Move everything into the main file, so that closing a connection, which
+    // checkpoints, cannot change its bytes; only a write could.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
     let Fixture { dir, store } = f.close().await;
     drop(store);
     let files = |dir: &std::path::Path| {
@@ -301,8 +307,14 @@ async fn newer_schema_is_refused_without_changes() {
         files.sort();
         files
     };
-    let before = files(dir.path());
     let rows_before = logical_contents(dir.path()).await;
+    let before = files(dir.path());
+    assert!(
+        before
+            .iter()
+            .all(|(n, b)| n != "openporch.db-wal" || b.is_empty()),
+        "the log was checkpointed"
+    );
     let ownership = Ownership::acquire(dir.path()).unwrap();
     let e = SqliteStore::open(ownership, ORG).await.unwrap_err();
     assert!(
@@ -317,7 +329,7 @@ async fn newer_schema_is_refused_without_changes() {
     );
     // The message names the way out.
     assert!(e.to_string().contains("restore a compatible backup"), "{e}");
-    // Nothing was migrated or written: the database is byte for byte the same.
+    // Nothing was migrated or written: the main file is byte for byte the same.
     let after = files(dir.path());
     let names = |f: &[(String, Vec<u8>)]| f.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
     let db = |f: &[(String, Vec<u8>)]| {
