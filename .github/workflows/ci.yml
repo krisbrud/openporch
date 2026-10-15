@@ -119,3 +119,35 @@ jobs:
         run: cargo test -p openporch-drivers opentofu -- --ignored
       - name: OpenTofu behind the local executor
         run: cargo test -p openporch-engine opentofu -- --ignored
+
+  provider:
+    name: OpenTofu provider
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: provider
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: provider/go.mod
+          cache-dependency-path: provider/go.sum
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Install toolchain from rust-toolchain.toml
+        working-directory: .
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.11.5
+          tofu_wrapper: false
+      - name: Build the server
+        working-directory: .
+        run: cargo build -p openporch-server --bin openporch
+      - name: OpenTofu loads the provider and authenticates
+        run: scripts/smoke.sh ../target/debug/openporch

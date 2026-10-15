@@ -21,6 +21,7 @@ openporch is under active development. The milestone 1 specification lives in [`
 | `crates/server` | The HTTP API and the `openporch` binary |
 | `crates/client` | Typed API client |
 | `crates/cli` | The `porch` command-line interface |
+| `provider` | The OpenTofu provider, a Go module |
 
 ## Getting started
 
@@ -38,6 +39,7 @@ just e2e    # end-to-end tests
 just deny   # dependency license and advisory checks
 just dev    # run the server locally
 just docs   # run the documented examples and the quickstart against a dev server
+just provider  # test the OpenTofu provider and load it into OpenTofu (needs Go and tofu)
 ```
 
 ## License

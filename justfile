@@ -24,6 +24,13 @@ docs:
 cli-docs:
     OPENPORCH_UPDATE_DOCS=1 cargo test -p openporch-cli cli_reference
 
+# Test the OpenTofu provider, then check that OpenTofu loads a local build of it
+# against a dev server. Needs `go` and `tofu`.
+provider:
+    cd provider && { test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }; } && go vet ./... && go test ./...
+    cargo build -p openporch-server --bin openporch
+    provider/scripts/smoke.sh target/debug/openporch
+
 # Check dependency licenses, advisories and sources.
 deny:
     cargo deny check

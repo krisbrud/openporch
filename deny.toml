@@ -26,6 +26,8 @@ ignore = [
 [licenses]
 version = 2
 # Permissive licenses compatible with distributing openporch under Apache-2.0.
+# This covers the Rust workspace. The Go module in provider/ also uses HashiCorp's
+# MPL-2.0 plugin libraries unmodified; see provider/README.md.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
