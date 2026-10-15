@@ -1,0 +1,143 @@
+# End-to-end tests
+
+`just test` and CI run the in-memory end-to-end tests, which use fake drivers.
+CI also applies [`examples/aws-platform`](../examples/aws-platform) and the
+modules against Floci, an AWS emulator (see `just example-platform`). Neither
+runs a Lambda function. `just e2e-aws` does that, in a real AWS account. It
+is opt-in, and it creates resources that AWS bills.
+
+## `just e2e-aws`
+
+[`scripts/e2e-aws.sh`](../scripts/e2e-aws.sh) starts a dev server and takes
+these steps:
+
+1. It applies `examples/aws-platform` with a fresh name prefix (`ope2e-<hex>`)
+   and checks that openporch can assume the platform's role.
+2. It creates the application `shop`, the environment `e2e` and the secret
+   shared value `ORDER_SIGNING_KEY`.
+3. It uploads the order worker's zip to the artifact bucket, and pushes the
+   API's image to a new ECR repository.
+4. It deploys [`examples/lambda-order-worker`](../examples/lambda-order-worker)
+   and [`examples/lambda-api`](../examples/lambda-api) with
+   `porch workload deploy --wait`.
+5. It checks these in AWS:
+   - both functions;
+   - the worker's code hash and its environment: `TABLE`, and
+     `SIGNING_KEY_SECRET_REF` without the key itself;
+   - the table, the queue, and the queue's enabled event source mapping;
+   - the nightly schedule, `cron(0 3 * * ? *)` in `Europe/Oslo`.
+
+   It also checks that the signing key is not in the server's log.
+6. It sends a signed order to the queue and waits for the worker to store it.
+7. It calls the API's function URL at `/`, `/health` and an unknown path.
+8. It uploads a second build of the worker under the same key and deploys it,
+   then checks that the function runs the second zip and still stores orders.
+9. It replays the first deployment's snapshot with `porch deploy deploy ID
+   --replay snapshot`, then checks that the function runs the first zip again.
+   S3 keeps both versions, and the deployment pinned the first one. It also
+   checks that orders are still stored.
+10. It deletes the environment with `porch delete env`, acknowledging each
+    deletion the preview marks for a permit. It waits until the environment is
+    gone, then checks that none of these is left:
+    - the functions, the table, the queue, the schedule and the event source
+      mappings;
+    - the log groups, the SSM parameters, and the IAM roles and policies.
+11. It lists what is kept and what it costs. Then it deletes the application,
+    the ECR repository and every artifact version, and destroys the platform.
+
+The results are printed and written to `target/e2e-aws-results.md`, or to
+`OPENPORCH_E2E_RESULTS`.
+
+### What it needs
+
+- **An AWS account the test may create and delete resources in.** Use a
+  sandbox account, not one with production in it. Name the account in
+  `OPENPORCH_E2E_AWS_ACCOUNT`: the script refuses to run unless the
+  credentials belong to that account, and it refuses when
+  `AWS_ENDPOINT_URL` is set.
+- **AWS credentials** in the environment or a profile, with `AWS_REGION` set.
+  The identity needs to do the following:
+  - create IAM roles and policies, an S3 bucket and an ECR repository;
+  - call STS, Lambda, DynamoDB, SQS, EventBridge Scheduler, CloudWatch Logs, SSM
+    and the Resource Groups Tagging API.
+
+  `AdministratorAccess` in a sandbox account is the simple choice. The server
+  runs with the same credentials and assumes the platform's role with them, so
+  the role trusts that identity:
+  - for an IAM user, its ARN;
+  - for a role session (SSO, `assume-role`), the role. If that role has a path,
+    set `OPENPORCH_E2E_TRUSTED_PRINCIPAL` to its ARN, because the session ARN
+    leaves the path out.
+- **The commit pushed to GitHub.** The definitions fetch the modules from
+  `https://github.com/krisbrud/openporch` at the commit being tested.
+  `OPENPORCH_E2E_MODULES_REV` picks another commit, branch or tag.
+- **Tools:** `go`, `tofu`, AWS CLI v2, `docker` (with `buildx`), `git`, `zip`,
+  `openssl`, `curl` and `jq`.
+
+```sh
+export AWS_PROFILE=sandbox AWS_REGION=eu-north-1
+OPENPORCH_E2E_AWS_ACCOUNT=111122223333 just e2e-aws
+```
+
+A run takes roughly 10 to 20 minutes. Most of that is IAM propagation and the
+OpenTofu runs.
+
+### Cost
+
+Everything in the test is pay-per-use, and it all exists for less than an
+hour. The worker runs three times and the API three times, which is well
+inside the Lambda free tier. These cost a fraction of a cent:
+
+- DynamoDB on-demand writes and storage;
+- a few SQS requests;
+- S3 storage of two small zips;
+- ECR storage of one image, about 200 MB;
+- log storage.
+
+Nothing is provisioned by the hour. The table is on demand, the functions
+have no provisioned concurrency, and there is no NAT gateway or load balancer.
+A run that fails and leaves resources behind costs about the same per day,
+until they are deleted.
+
+### When it fails
+
+The script deletes what it can before it exits:
+
+- the environment, through openporch, when the failure came after the first
+  deployment;
+- the application and the ECR repository;
+- the platform, after emptying the artifact bucket.
+
+Whatever it could not delete is printed after `NOT DELETED`. In that case it
+keeps its working directory and prints the path. The directory holds:
+
+- `data/`: the server's database and the OpenTofu state of every resource
+  openporch created;
+- `platform/`: the platform's OpenTofu state;
+- the server log and the deletion preview.
+
+To finish the cleanup by hand:
+
+1. Start a server on `data/`, with `OPENPORCH_DATA_DIR` and the same AWS
+   credentials.
+2. Delete the environment with `porch delete env e2e --app shop`, using the
+   `--plan` and `--ack` arguments its `--preview` prints.
+3. Empty the artifact bucket.
+4. Run `tofu destroy` in `platform/`. The variables, apart from `external_id`,
+   are in `platform/vars.txt`, and any value of at least 16 characters works
+   for `external_id` when destroying.
+
+Resources that the state no longer covers can be found by name:
+
+- functions, roles and the schedule start with `shop-e2e-`;
+- policies and buckets start with the run's prefix;
+- the ECR repository is `<prefix>-lambda-api`.
+
+## Results
+
+| Date | Commit | Account, region | Result |
+| --- | --- | --- | --- |
+| | | | Not yet run against a real account |
+
+Add a row for each manual run, with the summary from
+`target/e2e-aws-results.md`.
