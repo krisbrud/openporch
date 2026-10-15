@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -50,7 +49,8 @@ type MissingAcksError struct {
 func (e *MissingAcksError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "deleting %s deletes resources that have not been acknowledged, so nothing was deleted. "+
-		"Add these to its destroy_acknowledgements, apply, and delete it again:", e.What)
+		"Add these to its destroy_acknowledgements (putting its resource block back if it was removed), "+
+		"apply, and then remove it again:", e.What)
 	for _, m := range e.Missing {
 		fmt.Fprintf(&b, "\n  %q,", m)
 	}
@@ -183,7 +183,8 @@ func (c *Client) DeleteEnv(ctx context.Context, app, id string, acks []Ack, comm
 			"permits":             permits,
 			"comment":             comment,
 		}
-		// The key returns the same deletion to a retry of this request.
+		// The key makes the server return the same deletion if this request is
+		// sent twice, as a retry after a lost response would.
 		headers := map[string]string{"Idempotency-Key": "openporch-provider-" + d.plan.ID}
 		err = c.DoWithHeaders(ctx, http.MethodDelete, c.OrgPath("apps", app, "envs", id), headers, body, nil)
 		if err != nil && !IsNotFound(err) {
@@ -266,14 +267,20 @@ func ackStrings(prefix string, acks []Ack) []string {
 }
 
 // waitGone polls state until it reports 404, and fails when the deletion failed.
+// A few errors in a row, such as a restarting server, are retried.
 func (c *Client) waitGone(ctx context.Context, what string, state func() (string, error)) error {
+	failures := 0
 	for {
 		s, err := state()
 		if IsNotFound(err) {
 			return nil
 		}
 		if err != nil {
-			return err
+			if failures++; failures > 5 {
+				return fmt.Errorf("checking whether %s is deleted: %w", what, err)
+			}
+		} else {
+			failures = 0
 		}
 		if s == "deletion_failed" {
 			return fmt.Errorf("deleting %s failed: a resource could not be deleted. `porch resources graph` shows "+
@@ -281,7 +288,7 @@ func (c *Client) waitGone(ctx context.Context, what string, state func() (string
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for %s to be deleted: %w", what, errors.Join(ctx.Err()))
+			return fmt.Errorf("waiting for %s to be deleted: %w", what, ctx.Err())
 		case <-time.After(pollInterval):
 		}
 	}

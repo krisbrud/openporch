@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/krisbrud/openporch/provider/internal/client"
@@ -48,7 +51,8 @@ func destroyAcksAttribute(prefixed bool) schema.SetAttribute {
 		MarkdownDescription: "Acknowledges the resources that deleting this object deletes, each written " + form +
 			" (with `@FINGERPRINT` when the preview shows one). Deleting it previews the deletion first and " +
 			"deletes nothing unless every resource the preview marks is acknowledged; the error lists the " +
-			"entries to add. Set them, apply, and then remove the object. Entries for changes the preview does " +
+			"entries to add. Set them, apply, and then remove the object (if it is already removed from the " +
+			"configuration, put it back with the entries first). Entries for changes the preview does " +
 			"not show are ignored.",
 	}
 }
@@ -82,6 +86,38 @@ func parseAcks(ctx context.Context, set types.Set, prefixed bool, diags *diag.Di
 		out[env] = append(out[env], ack)
 	}
 	return out
+}
+
+// nameAttribute is a display name that defaults to the object's ID. Once known,
+// the name is kept from state, so an imported object keeps its name.
+func nameAttribute() schema.StringAttribute {
+	return schema.StringAttribute{
+		Optional:            true,
+		Computed:            true,
+		MarkdownDescription: "The display name, 1 to 100 characters without surrounding spaces. Defaults to the ID when the object is created.",
+		PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+	}
+}
+
+// validateName checks a configured name as the server does, so a name the
+// server would trim or refuse fails at plan.
+func validateName(name types.String, diags *diag.Diagnostics) {
+	if name.IsNull() || name.IsUnknown() {
+		return
+	}
+	v := name.ValueString()
+	if v != strings.TrimSpace(v) || v == "" || utf8.RuneCountInString(v) > 100 {
+		diags.AddAttributeError(path.Root("name"), "Invalid name",
+			fmt.Sprintf("%q: names are 1 to 100 characters without surrounding spaces", v))
+	}
+}
+
+// nameOrID is the name to create an object with: the configured one, or the ID.
+func nameOrID(name, id types.String) string {
+	if name.IsNull() || name.IsUnknown() {
+		return id.ValueString()
+	}
+	return name.ValueString()
 }
 
 // importSplit splits an import ID of the form `A/B`.

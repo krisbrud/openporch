@@ -16,6 +16,11 @@ importable, and the `openporch_current_user` data source; more follow in tasks
 | `openporch_environment_type` | `TYPE` |
 | `openporch_environment` | `APP/ENV` |
 
+A name left out of the configuration defaults to the ID when the object is
+created; an imported object keeps the name it has. `destroy_acknowledgements`
+lives only in the configuration, so the first apply after an import that sets
+it records it as an in-place update that changes nothing on the server.
+
 ## Deleting applications and environments
 
 Deleting an application or environment deletes the cloud resources it owns, so

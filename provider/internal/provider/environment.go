@@ -20,7 +20,6 @@ type environment struct {
 
 var (
 	_ resource.ResourceWithImportState    = &environment{}
-	_ resource.ResourceWithModifyPlan     = &environment{}
 	_ resource.ResourceWithValidateConfig = &environment{}
 )
 
@@ -56,11 +55,7 @@ func (r *environment) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				MarkdownDescription: "The environment ID. Changing it replaces the environment.",
 				PlanModifiers:       replace,
 			},
-			"name": schema.StringAttribute{
-				Optional:            true,
-				Computed:            true,
-				MarkdownDescription: "The display name. Defaults to the ID.",
-			},
+			"name": nameAttribute(),
 			"type": schema.StringAttribute{
 				Required:            true,
 				MarkdownDescription: "The environment type. Changing it replaces the environment.",
@@ -85,21 +80,8 @@ func (r *environment) ValidateConfig(ctx context.Context, req resource.ValidateC
 		resp.Diagnostics.AddAttributeError(path.Root("id"), "The development environment is not managed here",
 			"Every application has a `development` environment, created and deleted with the application.")
 	}
+	validateName(config.Name, &resp.Diagnostics)
 	parseAcks(ctx, config.DestroyAcks, false, &resp.Diagnostics)
-}
-
-// ModifyPlan plans the default name, the ID, so the plan shows it.
-func (r *environment) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() {
-		return
-	}
-	var config, plan environmentModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() || !config.Name.IsNull() {
-		return
-	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("name"), plan.ID)...)
 }
 
 func (m *environmentModel) set(env *client.Env) {
@@ -116,7 +98,7 @@ func (r *environment) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 	env, err := r.client.CreateEnv(ctx, plan.AppID.ValueString(), plan.ID.ValueString(),
-		plan.Name.ValueString(), plan.Type.ValueString())
+		nameOrID(plan.Name, plan.ID), plan.Type.ValueString())
 	if err != nil {
 		apiError(&resp.Diagnostics, "creating the environment", err)
 		return

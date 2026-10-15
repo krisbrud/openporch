@@ -20,7 +20,6 @@ type application struct {
 
 var (
 	_ resource.ResourceWithImportState    = &application{}
-	_ resource.ResourceWithModifyPlan     = &application{}
 	_ resource.ResourceWithValidateConfig = &application{}
 )
 
@@ -47,11 +46,7 @@ func (r *application) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				MarkdownDescription: "The application ID. Changing it replaces the application.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"name": schema.StringAttribute{
-				Optional:            true,
-				Computed:            true,
-				MarkdownDescription: "The display name. Defaults to the ID.",
-			},
+			"name":                     nameAttribute(),
 			"destroy_acknowledgements": destroyAcksAttribute(true),
 		},
 	}
@@ -67,21 +62,8 @@ func (r *application) ValidateConfig(ctx context.Context, req resource.ValidateC
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	validateName(config.Name, &resp.Diagnostics)
 	parseAcks(ctx, config.DestroyAcks, true, &resp.Diagnostics)
-}
-
-// ModifyPlan plans the default name, the ID, so the plan shows it.
-func (r *application) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() {
-		return
-	}
-	var config, plan applicationModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() || !config.Name.IsNull() {
-		return
-	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("name"), plan.ID)...)
 }
 
 func (r *application) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -90,7 +72,7 @@ func (r *application) Create(ctx context.Context, req resource.CreateRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	app, err := r.client.CreateApp(ctx, plan.ID.ValueString(), plan.Name.ValueString())
+	app, err := r.client.CreateApp(ctx, plan.ID.ValueString(), nameOrID(plan.Name, plan.ID))
 	if err != nil {
 		apiError(&resp.Diagnostics, "creating the application", err)
 		return
@@ -116,9 +98,6 @@ func (r *application) Read(ctx context.Context, req resource.ReadRequest, resp *
 	}
 	state.ID = types.StringValue(app.ID)
 	state.Name = types.StringValue(app.Name)
-	if state.DestroyAcks.IsUnknown() {
-		state.DestroyAcks = types.SetNull(types.StringType)
-	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 

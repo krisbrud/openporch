@@ -279,3 +279,62 @@ resource "openporch_environment" "staging" {
 		},
 	})
 }
+
+// An imported application keeps its name when the configuration sets none, so
+// the plan after `tofu import` is empty.
+func TestAccImportKeepsTheName(t *testing.T) {
+	app := randomID("acc-app")
+	c := apiClient(t)
+	if _, err := c.CreateApp(context.Background(), app, "Imported shop"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.DeleteApp(context.Background(), app, nil, "test cleanup") })
+	// Import with a persisted state needs the provider's source spelled out.
+	config := fmt.Sprintf(`
+terraform {
+  required_providers {
+    openporch = { source = "openporch/openporch" }
+  }
+}
+
+resource "openporch_application" "app" {
+  id = %q
+}
+`, app)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       "openporch_application.app",
+				ImportState:        true,
+				ImportStateId:      app,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_application.app", tfjsonpath.New("name"),
+						knownvalue.StringExact("Imported shop")),
+				},
+			},
+			// A name the server would trim fails at plan.
+			{
+				Config: fmt.Sprintf(`
+resource "openporch_application" "app" {
+  id   = %q
+  name = "Shop "
+}
+`, app),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`without\s+surrounding\s+spaces`),
+			},
+			// The destroy after the test uses the last configuration.
+			{Config: config},
+		},
+	})
+}
