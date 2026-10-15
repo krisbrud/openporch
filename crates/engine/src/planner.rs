@@ -35,7 +35,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::cloud::{S3Object, S3Version};
+use crate::cloud::{EcrImage, S3Object, S3Version, in_ecr, pinned_image};
 
 mod deprovision;
 mod log;
@@ -378,6 +378,18 @@ pub trait Executor: Send + Sync + 'static {
             )))
         }
     }
+
+    /// Pins `pin.image` to the digest its tag points at now, such as
+    /// `<registry>/<repository>@sha256:<digest>`.
+    fn pin_image(&self, pin: ImagePin) -> impl Future<Output = Result<String, ExecFailure>> + Send {
+        async move {
+            Err(ExecFailure::Permanent(format!(
+                "image `{}` of `{}` cannot be pinned by this executor; name it by digest as \
+                 `<image>@sha256:<digest>`",
+                pin.image, pin.descriptor
+            )))
+        }
+    }
 }
 
 /// Why artifacts could not be pinned.
@@ -407,6 +419,23 @@ pub struct ArtifactPin {
     pub account: AccountId,
     /// The artifact URI, such as `s3://bucket/key`.
     pub artifact: String,
+}
+
+/// An image named by a mutable tag, to pin to a digest before a deployment
+/// is accepted.
+#[derive(Debug, Clone)]
+pub struct ImagePin {
+    /// The deployment the workload belongs to.
+    pub context: JobContext,
+    /// The workload.
+    pub descriptor: Descriptor,
+    /// The definition it matched.
+    pub definition_id: DefinitionId,
+    /// The cloud account the workload's driver gets credentials for, which
+    /// reads the image.
+    pub account: AccountId,
+    /// The image, such as `<account>.dkr.ecr.<region>.amazonaws.com/web:1`.
+    pub image: String,
 }
 
 /// The artifacts a workload deploys, checked before its deployment changes
@@ -655,37 +684,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         .into(),
                 ));
             }
-            let def = deployment
-                .definitions
-                .get(&node.definition)
-                .map(|(_, def)| def)
-                .ok_or_else(|| {
-                    refused(format!(
-                        "cannot be pinned: definition `{}` is not in the deployment",
-                        node.definition
-                    ))
-                })?;
-            // The artifact is read as the driver reads it: with the
-            // definition's account, which must be known now. The server's own
-            // identity is never used for it.
-            let account = match driver_account(def, &scope) {
-                Ok(Some(account)) => account,
-                Ok(None) => {
-                    return Err(refused(format!(
-                        "cannot be pinned to a version: definition `{}` has no cloud account to \
-                         read it with; give it one, or name the version with `?versionId=`",
-                        def.id
-                    )));
-                }
-                Err(_) => {
-                    return Err(refused(format!(
-                        "cannot be pinned to a version: the cloud account of definition `{}` \
-                         comes from another resource, which is not known before the deployment \
-                         runs; name the version with `?versionId=`",
-                        def.id
-                    )));
-                }
-            };
+            let (def, account) = pin_account(
+                deployment,
+                node,
+                &scope,
+                &refused,
+                "name the version with `?versionId=`",
+            )?;
             let pin = ArtifactPin {
                 context: JobContext::of(deployment),
                 descriptor: node.descriptor.clone(),
@@ -694,7 +699,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 artifact: artifact.clone(),
             };
             let version = self
-                .with_retries(&pin.descriptor, deadline, || {
+                .with_retries("artifacts", &pin.descriptor, deadline, || {
                     self.executor.pin_artifact(pin.clone())
                 })
                 .await?;
@@ -703,10 +708,93 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         Ok(pinned)
     }
 
+    /// Pins every ECR image the deployment's workloads name by tag to the
+    /// digest the tag points at now: for each such workload, the pinned image
+    /// by its JSON pointer in the workload's node, with shared values
+    /// resolved. Images already pinned by digest are kept, and images in other
+    /// registries, or built from other resources' outputs outside ECR, are
+    /// not pinned.
+    pub async fn pin_images(
+        &self,
+        deployment: &Deployment,
+        timeout: Duration,
+    ) -> Result<BTreeMap<Descriptor, BTreeMap<String, String>>, PinError> {
+        let deadline = Instant::now() + timeout;
+        let mut pinned: BTreeMap<Descriptor, BTreeMap<String, String>> = BTreeMap::new();
+        for node in deployment.graph.nodes.values() {
+            for (pointer, named) in images(node) {
+                let refused = |why: String| {
+                    PinError::Refused(format!("image `{named}` of `{}` {why}", node.descriptor))
+                };
+                let scope = scope_for(deployment, node, &BTreeMap::new());
+                // An image built from other resources' outputs is known only
+                // when the deployment runs; only one in ECR must be pinned.
+                let Some(image) = resolve_plain(&named, &scope) else {
+                    if in_ecr(&named) {
+                        return Err(refused(
+                            "must be known before the deployment runs to be pinned: name it \
+                             literally or through shared values"
+                                .into(),
+                        ));
+                    }
+                    continue;
+                };
+                if pinned_image(&image) {
+                    if image != named {
+                        pinned
+                            .entry(node.descriptor.clone())
+                            .or_default()
+                            .insert(pointer, image);
+                    }
+                    continue;
+                }
+                if image == "." {
+                    return Err(refused(
+                        "was not supplied: pass `--image <container>=<image>`".into(),
+                    ));
+                }
+                if image.contains('@') {
+                    return Err(refused(format!(
+                        "names a digest that is not `sha256:` and 64 hex digits: `{image}`"
+                    )));
+                }
+                // Only ECR images can be read with the workload's account.
+                if EcrImage::parse(&image).is_none() {
+                    continue;
+                }
+                let (def, account) = pin_account(
+                    deployment,
+                    node,
+                    &scope,
+                    &refused,
+                    "name it by digest as `<image>@sha256:<digest>`",
+                )?;
+                let pin = ImagePin {
+                    context: JobContext::of(deployment),
+                    descriptor: node.descriptor.clone(),
+                    definition_id: def.id.clone(),
+                    account,
+                    image,
+                };
+                let digest = self
+                    .with_retries("images", &pin.descriptor, deadline, || {
+                        self.executor.pin_image(pin.clone())
+                    })
+                    .await?;
+                pinned
+                    .entry(node.descriptor.clone())
+                    .or_default()
+                    .insert(pointer, digest);
+            }
+        }
+        Ok(pinned)
+    }
+
     /// Runs `call`, retrying failures that may pass with backoff, within the
     /// deployment's attempts and `deadline`.
     async fn with_retries<T, F, Fut>(
         &self,
+        what: &str,
         descriptor: &Descriptor,
         deadline: Instant,
         call: F,
@@ -726,7 +814,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
                 Err(_) => {
                     return Err(PinError::Unavailable(format!(
-                        "ran out of time pinning the artifacts of `{descriptor}`"
+                        "ran out of time pinning the {what} of `{descriptor}`"
                     )));
                 }
             };
@@ -1067,6 +1155,92 @@ fn artifacts(node: &Node) -> Vec<String> {
         .map(str::to_owned)
         .into_iter()
         .collect()
+}
+
+/// The images a workload deploys, by their JSON pointer in its node: each
+/// container's, and an image function's.
+fn images(node: &Node) -> Vec<(String, String)> {
+    if node.descriptor.ty.as_str() != "workload" {
+        return Vec::new();
+    }
+    let Some(spec) = node.params.as_ref().and_then(|p| p.get("spec")) else {
+        return Vec::new();
+    };
+    let escape = |s: &str| s.replace('~', "~0").replace('/', "~1");
+    let mut out: Vec<(String, String)> = spec["containers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, c)| {
+            let image = c["image"].as_str()?;
+            Some((
+                format!("/params/spec/containers/{}/image", escape(id)),
+                image.to_owned(),
+            ))
+        })
+        .collect();
+    if let Some(image) = spec
+        .pointer("/function/package/image")
+        .and_then(Value::as_str)
+    {
+        out.push((
+            "/params/spec/function/package/image".into(),
+            image.to_owned(),
+        ));
+    }
+    out
+}
+
+/// `named` with shared values resolved, when it can be resolved before the
+/// deployment runs.
+fn resolve_plain(named: &str, scope: &MapScope) -> Option<String> {
+    if !named.contains("${") {
+        return Some(named.to_owned());
+    }
+    resolve_value(
+        &Value::String(named.to_owned()),
+        Dialect::Set,
+        scope,
+        Sink::Plain,
+        "image",
+    )
+    .ok()
+    .and_then(|r| r.as_plain().and_then(Value::as_str).map(str::to_owned))
+}
+
+/// The definition `node` matched and the cloud account it reads with, which
+/// must be known before the deployment runs. The server's own identity is
+/// never used. `pinned_form` says how to name the input pinned instead.
+fn pin_account<'d>(
+    deployment: &'d Deployment,
+    node: &Node,
+    scope: &MapScope,
+    refused: &dyn Fn(String) -> PinError,
+    pinned_form: &str,
+) -> Result<(&'d ResourceDefinition, AccountId), PinError> {
+    let def = deployment
+        .definitions
+        .get(&node.definition)
+        .map(|(_, def)| def)
+        .ok_or_else(|| {
+            refused(format!(
+                "cannot be pinned: definition `{}` is not in the deployment",
+                node.definition
+            ))
+        })?;
+    match driver_account(def, scope) {
+        Ok(Some(account)) => Ok((def, account)),
+        Ok(None) => Err(refused(format!(
+            "cannot be pinned: definition `{}` has no cloud account to read it with; give it \
+             one, or {pinned_form}",
+            def.id
+        ))),
+        Err(_) => Err(refused(format!(
+            "cannot be pinned: the cloud account of definition `{}` comes from another \
+             resource, which is not known before the deployment runs; {pinned_form}",
+            def.id
+        ))),
+    }
 }
 
 fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, Done>) -> MapScope {

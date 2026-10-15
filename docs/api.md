@@ -1566,6 +1566,21 @@ is accepted; naming the version with `?versionId=` avoids the lookup. When S3
 cannot be reached, the request fails with `502` (`CLD-002`) and can be sent
 again.
 
+Container and function images in Amazon ECR named by tag,
+`<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>]` (`latest`
+without a tag; FIPS, China and dual-stack `dkr-ecr.<region>.on.aws` hosts
+too), are pinned the same way: acceptance reads the digest the tag
+points at with the workload definition's cloud account
+(`ecr:DescribeImages`), and the recorded graph names
+`<registry>/<repository>@sha256:<digest>` while the set keeps the tag. A
+missing repository or tag, or an ECR image whose definition has no cloud
+account known before the deployment runs, is refused with `400`; naming the
+image by digest avoids the lookup, and a digest that is not `sha256:` with 64
+hex digits is refused. Images already named by digest are kept. Images in
+other registries, including ones built from other resources' outputs, are not
+pinned yet; an ECR image built from them is refused, since it cannot be pinned
+before the deployment runs.
+
 Before a deployment changes anything, it checks that every function artifact
 its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`
 (key percent-encoded), still exists, reading it with the workload definition's

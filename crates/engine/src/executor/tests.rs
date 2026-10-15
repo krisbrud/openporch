@@ -23,7 +23,9 @@ use openporch_store::{
 use serde_json::json;
 
 use super::*;
-use crate::cloud::{AssumeRole, AwsCredentials, CallerIdentity, Latest, S3Object, S3Version, Sts};
+use crate::cloud::{
+    AssumeRole, AwsCredentials, CallerIdentity, EcrImage, Latest, S3Object, S3Version, Sts,
+};
 use crate::planner::{
     Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
 };
@@ -255,6 +257,20 @@ impl Sts for FakeSts {
             _ => Latest::Missing,
         };
         Box::pin(async move { Ok(latest) })
+    }
+    /// Repository `web` has tag `1`; nothing else exists.
+    fn image_digest<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrImage,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .push((Some(credentials.access_key_id.clone()), image.to_string()));
+        let digest = (image.repository == "web" && image.tag == "1")
+            .then(|| format!("sha256:{}", "ab".repeat(32)));
+        Box::pin(async move { Ok(digest) })
     }
 }
 
@@ -1303,4 +1319,50 @@ async fn artifacts_are_pinned_to_their_current_version_with_the_workloads_accoun
         "{failure:?}"
     );
     assert_eq!(read().len(), 3);
+}
+
+#[tokio::test]
+async fn ecr_images_are_pinned_to_their_digest_with_the_workloads_account() {
+    let f = Fixture::new().await;
+    f.account().await;
+    let mut pg = plain_pg();
+    pg.driver_account = Some("aws-main".into());
+    f.define(pg, "openporch/none").await;
+    let executor = f.executor(Arc::new(NoPermits));
+    let pin = |image: &str| crate::planner::ImagePin {
+        context: crate::planner::JobContext {
+            org: ORG.parse().unwrap(),
+            app: "shop".parse().unwrap(),
+            env: "development".parse().unwrap(),
+            env_type: "development".parse().unwrap(),
+            deployment_id: "acceptance".into(),
+            permits: Vec::new(),
+        },
+        descriptor: Descriptor::parse(DB).unwrap(),
+        definition_id: "pg".parse().unwrap(),
+        account: "aws-main".parse().unwrap(),
+        image: image.to_owned(),
+    };
+    let registry = "111122223333.dkr.ecr.eu-west-1.amazonaws.com";
+
+    let pinned = executor
+        .pin_image(pin(&format!("{registry}/web:1")))
+        .await
+        .unwrap();
+    assert_eq!(pinned, format!("{registry}/web@sha256:{}", "ab".repeat(32)));
+    assert_eq!(
+        f.sts.objects.lock().unwrap().clone(),
+        [(Some("AKIATEST".to_owned()), format!("{registry}/web:1"))]
+    );
+
+    for (image, expected) in [
+        (format!("{registry}/web:2"), "does not exist"),
+        ("nginx:1".to_owned(), "not an ECR image"),
+    ] {
+        let failure = executor.pin_image(pin(&image)).await.unwrap_err();
+        assert!(
+            matches!(&failure, ExecFailure::Permanent(e) if e.contains(expected)),
+            "{image}: {failure:?}"
+        );
+    }
 }

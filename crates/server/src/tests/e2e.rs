@@ -9,7 +9,8 @@ use axum::http::StatusCode;
 use openporch_core::catalog::builtin_types;
 use openporch_core::workload::Workload;
 use openporch_engine::cloud::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, S3Version, Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrImage, Latest, S3Object, S3Version,
+    Sts,
 };
 use openporch_store::Store;
 use openporch_store::secrets::BoxFuture;
@@ -17,9 +18,9 @@ use serde_json::{Value, json};
 
 use super::{Server, server, server_from};
 
-/// S3 as the account `aws-dev` sees it: bucket `artifacts` keeps versions, and
-/// its objects' current version is `version`; bucket `plain` does not; nothing
-/// else exists.
+/// S3 and ECR as the account `aws-dev` sees them: bucket `artifacts` keeps
+/// versions, and its objects' current version is `version`; bucket `plain`
+/// does not; nothing else exists.
 #[derive(Default)]
 struct ArtifactSts {
     version: Mutex<String>,
@@ -73,6 +74,18 @@ impl Sts for ArtifactSts {
                 _ => Latest::Missing,
             })
         })
+    }
+    /// ECR repository `web` has tags `1` and `2`, each at a digest of its
+    /// digit repeated.
+    fn image_digest<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrImage,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        assert_eq!(credentials.access_key_id, "AKIAEXAMPLE");
+        let digest = (image.repository == "web" && matches!(image.tag.as_str(), "1" | "2"))
+            .then(|| format!("sha256:{}", image.tag.repeat(64)));
+        Box::pin(async move { Ok(digest) })
     }
 }
 
@@ -637,4 +650,88 @@ async fn a_deployment_pins_its_versions_and_replay_refuses_missing_inputs() {
     );
     let (_, env) = s.get(&path, &s.admin).await;
     assert_eq!(env["generation"], generation, "nothing was accepted");
+}
+
+const ECR: &str = "111122223333.dkr.ecr.eu-west-1.amazonaws.com";
+
+/// Image tags in ECR are pinned to digests at acceptance: the snapshot runs
+/// the digest, the set keeps the tag, and a missing tag deploys nothing.
+#[tokio::test]
+async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
+    let s = server_with_s3(Arc::new(ArtifactSts::default())).await;
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": "openporch/none",
+                       "driver_account": "aws-dev", "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let deploy = |image: String| {
+        let s = &s;
+        async move {
+            let doc = "apiVersion: openporch.dev/v1\nkind: Workload\nmetadata: {name: web}\n\
+                       containers: {web: {image: \".\"}, sidecar: {image: \"nginx:1\"}}\n";
+            let (st, delta) = s
+                .post(
+                    &format!("{APP}/deltas"),
+                    &s.admin,
+                    json!({"env": "development", "workload": doc,
+                           "overrides": {"images": {"web": image}}}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{delta}");
+            s.post(
+                &format!("{APP}/envs/development/deploys"),
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": delta["base_generation"]}),
+            )
+            .await
+        }
+    };
+
+    let (st, b) = deploy(format!("{ECR}/web:missing")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("does not exist"),
+        "{b}"
+    );
+
+    let (st, d) = deploy(format!("{ECR}/web:1")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let d = s
+        .finished_at(&format!("{APP}/envs/development/deploys/{id}"))
+        .await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let snapshot = s
+        .state
+        .store
+        .deployment_snapshot("acme", "shop", "development", &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let containers =
+        &snapshot["graph"]["nodes"]["workload.default#modules.web"]["params"]["spec"]["containers"];
+    assert_eq!(
+        containers["web"]["image"],
+        format!("{ECR}/web@sha256:{}", "1".repeat(64))
+    );
+    // Another registry's image is not pinned.
+    assert_eq!(containers["sidecar"]["image"], "nginx:1");
+    // The set keeps the tag it was given.
+    let (_, set) = s
+        .get(
+            &format!("{APP}/sets/{}", d["set_id"].as_str().unwrap()),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(
+        set["modules"]["web"]["spec"]["containers"]["web"]["image"],
+        format!("{ECR}/web:1")
+    );
 }

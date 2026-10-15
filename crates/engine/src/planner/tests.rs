@@ -138,6 +138,8 @@ struct Fake {
     artifact_checks: Mutex<Vec<ArtifactCheck>>,
     /// Every artifact pinned; each pins to version `v9`.
     artifact_pins: Mutex<Vec<ArtifactPin>>,
+    /// Every image pinned; each pins to digest `sha256:aa…`.
+    image_pins: Mutex<Vec<ImagePin>>,
     gone: Mutex<BTreeSet<String>>,
     /// How many artifact checks fail in a way that may pass before one
     /// answers.
@@ -319,6 +321,12 @@ impl Executor for Fake {
             ))),
             None => Ok(()),
         }
+    }
+
+    async fn pin_image(&self, pin: ImagePin) -> Result<String, ExecFailure> {
+        self.image_pins.lock().unwrap().push(pin.clone());
+        let image = EcrImage::parse(&pin.image).expect("only ECR images are pinned");
+        Ok(image.at(&format!("sha256:{}", "aa".repeat(32))))
     }
 
     async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
