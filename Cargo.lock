@@ -1972,6 +1972,7 @@ dependencies = [
  "axum",
  "clap",
  "openporch-client",
+ "openporch-engine",
  "openporch-server",
  "rand 0.8.8",
  "rpassword",

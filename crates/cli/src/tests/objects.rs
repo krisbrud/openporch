@@ -334,12 +334,6 @@ async fn objects_have_the_lifecycle_verbs_of_the_api() {
         assert_eq!(r.code, 2, "{kind}: {r:?}");
     }
 
-    // Applications and environments go with their resources, which needs a
-    // preview and permits: no plain delete verb for them yet.
-    for kind in ["app", "env"] {
-        let r = m.porch(&["delete", kind, "x"], "").await;
-        assert_eq!(r.code, 2, "{kind}: {r:?}");
-    }
     let r = m
         .porch(&["get", "deploys", "--env", "stg", "--limit", "5"], "")
         .await;

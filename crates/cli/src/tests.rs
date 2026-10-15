@@ -19,6 +19,7 @@ use crate::config::{Credentials, FileConfig};
 
 mod deploys;
 mod objects;
+mod plans;
 
 /// A dev server on a loopback port.
 struct DevServer {

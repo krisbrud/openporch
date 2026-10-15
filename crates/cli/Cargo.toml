@@ -26,6 +26,7 @@ toml.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+openporch-engine = { path = "../engine" }
 openporch-server = { path = "../server" }
 
 [lints]

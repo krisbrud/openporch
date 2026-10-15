@@ -1954,6 +1954,10 @@ their values or references), the resources it depends on, and its `usage`:
   counts from the last success, and `outputs` are still that success's.
 - `referenced`: whether the environment's latest deployment includes it.
 
+While a resource's `status` is `unknown` or `recovery_required`,
+`unknown_operation` names the operation whose outcome is unknown; recovering
+it is described below.
+
 A resource that a later deployment no longer includes stays tracked, with
 `referenced: false`, because it still exists and may cost money. Including it
 again reuses it with its data. If a definition switches a provisioned resource to

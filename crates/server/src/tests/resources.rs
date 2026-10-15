@@ -1143,6 +1143,13 @@ async fn an_unknown_outcome_is_recovered_or_resolved() {
     assert_eq!(d["status"], "failed", "{d}");
     let db = s.resource(DB).await;
     assert_eq!(db["status"], "unknown", "{db}");
+    // It names the operation whose outcome is unknown.
+    assert!(
+        db["unknown_operation"]
+            .as_str()
+            .is_some_and(|o| !o.is_empty()),
+        "{db}"
+    );
     let path = format!("{RESOURCES}/postgres/modules.web.externals.db");
     let (recover, resolve) = (format!("{path}/recover"), format!("{path}/resolve"));
 

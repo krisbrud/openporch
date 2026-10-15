@@ -8,6 +8,7 @@ pub mod deploys;
 pub mod members;
 pub mod objects;
 pub mod output;
+pub mod plans;
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
@@ -223,7 +224,7 @@ impl Session {
 }
 
 /// The message for a failed API call, with a hint for rejected credentials.
-fn api(e: ApiError) -> String {
+pub(crate) fn api(e: ApiError) -> String {
     match e.status() {
         Some(401) => format!("{e}; run `porch login` or check OPENPORCH_TOKEN"),
         _ => e.to_string(),

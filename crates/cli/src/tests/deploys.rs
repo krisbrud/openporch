@@ -51,7 +51,7 @@ containers:
 /// `shop` with definitions that deploy workloads without a cloud, and a
 /// machine logged in as the administrator with `--app shop --env development`
 /// in its environment.
-async fn deployable(server: &DevServer, workload_driver: Value) -> Machine {
+pub(super) async fn deployable(server: &DevServer, workload_driver: Value) -> Machine {
     server.post("/orgs/acme/apps", json!({"id": "shop"})).await;
     server
         .post(
@@ -70,13 +70,13 @@ async fn deployable(server: &DevServer, workload_driver: Value) -> Machine {
     m
 }
 
-fn file(m: &Machine, name: &str, content: &str) -> String {
+pub(super) fn file(m: &Machine, name: &str, content: &str) -> String {
     let path = m.home.path().join(name);
     std::fs::write(&path, content).unwrap();
     path.to_string_lossy().into_owned()
 }
 
-async fn deploys(server: &DevServer) -> Vec<Value> {
+pub(super) async fn deploys(server: &DevServer) -> Vec<Value> {
     let page = admin_client(server)
         .request(
             Method::GET,
@@ -351,7 +351,7 @@ async fn raw_api_requests() {
 }
 
 /// Serves `router` on a loopback port.
-async fn serve(router: axum::Router, data: tempfile::TempDir) -> DevServer {
+pub(super) async fn serve(router: axum::Router, data: tempfile::TempDir) -> DevServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -467,4 +467,38 @@ async fn lost_acceptance_response_returns_the_original_deployment() {
         "Deployment {} started.",
         list[0]["id"].as_str().unwrap()
     )));
+}
+
+/// `--timeout` stops waiting on a deployment that is still running, which
+/// carries on.
+#[tokio::test]
+async fn waiting_stops_at_the_timeout() {
+    let data = tempfile::tempdir().unwrap();
+    let state = openporch_server::start(openporch_server::Config::new("acme", data.path()), None)
+        .await
+        .unwrap();
+    state.runners.set(Arc::new(Gated {
+        gate: Arc::new(Semaphore::new(0)),
+        inner: state.runners.current(),
+    }));
+    let (router, _) = openporch_server::router(state);
+    let server = serve(router, data).await;
+    let m = deployable(&server, json!({"driver_type": "openporch/none"})).await;
+    let f = file(&m, "workload.yaml", SCORE_AS_WORKLOAD);
+    let r = m
+        .porch(
+            &["workload", "deploy", "-f", &f, "--wait", "--timeout", "1s"],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("still running after 1s"), "{r:?}");
+    assert!(r.err.contains("porch logs deploy"), "{r:?}");
+    assert_eq!(deploys(&server).await[0]["status"], "in_progress");
+
+    // A timeout needs `--wait`.
+    let r = m
+        .porch(&["workload", "deploy", "-f", &f, "--timeout", "1s"], "")
+        .await;
+    assert_eq!(r.code, 2, "{r:?}");
 }
