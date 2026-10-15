@@ -29,6 +29,23 @@ variable "log_retention_days" {
   description = "How long the function's log group keeps logs."
 }
 
+variable "iam_path" {
+  type        = string
+  default     = "/"
+  description = "The IAM path of the function's roles, such as `/openporch/`."
+
+  validation {
+    condition     = can(regex("^/([A-Za-z0-9+=,.@_-]+/)*$", var.iam_path))
+    error_message = "An IAM path starts and ends with `/`."
+  }
+}
+
+variable "permissions_boundary" {
+  type        = string
+  default     = null
+  description = "The ARN of a managed policy that bounds the function's roles, which a platform's role may be required to set."
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

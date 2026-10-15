@@ -766,3 +766,29 @@ run "long_names_stay_unique" {
     error_message = "Long schedule names are shortened and stay distinct."
   }
 }
+
+run "bounded_roles" {
+  command = plan
+
+  variables {
+    iam_path             = "/openporch/"
+    permissions_boundary = "arn:aws:iam::123456789012:policy/openporch-boundary"
+    resource = {
+      id = "order-worker"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = { nightly = { schedule = { cron = "0 3 * * *" } } }
+      }
+    }
+    resource_secrets = {}
+  }
+
+  assert {
+    condition = (
+      aws_iam_role.this.path == "/openporch/" && aws_iam_role.scheduler[0].path == "/openporch/" &&
+      aws_iam_role.this.permissions_boundary == "arn:aws:iam::123456789012:policy/openporch-boundary" &&
+      aws_iam_role.scheduler[0].permissions_boundary == "arn:aws:iam::123456789012:policy/openporch-boundary"
+    )
+    error_message = "Both roles are created under the path, with the boundary."
+  }
+}

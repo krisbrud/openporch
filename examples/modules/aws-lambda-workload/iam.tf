@@ -15,9 +15,11 @@ data "aws_iam_policy_document" "assume" {
 
 resource "aws_iam_role" "this" {
   # A name too long for IAM is shortened with a hash, so it stays unique.
-  name               = length("${local.name}-lambda") <= 64 ? "${local.name}-lambda" : "${substr(local.name, 0, 47)}-${substr(sha1(local.name), 0, 8)}-lambda"
-  assume_role_policy = data.aws_iam_policy_document.assume.json
-  tags               = var.tags
+  name                 = length("${local.name}-lambda") <= 64 ? "${local.name}-lambda" : "${substr(local.name, 0, 47)}-${substr(sha1(local.name), 0, 8)}-lambda"
+  assume_role_policy   = data.aws_iam_policy_document.assume.json
+  path                 = var.iam_path
+  permissions_boundary = var.permissions_boundary
+  tags                 = var.tags
 }
 
 data "aws_iam_policy_document" "this" {

@@ -35,3 +35,9 @@ provider:
 # Check dependency licenses, advisories and sources.
 deny:
     cargo deny check
+
+# Apply examples/aws-platform against a dev server and an AWS endpoint, such as
+# Floci at AWS_ENDPOINT_URL, then destroy it. Needs `go`, `tofu` and `jq`.
+example-platform:
+    cargo build -p openporch-server --bin openporch
+    examples/aws-platform/test.sh target/debug/openporch

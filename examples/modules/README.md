@@ -21,7 +21,9 @@ Each module's header describes its params. The resource modules take the
 resource's name as the variable `name`; the policy modules take `name` and the
 resource's ARN (`table_arn`, `queue_arn` or `bucket_arn`), and `read_only` for
 tables and buckets or `access` (`send`, `consume` or `send-and-consume`) for
-queues. The table policy also reads the table's stream. Every module also takes `tags`. The modules use the
+queues. The table policy also reads the table's stream. Every module also takes `tags`, the policy modules `iam_path`, and
+`aws-lambda-workload` `iam_path` and `permissions_boundary` for its roles, so a
+platform's role can be limited to the IAM objects openporch creates. The modules use the
 `hashicorp/aws` provider 6.x (6.28 or later for `aws-lambda-workload`) with the credentials the driver exports for the
 definition's cloud account. Deleting an `s3` resource deletes its objects too,
 so, like every deletion the driver plans, it needs an acknowledgement.
