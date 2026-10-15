@@ -283,7 +283,8 @@ impl fmt::Display for S3Version {
 }
 
 /// A container image named by a mutable tag in an Amazon ECR repository, as
-/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>]`.
+/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>]` (or its
+/// FIPS, China and dual-stack hosts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EcrImage {
     /// The registry host.
@@ -292,58 +293,70 @@ pub struct EcrImage {
     pub account: String,
     /// The registry's region.
     pub region: String,
+    /// Whether the registry is a FIPS endpoint, so ECR is asked through one.
+    pub fips: bool,
     /// The repository.
     pub repository: String,
     /// The tag; `latest` when none is given.
     pub tag: String,
 }
 
+/// The account, region and FIPS flag of an ECR registry host, which may
+/// carry the HTTPS port.
+pub fn ecr_registry(host: &str) -> Option<(String, String, bool)> {
+    let host = host
+        .strip_suffix(":443")
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    let parts: Vec<&str> = host.split('.').collect();
+    let (account, kind, region) = match parts.as_slice() {
+        [account, "dkr", kind, region, "amazonaws", "com"]
+        | [account, "dkr", kind, region, "amazonaws", "com", "cn"] => (*account, *kind, *region),
+        [account, "dkr-ecr", region, "on", "aws"] => (*account, "ecr", *region),
+        [account, "dkr-ecr-fips", region, "on", "aws"] => (*account, "ecr-fips", *region),
+        _ => return None,
+    };
+    let fips = match kind {
+        "ecr" => false,
+        "ecr-fips" => true,
+        _ => return None,
+    };
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) || region.is_empty() {
+        return None;
+    }
+    Some((account.to_owned(), region.to_owned(), fips))
+}
+
+/// Whether `image` names an ECR registry, pinned or not.
+pub fn in_ecr(image: &str) -> bool {
+    image
+        .split_once('/')
+        .is_some_and(|(host, _)| ecr_registry(host).is_some())
+}
+
 impl EcrImage {
-    /// `image` as an ECR image named by tag; `None` for an image pinned by
+    /// `image` as an ECR image named by tag; `None` for an image with a
     /// digest, or one in another registry.
     pub fn parse(image: &str) -> Option<Self> {
         if image.contains('@') {
             return None;
         }
         let (registry, path) = image.split_once('/')?;
-        let parts: Vec<&str> = registry.split('.').collect();
-        let (account, region) = match parts.as_slice() {
-            [
-                account,
-                "dkr",
-                "ecr" | "ecr-fips",
-                region,
-                "amazonaws",
-                "com",
-            ]
-            | [
-                account,
-                "dkr",
-                "ecr" | "ecr-fips",
-                region,
-                "amazonaws",
-                "com",
-                "cn",
-            ] => (*account, *region),
-            _ => return None,
-        };
-        if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) || region.is_empty()
-        {
-            return None;
-        }
+        let (account, region, fips) = ecr_registry(registry)?;
         // A tag follows the last `:` after the last `/`.
         let last = path.rsplit('/').next().unwrap_or(path);
         let (repository, tag) = match last.rsplit_once(':') {
             Some((_, tag)) => (&path[..path.len() - tag.len() - 1], tag),
             None => (path, "latest"),
         };
-        if repository.is_empty() || tag.is_empty() {
+        if repository.is_empty() || repository.ends_with('/') || tag.is_empty() {
             return None;
         }
         Some(Self {
             registry: registry.to_owned(),
-            account: account.to_owned(),
-            region: region.to_owned(),
+            account,
+            region,
+            fips,
             repository: repository.to_owned(),
             tag: tag.to_owned(),
         })

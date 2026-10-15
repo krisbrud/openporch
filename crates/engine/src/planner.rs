@@ -35,7 +35,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::cloud::{EcrImage, S3Object, S3Version, pinned_image};
+use crate::cloud::{EcrImage, S3Object, S3Version, in_ecr, pinned_image};
 
 mod deprovision;
 mod log;
@@ -699,7 +699,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 artifact: artifact.clone(),
             };
             let version = self
-                .with_retries(&pin.descriptor, deadline, || {
+                .with_retries("artifacts", &pin.descriptor, deadline, || {
                     self.executor.pin_artifact(pin.clone())
                 })
                 .await?;
@@ -712,7 +712,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     /// digest the tag points at now: for each such workload, the pinned image
     /// by its JSON pointer in the workload's node, with shared values
     /// resolved. Images already pinned by digest are kept, and images in other
-    /// registries are not pinned.
+    /// registries, or built from other resources' outputs outside ECR, are
+    /// not pinned.
     pub async fn pin_images(
         &self,
         deployment: &Deployment,
@@ -726,13 +727,18 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     PinError::Refused(format!("image `{named}` of `{}` {why}", node.descriptor))
                 };
                 let scope = scope_for(deployment, node, &BTreeMap::new());
-                let image = resolve_plain(&named, &scope).ok_or_else(|| {
-                    refused(
-                        "must be known before the deployment runs to be pinned: name it \
-                         literally or through shared values"
-                            .into(),
-                    )
-                })?;
+                // An image built from other resources' outputs is known only
+                // when the deployment runs; only one in ECR must be pinned.
+                let Some(image) = resolve_plain(&named, &scope) else {
+                    if in_ecr(&named) {
+                        return Err(refused(
+                            "must be known before the deployment runs to be pinned: name it \
+                             literally or through shared values"
+                                .into(),
+                        ));
+                    }
+                    continue;
+                };
                 if pinned_image(&image) {
                     if image != named {
                         pinned
@@ -746,6 +752,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     return Err(refused(
                         "was not supplied: pass `--image <container>=<image>`".into(),
                     ));
+                }
+                if image.contains('@') {
+                    return Err(refused(format!(
+                        "names a digest that is not `sha256:` and 64 hex digits: `{image}`"
+                    )));
                 }
                 // Only ECR images can be read with the workload's account.
                 if EcrImage::parse(&image).is_none() {
@@ -766,7 +777,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     image,
                 };
                 let digest = self
-                    .with_retries(&pin.descriptor, deadline, || {
+                    .with_retries("images", &pin.descriptor, deadline, || {
                         self.executor.pin_image(pin.clone())
                     })
                     .await?;
@@ -783,6 +794,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     /// deployment's attempts and `deadline`.
     async fn with_retries<T, F, Fut>(
         &self,
+        what: &str,
         descriptor: &Descriptor,
         deadline: Instant,
         call: F,
@@ -802,7 +814,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
                 Err(_) => {
                     return Err(PinError::Unavailable(format!(
-                        "ran out of time pinning the artifacts of `{descriptor}`"
+                        "ran out of time pinning the {what} of `{descriptor}`"
                     )));
                 }
             };

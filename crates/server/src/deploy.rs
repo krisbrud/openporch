@@ -62,9 +62,10 @@ pub type ImagePinFuture = Pin<
     Box<dyn Future<Output = Result<BTreeMap<String, BTreeMap<String, String>>, PinError>> + Send>,
 >;
 
-/// How long pinning a deployment's artifacts or images may take at acceptance.
-/// Well within a client's request timeout, so the client hears why.
-pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long pinning a deployment's artifacts, and then its images, may each
+/// take at acceptance. Both together stay well within a client's request
+/// timeout, so the client hears why.
+pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What recovering a resource returns.
 pub type RecoverFuture = Pin<Box<dyn Future<Output = Result<Recovered, RecoverError>> + Send>>;
@@ -88,16 +89,11 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
     }
 
     /// Pins the ECR images `deployment`'s workloads name by tag to their
-    /// digests. A runner without an executor cannot.
+    /// digests. A runner without an executor pins none; the server always
+    /// runs with one.
     fn pin_images(&self, deployment: Deployment) -> ImagePinFuture {
         let _ = deployment;
-        Box::pin(async {
-            Err(PinError::Refused(
-                "images cannot be pinned until the server runs with an executor; name each ECR \
-                 image by digest as `<image>@sha256:<digest>`"
-                    .into(),
-            ))
-        })
+        Box::pin(async { Ok(BTreeMap::new()) })
     }
 
     /// Observes a resource whose last operation has an unknown outcome and

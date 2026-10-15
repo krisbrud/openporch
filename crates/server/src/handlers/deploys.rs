@@ -14,7 +14,7 @@ use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ClassRegistry, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
-use openporch_engine::cloud::{EcrImage, S3Version};
+use openporch_engine::cloud::{EcrImage, S3Version, pinned_image};
 use openporch_engine::planner::PinError;
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
@@ -506,9 +506,13 @@ async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) 
 /// digests, in the snapshot's graph, as [`pin_artifacts`] does for artifacts.
 /// Images in other registries are not pinned.
 async fn pin_images(state: &AppState, env: &EnvRecord, snapshot: &mut Value) -> ApiResult<()> {
+    // Tags in ECR, malformed digests and images that may resolve to either.
     let image = |v: &Value| {
-        v.as_str()
-            .is_some_and(|i| EcrImage::parse(i).is_some() || i.contains("${"))
+        v.as_str().is_some_and(|i| {
+            EcrImage::parse(i).is_some()
+                || i.contains("${")
+                || (i.contains('@') && !pinned_image(i))
+        })
     };
     let unpinned = snapshot["graph"]["nodes"]
         .as_object()

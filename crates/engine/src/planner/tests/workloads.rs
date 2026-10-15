@@ -504,6 +504,67 @@ async fn ecr_images_are_pinned_to_digests_with_the_definitions_account() {
     }
     assert_eq!(fake.image_pins.lock().unwrap().len(), 1);
 
+    // An image from another resource's outputs is pinned only in ECR, and a
+    // malformed digest is refused.
+    let from_output = "${resources.db.host}/web:1".to_owned();
+    let f = Fixture::new().await;
+    let deployment = f
+        .accept_set(Some(&image_worker(&from_output)), with_lambda_account(None))
+        .await
+        .unwrap();
+    let pinned = planner(&f, &fake, fast())
+        .pin_images(&deployment, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(pinned.is_empty(), "{pinned:?}");
+    for (image, expected) in [
+        (format!("{ECR}/${{resources.db.host}}:1"), "must be known"),
+        (format!("{ECR}/worker@sha256:abc"), "not `sha256:`"),
+    ] {
+        let f = Fixture::new().await;
+        let deployment = f
+            .accept_set(
+                Some(&image_worker(&image)),
+                with_lambda_account(Some("aws-lambda")),
+            )
+            .await
+            .unwrap();
+        let e = planner(&f, &fake, fast())
+            .pin_images(&deployment, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, PinError::Refused(m) if m.contains(expected)),
+            "{image}: {e:?}"
+        );
+    }
+
+    // A shared value naming an ECR tag is resolved, then pinned.
+    let f = Fixture::new().await;
+    let mut deployment = f
+        .accept_set(
+            Some(&image_worker("${values.IMAGE}")),
+            with_lambda_account(Some("aws-lambda")),
+        )
+        .await
+        .unwrap();
+    deployment.values.insert(
+        "IMAGE".into(),
+        SharedValue::Value(json!(format!("{ECR}/worker:2"))),
+    );
+    let pinned = planner(&f, &fake, fast())
+        .pin_images(&deployment, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned[&d(WORKER_WORKLOAD)]["/params/spec/function/package/image"],
+        digest
+    );
+    assert_eq!(
+        fake.image_pins.lock().unwrap()[1].image,
+        format!("{ECR}/worker:2")
+    );
+
     // An ECR image needs an account to be read with.
     let f = Fixture::new().await;
     let deployment = f

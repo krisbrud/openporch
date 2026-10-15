@@ -803,8 +803,8 @@ where
                 pin.descriptor
             ))),
             Ok(None) => Err(ExecFailure::Permanent(format!(
-                "image `{image}` of `{}` does not exist",
-                pin.descriptor
+                "image `{image}` of `{}` does not exist, or cloud account `{}` cannot see it",
+                pin.descriptor, pin.account
             ))),
             Err(e) => Err(log.failure(cloud_failure(e))),
         }

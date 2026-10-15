@@ -91,12 +91,16 @@ impl AwsSts {
         aws_sdk_s3::Client::from_conf(config.build())
     }
 
-    /// An ECR client in `region` with `credentials`.
-    async fn ecr(&self, region: &str, credentials: Credentials) -> aws_sdk_ecr::Client {
+    /// An ECR client for `image`'s region, through a FIPS endpoint for a
+    /// FIPS registry, with `credentials`.
+    async fn ecr(&self, image: &EcrImage, credentials: Credentials) -> aws_sdk_ecr::Client {
         let host = self.host().await;
-        let config = aws_sdk_ecr::config::Builder::from(host)
-            .region(Region::new(region.to_owned()))
+        let mut config = aws_sdk_ecr::config::Builder::from(host)
+            .region(Region::new(image.region.clone()))
             .credentials_provider(credentials);
+        if image.fips {
+            config = config.use_fips(true);
+        }
         aws_sdk_ecr::Client::from_conf(config.build())
     }
 }
@@ -230,7 +234,7 @@ impl Sts for AwsSts {
         image: &'a EcrImage,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
-            let client = self.ecr(&image.region, provider(credentials)).await;
+            let client = self.ecr(image, provider(credentials)).await;
             let id = aws_sdk_ecr::types::ImageIdentifier::builder()
                 .image_tag(&image.tag)
                 .build();
