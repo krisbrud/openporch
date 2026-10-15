@@ -53,7 +53,14 @@ jobs:
             --git https://github.com/krisbrud/openporch --rev "${{ vars.PORCH_REV }}" openporch-cli
       - name: Deploy
         # openporch pins the object's current version when it accepts the
-        # deployment, so rollbacks and replays run this exact zip.
+        # deployment, so rollbacks and replays run this exact zip. Set the
+        # organization, application and environment to your own.
+        env:
+          OPENPORCH_URL: ${{ vars.OPENPORCH_URL }}
+          OPENPORCH_ORG: acme
+          OPENPORCH_APP: shop
+          OPENPORCH_ENV: development
+          OPENPORCH_TOKEN: ${{ secrets.OPENPORCH_TOKEN }}
         run: |
           porch workload deploy -f workload.yaml \
             --artifact "main=${{ steps.upload.outputs.uri }}" \
