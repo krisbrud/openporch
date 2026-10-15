@@ -1,8 +1,11 @@
 package provider
 
 import (
+	"context"
+
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/krisbrud/openporch/provider/internal/client"
@@ -28,7 +31,7 @@ func secretRefAttributes(computed bool) map[string]schema.Attribute {
 	return map[string]schema.Attribute{
 		"store": schema.StringAttribute{Required: true, MarkdownDescription: "The secret store, such as `openporch`."},
 		"ref":   schema.StringAttribute{Required: true, MarkdownDescription: "The secret's path in the store."},
-		"version": schema.StringAttribute{Optional: true,
+		"version": schema.StringAttribute{Optional: true, Validators: []validator.String{notEmpty{}},
 			MarkdownDescription: "A version; without one, deployments pin the version current when they are accepted."},
 	}
 }
@@ -69,4 +72,18 @@ func refFromObject(o types.Object) *client.SecretRef {
 		return ""
 	}
 	return &client.SecretRef{Store: str("store"), Ref: str("ref"), Version: str("version")}
+}
+
+// notEmpty rejects an empty string, which the API would read as "no version".
+type notEmpty struct{}
+
+func (notEmpty) Description(context.Context) string { return "must not be empty" }
+
+func (v notEmpty) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+
+func (notEmpty) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if !req.ConfigValue.IsNull() && !req.ConfigValue.IsUnknown() && req.ConfigValue.ValueString() == "" {
+		resp.Diagnostics.AddAttributeError(req.Path, "Empty version",
+			"Leave `version` out for the current version, or give one.")
+	}
 }

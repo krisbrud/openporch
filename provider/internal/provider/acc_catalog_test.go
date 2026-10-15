@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/statecheck"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 
 	"github.com/krisbrud/openporch/provider/internal/client"
@@ -111,6 +112,13 @@ resource "openporch_value" "token" {
   secret_value = %q
 }
 
+resource "openporch_value" "token_dev" {
+  app_id       = openporch_application.app.id
+  env_id       = "development"
+  key          = openporch_value.token.key
+  secret_value = "${%[3]q}-dev"
+}
+
 resource "openporch_value" "token_alias" {
   app_id     = openporch_application.app.id
   key        = "TOKEN_ALIAS"
@@ -135,8 +143,12 @@ resource "openporch_value" "token_alias" {
 		ProtoV6ProviderFactories: providers,
 		Steps: []resource.TestStep{
 			{
-				Config:            config("one", "https://api.dev.example/v1"),
-				ConfigStateChecks: []statecheck.StateCheck{written("1")},
+				Config: config("one", "https://api.dev.example/v1"),
+				ConfigStateChecks: []statecheck.StateCheck{
+					written("1"),
+					statecheck.ExpectKnownValue("openporch_value.token_dev",
+						tfjsonpath.New("written_secret_ref").AtMapKey("version"), knownvalue.StringExact("1")),
+				},
 			},
 			{
 				// Changing another value keeps the secret's version.
@@ -192,27 +204,66 @@ resource "openporch_value" "token_alias" {
 				ImportStateId:   app + "/TOKEN_ALIAS",
 				ImportStateKind: resource.ImportBlockWithID,
 			},
+			{
+				// A secret value is imported as its reference.
+				ResourceName:  "openporch_value.token_dev",
+				ImportState:   true,
+				ImportStateId: app + "/development/API_TOKEN",
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("imported %d values", len(states))
+					}
+					a := states[0].Attributes
+					if a["secret_ref.store"] != "openporch" || a["secret_ref.ref"] == "" || a["secret_value"] != "" {
+						return fmt.Errorf("imported %v", a)
+					}
+					return nil
+				},
+			},
 		},
 	})
 }
 
-func TestAccValueNeedsOneKind(t *testing.T) {
+func TestAccInvalidSecretConfig(t *testing.T) {
+	invalid := func(body, message string) resource.TestStep {
+		return resource.TestStep{Config: body, PlanOnly: true, ExpectError: regexp.MustCompile(message)}
+	}
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { preCheck(t) },
 		ProtoV6ProviderFactories: providers,
 		Steps: []resource.TestStep{
-			{
-				Config: `
+			invalid(`
 resource "openporch_value" "v" {
   app_id       = "shop"
   key          = "API_TOKEN"
   value        = "plain"
   secret_value = "secret"
 }
-`,
-				PlanOnly:    true,
-				ExpectError: regexp.MustCompile("Set exactly one of"),
-			},
+`, "Set exactly one of"),
+			invalid(`
+resource "openporch_value" "v" {
+  app_id = "shop"
+  key    = "API_TOKEN"
+}
+`, "Set exactly one of"),
+			invalid(`
+resource "openporch_value" "v" {
+  app_id     = "shop"
+  key        = "API_TOKEN"
+  secret_ref = { store = "openporch", ref = "apps/shop/values/API_TOKEN", version = "" }
+}
+`, "Empty version"),
+			invalid(`
+resource "openporch_cloud_account" "a" {
+  id      = "aws-dev"
+  type    = "aws"
+  config  = { access_key_id = "AKIAIOSFODNN7EXAMPLE" }
+  secrets = { secret_access_key = "secret" }
+  secret_refs = {
+    secret_access_key = { store = "openporch", ref = "accounts/other/secret_access_key" }
+  }
+}
+`, "Duplicate secret"),
 		},
 	})
 }
@@ -231,6 +282,20 @@ func TestAccCloudAccount(t *testing.T) {
 	c := apiClient(t)
 	id := randomID("acc-aws")
 	roleID := randomID("acc-role")
+	aliasID := randomID("acc-alias")
+	// The alias account references the other account's secret, which needs a grant.
+	var grant struct {
+		ID string `json:"id"`
+	}
+	err := c.Do(context.Background(), http.MethodPost, c.OrgPath("secretstores", "openporch", "grants"),
+		map[string]any{"ref": "accounts/" + id + "/secret_access_key", "org_wide": true}, &grant)
+	if err != nil {
+		t.Fatalf("granting the secret: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = c.Do(context.Background(), http.MethodDelete,
+			c.OrgPath("secretstores", "openporch", "grants", grant.ID), nil, nil)
+	})
 	config := func(region, secret string) string {
 		return fmt.Sprintf(`
 resource "openporch_cloud_account" "keys" {
@@ -245,8 +310,20 @@ resource "openporch_cloud_account" "keys" {
   }
 }
 
+resource "openporch_cloud_account" "alias" {
+  id     = %[5]q
+  type   = "aws"
+  config = { access_key_id = "AKIAIOSFODNN7EXAMPLE" }
+  secret_refs = {
+    secret_access_key = {
+      store = "openporch"
+      ref   = openporch_cloud_account.keys.written_secret_refs["secret_access_key"].ref
+    }
+  }
+}
+
 resource "openporch_cloud_account" "role" {
-  id   = %q
+  id   = %[4]q
   name = "Production role"
   type = "aws-role"
   config = {
@@ -255,7 +332,7 @@ resource "openporch_cloud_account" "role" {
     session_duration = 7200
   }
 }
-`, id, region, secret, roleID)
+`, id, region, secret, roleID, aliasID)
 	}
 	written := func(version string) statecheck.StateCheck {
 		return statecheck.ExpectKnownValue("openporch_cloud_account.keys",
@@ -316,6 +393,12 @@ resource "openporch_cloud_account" "role" {
 					},
 				},
 				ConfigStateChecks: []statecheck.StateCheck{written("4")},
+			},
+			{
+				ResourceName:      "openporch_cloud_account.alias",
+				ImportState:       true,
+				ImportStateId:     aliasID,
+				ImportStateVerify: true,
 			},
 			{
 				ResourceName:      "openporch_cloud_account.role",

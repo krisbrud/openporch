@@ -152,8 +152,11 @@ func (m *valueModel) apply(v *client.SharedValue) {
 	case !m.SecretValue.IsNull():
 		written := refFromObject(m.Written)
 		if written != nil && *written != *v.SecretRef {
-			// Changed outside OpenTofu: forget the value, so the plan writes it again.
+			// Changed outside OpenTofu: forget the value, so the plan writes it
+			// again, and the reference, which the provider did not write.
 			m.SecretValue = types.StringNull()
+			m.Written = types.ObjectNull(secretRefAttrTypes)
+			return
 		}
 		m.Written = writtenRef(*v.SecretRef)
 	default:
