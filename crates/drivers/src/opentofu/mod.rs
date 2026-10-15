@@ -380,7 +380,7 @@ pub fn check_definition(
     }
     // Secret leaves are references here; only their names are checked.
     let mut stand_ins = Map::new();
-    for key in ["files", "tokens"] {
+    for key in ["files", "tokens", "variables"] {
         if let Some(Value::Object(m)) = secrets.get(key) {
             let names = m.keys().map(|k| (k.clone(), Value::from(""))).collect();
             stand_ins.insert(key.into(), Value::Object(names));
@@ -529,7 +529,7 @@ fn parse(
         }
         tokens.insert(host, token);
     }
-    Ok(Inputs {
+    let inputs = Inputs {
         source,
         script,
         variables: string_map(values.get("variables"), "variables")?,
@@ -537,8 +537,28 @@ fn parse(
         files,
         credentials_config,
         tokens,
-    })
+    };
+    let credential_variables = inputs
+        .credentials_config
+        .iter()
+        .flat_map(|cc| cc.variables.keys().chain(cc.file.as_ref()));
+    if let Some(name) = inputs
+        .variables
+        .keys()
+        .chain(inputs.secret_variables.keys())
+        .chain(credential_variables)
+        .find(|name| RESOURCE_VARIABLES.contains(&name.as_str()))
+    {
+        return Err(input(format!(
+            "the variable `{name}` is reserved for the resource's inputs"
+        )));
+    }
+    Ok(inputs)
 }
+
+/// The variables that carry the resource's inputs: plain ones, and those that
+/// resolved from secrets.
+const RESOURCE_VARIABLES: [&str; 2] = ["resource", "resource_secrets"];
 
 /// Whether OpenTofu loads `name` as an override file, which can replace the
 /// orchestrator's backend.
@@ -895,6 +915,19 @@ impl OpenTofu {
             run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
         }
 
+        // The resource's inputs, such as a workload's spec or a table's key.
+        let mut variables = inputs.variables.clone();
+        let [plain, secret] = RESOURCE_VARIABLES;
+        if !req.resource.is_empty() {
+            variables.insert(plain.into(), Value::Object(req.resource.clone()));
+        }
+        if !req.resource_secrets.expose().is_empty() {
+            secret_variables.insert(
+                secret.into(),
+                Value::Object(req.resource_secrets.expose().clone()),
+            );
+        }
+
         // Variables: plain and secret in separate files, both outside the module.
         let mut redact = Vec::new();
         secret_variables
@@ -902,7 +935,7 @@ impl OpenTofu {
             .for_each(|v| strings(v, &mut redact));
         run.log.redact_values(redact);
         for (name, vars) in [
-            ("values.tfvars.json", &inputs.variables),
+            ("values.tfvars.json", &variables),
             ("secrets.tfvars.json", &secret_variables),
         ] {
             if vars.is_empty() {

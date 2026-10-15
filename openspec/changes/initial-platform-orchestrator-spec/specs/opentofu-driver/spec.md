@@ -18,6 +18,18 @@ The OpenTofu driver provisions any resource type by running OpenTofu code from a
 - **WHEN** a definition provides neither
 - **THEN** creating the definition fails with `400`
 
+### Requirement: Resource inputs
+
+`openporch/opentofu` SHALL pass a resource's inputs (the params a workload gives it, or a `workload` resource's resolved spec and dependency outputs) to the module as the OpenTofu variable `resource`, holding the plain inputs, and `resource_secrets`, holding the top-level inputs that resolved from secrets, which SHALL be written only to the secret variable file and redacted from logs. Each SHALL be set only when the resource has such inputs. A definition SHALL NOT set variables with either name.
+
+#### Scenario: Table key from params
+- **WHEN** a workload gives a `dynamodb-table` `params.primaryKey: {name: id, type: S}` and the module reads `var.resource.primaryKey`
+- **THEN** the run applies the module with that key
+
+#### Scenario: Reserved variable name
+- **WHEN** a definition sets `driver_inputs.values.variables.resource`
+- **THEN** creating the definition fails with `400`
+
 ### Requirement: Run procedure
 
 For `put`, prepare a restricted run directory, resolve source to an immutable commit or write the script, and generate protected input files. Run noninteractive init and a saved plan; inspect actions/permits before applying that exact plan. Stale state SHALL require re-planning. Checkpoint result/state before exposing outputs. Configurable OpenTofu versions SHALL stay within the support matrix and preserve dependency integrity/TLS verification.

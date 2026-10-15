@@ -873,6 +873,14 @@ async fn opentofu_definition_inputs_are_checked_when_written() {
                    "secrets": {"files": {"ok.txt": "${resources.x.outputs.y}"}}}),
             "would replace the script",
         ),
+        (
+            json!({"values": {"script": "", "variables": {"resource": "x"}}}),
+            "the variable `resource` is reserved",
+        ),
+        (
+            json!({"values": {"script": ""}, "secrets": {"variables": {"resource_secrets": "x"}}}),
+            "the variable `resource_secrets` is reserved",
+        ),
     ] {
         let (status, b) = s
             .post("/orgs/acme/resources/defs", &s.admin, def(inputs))
