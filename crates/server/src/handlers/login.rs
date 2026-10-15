@@ -275,6 +275,8 @@ pub async fn callback(
             return fail("unavailable");
         }
     };
+    // The exchange window starts once GitHub has answered.
+    let now = openporch_store::now_ms();
     let Some(login_code) = state.browser_logins.complete(identity, now) else {
         return fail("unavailable");
     };
