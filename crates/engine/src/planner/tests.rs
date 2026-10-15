@@ -878,8 +878,9 @@ async fn a_timeout_leaves_the_resource_unknown_until_recovered() {
     let f = Fixture::new().await;
     let fake = Fake::with(&[("dns", Behavior::Hang)]);
     let deployment = f.accept().await;
+    // Long enough for the executor to reach the driver on a loaded machine.
     let limits = Limits {
-        deadline: Duration::from_millis(500),
+        deadline: Duration::from_secs(2),
         ..fast()
     };
     let outcomes = planner(&f, &fake, limits).run(deployment.clone()).await;

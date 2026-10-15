@@ -16,11 +16,11 @@ pub async fn livez() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Ready when the database answers, the required keys are loaded and the in-process
-/// executor runs. Ownership is held for the life of the process. Reasons name key
-/// IDs only, never key material.
+/// Ready when the database answers, the required keys are loaded, the in-process
+/// executor runs and shutdown has not begun. Ownership is held for the life of the
+/// process. Reasons name key IDs only, never key material.
 pub async fn readyz(State(state): State<AppState>) -> Response {
-    let mut reasons = state.not_ready.clone();
+    let mut reasons = state.not_ready_reasons();
     if sqlx_ping(&state).await.is_err() {
         reasons.push("database_unavailable".to_owned());
     }

@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::planner::{
@@ -75,6 +76,12 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
     /// Runs `job` and finishes its deployment.
     fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
+    /// Whether the runner has an executor to change resources with. The server
+    /// is not ready without one.
+    fn has_executor(&self) -> bool {
+        true
+    }
+
     /// Pins the artifacts `deployment`'s workloads name without a fixed
     /// identity. A runner without an executor cannot.
     fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
@@ -115,6 +122,10 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
 pub struct Unimplemented;
 
 impl Runner for Unimplemented {
+    fn has_executor(&self) -> bool {
+        false
+    }
+
     fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
             finish(
@@ -267,26 +278,45 @@ pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
     }
 }
 
-/// The runner a server hands accepted deployments to.
+/// The runner a server hands accepted deployments to, and the deployments it
+/// runs.
 #[derive(Debug)]
-pub struct Runners(RwLock<Arc<dyn Runner>>);
+pub struct Runners {
+    runner: RwLock<Arc<dyn Runner>>,
+    /// Running deployments, as `app/env/id`.
+    active: Mutex<std::collections::BTreeSet<String>>,
+    /// Signaled whenever a deployment stops running.
+    stopped: tokio::sync::Notify,
+}
 
 impl Default for Runners {
     fn default() -> Self {
-        Self(RwLock::new(Arc::new(Unimplemented)))
+        Self {
+            runner: RwLock::new(Arc::new(Unimplemented)),
+            active: Mutex::default(),
+            stopped: tokio::sync::Notify::new(),
+        }
     }
 }
 
 impl Runners {
     /// Replaces the runner for deployments accepted from now on.
     pub fn set(&self, runner: Arc<dyn Runner>) {
-        let mut current = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut current = self.runner.write().unwrap_or_else(|e| e.into_inner());
         *current = runner;
     }
 
     /// The runner for deployments accepted now.
     pub fn current(&self) -> Arc<dyn Runner> {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.runner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether the current runner has an executor.
+    pub fn has_executor(&self) -> bool {
+        self.current().has_executor()
     }
 
     /// Pins artifacts with the current runner.
@@ -301,16 +331,44 @@ impl Runners {
 
     /// Recovers a resource with the current runner.
     pub fn recover(&self, recovery: Recovery) -> RecoverFuture {
-        let runner = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
-        runner.recover(recovery)
+        self.current().recover(recovery)
+    }
+
+    /// The running deployments, as `app/env/id`.
+    pub fn running(&self) -> Vec<String> {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.iter().cloned().collect()
+    }
+
+    /// Waits up to `grace` for the running deployments to stop, and returns
+    /// those still running.
+    pub async fn wait_idle(&self, grace: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            // Created before the check, so a deployment that stops in between
+            // still wakes it.
+            let stopped = self.stopped.notified();
+            let running = self.running();
+            if running.is_empty() {
+                return running;
+            }
+            tokio::select! {
+                () = stopped => {}
+                () = tokio::time::sleep_until(deadline) => return self.running(),
+            }
+        }
     }
 
     /// Starts `job` in the background.
     pub fn spawn(&self, state: AppState, job: Job) {
-        let runner = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let run = tokio::spawn(runner.run(state.clone(), job.clone()));
-        // A runner that panics must not leave the environment blocked.
+        let key = format!("{}/{}/{}", job.app, job.env, job.id);
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        let run = tokio::spawn(self.current().run(state.clone(), job.clone()));
         tokio::spawn(async move {
+            // A runner that panics must not leave the environment blocked.
             if run.await.is_err() {
                 finish(
                     &state,
@@ -323,6 +381,13 @@ impl Runners {
                 )
                 .await;
             }
+            state
+                .runners
+                .active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            state.runners.stopped.notify_waiters();
         });
     }
 }

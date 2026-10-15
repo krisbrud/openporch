@@ -34,6 +34,9 @@ pub struct Config {
     /// Maximum request body size in bytes.
     #[serde(default = "default_body_limit")]
     pub max_body_bytes: usize,
+    /// How long shutdown waits for running deployments before it exits.
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_seconds: u64,
     /// The GitHub identity provider, when GitHub login is enabled.
     #[serde(default)]
     pub github: Option<GithubConfig>,
@@ -265,6 +268,10 @@ fn default_body_limit() -> usize {
     1024 * 1024
 }
 
+fn default_shutdown_grace() -> u64 {
+    60
+}
+
 /// Configuration errors.
 #[derive(Debug, thiserror::Error)]
 #[error("configuration: {0}")]
@@ -282,6 +289,7 @@ impl Config {
             bootstrap_token_hours: default_bootstrap_hours(),
             tls_terminated_by_proxy: false,
             max_body_bytes: default_body_limit(),
+            shutdown_grace_seconds: default_shutdown_grace(),
             github: None,
             rate_limits: RateLimits::default(),
             opentofu: OpenTofuSettings::default(),

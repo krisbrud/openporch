@@ -104,7 +104,8 @@ Before archiving the first release, move unimplemented later-stage requirements/
 - [ ] 11.3 Add an optional reference-platform variant using `aws-identity`, preserving the host-identity/`aws-role` quickstart and document the trust policy setup in `docs/security.md`; verify the AWS e2e job passes with no static credentials stored in openporch
 
 ## 12. Operational basics — milestone 1
-- [ ] 12.1 Implement liveness/readiness, exclusive installation ownership and graceful shutdown; verify a second writer never starts and loss of a required key or executor blocks mutations
+- [x] 12.1 Implement liveness/readiness, exclusive installation ownership and graceful shutdown; verify a second writer never starts and loss of a required key or executor blocks mutations
+  - Verified by `a_second_server_on_the_same_installation_exits_before_any_work`, `missing_master_key_blocks_readiness_and_mutations`, `without_an_executor_deployments_are_refused` and `shutdown_refuses_changes_and_waits_for_running_deployments`.
 - [ ] 12.2 Add the schema version guard and uninstall/retention documentation; verify an unsupported binary refuses mutations and leaves data unchanged, and uninstall does not destroy infrastructure
 - [ ] 12.3 Implement bounded queue/graph/request/log storage and global subprocess concurrency; verify `429` with `Retry-After` under throttling and that status requests stay available while four OpenTofu processes run
 - [ ] 12.4 Implement structured correlated events/metrics and sanitized diagnostics, audit intent/outcomes and configurable retention/export; verify secret omission, denied-action events, async failure correlation and no silent audit loss on storage failure

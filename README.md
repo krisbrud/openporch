@@ -30,6 +30,7 @@ Lambda function in your own AWS account, without Kubernetes. The
 [developer quickstart](docs/quickstart.md) runs a server locally and deploys
 a workload with the `porch` command line, without a cloud account. The [command reference](docs/cli.md)
 lists every `porch` command, and the [API reference](docs/api.md) every route.
+[Operating openporch](docs/operations.md) covers health checks and shutdown.
 
 ## Development
 
