@@ -453,7 +453,7 @@ async fn start(
             b.remove("comment");
         }
         let plan = plans::create(client, &base, &body).await?;
-        return plans::print(io, &plan, &scope, Some(&commands.carry_out));
+        return plans::print(io, &plan, &scope, None, Some(&commands.carry_out));
     }
     let acknowledged = match &run.confirm.plan {
         Some(plan) => {
@@ -475,35 +475,18 @@ async fn start(
         None => None,
     };
     let path = format!("{base}/deploys");
-    let key: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-    let headers = [("idempotency-key", key.as_str())];
-    let mut attempt = 0;
-    let deployment = loop {
-        match client
-            .send(Method::POST, &path, Some(&body), &headers)
-            .await
-        {
-            Ok((_, d)) => break d,
-            Err(ApiError::Transport(e)) if attempt < RETRIES => {
-                attempt += 1;
-                let _ = writeln!(io.err, "warning: {e}; sending the same request again");
-                tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
-            }
-            Err(e) => {
-                return Err(refusal(
-                    session,
-                    client,
-                    env,
-                    e,
-                    acknowledged.as_ref(),
-                    &commands.preview,
-                )
-                .await);
-            }
+    let deployment = match send_idempotent(client, Method::POST, &path, &body, io).await {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(refusal(
+                session,
+                client,
+                env,
+                e,
+                acknowledged.as_ref(),
+                &commands.preview,
+            )
+            .await);
         }
     };
     let id = deployment["id"]
@@ -517,6 +500,39 @@ async fn start(
         finished(session, client, env, &id, &commands.preview, io).await
     } else {
         Ok(())
+    }
+}
+
+/// Sends a mutating request with an idempotency key, sending it again with the
+/// same key and body when the response is lost, so the server returns what it
+/// already accepted instead of doing it twice.
+pub(crate) async fn send_idempotent(
+    client: &Client,
+    method: Method,
+    path: &str,
+    body: &Value,
+    io: &mut Io<'_>,
+) -> Result<Value, ApiError> {
+    let key: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let headers = [("idempotency-key", key.as_str())];
+    let mut attempt = 0;
+    loop {
+        match client
+            .send(method.clone(), path, Some(body), &headers)
+            .await
+        {
+            Ok((_, v)) => return Ok(v),
+            Err(ApiError::Transport(e)) if attempt < RETRIES => {
+                attempt += 1;
+                let _ = writeln!(io.err, "warning: {e}; sending the same request again");
+                tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -646,16 +662,30 @@ async fn finished(
     }
     let resources = client
         .request(Method::GET, &env_path(session, env, "/resources")?, None)
-        .await
-        .map_err(api)?;
-    let uncertain = recovery_steps(&resources);
-    if !uncertain.is_empty() {
+        .await;
+    let uncertain = match &resources {
+        Ok(list) => recovery_steps(session, env, list)?,
+        Err(_) => Vec::new(),
+    };
+    // The planner's summary names outcomes that need recovery.
+    if !uncertain.is_empty() || error.contains("needs recovery") {
         return Err(format!(
             "deployment {id} failed: {error}\nrecovery required: deploying again does not repeat an operation whose outcome is unknown.\n{}",
-            uncertain.join("\n")
+            if uncertain.is_empty() {
+                "  recover each resource named above with `porch resources recover <type> <res_id>`"
+                    .to_owned()
+            } else {
+                uncertain.join("\n")
+            }
         ));
     }
-    if error.contains("approval_required") {
+    if let Err(e) = resources {
+        return Err(format!(
+            "deployment {id} failed: {error}\nits resources could not be listed ({}); check them with `porch get active-resources` before deploying again",
+            api(e)
+        ));
+    }
+    if error.contains("approval_required:") {
         return Err(format!(
             "deployment {id} failed: {error}\napproval required: preview again and acknowledge the replacement it shows:\n  {preview}"
         ));
@@ -667,12 +697,13 @@ async fn finished(
 
 /// A line per resource of `list` (`GET .../resources`) whose last operation
 /// has an unknown outcome, naming it and its recovery.
-fn recovery_steps(list: &Value) -> Vec<String> {
+fn recovery_steps(session: &Session, env: &str, list: &Value) -> Result<Vec<String>, String> {
     let resources = list["resources"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    resources
+    let base = env_path(session, env, "/resources")?;
+    Ok(resources
         .iter()
         .filter_map(|r| {
             let status = r["status"].as_str()?;
@@ -688,12 +719,14 @@ fn recovery_steps(list: &Value) -> Vec<String> {
                     "  {descriptor}{operation}, GUResID {guresid}: outcome unknown; observe it with `porch resources recover {ty} {res_id}`"
                 )),
                 "recovery_required" => Some(format!(
-                    "  {descriptor}{operation}, GUResID {guresid}: the driver cannot tell what happened; an administrator checks the cloud and resolves it with `porch api post <environment>/resources/{ty}/{res_id}/resolve -d '{{\"reason\": \"...\"}}'`"
+                    "  {descriptor}{operation}, GUResID {guresid}: the driver cannot tell what happened; an administrator checks the cloud and resolves it with `porch api post {base}/{}/{}/resolve -d '{{\"reason\": \"...\"}}'`",
+                    segment(ty),
+                    segment(res_id)
                 )),
                 _ => None,
             }
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) async fn logs(session: &Session, cmd: LogsCmd, io: &mut Io<'_>) -> Result<(), String> {
@@ -779,11 +812,17 @@ pub(crate) async fn resources(
             output,
         ),
     };
-    let value = client
-        .request(method, &env_path(session, &env, &path)?, None)
-        .await
-        .map_err(api)?;
-    output::print(io.out, structured(output), &value, &[])
+    let path = env_path(session, &env, &path)?;
+    let value = client.request(method, &path, None).await.map_err(api)?;
+    output::print(io.out, structured(output), &value, &[])?;
+    if value["outcome"] == "recovery_required" {
+        let resolve = format!("{}/resolve", path.strip_suffix("/recover").unwrap_or(&path));
+        let _ = writeln!(
+            io.err,
+            "The driver cannot tell what happened. An administrator checks the cloud and, if repeating the operation is safe, resolves it:\n  porch api post {resolve} -d '{{\"reason\": \"...\"}}'"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn raw(session: &Session, args: ApiArgs, io: &mut Io<'_>) -> Result<(), String> {

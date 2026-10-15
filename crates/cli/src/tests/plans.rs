@@ -291,6 +291,12 @@ async fn an_interrupted_deployment_names_the_resource_and_its_recovery() {
     assert_eq!(r.code, 0, "{r:?}");
     let outcome: Value = serde_json::from_str(&r.out).unwrap();
     assert_eq!(outcome["outcome"], "recovery_required", "{outcome}");
+    assert!(
+        r.err.contains(
+            "porch api post /orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db/resolve"
+        ),
+        "{r:?}"
+    );
 }
 
 /// Deleting an environment and then the application, each behind a preview
@@ -343,8 +349,26 @@ async fn environments_and_applications_are_deleted_behind_previews() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // The application's deletion previews every environment.
+    // An ack names the preview of its environment.
     m.set("OPENPORCH_APP", "");
+    let r = m
+        .porch(
+            &[
+                "delete",
+                "app",
+                "shop",
+                "--plan",
+                "development=pln-x",
+                "--ack",
+                &format!("staging:{DB}=delete"),
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("names no preview"), "{r:?}");
+
+    // The application's deletion previews every environment.
     let r = m.porch(&["delete", "app", "shop", "--preview"], "").await;
     assert_eq!(r.code, 0, "{r:?}");
     assert!(r.out.contains("Preview pln-"), "{r:?}");

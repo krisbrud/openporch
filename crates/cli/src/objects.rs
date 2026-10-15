@@ -6,10 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
-use openporch_client::{Method, segment, with_query};
+use openporch_client::{Error as ApiError, Method, segment, with_query};
 use serde_json::{Value, json};
 
-use crate::deploys::{env_path, generation};
+use crate::deploys::{env_path, generation, send_idempotent};
 use crate::output::{self, Format};
 use crate::plans::{self, Ack, Acknowledged, Confirm};
 use crate::{Io, Session, api};
@@ -510,7 +510,7 @@ async fn delete_env(
             let generation = generation(session, &client, id).await?;
             let body = json!({"kind": "delete_env", "expected_generation": generation});
             let plan = plans::create(&client, &base, &body).await?;
-            plans::print(io, &plan, &format!("{app}/{id}"), Some(&command))?;
+            plans::print(io, &plan, &format!("{app}/{id}"), None, Some(&command))?;
             if confirm.preview {
                 return Ok(Value::Null);
             }
@@ -531,8 +531,8 @@ async fn delete_env(
         "permits": acknowledged.permits,
         "comment": comment,
     });
-    match client.send(Method::DELETE, &base, Some(&body), &[]).await {
-        Ok((_, value)) => Ok(value),
+    match send_idempotent(&client, Method::DELETE, &base, &body, io).await {
+        Ok(value) => Ok(value),
         Err(e) => {
             let current = generation(session, &client, id).await.ok();
             Err(plans::refused(
@@ -576,8 +576,20 @@ async fn delete_app(
     if let Some((env, _)) = given.iter().find(|(e, _)| !envs.contains(e)) {
         return Err(format!("application {id} has no environment `{env}`"));
     }
+    if let Some((env, a)) = acks
+        .iter()
+        .find(|(e, _)| !given.iter().any(|(g, _)| g == e))
+    {
+        return Err(format!(
+            "`--ack {env}:{}` names no preview: add `--plan {env}=PLAN`",
+            a.descriptor
+        ));
+    }
     let command = format!("porch delete app {id}");
-    let mut permits = Vec::new();
+    let permission =
+        format!("ownership of {id} and the deployer role on the environment types it uses");
+    // Permits are issued only once every environment is acknowledged.
+    let mut prepared = Vec::new();
     // What the full command needs: every environment's preview and acks.
     let mut flags = String::new();
     let mut unacknowledged = false;
@@ -589,28 +601,29 @@ async fn delete_app(
             .map(|(_, a)| a)
             .collect();
         if let Some((_, plan)) = given.iter().find(|(e, _)| e == env) {
-            let a = plans::acknowledge(
-                &client,
-                &base,
-                plan,
-                "delete_env",
-                &env_acks,
-                &command,
-                &format!("{command} --preview"),
-            )
-            .await
-            .map_err(|e| format!("environment {env}: {e}"))?;
-            permits.extend(a.permits);
+            let p = plans::prepare(&client, &base, plan, "delete_env", &env_acks)
+                .await
+                .map_err(|e| format!("environment {env}: {e}"))?;
             flags.push_str(&format!(" --plan {env}={plan}"));
-            for a in env_acks {
-                let fingerprint = a.fingerprint.as_deref().map(|f| format!("@{f}"));
-                flags.push_str(&format!(
-                    " --ack '{env}:{}={}{}'",
-                    a.descriptor,
-                    a.action,
-                    fingerprint.unwrap_or_default()
-                ));
+            let mut named: Vec<String> = env_acks
+                .iter()
+                .map(|a| {
+                    let fingerprint = a.fingerprint.as_deref().map(|f| format!("@{f}"));
+                    format!(
+                        "{}={}{}",
+                        a.descriptor,
+                        a.action,
+                        fingerprint.unwrap_or_default()
+                    )
+                })
+                .collect();
+            if !p.missing.is_empty() {
+                unacknowledged = true;
+                named.extend(p.missing.iter().cloned());
             }
+            let prefixed: Vec<String> = named.iter().map(|r| format!("{env}:{r}")).collect();
+            flags.push_str(&plans::ack_args(&prefixed));
+            prepared.push(p);
             continue;
         }
         let record = client
@@ -622,7 +635,7 @@ async fn delete_app(
             .ok_or("unexpected response from the server: no environment generation")?;
         let body = json!({"kind": "delete_env", "expected_generation": generation});
         let plan = plans::create(&client, &base, &body).await?;
-        plans::print(io, &plan, &format!("{id}/{env}"), None)?;
+        plans::print(io, &plan, &format!("{id}/{env}"), Some(&permission), None)?;
         let required = plans::required(&plan);
         if !required.is_empty() {
             unacknowledged = true;
@@ -643,12 +656,25 @@ async fn delete_app(
             "deleting application {id} deletes the resources marked above; nothing was deleted. Acknowledge them one by one:\n  {command}{flags}"
         ));
     }
+    let preview = format!("{command} --preview");
+    let mut permits = Vec::new();
+    for p in prepared {
+        permits.extend(plans::issue(&client, p, &preview).await?.permits);
+    }
     let body = json!({"permits": permits, "comment": comment});
+    // The application's deletion takes no idempotency key, and its permits
+    // bind on acceptance, so a lost response is not sent again.
     client
         .send(Method::DELETE, &app_base, Some(&body), &[])
         .await
         .map(|(_, v)| v)
-        .map_err(|e| plans::refused(e, None, None, &format!("{command} --preview")))
+        .map_err(|e| match e {
+            ApiError::Transport(_) => format!(
+                "{}; the deletion may have been accepted: check with `porch get apps`",
+                api(e)
+            ),
+            e => plans::refused(e, None, None, &preview),
+        })
 }
 
 /// `porch delete`.

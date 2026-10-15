@@ -18,6 +18,8 @@ use crate::Io;
 pub(crate) const APPROVAL_REQUIRED: &str = "DPL-001";
 /// The error code of an unknown, expired, stale or used permit.
 pub(crate) const PERMIT_INVALID: &str = "DPL-003";
+/// The error code of a conflict, such as a stale generation.
+pub(crate) const CONFLICT: &str = "API-004";
 /// The error code of an acceptance blocked by resources needing recovery.
 pub(crate) const RECOVERY_REQUIRED: &str = "DPL-004";
 
@@ -34,15 +36,16 @@ pub struct Ack {
 }
 
 pub(crate) fn ack(s: &str) -> Result<Ack, String> {
-    let (descriptor, rest) = s
+    // A fingerprint may contain `=`, so it is split off first.
+    let (named, fingerprint) = match s.split_once('@') {
+        Some((n, f)) if !f.is_empty() => (n, Some(f.to_owned())),
+        Some(_) => return Err("expected a fingerprint after `@`".into()),
+        None => (s, None),
+    };
+    let (descriptor, action) = named
         .rsplit_once('=')
         .filter(|(d, a)| !d.is_empty() && !a.is_empty())
         .ok_or("expected DESCRIPTOR=ACTION")?;
-    let (action, fingerprint) = match rest.split_once('@') {
-        Some((a, f)) if !f.is_empty() => (a, Some(f.to_owned())),
-        Some(_) => return Err("expected a fingerprint after `@`".into()),
-        None => (rest, None),
-    };
     Ok(Ack {
         descriptor: descriptor.to_owned(),
         action: action.to_owned(),
@@ -181,12 +184,13 @@ pub(crate) fn required(plan: &Value) -> Vec<String> {
 }
 
 /// Prints `plan` of `scope` (`app/env`): each change, what is unknown and
-/// what it needs. When changes need permits and `command` is given, it ends
+/// what it needs: `permission`, or the deploy permission. When changes need permits and `command` is given, it ends
 /// with `command` and the `--plan` and `--ack` that carry the preview out.
 pub(crate) fn print(
     io: &mut Io<'_>,
     plan: &Value,
     scope: &str,
+    permission: Option<&str>,
     command: Option<&str>,
 ) -> Result<(), String> {
     let id = plan["id"].as_str().unwrap_or_default();
@@ -227,12 +231,12 @@ pub(crate) fn print(
         ));
     }
     let required = required(plan);
-    let permission = if plan["kind"] == "detach" {
-        "an administrator of the organization"
-    } else {
-        "the deploy permission"
+    let permission = match permission {
+        Some(p) => p.to_owned(),
+        None if plan["kind"] == "detach" => format!("an administrator, for {scope}"),
+        None => format!("the deploy permission on {scope}"),
     };
-    text.push_str(&format!("Needs {permission} on {scope}"));
+    text.push_str(&format!("Needs {permission}"));
     match command {
         _ if required.is_empty() => text.push_str(".\n"),
         Some(command) => text.push_str(&format!(
@@ -244,18 +248,25 @@ pub(crate) fn print(
     io.out.write_all(text.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Fetches preview `plan_id` of `kind` at `env_path`, checks that `acks` name
-/// every change it marks, and issues their permits. `command` carries out a
-/// preview and `preview` makes a new one.
-pub(crate) async fn acknowledge(
+/// A preview whose acknowledgements were checked, before permits are issued.
+pub(crate) struct Prepared {
+    path: String,
+    id: String,
+    base_generation: i64,
+    asks: Vec<Value>,
+    /// The `--ack` values still missing.
+    pub missing: Vec<String>,
+}
+
+/// Fetches preview `plan_id` of `kind` at `env_path` and checks `acks`
+/// against the changes it marks, without issuing anything.
+pub(crate) async fn prepare(
     client: &Client,
     env_path: &str,
     plan_id: &str,
     kind: &str,
     acks: &[&Ack],
-    command: &str,
-    preview: &str,
-) -> Result<Acknowledged, String> {
+) -> Result<Prepared, String> {
     let path = format!("{env_path}/plans/{}", segment(plan_id));
     let plan = client
         .request(Method::GET, &path, None)
@@ -271,20 +282,30 @@ pub(crate) async fn acknowledge(
         .as_i64()
         .ok_or("unexpected response from the server: no preview generation")?;
     let checked = check(&plan, acks)?;
-    if !checked.missing.is_empty() {
-        return Err(format!(
-            "preview {plan_id} has changes that need acknowledging, one by one:\n  {command} --plan {plan_id}{}",
-            ack_args(&checked.missing)
-        ));
-    }
-    let permits = if checked.asks.is_empty() {
+    Ok(Prepared {
+        path,
+        id: plan_id.to_owned(),
+        base_generation,
+        asks: checked.asks,
+        missing: checked.missing,
+    })
+}
+
+/// Issues the permits `prepared` asks for. `preview` makes a new preview.
+pub(crate) async fn issue(
+    client: &Client,
+    prepared: Prepared,
+    preview: &str,
+) -> Result<Acknowledged, String> {
+    let plan_id = &prepared.id;
+    let permits = if prepared.asks.is_empty() {
         Vec::new()
     } else {
         let issued = client
             .request(
                 Method::POST,
-                &format!("{path}/permits"),
-                Some(&json!({"permits": checked.asks})),
+                &format!("{}/permits", prepared.path),
+                Some(&json!({"permits": prepared.asks})),
             )
             .await
             .map_err(|e| match &e {
@@ -303,10 +324,32 @@ pub(crate) async fn acknowledge(
             .collect()
     };
     Ok(Acknowledged {
-        id: plan_id.to_owned(),
-        base_generation,
+        id: prepared.id,
+        base_generation: prepared.base_generation,
         permits,
     })
+}
+
+/// Fetches preview `plan_id` of `kind` at `env_path`, checks that `acks` name
+/// every change it marks, and issues their permits. `command` carries out a
+/// preview and `preview` makes a new one.
+pub(crate) async fn acknowledge(
+    client: &Client,
+    env_path: &str,
+    plan_id: &str,
+    kind: &str,
+    acks: &[&Ack],
+    command: &str,
+    preview: &str,
+) -> Result<Acknowledged, String> {
+    let prepared = prepare(client, env_path, plan_id, kind, acks).await?;
+    if !prepared.missing.is_empty() {
+        return Err(format!(
+            "preview {plan_id} has changes that need acknowledging, one by one:\n  {command} --plan {plan_id}{}",
+            ack_args(&prepared.missing)
+        ));
+    }
+    issue(client, prepared, preview).await
 }
 
 /// The message for a refused acceptance: a stale preview, a missing permit or
@@ -323,10 +366,14 @@ pub(crate) fn refused(
         _ => String::new(),
     };
     let message = crate::api(e);
+    // A generation conflict is `API-004`, which other conflicts share, so it
+    // counts as a stale preview only when the generation did move.
+    let conflict = code == PERMIT_INVALID
+        || code == APPROVAL_REQUIRED
+        || (code == CONFLICT
+            && current.is_some_and(|g| acknowledged.is_some_and(|a| g != a.base_generation)));
     if let Some(a) = acknowledged
-        && (code == PERMIT_INVALID
-            || code == APPROVAL_REQUIRED
-            || current.is_some_and(|g| g != a.base_generation))
+        && conflict
     {
         return format!(
             "{message}\npreview {} no longer matches the environment, so nothing was changed; preview again:\n  {preview}",
