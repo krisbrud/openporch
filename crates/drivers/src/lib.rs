@@ -171,8 +171,13 @@ pub struct DriverRequest {
     pub resource_type: String,
     /// The resource's resolved inputs.
     pub resource: Map<String, Value>,
-    /// Resource inputs that resolved from secrets.
+    /// Resource inputs that resolved from secrets: each top-level input with a
+    /// secret anywhere inside, whole.
     pub resource_secrets: SecretMap,
+    /// Where the secrets are inside `resource_secrets`: the path of each value
+    /// that resolved from a secret, such as `["spec", "function", "variables",
+    /// "DB_PASSWORD"]`. Array items are addressed by their index.
+    pub resource_secret_paths: Vec<Vec<String>>,
     /// The definition's resolved `driver_inputs.values`.
     pub values: Map<String, Value>,
     /// The definition's resolved `driver_inputs.secrets` and `secret_refs`.

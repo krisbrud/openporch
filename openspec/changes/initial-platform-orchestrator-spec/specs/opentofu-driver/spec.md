@@ -20,11 +20,15 @@ The OpenTofu driver provisions any resource type by running OpenTofu code from a
 
 ### Requirement: Resource inputs
 
-`openporch/opentofu` SHALL pass a resource's inputs (the params a workload gives it, or a `workload` resource's resolved spec and dependency outputs) to the module as the OpenTofu variable `resource`, holding the plain inputs, and `resource_secrets`, holding the top-level inputs that resolved from secrets, which SHALL be written only to the secret variable file and redacted from logs. Each SHALL be set only when the resource has such inputs. A definition SHALL NOT set variables with either name.
+`openporch/opentofu` SHALL pass a resource's inputs (the params a workload gives it, or a `workload` resource's resolved spec and dependency outputs) to the module as the OpenTofu variable `resource`, holding the inputs without the values that resolved from secrets, and `resource_secrets`, holding those values alone at the same paths, which SHALL be written only to the secret variable file and redacted from logs. Each SHALL be set only when the resource has such inputs. A definition SHALL NOT set variables with either name.
 
 #### Scenario: Table key from params
 - **WHEN** a workload gives a `dynamodb-table` `params.primaryKey: {name: id, type: S}` and the module reads `var.resource.primaryKey`
 - **THEN** the run applies the module with that key
+
+#### Scenario: Secret workload variable
+- **WHEN** a Lambda workload's variable `DB_PASSWORD` resolves from a postgres secret output and its variable `TABLE` is plain
+- **THEN** the module receives `TABLE` under `var.resource.spec.function.variables` and `DB_PASSWORD` only under `var.resource_secrets.spec.function.variables`
 
 #### Scenario: Reserved variable name
 - **WHEN** a definition sets `driver_inputs.values.variables.resource`

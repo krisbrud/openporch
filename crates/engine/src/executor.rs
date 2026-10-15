@@ -143,6 +143,7 @@ where
             resource_type: job.descriptor.ty.to_string(),
             resource,
             resource_secrets: SecretMap::new(resource_secrets),
+            resource_secret_paths: secret_paths(&job.inputs.resource),
             values,
             secrets: SecretMap::new(secrets),
             credentials,
@@ -913,6 +914,34 @@ fn render(r: &Resolved, read: &BTreeMap<SecretRef, SecretValue>) -> Result<Value
                 .collect::<Result<_, ExecFailure>>()?,
         ),
     })
+}
+
+/// The path of every secret value inside `r`.
+fn secret_paths(r: &Resolved) -> Vec<Vec<String>> {
+    fn walk(r: &Resolved, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        let mut child = |key: String, r: &Resolved, out: &mut Vec<Vec<String>>| {
+            path.push(key);
+            walk(r, path, out);
+            path.pop();
+        };
+        match r {
+            Resolved::Value(_) => {}
+            Resolved::Secret(_) => out.push(path.clone()),
+            Resolved::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    child(i.to_string(), item, out);
+                }
+            }
+            Resolved::Object(fields) => {
+                for (k, f) in fields {
+                    child(k.clone(), f, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(r, &mut Vec::new(), &mut out);
+    out
 }
 
 /// A rendered input object.

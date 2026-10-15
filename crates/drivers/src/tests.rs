@@ -23,6 +23,7 @@ fn request() -> DriverRequest {
         resource_type: "postgres".into(),
         resource: Map::new(),
         resource_secrets: SecretMap::default(),
+        resource_secret_paths: Vec::new(),
         values: Map::new(),
         secrets: SecretMap::default(),
         credentials: None,

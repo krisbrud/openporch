@@ -30,6 +30,7 @@ fn request(values: Value, secrets: Value) -> DriverRequest {
         resource_type: "password".into(),
         resource: Map::new(),
         resource_secrets: SecretMap::default(),
+        resource_secret_paths: Vec::new(),
         values: object(values),
         secrets: SecretMap::new(object(secrets)),
         credentials: None,
@@ -377,6 +378,46 @@ output "password" {
 output "length" { value = var.length }
 output "label_length" { value = length(nonsensitive(var.label)) }
 "#;
+
+#[test]
+fn secret_resource_inputs_are_moved_out_one_by_one() {
+    let mut req = request(json!({"script": ""}), json!({}));
+    req.resource = object(json!({"id": "worker"}));
+    req.resource_secrets = SecretMap::new(object(json!({
+        "spec": {"function": {"variables": {"TABLE": "orders", "DB_PASSWORD": "pw-1"}},
+                 "args": ["--token", "tok-1"]},
+        "dependencies": {"db": {"host": "db.internal", "password": "pw-1"}},
+        "whole": "w-1",
+        "unlocated": {"a": "u-1", "b": "plain"},
+    })));
+    let path = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    req.resource_secret_paths = vec![
+        path(&["spec", "function", "variables", "DB_PASSWORD"]),
+        path(&["spec", "args", "1"]),
+        path(&["dependencies", "db", "password"]),
+        path(&["whole"]),
+        path(&["unlocated", "missing"]),
+    ];
+    let (plain, secrets) = split_resource(&req);
+    assert_eq!(
+        Value::Object(plain),
+        json!({
+            "id": "worker",
+            "spec": {"function": {"variables": {"TABLE": "orders"}}, "args": ["--token", null]},
+            "dependencies": {"db": {"host": "db.internal"}},
+        })
+    );
+    // A secret the paths do not locate stays a secret as a whole.
+    assert_eq!(
+        Value::Object(secrets),
+        json!({
+            "spec": {"function": {"variables": {"DB_PASSWORD": "pw-1"}}, "args": {"1": "tok-1"}},
+            "dependencies": {"db": {"password": "pw-1"}},
+            "whole": "w-1",
+            "unlocated": {"a": "u-1", "b": "plain"},
+        })
+    );
+}
 
 /// A module that reads the resource's inputs and creates nothing.
 const RESOURCE_MODULE: &str = r#"

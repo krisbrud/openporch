@@ -560,6 +560,79 @@ fn parse(
 /// resolved from secrets.
 const RESOURCE_VARIABLES: [&str; 2] = ["resource", "resource_secrets"];
 
+/// The resource's inputs without the values that resolved from secrets, and
+/// those values alone, each at its own path. A secret input whose secrets the
+/// request does not locate is a secret as a whole.
+fn split_resource(req: &DriverRequest) -> (Map<String, Value>, Map<String, Value>) {
+    let mut plain = req.resource.clone();
+    let mut secrets = Map::new();
+    for (key, value) in req.resource_secrets.expose() {
+        let paths: Vec<&[String]> = req
+            .resource_secret_paths
+            .iter()
+            .filter(|p| p.first() == Some(key))
+            .map(|p| &p[1..])
+            .collect();
+        let mut value = value.clone();
+        let mut moved = Map::new();
+        let located = !paths.is_empty()
+            && paths.iter().all(|p| match take(&mut value, p) {
+                Some(secret) => {
+                    put(&mut moved, p, secret);
+                    true
+                }
+                None => false,
+            });
+        if located && !paths.iter().any(|p| p.is_empty()) {
+            plain.insert(key.clone(), value);
+            secrets.insert(key.clone(), Value::Object(moved));
+        } else {
+            secrets.insert(key.clone(), req.resource_secrets.expose()[key].clone());
+        }
+    }
+    (plain, secrets)
+}
+
+/// Removes the value at `path` inside `v`: from an object its key, in an array
+/// it becomes `null`.
+fn take(v: &mut Value, path: &[String]) -> Option<Value> {
+    let Some((last, parents)) = path.split_last() else {
+        return Some(v.take());
+    };
+    let mut v = v;
+    for key in parents {
+        v = match v {
+            Value::Object(m) => m.get_mut(key)?,
+            Value::Array(a) => a.get_mut(key.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    match v {
+        Value::Object(m) => m.remove(last),
+        Value::Array(a) => a.get_mut(last.parse::<usize>().ok()?).map(Value::take),
+        _ => None,
+    }
+}
+
+/// Sets `value` at `path` inside `m`, creating objects on the way; array
+/// indexes become object keys.
+fn put(m: &mut Map<String, Value>, path: &[String], value: Value) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut m = m;
+    for key in parents {
+        let next = m
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !next.is_object() {
+            *next = Value::Object(Map::new());
+        }
+        m = next.as_object_mut().expect("an object");
+    }
+    m.insert(last.clone(), value);
+}
+
 /// Whether OpenTofu loads `name` as an override file, which can replace the
 /// orchestrator's backend.
 fn is_override(name: &str) -> bool {
@@ -915,17 +988,16 @@ impl OpenTofu {
             run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
         }
 
-        // The resource's inputs, such as a workload's spec or a table's key.
+        // The resource's inputs, such as a workload's spec or a table's key,
+        // with each secret value moved to the secret variable at its path.
         let mut variables = inputs.variables.clone();
         let [plain, secret] = RESOURCE_VARIABLES;
-        if !req.resource.is_empty() {
-            variables.insert(plain.into(), Value::Object(req.resource.clone()));
+        let (resource, resource_secrets) = split_resource(req);
+        if !resource.is_empty() {
+            variables.insert(plain.into(), Value::Object(resource));
         }
-        if !req.resource_secrets.expose().is_empty() {
-            secret_variables.insert(
-                secret.into(),
-                Value::Object(req.resource_secrets.expose().clone()),
-            );
+        if !resource_secrets.is_empty() {
+            secret_variables.insert(secret.into(), Value::Object(resource_secrets));
         }
 
         // Variables: plain and secret in separate files, both outside the module.

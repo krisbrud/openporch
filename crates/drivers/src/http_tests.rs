@@ -120,6 +120,7 @@ fn request(cookie: Option<Cookie>) -> DriverRequest {
         resource_type: "postgres".into(),
         resource: object(json!({"name": "shop"})),
         resource_secrets: SecretMap::new(object(json!({"admin_password": "hunter2"}))),
+        resource_secret_paths: vec![vec!["admin_password".into()]],
         values: object(json!({"version": "16"})),
         secrets: SecretMap::new(object(json!({"master": "s3cret"}))),
         credentials: None,
