@@ -282,8 +282,95 @@ impl fmt::Display for S3Version {
     }
 }
 
-/// The AWS calls the executor makes: the Security Token Service, and S3 to
-/// check that the artifacts a deployment names exist.
+/// A container image named by a mutable tag in an Amazon ECR repository, as
+/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>[:<tag>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcrImage {
+    /// The registry host.
+    pub registry: String,
+    /// The account that owns the registry.
+    pub account: String,
+    /// The registry's region.
+    pub region: String,
+    /// The repository.
+    pub repository: String,
+    /// The tag; `latest` when none is given.
+    pub tag: String,
+}
+
+impl EcrImage {
+    /// `image` as an ECR image named by tag; `None` for an image pinned by
+    /// digest, or one in another registry.
+    pub fn parse(image: &str) -> Option<Self> {
+        if image.contains('@') {
+            return None;
+        }
+        let (registry, path) = image.split_once('/')?;
+        let parts: Vec<&str> = registry.split('.').collect();
+        let (account, region) = match parts.as_slice() {
+            [
+                account,
+                "dkr",
+                "ecr" | "ecr-fips",
+                region,
+                "amazonaws",
+                "com",
+            ]
+            | [
+                account,
+                "dkr",
+                "ecr" | "ecr-fips",
+                region,
+                "amazonaws",
+                "com",
+                "cn",
+            ] => (*account, *region),
+            _ => return None,
+        };
+        if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) || region.is_empty()
+        {
+            return None;
+        }
+        // A tag follows the last `:` after the last `/`.
+        let last = path.rsplit('/').next().unwrap_or(path);
+        let (repository, tag) = match last.rsplit_once(':') {
+            Some((_, tag)) => (&path[..path.len() - tag.len() - 1], tag),
+            None => (path, "latest"),
+        };
+        if repository.is_empty() || tag.is_empty() {
+            return None;
+        }
+        Some(Self {
+            registry: registry.to_owned(),
+            account: account.to_owned(),
+            region: region.to_owned(),
+            repository: repository.to_owned(),
+            tag: tag.to_owned(),
+        })
+    }
+
+    /// The image pinned to `digest`.
+    pub fn at(&self, digest: &str) -> String {
+        format!("{}/{}@{digest}", self.registry, self.repository)
+    }
+}
+
+impl fmt::Display for EcrImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}:{}", self.registry, self.repository, self.tag)
+    }
+}
+
+/// Whether `image` is pinned to a content digest (`...@sha256:<64 hex>`),
+/// which names the same content wherever it is pulled from.
+pub fn pinned_image(image: &str) -> bool {
+    image.rsplit_once("@sha256:").is_some_and(|(name, hex)| {
+        !name.is_empty() && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+/// The AWS calls the executor makes: the Security Token Service, S3 to check
+/// that the artifacts a deployment names exist, and ECR to pin image tags.
 pub trait Sts: Send + Sync {
     /// Assumes a role from the host's own identity.
     fn assume_role(&self, request: AssumeRole)
@@ -315,6 +402,17 @@ pub trait Sts: Send + Sync {
     ) -> BoxFuture<'a, Result<Latest, CloudError>> {
         let _ = (credentials, object);
         Box::pin(async { Err(CloudError::Unavailable("S3 cannot be reached".into())) })
+    }
+
+    /// The digest `image`'s tag points at now, read with `credentials`;
+    /// `None` when the repository or tag does not exist.
+    fn image_digest<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrImage,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        let _ = (credentials, image);
+        Box::pin(async { Err(CloudError::Unavailable("ECR cannot be reached".into())) })
     }
 }
 
@@ -425,6 +523,19 @@ impl CredentialResolver {
             Some(c) => latest.map_err(|e| redacted(e, c)),
             None => latest,
         }
+    }
+
+    /// The digest `image`'s tag points at now, read with `credentials`;
+    /// `None` when the repository or tag does not exist.
+    pub async fn image_digest(
+        &self,
+        credentials: &AwsCredentials,
+        image: &EcrImage,
+    ) -> Result<Option<String>, CloudError> {
+        self.sts
+            .image_digest(credentials, image)
+            .await
+            .map_err(|e| redacted(e, credentials))
     }
 
     /// Asks STS who `credentials` belong to.

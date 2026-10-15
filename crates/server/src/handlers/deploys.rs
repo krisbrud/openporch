@@ -14,7 +14,7 @@ use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ClassRegistry, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
-use openporch_engine::cloud::S3Version;
+use openporch_engine::cloud::{EcrImage, S3Version};
 use openporch_engine::planner::PinError;
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
@@ -453,6 +453,7 @@ async fn snapshot(
         "values": values(state, env).await?,
     });
     pin_artifacts(state, env, &mut snapshot).await?;
+    pin_images(state, env, &mut snapshot).await?;
     pin_secrets(state, &mut snapshot).await?;
     Ok(snapshot)
 }
@@ -489,14 +490,7 @@ async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) 
         .runners
         .pin_artifacts(deployment)
         .await
-        .map_err(|e| match e {
-            PinError::Refused(e) => ApiError::invalid(e),
-            PinError::Unavailable(e) => ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                crate::error::code::CLOUD_UNAVAILABLE,
-                format!("{e}; nothing was deployed; try again"),
-            ),
-        })?;
+        .map_err(pin_error)?;
     for (descriptor, uri) in pinned {
         if let Some(slot) = snapshot["graph"]["nodes"]
             .get_mut(&descriptor)
@@ -506,6 +500,71 @@ async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) 
         }
     }
     Ok(())
+}
+
+/// Pins the ECR images the snapshot's workloads name by tag to their
+/// digests, in the snapshot's graph, as [`pin_artifacts`] does for artifacts.
+/// Images in other registries are not pinned.
+async fn pin_images(state: &AppState, env: &EnvRecord, snapshot: &mut Value) -> ApiResult<()> {
+    let image = |v: &Value| {
+        v.as_str()
+            .is_some_and(|i| EcrImage::parse(i).is_some() || i.contains("${"))
+    };
+    let unpinned = snapshot["graph"]["nodes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .any(|(_, node)| {
+            let spec = &node["params"]["spec"];
+            spec["containers"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .any(|(_, c)| image(&c["image"]))
+                || spec.pointer("/function/package/image").is_some_and(image)
+        });
+    if !unpinned {
+        return Ok(());
+    }
+    let deployment = crate::deploy::planned(
+        state,
+        &env.app,
+        &env.id,
+        "acceptance",
+        String::new(),
+        snapshot,
+        false,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let pinned = state
+        .runners
+        .pin_images(deployment)
+        .await
+        .map_err(pin_error)?;
+    for (descriptor, images) in pinned {
+        for (pointer, image) in images {
+            if let Some(slot) = snapshot["graph"]["nodes"]
+                .get_mut(&descriptor)
+                .and_then(|n| n.pointer_mut(&pointer))
+            {
+                *slot = Value::String(image);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The response for artifacts or images that could not be pinned.
+fn pin_error(e: PinError) -> ApiError {
+    match e {
+        PinError::Refused(e) => ApiError::invalid(e),
+        PinError::Unavailable(e) => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            crate::error::code::CLOUD_UNAVAILABLE,
+            format!("{e}; nothing was deployed; try again"),
+        ),
+    }
 }
 
 /// The built-in secret references a snapshot reads: those of the definitions'

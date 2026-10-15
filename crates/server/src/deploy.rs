@@ -56,7 +56,13 @@ pub struct Recovery {
 pub type PinFuture =
     Pin<Box<dyn Future<Output = Result<BTreeMap<String, String>, PinError>> + Send>>;
 
-/// How long pinning a deployment's artifacts may take at acceptance.
+/// What pinning images returns: for each workload with an image named by
+/// tag, the pinned image by its JSON pointer in the workload's node.
+pub type ImagePinFuture = Pin<
+    Box<dyn Future<Output = Result<BTreeMap<String, BTreeMap<String, String>>, PinError>> + Send>,
+>;
+
+/// How long pinning a deployment's artifacts or images may take at acceptance.
 /// Well within a client's request timeout, so the client hears why.
 pub const PIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -68,9 +74,6 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
     /// Runs `job` and finishes its deployment.
     fn run(&self, state: AppState, job: Job) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
-    /// Observes a resource whose last operation has an unknown outcome and
-    /// records what the observation establishes. A runner without an
-    /// executor cannot.
     /// Pins the artifacts `deployment`'s workloads name without a fixed
     /// identity. A runner without an executor cannot.
     fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
@@ -84,6 +87,22 @@ pub trait Runner: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Pins the ECR images `deployment`'s workloads name by tag to their
+    /// digests. A runner without an executor cannot.
+    fn pin_images(&self, deployment: Deployment) -> ImagePinFuture {
+        let _ = deployment;
+        Box::pin(async {
+            Err(PinError::Refused(
+                "images cannot be pinned until the server runs with an executor; name each ECR \
+                 image by digest as `<image>@sha256:<digest>`"
+                    .into(),
+            ))
+        })
+    }
+
+    /// Observes a resource whose last operation has an unknown outcome and
+    /// records what the observation establishes. A runner without an
+    /// executor cannot.
     fn recover(&self, recovery: Recovery) -> RecoverFuture {
         let _ = recovery;
         Box::pin(async {
@@ -155,6 +174,17 @@ impl<E: Executor> Runner for PlannerRunner<E> {
             Ok(pinned
                 .into_iter()
                 .map(|(d, uri)| (d.to_string(), uri))
+                .collect())
+        })
+    }
+
+    fn pin_images(&self, deployment: Deployment) -> ImagePinFuture {
+        let planner = self.0.clone();
+        Box::pin(async move {
+            let pinned = planner.pin_images(&deployment, PIN_TIMEOUT).await?;
+            Ok(pinned
+                .into_iter()
+                .map(|(d, images)| (d.to_string(), images))
                 .collect())
         })
     }
@@ -266,6 +296,11 @@ impl Runners {
     /// Pins artifacts with the current runner.
     pub fn pin_artifacts(&self, deployment: Deployment) -> PinFuture {
         self.current().pin_artifacts(deployment)
+    }
+
+    /// Pins images with the current runner.
+    pub fn pin_images(&self, deployment: Deployment) -> ImagePinFuture {
+        self.current().pin_images(deployment)
     }
 
     /// Recovers a resource with the current runner.

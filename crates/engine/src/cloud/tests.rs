@@ -603,3 +603,36 @@ async fn real_artifact_check() {
         Latest::Unversioned
     );
 }
+
+#[test]
+fn ecr_images_named_by_tag_are_recognized() {
+    let image =
+        EcrImage::parse("111122223333.dkr.ecr.eu-west-1.amazonaws.com/team/web:1.2").unwrap();
+    assert_eq!(image.account, "111122223333");
+    assert_eq!(image.region, "eu-west-1");
+    assert_eq!(image.repository, "team/web");
+    assert_eq!(image.tag, "1.2");
+    let digest = format!("sha256:{}", "0f".repeat(32));
+    assert_eq!(
+        image.at(&digest),
+        format!("111122223333.dkr.ecr.eu-west-1.amazonaws.com/team/web@{digest}")
+    );
+    assert!(pinned_image(&image.at(&digest)));
+
+    let untagged = EcrImage::parse("111122223333.dkr.ecr.cn-north-1.amazonaws.com.cn/web").unwrap();
+    assert_eq!(untagged.tag, "latest");
+
+    for other in [
+        "nginx:1",
+        "ghcr.io/acme/web:1",
+        "public.ecr.aws/acme/web:1",
+        "12345.dkr.ecr.eu-west-1.amazonaws.com/web:1",
+        "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web@sha256:abc",
+        "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web:",
+    ] {
+        assert_eq!(EcrImage::parse(other), None, "{other}");
+    }
+    assert!(!pinned_image("nginx:1"));
+    assert!(!pinned_image("nginx@sha256:abc"));
+    assert!(pinned_image(&format!("nginx@sha256:{}", "AB".repeat(32))));
+}

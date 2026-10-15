@@ -13,7 +13,8 @@ use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
 use super::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, Latest, S3Object, S3Version, Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrImage, Latest, S3Object, S3Version,
+    Sts,
 };
 
 /// The region STS is called in when neither the account nor the host names one.
@@ -88,6 +89,15 @@ impl AwsSts {
             config = config.credentials_provider(c);
         }
         aws_sdk_s3::Client::from_conf(config.build())
+    }
+
+    /// An ECR client in `region` with `credentials`.
+    async fn ecr(&self, region: &str, credentials: Credentials) -> aws_sdk_ecr::Client {
+        let host = self.host().await;
+        let config = aws_sdk_ecr::config::Builder::from(host)
+            .region(Region::new(region.to_owned()))
+            .credentials_provider(credentials);
+        aws_sdk_ecr::Client::from_conf(config.build())
     }
 }
 
@@ -212,6 +222,55 @@ impl Sts for AwsSts {
                 Some(Some(v)) if v != "null" => Latest::Version(v),
                 Some(_) => Latest::Unversioned,
             })
+        })
+    }
+    fn image_digest<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrImage,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        Box::pin(async move {
+            let client = self.ecr(&image.region, provider(credentials)).await;
+            let id = aws_sdk_ecr::types::ImageIdentifier::builder()
+                .image_tag(&image.tag)
+                .build();
+            let out = match client
+                .describe_images()
+                .registry_id(&image.account)
+                .repository_name(&image.repository)
+                .image_ids(id)
+                .send()
+                .await
+            {
+                Ok(out) => out,
+                Err(SdkError::ServiceError(e))
+                    if matches!(
+                        e.err().code(),
+                        Some("ImageNotFoundException" | "RepositoryNotFoundException")
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(SdkError::ServiceError(e)) => {
+                    let err = e.err();
+                    return Err(CloudError::Rejected(format!(
+                        "ECR DescribeImages of `{image}` failed: {}: {}",
+                        err.code().unwrap_or("Unknown"),
+                        err.message().unwrap_or("no message")
+                    )));
+                }
+                Err(e) => {
+                    return Err(CloudError::Unavailable(format!(
+                        "ECR DescribeImages of `{image}` failed: {}",
+                        DisplayErrorContext(&e)
+                    )));
+                }
+            };
+            Ok(out
+                .image_details()
+                .first()
+                .and_then(|d| d.image_digest())
+                .map(str::to_owned))
         })
     }
 }

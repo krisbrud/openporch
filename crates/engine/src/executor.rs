@@ -26,10 +26,11 @@ use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 use crate::cloud::{
-    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, Latest, S3Object, S3Version,
+    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, EcrImage, Latest, S3Object,
+    S3Version, pinned_image,
 };
 use crate::planner::{
-    ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor,
+    ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
     JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
     RedactingLog, SecretSource,
 };
@@ -775,6 +776,34 @@ where
             ))),
             Ok(Latest::Missing) => Err(ExecFailure::Permanent(format!(
                 "artifact `{object}` of `{}` does not exist",
+                pin.descriptor
+            ))),
+            Err(e) => Err(log.failure(cloud_failure(e))),
+        }
+    }
+
+    async fn pin_image(&self, pin: ImagePin) -> Result<String, ExecFailure> {
+        let image = EcrImage::parse(&pin.image).ok_or_else(|| {
+            ExecFailure::Permanent(format!(
+                "image `{}` of `{}` is not an ECR image named by tag",
+                pin.image, pin.descriptor
+            ))
+        })?;
+        let mut log = JobLog::discard().redacting();
+        self.definition_matches(&pin.context, &pin.definition_id, &pin.descriptor)
+            .await?;
+        let credentials = self
+            .account_credentials(&pin.context, &pin.account, CHECK_WINDOW, &mut log)
+            .await
+            .map_err(|f| log.failure(f))?;
+        match self.cloud.image_digest(&credentials, &image).await {
+            Ok(Some(digest)) if pinned_image(&image.at(&digest)) => Ok(image.at(&digest)),
+            Ok(Some(digest)) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{}` has digest `{digest}`, which is not a sha256 digest",
+                pin.descriptor
+            ))),
+            Ok(None) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{}` does not exist",
                 pin.descriptor
             ))),
             Err(e) => Err(log.failure(cloud_failure(e))),
