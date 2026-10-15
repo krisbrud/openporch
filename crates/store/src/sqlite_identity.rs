@@ -74,6 +74,17 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Principal>> + Send;
 
+    /// Changes a principal's organization role, display name or both in one
+    /// transaction, keeping at least one administrator.
+    fn update_principal(
+        &self,
+        org: &str,
+        id: &str,
+        role: Option<OrgRole>,
+        name: Option<&str>,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Principal>> + Send;
+
     /// Removes a principal with their identities, tokens, sessions and roles, keeping
     /// at least one administrator.
     fn remove_principal(
@@ -433,6 +444,43 @@ impl IdentityStore for SqliteStore {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        audit_in(&mut tx, &audit).await?;
+        let p = require_principal(&mut tx, org, id).await?;
+        tx.commit().await?;
+        Ok(p)
+    }
+
+    async fn update_principal(
+        &self,
+        org: &str,
+        id: &str,
+        role: Option<OrgRole>,
+        name: Option<&str>,
+        audit: AuditIntent,
+    ) -> Result<Principal> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let current = require_principal(&mut tx, org, id).await?;
+        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), role).await?;
+        if let Some(role) = role {
+            if current.role == OrgRole::Administrator && role != OrgRole::Administrator {
+                guard_last_admin(&mut tx, org, id).await?;
+            }
+            sqlx::query("UPDATE principals SET org_role = ? WHERE org_id = ? AND id = ?")
+                .bind(role.as_str())
+                .bind(org)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(name) = name {
+            sqlx::query("UPDATE principals SET name = ? WHERE org_id = ? AND id = ?")
+                .bind(name)
+                .bind(org)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         audit_in(&mut tx, &audit).await?;
         let p = require_principal(&mut tx, org, id).await?;
         tx.commit().await?;

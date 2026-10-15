@@ -7,8 +7,8 @@ protocol 6. Deployments are not resources: use `porch score deploy` or
 `porch workload deploy` for those.
 
 It is not published to a registry yet. It offers these resources, each
-importable, and the `openporch_current_user` data source; more follow in tasks
-7.2 and 7.3:
+importable, and the `openporch_current_user` data source; resource definitions
+follow in task 7.3:
 
 | Resource | Import ID |
 | --- | --- |
@@ -18,6 +18,10 @@ importable, and the `openporch_current_user` data source; more follow in tasks
 | `openporch_resource_class` | `TYPE/CLASS` |
 | `openporch_value` | `APP/KEY` or `APP/ENV/KEY` |
 | `openporch_cloud_account` | `ACCOUNT` |
+| `openporch_user` (service users) | `USER` |
+| `openporch_service_user_token` | `USER/TOKEN` |
+| `openporch_application_user` | `APP/USER` |
+| `openporch_environment_type_user` | `TYPE/USER` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
@@ -38,10 +42,23 @@ changes, or when the version on the server is no longer the one it wrote, as
 happens when someone writes the secret outside OpenTofu. An imported secret is
 imported as its reference.
 
-Secret values are kept in the OpenTofu state, as with any provider. Keep the
-state in an encrypted backend that only platform administrators can read, or
-use OpenTofu's state encryption, and prefer references where a secret already
-lives in a store.
+## Protecting the state
+
+Secret values and service user tokens are kept in the OpenTofu state, as with
+any provider: OpenTofu marks them sensitive, which keeps them out of plans and
+logs but not out of the state file. Whoever can read the state can use them.
+
+- Keep the state in a remote backend with encryption at rest and access limited
+  to platform administrators, or turn on OpenTofu's
+  [state encryption](https://opentofu.org/docs/language/state/encryption/).
+- Do not commit state files or plan files (`tofu plan -out`), which hold the
+  same values.
+- Prefer `secret_ref`/`secret_refs` where a secret already lives in a store, so
+  only its reference reaches the state.
+- Give tokens an `expires_at` and rotate them by changing it together with the
+  token's `id`. The server returns a token only when it is created, so an
+  imported token has no `token`, and a token revoked outside OpenTofu leaves the
+  state and needs a new `id`, since a revoked token keeps its ID.
 
 ## Deleting applications and environments
 

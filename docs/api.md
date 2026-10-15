@@ -248,8 +248,11 @@ Authorization: Bearer $ADMIN_TOKEN
 {"id": "ci", "type": "service", "name": "CI", "role": "member"}
 ```
 
-Changing a role needs authority over both the current and the new role. The last
-administrator cannot be demoted or removed.
+`PATCH` changes a member's `role`, a service user's display `name`, or both; a
+person's name comes from their identity. Changing a
+member needs authority over their current role, and a role change also over the
+new one. The last administrator cannot be demoted or removed. Names are trimmed
+and 1 to 100 characters long, on creation too.
 
 ```http
 PATCH /orgs/acme/users/ci
@@ -262,6 +265,19 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"id": "ci", "role": "manager"}
+```
+
+```http
+PATCH /orgs/acme/users/ci
+Authorization: Bearer $ADMIN_TOKEN
+
+{"name": "CI deployments"}
+```
+
+```http-response
+200 OK
+
+{"id": "ci", "name": "CI deployments", "role": "manager"}
 ```
 
 An invitation names a role and either an email address or an external identity. A

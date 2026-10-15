@@ -252,7 +252,7 @@ resource "openporch_value" "v" {
   key        = "API_TOKEN"
   secret_ref = { store = "openporch", ref = "apps/shop/values/API_TOKEN", version = "" }
 }
-`, "Empty version"),
+`, "Empty value"),
 			invalid(`
 resource "openporch_cloud_account" "a" {
   id      = "aws-dev"
