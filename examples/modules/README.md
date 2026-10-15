@@ -22,7 +22,7 @@ resource's name as the variable `name`; the policy modules take `name` and the
 resource's ARN (`table_arn`, `queue_arn` or `bucket_arn`), and `read_only` for
 tables and buckets or `access` (`send`, `consume` or `send-and-consume`) for
 queues. The table policy also reads the table's stream. Every module also takes `tags`. The modules use the
-`hashicorp/aws` provider 6.x with the credentials the driver exports for the
+`hashicorp/aws` provider 6.x (6.28 or later for `aws-lambda-workload`) with the credentials the driver exports for the
 definition's cloud account. Deleting an `s3` resource deletes its objects too,
 so, like every deletion the driver plans, it needs an acknowledgement.
 
@@ -94,9 +94,10 @@ Secret variables never reach the function's environment. Each is a SecureString
 parameter `/openporch/<function>/<NAME>` (or, with
 `target.lambda.secrets: secretsmanager`, a secret
 `openporch/<function>/<NAME>`) that only the function's role may read, and the
-function finds its name in `<NAME>_SECRET_REF` and reads it at startup. The
-values are kept in the OpenTofu state, like every secret a module writes, so
-protect the state.
+function finds its name in `<NAME>_SECRET_REF` and reads it at startup. A
+secret anywhere else in the workload, such as in a container's `args` or a
+schedule's `input`, is refused rather than dropped. The values are kept in the
+OpenTofu state, like every secret a module writes, so protect the state.
 
 A container workload runs an image that must answer Lambda's runtime API. For
 an ordinary HTTP server, add the [Lambda Web
@@ -113,8 +114,9 @@ Setting `AWS_LWA_PORT` does not by itself make an image run on Lambda.
 Schedules translate 5-field cron expressions into EventBridge Scheduler's
 `cron(...)`, which numbers days of the week from Sunday = 1 and cannot restrict
 both the day of the month and the day of the week; such an expression, a step
-in the day of the week, and macros such as `@daily` are refused rather than
-approximated. The checks run when OpenTofu plans the workload, so they stop
+in the day of the week, a value out of its field's range, a reversed range,
+macros such as `@daily`, and a time zone that is not an IANA name or `UTC` are
+refused rather than approximated. The checks run when OpenTofu plans the workload, so they stop
 the function from being created but come after its dependencies are
 provisioned.
 

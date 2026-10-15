@@ -1,5 +1,7 @@
 # The function's execution role: its logs, its secrets, the queues that
 # trigger it, and the policies its dependencies' definitions co-provision.
+# SecureString parameters use the account's `aws/ssm` key, whose key policy
+# already lets the account's principals decrypt through SSM.
 
 data "aws_iam_policy_document" "assume" {
   statement {
@@ -12,7 +14,8 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "this" {
-  name               = substr("${local.name}-lambda", 0, 64)
+  # A name too long for IAM is shortened with a hash, so it stays unique.
+  name               = length("${local.name}-lambda") <= 64 ? "${local.name}-lambda" : "${substr(local.name, 0, 47)}-${substr(sha1(local.name), 0, 8)}-lambda"
   assume_role_policy = data.aws_iam_policy_document.assume.json
   tags               = var.tags
 }
@@ -30,20 +33,6 @@ data "aws_iam_policy_document" "this" {
       sid       = "SecretParameters"
       actions   = ["ssm:GetParameter", "ssm:GetParameters"]
       resources = [for p in aws_ssm_parameter.variable : p.arn]
-    }
-  }
-  dynamic "statement" {
-    # SecureString parameters use the account's `aws/ssm` key.
-    for_each = length(aws_ssm_parameter.variable) > 0 ? [1] : []
-    content {
-      sid       = "DecryptSecretParameters"
-      actions   = ["kms:Decrypt"]
-      resources = ["arn:${data.aws_partition.current.partition}:kms:${local.region}:${data.aws_caller_identity.current.account_id}:key/*"]
-      condition {
-        test     = "StringEquals"
-        variable = "kms:ViaService"
-        values   = ["ssm.${local.region}.amazonaws.com"]
-      }
     }
   }
   dynamic "statement" {

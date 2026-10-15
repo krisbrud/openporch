@@ -15,7 +15,8 @@
 # - Plain variables become environment variables. A secret variable `NAME` is
 #   stored as an SSM SecureString parameter (or a Secrets Manager secret with
 #   `target.lambda.secrets: secretsmanager`) that the function may read, and
-#   the environment has `NAME_SECRET_REF` with its name (or ARN) instead.
+#   the environment has `NAME_SECRET_REF` with its name instead. Secrets
+#   anywhere else in the workload's spec are refused, never dropped.
 # - The execution role attaches the `arn` of every `aws-policy` among the
 #   workload's dependencies, which the definitions of its tables, queues and
 #   buckets co-provision.
@@ -30,12 +31,12 @@
 terraform {
   required_version = ">= 1.8"
   required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 6.0" }
+    # 6.28 added `invoked_via_function_url` to `aws_lambda_permission`.
+    aws = { source = "hashicorp/aws", version = ">= 6.28, < 7.0" }
   }
 }
 
 data "aws_region" "current" {}
-data "aws_partition" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
@@ -54,7 +55,8 @@ locals {
   container_id   = local.is_function ? null : try(keys(local.containers)[0], null)
   container      = local.container_id == null ? null : local.containers[local.container_id]
   package        = try(local.function.package, {})
-  is_zip         = local.is_function && try(local.package.type, "") == "zip"
+  package_type   = try(local.package.type, null)
+  is_zip         = local.is_function && local.package_type == "zip"
   image          = local.is_zip ? null : (local.is_function ? try(local.package.image, null) : try(local.container.image, null))
   image_in_ecr   = local.image == null || can(regex("^[0-9]{12}\\.dkr\\.ecr\\.${local.region}\\.amazonaws\\.com/", local.image))
   artifact       = local.is_zip ? try(regex("^s3://([^/?]+)/([^?]+)(?:\\?versionId=(.+))?$", local.package.artifact), null) : null
@@ -69,8 +71,11 @@ locals {
     for p in regexall("([0-9]+)(h|m|s)", local.timeout_text) : tonumber(p[0]) * lookup({ h = 3600, m = 60, s = 1 }, p[1])
   ] : []
   timeout_seconds = length(local.timeout_parts) == 0 ? 0 : sum(local.timeout_parts)
-  reserved        = try(tonumber(local.function.concurrency.reserved), -1)
-  provisioned     = try(tonumber(local.function.concurrency.provisioned), null)
+  # Concurrency that is not a whole number fails its precondition as -2 or 0.
+  reserved_text    = try(local.function.concurrency.reserved, null)
+  reserved         = local.reserved_text == null ? -1 : try(tonumber(local.reserved_text) == floor(tonumber(local.reserved_text)) ? tonumber(local.reserved_text) : -2, -2)
+  provisioned_text = try(local.function.concurrency.provisioned, null)
+  provisioned      = local.provisioned_text == null ? null : try(tonumber(local.provisioned_text) == floor(tonumber(local.provisioned_text)) ? tonumber(local.provisioned_text) : 0, 0)
 
   # Variables: plain ones as they are, secret ones by reference.
   plain_variables = local.is_function ? try(local.function.variables, {}) : try(local.container.variables, {})
@@ -81,9 +86,23 @@ locals {
   secret_backend = try(local.target.secrets, "ssm")
   secret_refs = {
     for n in local.secret_names : "${n}_SECRET_REF" => (
-      local.secret_backend == "secretsmanager" ? aws_secretsmanager_secret.variable[n].arn : aws_ssm_parameter.variable[n].name
+      local.secret_backend == "secretsmanager" ? aws_secretsmanager_secret.variable[n].name : aws_ssm_parameter.variable[n].name
     )
   }
+  # Secrets the function would not get: anywhere but the selected variables
+  # and the dependencies' outputs, such as in `args` or a schedule's input.
+  secret_spec = try(var.resource_secrets.spec, {})
+  stray_secrets = nonsensitive(concat(
+    [for k in keys(var.resource_secrets) : k if !contains(["spec", "dependencies"], k)],
+    [for k in try(keys(local.secret_spec), ["?"]) : "spec.${k}" if k != (local.is_function ? "function" : "containers")],
+    local.is_function ? [
+      for k in try(keys(try(local.secret_spec.function, {})), ["?"]) : "spec.function.${k}" if k != "variables"
+      ] : flatten([
+        for c, v in try(local.secret_spec.containers, {}) : [
+          for k in try(keys(v), ["?"]) : "spec.containers.${c}.${k}" if c != local.container_id || k != "variables"
+        ]
+    ]),
+  ))
 
   # The service port a container listens on: the HTTP trigger's, or the first.
   ports     = try(local.spec.service.ports, {})
@@ -91,6 +110,20 @@ locals {
   lwa_port  = local.is_function || local.http_port == null ? {} : { AWS_LWA_PORT = tostring(try(local.ports[local.http_port].targetPort, local.ports[local.http_port].port)) }
 
   environment = merge(local.plain_variables, local.secret_refs, local.lwa_port)
+  # Lambda measures its 4 KB limit over names and values.
+  environment_size = sum(concat([0], [for k, v in local.environment : length(k) + length(tostring(v))]))
+  # Names Lambda sets itself, and the Web Adapter's port, which the module sets.
+  reserved_names = [
+    "_HANDLER", "_X_AMZN_TRACE_ID", "AWS_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_DEFAULT_REGION",
+    "AWS_EXECUTION_ENV", "AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_VERSION", "AWS_LAMBDA_INITIALIZATION_TYPE", "AWS_LAMBDA_LOG_GROUP_NAME",
+    "AWS_LAMBDA_LOG_STREAM_NAME", "AWS_LAMBDA_RUNTIME_API", "AWS_REGION", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN", "LAMBDA_RUNTIME_DIR", "LAMBDA_TASK_ROOT",
+  ]
+  reserved_used = setintersection(
+    concat(keys(local.plain_variables), tolist(local.secret_names)),
+    concat(local.reserved_names, keys(local.lwa_port)),
+  )
 
   # The policies its dependencies' definitions co-provision.
   policies = { for key, outputs in local.dependencies : key => outputs.arn if startswith(key, "aws-policy.") && can(outputs.arn) }
@@ -132,8 +165,8 @@ resource "aws_lambda_function" "this" {
   s3_bucket         = local.is_zip ? local.artifact[0] : null
   s3_key            = local.is_zip ? local.artifact[1] : null
   s3_object_version = local.is_zip ? local.artifact[2] : null
-  runtime           = local.is_zip ? local.package.runtime : null
-  handler           = local.is_zip ? local.package.handler : null
+  runtime           = local.is_zip ? try(local.package.runtime, null) : null
+  handler           = local.is_zip ? try(local.package.handler, null) : null
   image_uri         = local.image
 
   dynamic "image_config" {
@@ -186,6 +219,18 @@ resource "aws_lambda_function" "this" {
       error_message = "Container `${coalesce(local.container_id, "-")}` has `files`, which Lambda cannot mount; build them into the image."
     }
     precondition {
+      condition     = !local.is_function || contains(["zip", "image"], coalesce(local.package_type, "-"))
+      error_message = "`function.package.type` is `zip` or `image`."
+    }
+    precondition {
+      condition     = local.is_zip || local.image != null
+      error_message = "An image function or container needs an `image`."
+    }
+    precondition {
+      condition     = !local.is_zip || (try(local.package.runtime, null) != null && try(local.package.handler, null) != null)
+      error_message = "A zip function needs `package.runtime` and `package.handler`."
+    }
+    precondition {
       condition     = local.image_in_ecr
       error_message = "Lambda container images must come from ECR in the function's region (${local.region}); `${coalesce(local.image, "-")}` does not."
     }
@@ -206,15 +251,31 @@ resource "aws_lambda_function" "this" {
       error_message = "`function.timeout` must be 1s to 15m, written like `30s` or `5m`."
     }
     precondition {
+      condition     = local.reserved >= -1
+      error_message = "`function.concurrency.reserved` must be a whole number, 0 or more."
+    }
+    precondition {
       condition     = local.provisioned == null || try(local.provisioned >= 1, false)
-      error_message = "`function.concurrency.provisioned` must be at least 1."
+      error_message = "`function.concurrency.provisioned` must be a whole number, at least 1."
+    }
+    precondition {
+      condition     = local.provisioned == null || local.reserved == -1 || try(local.provisioned <= local.reserved, false)
+      error_message = "`function.concurrency.provisioned` cannot exceed `reserved`."
+    }
+    precondition {
+      condition     = length(local.stray_secrets) == 0
+      error_message = "Only variables and dependencies may hold secrets on Lambda; these would not reach the function: ${join(", ", local.stray_secrets)}."
+    }
+    precondition {
+      condition     = length(local.reserved_used) == 0
+      error_message = "These environment variable names are set by Lambda or by this module: ${join(", ", local.reserved_used)}."
     }
     precondition {
       condition     = length(setintersection(keys(local.plain_variables), keys(local.secret_refs))) == 0
       error_message = "A plain variable has the name of a secret's reference: ${join(", ", setintersection(keys(local.plain_variables), keys(local.secret_refs)))}."
     }
     precondition {
-      condition     = length(jsonencode(local.environment)) <= 4096
+      condition     = local.environment_size <= 4096
       error_message = "The function's environment variables exceed Lambda's 4 KB limit."
     }
     precondition {

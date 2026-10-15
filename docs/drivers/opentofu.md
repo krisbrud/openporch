@@ -53,7 +53,9 @@ the secret variable file. For a workload whose variable `DB_PASSWORD` comes from
 a database's password, `var.resource.spec.function.variables` has the other
 variables and `var.resource_secrets.spec.function.variables.DB_PASSWORD` the
 password. A value that mixes text and a secret, such as a connection string,
-is a secret as a whole. A module that reads them declares them with defaults,
+is a secret as a whole. A secret in a list leaves `null` in its place in
+`resource`, and is in `resource_secrets` under its index as an object key: the
+second of a container's `args` is at `args["1"]`. A module that reads them declares them with defaults,
 so it also runs for a resource without inputs:
 
 ```hcl

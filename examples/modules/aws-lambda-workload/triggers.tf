@@ -29,10 +29,39 @@ locals {
       fields   = regexall("\\S+", t.schedule.cron)
     } if local.trigger_kinds[name] == "schedule"
   }
+  # Each field's range and names: minute, hour, day of month, month, day of
+  # week.
+  cron_fields = [
+    { min = 0, max = 59, names = {} },
+    { min = 0, max = 23, names = {} },
+    { min = 1, max = 31, names = {} },
+    { min = 1, max = 12, names = { JAN = 1, FEB = 2, MAR = 3, APR = 4, MAY = 5, JUN = 6, JUL = 7, AUG = 8, SEP = 9, OCT = 10, NOV = 11, DEC = 12 } },
+    { min = 0, max = 7, names = { SUN = 0, MON = 1, TUE = 2, WED = 3, THU = 4, FRI = 5, SAT = 6 } },
+  ]
+  # A list item: `*`, a value or a range, with an optional step.
+  cron_item = "^(\\*|([0-9]+|[A-Za-z]{3})(-([0-9]+|[A-Za-z]{3}))?)(/([0-9]+))?$"
+  cron_valid = {
+    for name, s in local.schedules : name => length(s.fields) == 5 && alltrue([
+      for i, f in s.fields : alltrue([
+        for item in split(",", f) : try(
+          regex(local.cron_item, item)[0] == "*" ? tonumber(coalesce(regex(local.cron_item, item)[5], "1")) >= 1 : (
+            alltrue([
+              for v in compact([regex(local.cron_item, item)[1], regex(local.cron_item, item)[3]]) :
+              try(tonumber(v), lookup(local.cron_fields[i].names, upper(v), -1)) >= local.cron_fields[i].min &&
+              try(tonumber(v), lookup(local.cron_fields[i].names, upper(v), -1)) <= local.cron_fields[i].max
+            ]) &&
+            try(tonumber(regex(local.cron_item, item)[1]), lookup(local.cron_fields[i].names, upper(regex(local.cron_item, item)[1]), -1)) <=
+            try(tonumber(coalesce(regex(local.cron_item, item)[3], regex(local.cron_item, item)[1])), lookup(local.cron_fields[i].names, upper(coalesce(regex(local.cron_item, item)[3], regex(local.cron_item, item)[1])), -1)) &&
+            tonumber(coalesce(regex(local.cron_item, item)[5], "1")) >= 1
+          ),
+          false
+        )
+      ])
+    ])
+  }
   schedule_expressions = {
     for name, s in local.schedules : name => (
-      length(s.fields) == 5
-      && alltrue([for f in s.fields : can(regex("^[0-9A-Za-z*,/-]+$", f))])
+      local.cron_valid[name]
       && (s.fields[2] == "*" || s.fields[4] == "*")
       && !strcontains(s.fields[4], "/")
       && alltrue([
@@ -44,7 +73,7 @@ locals {
         replace(s.fields[0], "/^\\*\\//", "0/"),
         replace(s.fields[1], "/^\\*\\//", "0/"),
         s.fields[4] == "*" ? replace(s.fields[2], "/^\\*\\//", "1/") : "?",
-        replace(s.fields[3], "/^\\*\\//", "1/"),
+        upper(replace(s.fields[3], "/^\\*\\//", "1/")),
         s.fields[4] == "*" ? "?" : join(",", [
           for t in split(",", s.fields[4]) : (
             can(regex("^[0-7]$", t)) ? tostring(tonumber(t) % 7 + 1) :
@@ -54,6 +83,18 @@ locals {
         ])
       )
       : null
+    )
+  }
+  # IANA time zone names, by their areas.
+  bad_timezones = [
+    for name, s in local.schedules : "`${name}` (${s.timezone})"
+    if !can(regex("^(UTC|(Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific|Etc)/[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)?)$", s.timezone))
+  ]
+  # Names too long for Scheduler are shortened with a hash, so they stay
+  # unique.
+  schedule_names = {
+    for name, s in local.schedules : name => (
+      length("${local.name}-${name}") <= 64 ? "${local.name}-${name}" : "${substr("${local.name}-${name}", 0, 55)}-${substr(sha1("${local.name}-${name}"), 0, 8)}"
     )
   }
 }
@@ -76,7 +117,15 @@ resource "terraform_data" "triggers" {
     }
     precondition {
       condition     = alltrue([for name, e in local.schedule_expressions : e != null])
-      error_message = "Schedules need a 5-field cron expression that restricts at most one of day-of-month and day-of-week, without steps in day-of-week: ${join(", ", [for name, e in local.schedule_expressions : "`${name}` (${local.schedules[name].cron})" if e == null])}."
+      error_message = "Schedules need a 5-field cron expression with values in range that restricts at most one of day-of-month and day-of-week, without steps in day-of-week: ${join(", ", [for name, e in local.schedule_expressions : "`${name}` (${local.schedules[name].cron})" if e == null])}."
+    }
+    precondition {
+      condition     = length(local.bad_timezones) == 0
+      error_message = "Schedules need an IANA time zone, such as `Europe/Oslo`, or `UTC`: ${join(", ", local.bad_timezones)}."
+    }
+    precondition {
+      condition     = local.http == null || contains(["/", ""], coalesce(try(local.http.path, null), "/"))
+      error_message = "A function URL has no path; the function sees every path, so the `http` trigger takes none."
     }
     precondition {
       condition     = alltrue([for t in values(local.queue_triggers) : t.arn != null && t.batch_size >= 1 && t.batch_size <= 10000])
@@ -139,7 +188,7 @@ data "aws_iam_policy_document" "scheduler_assume" {
 
 resource "aws_iam_role" "scheduler" {
   count              = length(local.schedules) > 0 ? 1 : 0
-  name               = substr("${local.name}-scheduler", 0, 64)
+  name               = length("${local.name}-scheduler") <= 64 ? "${local.name}-scheduler" : "${substr(local.name, 0, 44)}-${substr(sha1(local.name), 0, 8)}-scheduler"
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume.json
   tags               = var.tags
 }
@@ -160,7 +209,7 @@ resource "aws_iam_role_policy" "scheduler" {
 
 resource "aws_scheduler_schedule" "this" {
   for_each                     = local.schedules
-  name                         = substr("${local.name}-${each.key}", 0, 64)
+  name                         = local.schedule_names[each.key]
   schedule_expression          = local.schedule_expressions[each.key]
   schedule_expression_timezone = each.value.timezone
 

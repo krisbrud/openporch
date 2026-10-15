@@ -6,9 +6,6 @@ mock_provider "aws" {
   mock_data "aws_region" {
     defaults = { region = "eu-north-1" }
   }
-  mock_data "aws_partition" {
-    defaults = { partition = "aws" }
-  }
   mock_data "aws_caller_identity" {
     defaults = { account_id = "123456789012" }
   }
@@ -26,6 +23,12 @@ mock_provider "aws" {
   }
   mock_resource "aws_iam_role" {
     defaults = { arn = "arn:aws:iam::123456789012:role/mock" }
+  }
+  mock_resource "aws_lambda_function_url" {
+    defaults = { function_url = "https://mock.lambda-url.eu-north-1.on.aws/" }
+  }
+  mock_resource "aws_sqs_queue" {
+    defaults = {}
   }
   mock_resource "aws_cloudwatch_log_group" {
     defaults = { arn = "arn:aws:logs:eu-north-1:123456789012:log-group:mock" }
@@ -115,6 +118,17 @@ run "secret_variables_are_references" {
     condition     = length(aws_secretsmanager_secret.variable) == 0
     error_message = "Parameters are the default."
   }
+  assert {
+    condition = anytrue([
+      for st in data.aws_iam_policy_document.this.statement :
+      st.sid == "SecretParameters" && contains(st.actions, "ssm:GetParameter") && contains(st.resources, aws_ssm_parameter.variable["DB_PASSWORD"].arn)
+    ])
+    error_message = "The role may read the secret's parameter."
+  }
+  assert {
+    condition     = length(data.aws_iam_policy_document.this.statement) == 2
+    error_message = "The role may write its logs and read its secrets, nothing else."
+  }
 }
 
 run "secrets_manager" {
@@ -133,6 +147,17 @@ run "secrets_manager" {
   assert {
     condition     = length(aws_ssm_parameter.variable) == 0 && aws_secretsmanager_secret.variable["DB_PASSWORD"].name == "openporch/shop-dev-order-worker/DB_PASSWORD"
     error_message = "With `secrets: secretsmanager` the secret is a Secrets Manager secret."
+  }
+  assert {
+    condition     = aws_lambda_function.this.environment[0].variables["DB_PASSWORD_SECRET_REF"] == "openporch/shop-dev-order-worker/DB_PASSWORD"
+    error_message = "The function gets the secret's name."
+  }
+  assert {
+    condition = anytrue([
+      for st in data.aws_iam_policy_document.this.statement :
+      st.sid == "Secrets" && st.actions == toset(["secretsmanager:GetSecretValue"]) && contains(st.resources, aws_secretsmanager_secret.variable["DB_PASSWORD"].arn)
+    ])
+    error_message = "The role may read the secret."
   }
   assert {
     condition     = aws_lambda_function.this.architectures == tolist(["arm64"])
@@ -212,7 +237,7 @@ run "container_with_web_adapter_port" {
         triggers = { web = { http = { port = "http", auth = "none" } } }
       }
     }
-    resource_secrets = {}
+    resource_secrets = { spec = { containers = { main = { variables = { API_KEY = "k-1" } } } } }
   }
 
   assert {
@@ -226,6 +251,10 @@ run "container_with_web_adapter_port" {
   assert {
     condition     = aws_lambda_function.this.environment[0].variables["AWS_LWA_PORT"] == "8080" && aws_lambda_function.this.environment[0].variables["LOG_LEVEL"] == "info"
     error_message = "The service's target port is exported as AWS_LWA_PORT."
+  }
+  assert {
+    condition     = aws_lambda_function.this.environment[0].variables["API_KEY_SECRET_REF"] == "/openporch/shop-dev-web/API_KEY"
+    error_message = "A container's secret variable is a reference too."
   }
   assert {
     condition     = aws_lambda_function_url.this[0].authorization_type == "NONE" && length(aws_lambda_permission.url) == 1 && length(aws_lambda_permission.url_invoke) == 1
@@ -303,6 +332,10 @@ run "iam_url" {
     condition     = aws_lambda_function_url.this[0].authorization_type == "AWS_IAM" && length(aws_lambda_permission.url) == 0
     error_message = "`auth: iam` makes a URL that needs signed requests, with no public permission."
   }
+  assert {
+    condition     = output.url == "https://mock.lambda-url.eu-north-1.on.aws/"
+    error_message = "The module's `url` output is the function URL."
+  }
 }
 
 run "schedules" {
@@ -319,6 +352,7 @@ run "schedules" {
           sundays  = { schedule = { cron = "*/15 * * * 0,6" } }
           monthly  = { schedule = { cron = "0 0 1 */3 *" } }
           names    = { schedule = { cron = "0 9 * jan mon-fri" } }
+          steps    = { schedule = { cron = "5-55/10 8-18 1-15 * *" } }
         }
       }
     }
@@ -349,8 +383,20 @@ run "schedules" {
     error_message = "Day-of-month schedules leave day-of-week open."
   }
   assert {
-    condition     = aws_scheduler_schedule.this["names"].schedule_expression == "cron(0 9 ? jan MON-FRI *)"
-    error_message = "Day names stay names."
+    condition     = aws_scheduler_schedule.this["names"].schedule_expression == "cron(0 9 ? JAN MON-FRI *)"
+    error_message = "Month and day names stay names."
+  }
+  assert {
+    condition     = aws_scheduler_schedule.this["steps"].schedule_expression == "cron(5-55/10 8-18 1-15 * ? *)"
+    error_message = "Ranges with steps translate."
+  }
+  assert {
+    condition = (
+      jsondecode(aws_iam_role_policy.scheduler[0].policy).Statement[0].Action == "lambda:InvokeFunction" &&
+      jsondecode(aws_iam_role_policy.scheduler[0].policy).Statement[0].Resource[0] == aws_lambda_function.this.arn &&
+      length(jsondecode(aws_iam_role_policy.scheduler[0].policy).Statement) == 1
+    )
+    error_message = "The scheduler's role may only invoke the function."
   }
 }
 
@@ -410,6 +456,14 @@ run "queue_trigger" {
       aws_lambda_event_source_mapping.queue["inbox"].batch_size == 5
     )
     error_message = "The queue invokes the function in batches of 5."
+  }
+  assert {
+    condition = anytrue([
+      for st in data.aws_iam_policy_document.this.statement :
+      st.sid == "TriggerQueues" && st.resources == toset(["arn:aws:sqs:eu-north-1:123456789012:inbox"]) &&
+      contains(st.actions, "sqs:ReceiveMessage") && contains(st.actions, "sqs:DeleteMessage")
+    ])
+    error_message = "The role may receive and delete the queue's messages."
   }
 }
 
@@ -503,5 +557,212 @@ run "provisioned_concurrency" {
   assert {
     condition     = aws_scheduler_schedule.this["nightly"].target[0].arn == "arn:aws:lambda:eu-north-1:123456789012:function:mock:live"
     error_message = "Triggers invoke the alias."
+  }
+}
+
+run "cron_out_of_range" {
+  command = plan
+
+  variables {
+    resource = {
+      id = "order-worker"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = {
+          a = { schedule = { cron = "99 3 * * *" } }
+          b = { schedule = { cron = "0 3 * * xyz" } }
+          c = { schedule = { cron = "0 3 * * 5-1" } }
+          d = { schedule = { cron = "0 3 * 13 *" } }
+          e = { schedule = { cron = "*/0 3 0 * *" } }
+        }
+      }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [terraform_data.triggers]
+}
+
+run "unknown_timezone" {
+  command = plan
+
+  variables {
+    resource = {
+      id = "order-worker"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = { a = { schedule = { cron = "0 3 * * *", timezone = "Mars/Base" } } }
+      }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [terraform_data.triggers]
+}
+
+run "url_with_a_path" {
+  command = plan
+
+  variables {
+    resource = {
+      id = "order-worker"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = { api = { http = { auth = "iam", path = "/api" } } }
+      }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [terraform_data.triggers]
+}
+
+run "provisioned_above_reserved" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "zip", artifact = "s3://b/k.zip", runtime = "python3.12", handler = "a.h" }, concurrency = { reserved = 1, provisioned = 5 } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "reserved_not_a_number" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "zip", artifact = "s3://b/k.zip", runtime = "python3.12", handler = "a.h" }, concurrency = { reserved = "lots" } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "unknown_package_type" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "jar", image = "123456789012.dkr.ecr.eu-north-1.amazonaws.com/api:1" } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "image_function_without_image" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "image" } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "zip_without_handler" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "zip", artifact = "s3://b/k.zip", runtime = "python3.12" } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "reserved_variable_name" {
+  command = plan
+
+  variables {
+    resource = {
+      id   = "order-worker"
+      spec = { function = { package = { type = "zip", artifact = "s3://b/k.zip", runtime = "python3.12", handler = "a.h" }, variables = { AWS_REGION = "us-east-1" } } }
+    }
+    resource_secrets = {}
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "secret_outside_variables" {
+  command = plan
+
+  variables {
+    resource = {
+      id = "order-worker"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = { nightly = { schedule = { cron = "0 3 * * *", input = { token = "" } } } }
+      }
+    }
+    resource_secrets = { spec = { triggers = { nightly = { schedule = { input = { token = "t-1" } } } } } }
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "secret_in_container_args" {
+  command = plan
+
+  variables {
+    resource = {
+      id = "order-worker"
+      spec = { containers = { main = {
+        image = "123456789012.dkr.ecr.eu-north-1.amazonaws.com/web:1"
+        args  = ["--token", null]
+      } } }
+    }
+    resource_secrets = { spec = { containers = { main = { args = { "1" = "t-1" } } } } }
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "long_names_stay_unique" {
+  command = plan
+
+  variables {
+    app = "a-long-application-name"
+    env = "development"
+    resource = {
+      id = "a-workload-with-long-id"
+      spec = {
+        function = { package = { type = "zip", artifact = "s3://acme-artifacts/w.zip", runtime = "python3.12", handler = "app.handler" } }
+        triggers = { nightly = { schedule = { cron = "0 3 * * *" } }, nightly-reports = { schedule = { cron = "0 4 * * *" } } }
+      }
+    }
+    resource_secrets = {}
+  }
+
+  assert {
+    condition = (
+      length(aws_iam_role.this.name) <= 64 && length(aws_iam_role.scheduler[0].name) <= 64 &&
+      aws_iam_role.this.name != aws_iam_role.scheduler[0].name
+    )
+    error_message = "Long role names are shortened and stay distinct."
+  }
+  assert {
+    condition = (
+      length(aws_scheduler_schedule.this["nightly"].name) <= 64 && length(aws_scheduler_schedule.this["nightly-reports"].name) <= 64 &&
+      aws_scheduler_schedule.this["nightly"].name != aws_scheduler_schedule.this["nightly-reports"].name
+    )
+    error_message = "Long schedule names are shortened and stay distinct."
   }
 }

@@ -419,6 +419,61 @@ fn secret_resource_inputs_are_moved_out_one_by_one() {
     );
 }
 
+#[test]
+fn a_secret_inside_another_moves_with_it() {
+    let mut req = request(json!({"script": ""}), json!({}));
+    req.resource = object(json!({"id": "worker"}));
+    req.resource_secrets = SecretMap::new(object(json!({
+        "dependencies": {"db": {"host": "db.internal", "auth": {"password": "pw-1"}}},
+    })));
+    let path = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // The inner secret first, so moving the outer one cannot overwrite it.
+    req.resource_secret_paths = vec![
+        path(&["dependencies", "db", "auth", "password"]),
+        path(&["dependencies", "db", "auth"]),
+    ];
+    let (plain, secrets) = split_resource(&req);
+    assert_eq!(
+        Value::Object(plain),
+        json!({"id": "worker", "dependencies": {"db": {"host": "db.internal"}}})
+    );
+    assert_eq!(
+        Value::Object(secrets),
+        json!({"dependencies": {"db": {"auth": {"password": "pw-1"}}}})
+    );
+}
+
+#[tokio::test]
+async fn the_plain_variable_file_has_no_secret_input() {
+    let root = tempfile::tempdir().unwrap();
+    let d = driver(root.path());
+    let mut req = request(json!({"script": ""}), json!({}));
+    req.resource = object(json!({"id": "worker"}));
+    req.resource_secrets = SecretMap::new(object(json!({
+        "spec": {"function": {"variables": {"TABLE": "orders", "DB_PASSWORD": "pw-1"}}},
+    })));
+    req.resource_secret_paths = vec![
+        ["spec", "function", "variables", "DB_PASSWORD"]
+            .map(String::from)
+            .to_vec(),
+    ];
+    let mut run = d.start(&req).await.unwrap();
+    d.prepare(&mut run, &req, SourceAt::Current).await.unwrap();
+    let read = |name: &str| -> Value {
+        serde_json::from_slice(&std::fs::read(run.dir.join(name)).unwrap()).unwrap()
+    };
+    let plain = read("values.tfvars.json");
+    assert_eq!(
+        plain["resource"],
+        json!({"id": "worker", "spec": {"function": {"variables": {"TABLE": "orders"}}}})
+    );
+    assert!(!plain.to_string().contains("pw-1"), "{plain}");
+    assert_eq!(
+        read("secrets.tfvars.json")["resource_secrets"],
+        json!({"spec": {"function": {"variables": {"DB_PASSWORD": "pw-1"}}}})
+    );
+}
+
 /// A module that reads the resource's inputs and creates nothing.
 const RESOURCE_MODULE: &str = r#"
 variable "resource" {

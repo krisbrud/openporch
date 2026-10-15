@@ -571,6 +571,12 @@ fn split_resource(req: &DriverRequest) -> (Map<String, Value>, Map<String, Value
             .resource_secret_paths
             .iter()
             .filter(|p| p.first() == Some(key))
+            // A secret inside another moves with it.
+            .filter(|p| {
+                !req.resource_secret_paths
+                    .iter()
+                    .any(|q| q.len() < p.len() && p.starts_with(q))
+            })
             .map(|p| &p[1..])
             .collect();
         let mut value = value.clone();
@@ -723,7 +729,12 @@ impl OpenTofu {
     async fn start(&self, req: &DriverRequest) -> Result<Run, Failure> {
         let hold = self.hold(req).await?;
         let mut log = RunLog::default();
-        let mut redact = secret_strings(&[&req.secrets, &req.resource_secrets]);
+        let mut redact = secret_strings(&[&req.secrets]);
+        // Only the resource's secret values, not the plain inputs beside them.
+        let (_, resource_secrets) = split_resource(req);
+        resource_secrets
+            .values()
+            .for_each(|v| strings(v, &mut redact));
         if let Some(c) = &req.credentials {
             redact.extend(secret_strings(&[c]));
         }
