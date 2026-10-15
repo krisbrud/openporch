@@ -226,7 +226,7 @@ pub async fn trigger(
             audit: ctx.audit(org, "deployment.create", format!("{app}/{env}")),
         })
         .await?;
-    if let (Acceptance::Created(d), Some(slot)) = (&acceptance, slot) {
+    if let Acceptance::Created(d) = &acceptance {
         state.runners.spawn(
             state.clone(),
             Job {

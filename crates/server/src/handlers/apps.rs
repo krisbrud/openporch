@@ -179,8 +179,14 @@ pub async fn delete(
         .into());
     }
     let envs = state.store.envs(org, &app).await?;
-    // Room for every environment's deletion is taken before anything is stored.
-    let mut slots = state.runners.slots(envs.len())?;
+    // Room for the deletions is taken before anything is stored: one for each
+    // environment not already being deleted, which repeating the request does
+    // not start again. An application with more of them than the server runs
+    // at once takes every slot, and its other deletions wait for one.
+    let starting = envs.iter().filter(|e| e.state != "deleting").count();
+    let mut slots = state
+        .runners
+        .slots(starting.min(state.runners.capacity()))?;
     let mut permits = std::collections::BTreeMap::new();
     for env in envs {
         let entries = plans::preflight(&state, &env, String::new(), &snapshot, true).await?;

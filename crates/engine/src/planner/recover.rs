@@ -20,6 +20,8 @@ use super::{
 
 /// How long observing a resource may take.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long a recovery waits for a driver slot.
+const PERMIT_WAIT: Duration = Duration::from_secs(30);
 
 /// How recovering a resource ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +97,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 let updating = !deleting && job.existing;
                 // Observing runs the driver too, so it waits for a slot
                 // like any other driver operation.
-                let _permit = self.permits.clone().acquire_owned().await;
+                // A recovery request does not wait long: when every slot
+                // stays busy it is refused and can be repeated.
+                let permit =
+                    tokio::time::timeout(PERMIT_WAIT, self.permits.clone().acquire_owned()).await;
+                let Ok(Ok(_permit)) = permit else {
+                    return Err(RecoverError::Observation(
+                        "every driver slot is busy; try the recovery again later".into(),
+                    ));
+                };
                 let observed = self.executor.observe(job, deleting).await;
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),

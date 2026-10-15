@@ -401,7 +401,7 @@ pub(super) async fn start_deletion(
             .is_ok(),
         _ => false,
     };
-    if !finished && let Some(slot) = slot {
+    if !finished {
         state.runners.spawn(
             state.clone(),
             Job {

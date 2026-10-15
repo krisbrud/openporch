@@ -289,6 +289,7 @@ pub struct Runners {
     stopped: tokio::sync::Notify,
     /// One permit per deployment that may run or wait at once.
     slots: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
 }
 
 /// Room for one more running deployment, taken before it is accepted and
@@ -315,6 +316,7 @@ impl Runners {
             active: Mutex::default(),
             stopped: tokio::sync::Notify::new(),
             slots: Arc::new(tokio::sync::Semaphore::new(capacity.max(1))),
+            capacity: capacity.max(1),
         }
     }
 
@@ -396,16 +398,32 @@ impl Runners {
         }
     }
 
-    /// Starts `job` in the background, in `slot`.
-    pub fn spawn(&self, state: AppState, job: Job, slot: Slot) {
+    /// How many deployments may run at once.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Starts `job` in the background, in `slot`, or once a slot is free when
+    /// it was accepted without one.
+    pub fn spawn(&self, state: AppState, job: Job, slot: Option<Slot>) {
         let key = format!("{}/{}/{}", job.app, job.env, job.id);
         self.active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone());
-        let run = tokio::spawn(self.current().run(state.clone(), job.clone()));
+        let runner = self.current();
+        let slots = self.slots.clone();
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slot = match slot {
+                Some(slot) => Some(slot),
+                // The semaphore is never closed; were it, the job runs anyway.
+                None => slots
+                    .acquire_owned()
+                    .await
+                    .ok()
+                    .map(|p| Slot { _permit: p }),
+            };
+            let run = tokio::spawn(runner.run(state.clone(), job.clone()));
             // A runner that panics must not leave the environment blocked.
             if run.await.is_err() {
                 finish(

@@ -51,6 +51,11 @@ pub struct Config {
     pub limits: WorkLimits,
 }
 
+/// The longest deployment time a server accepts: a week.
+const MAX_DEPLOYMENT_MINUTES: u64 = 7 * 24 * 60;
+/// The most driver operations or deployments a server runs at once.
+const MAX_SLOTS: usize = 100_000;
+
 /// Bounds on work and storage.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,10 +421,20 @@ impl Config {
                 return Err(ConfigError(format!("`limits.{name}` must be at least 1")));
             }
         }
-        if l.deployment_minutes == 0 {
-            return Err(ConfigError(
-                "`limits.deployment_minutes` must be at least 1".into(),
-            ));
+        if l.deployment_minutes == 0 || l.deployment_minutes > MAX_DEPLOYMENT_MINUTES {
+            return Err(ConfigError(format!(
+                "`limits.deployment_minutes` must be between 1 and {MAX_DEPLOYMENT_MINUTES}"
+            )));
+        }
+        for (name, value) in [
+            ("driver_concurrency", l.driver_concurrency),
+            ("running_deployments", l.running_deployments),
+        ] {
+            if value > MAX_SLOTS {
+                return Err(ConfigError(format!(
+                    "`limits.{name}` must be at most {MAX_SLOTS}"
+                )));
+            }
         }
         if !self.listen.ip().is_loopback() && !self.tls_terminated_by_proxy {
             return Err(ConfigError(format!(
@@ -676,6 +691,10 @@ mod tests {
         let e = load("[limits]\nrunning_deployments = 0\n").unwrap_err();
         assert!(e.to_string().contains("limits.running_deployments"), "{e}");
         assert!(load("[limits]\nqueue = 1\n").is_err());
+        let e = load("[limits]\ndeployment_minutes = 100000000000000000\n").unwrap_err();
+        assert!(e.to_string().contains("limits.deployment_minutes"), "{e}");
+        let e = load("[limits]\ndriver_concurrency = 1000000\n").unwrap_err();
+        assert!(e.to_string().contains("limits.driver_concurrency"), "{e}");
     }
 
     #[test]

@@ -51,7 +51,7 @@ up the machine or starve the API. Set them in a `[limits]` table:
 [limits]
 driver_concurrency = 4         # driver operations at once, OpenTofu runs included
 running_deployments = 64       # deployments and deletions running or waiting at once
-deployment_minutes = 30        # how long one deployment may run
+deployment_minutes = 30        # how long one deployment may run (at most a week)
 deployment_log_bytes = 16777216  # log text kept per deployment
 graph_nodes = 500              # resources in one deployment
 graph_edges = 5000             # dependencies in one deployment
@@ -59,8 +59,8 @@ graph_edges = 5000             # dependencies in one deployment
 
 | Limit | When it is reached |
 | --- | --- |
-| `driver_concurrency` | Further driver operations, from any environment, wait for a slot. With the default, at most four OpenTofu processes run at once. |
-| `running_deployments` | New deployments and deletions get `429` with `Retry-After: 30`, and nothing is stored. |
+| `driver_concurrency` | Further driver operations, from any environment, wait for a slot. With the default, at most four OpenTofu processes run at once. A recovery request waits at most 30 seconds for one, then fails and can be repeated. |
+| `running_deployments` | New deployments and deletions get `429` with `Retry-After: 30`, and nothing is stored. Deleting an application takes a slot for each environment it starts deleting; one with more environments than the limit needs every slot free, and its other deletions wait for room. |
 | `deployment_minutes` | Operations still running fail, and resources whose outcome is unknown need recovery. |
 | `deployment_log_bytes` | Later log lines are dropped after a warning line saying so; each resource's final status is still logged. |
 | `graph_nodes`, `graph_edges` | The deployment is refused with `400` before anything is stored. |
