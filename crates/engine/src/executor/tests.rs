@@ -646,6 +646,16 @@ async fn a_secret_in_a_composite_string_is_rendered_only_for_the_driver() {
     );
     assert!(!workload.resource.contains_key("spec"));
     assert_eq!(workload.resource["id"], "web");
+    // The driver learns where each secret is.
+    let at = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        workload.resource_secret_paths,
+        [
+            at(&["spec", "containers", "web", "variables", "DB_PASSWORD"]),
+            at(&["spec", "containers", "web", "variables", "AUTH"]),
+            at(&["dependencies", "db", "password"]),
+        ]
+    );
     let recorded = f.recorded(&deployment).await;
     assert!(!recorded.contains(TOKEN), "{recorded}");
 }
