@@ -18,10 +18,10 @@
 # The definitions fetch the modules from GitHub at the commit being tested, so
 # that commit must be pushed; OPENPORCH_E2E_MODULES_REV picks another.
 #
-# Needs `go`, `tofu`, `aws` (v2), `docker`, `git`, `zip`, `openssl`, `curl` and
-# `jq` on PATH. If the test fails after it created anything, it deletes what it
-# can; whatever it could not delete is listed, and the working directory, with
-# the server's data and the resources' OpenTofu state, is kept.
+# Needs `go`, `tofu`, `aws` (v2), `docker`, `git`, `zip`, `openssl`, `curl`,
+# `jq` and `python3` on PATH. If the test fails after it created anything, it
+# deletes what it can; whatever it could not delete is listed, and the working
+# directory, with the server's data and the resources' OpenTofu state, is kept.
 set -euo pipefail
 
 server_bin=$(realpath "${1:?usage: e2e-aws.sh PATH_TO_OPENPORCH PATH_TO_PORCH}")
@@ -29,6 +29,10 @@ porch_bin=$(realpath "${2:?usage: e2e-aws.sh PATH_TO_OPENPORCH PATH_TO_PORCH}")
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
 # --- Guards -------------------------------------------------------------------
+
+for tool in go tofu aws docker git zip openssl curl jq python3; do
+  command -v "$tool" >/dev/null || { echo "$tool is not on PATH" >&2; exit 2; }
+done
 
 if env | grep -q '^AWS_ENDPOINT_URL'; then
   echo "an AWS_ENDPOINT_URL variable is set; this test runs against real AWS only (examples/aws-platform/test.sh runs against an emulator)" >&2
@@ -299,13 +303,34 @@ worker_zip() {
 }
 code_sha() { openssl dgst -sha256 -binary "$1" | base64; }
 upload() {
-  # Both builds go to the same key: openporch pins the version it saw.
-  aws s3api put-object --bucket "$bucket" --key order-worker/e2e.zip --body "$1" --output json | jq -r .VersionId
+  # Both builds go to the same key: openporch pins the version it saw. Versioning
+  # on a new bucket takes a while to apply everywhere (up to 15 minutes, says
+  # AWS): until then a write may get no version, or reads may miss it. So the
+  # upload is repeated until it gets a version, and returns once three reads in
+  # a row see that version as current, as the server's pinning will.
+  local version seen
+  for _ in $(seq 1 40); do
+    version=$(aws s3api put-object --bucket "$bucket" --key order-worker/e2e.zip --body "$1" --output json | jq -r '.VersionId // empty')
+    if [ -n "$version" ] && [ "$version" != null ]; then
+      seen=0
+      for _ in $(seq 1 30); do
+        if [ "$(aws s3api head-object --bucket "$bucket" --key order-worker/e2e.zip --query VersionId --output text 2>/dev/null)" = "$version" ]; then
+          seen=$((seen + 1))
+          [ "$seen" -lt 3 ] || { echo "$version"; return 0; }
+        else
+          seen=0
+        fi
+        sleep 5
+      done
+    fi
+    sleep 30
+  done
+  return 1
 }
 
 step "Upload the first worker artifact and push the API image"
 zip1=$(worker_zip 1)
-version1=$(upload "$zip1")
+version1=$(upload "$zip1") || fail "the artifact bucket did not keep a version of the upload"
 registry="$account.dkr.ecr.$region.amazonaws.com"
 aws ecr create-repository --repository-name "$repository" >/dev/null
 repository_created=1
@@ -374,7 +399,7 @@ get() { curl -s --retry 6 --retry-all-errors --retry-delay 5 -f "$1"; }
 
 step "Deploy a second artifact under the same key"
 zip2=$(worker_zip 2)
-version2=$(upload "$zip2")
+version2=$(upload "$zip2") || fail "the artifact bucket did not keep a version of the second upload"
 [ "$version1" != "$version2" ] || fail "the bucket did not keep a new version"
 porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
   --artifact "main=s3://$bucket/order-worker/e2e.zip" --comment "e2e build 2" --wait --timeout 30m ||

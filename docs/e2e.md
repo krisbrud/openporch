@@ -76,7 +76,8 @@ The results are printed and written to `target/e2e-aws-results.md`, or to
   another commit, branch or tag. The platform itself is applied from the
   working tree, so the script warns when `examples/` has uncommitted changes.
 - **Tools:** `go`, `tofu`, AWS CLI v2, `docker` (with `buildx`), `git`, `zip`,
-  `openssl`, `curl` and `jq`.
+  `openssl`, `curl`, `jq` and `python3`. The script checks for them before it
+  creates anything.
 
 ```sh
 export AWS_PROFILE=sandbox AWS_REGION=eu-north-1
