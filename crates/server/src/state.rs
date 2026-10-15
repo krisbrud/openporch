@@ -41,6 +41,8 @@ pub struct Inner {
     pub github: Option<Arc<dyn IdentityProvider>>,
     /// Resolves cloud accounts into credentials.
     pub cloud: Arc<CredentialResolver>,
+    /// Browser logins in progress.
+    pub browser_logins: crate::browser_login::BrowserLogins,
     /// Login requests per client address.
     pub login_limit: RateLimiter,
     /// Token creation per principal.
@@ -212,6 +214,7 @@ pub async fn start_with(
         not_ready,
         github,
         cloud: Arc::new(CredentialResolver::new(sts)),
+        browser_logins: Default::default(),
         login_limit,
         token_limit,
         runners: crate::deploy::Runners::default(),

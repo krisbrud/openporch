@@ -62,8 +62,45 @@ client_id = "Iv1.0123456789abcdef"
 # web_url = "https://github.example.com/"
 ```
 
-No client secret is needed. Without a `[github]` table, the server accepts only
-API tokens.
+The device flow needs no client secret. Without a `[github]` table, the server
+accepts only API tokens.
+
+#### Browser login
+
+A web portal signs people in with GitHub's authorization-code flow instead. It
+needs the OAuth app's client secret and its callback URL:
+
+1. In the OAuth app's settings on GitHub, set the **Authorization callback URL**
+   to the server's `/auth/github/callback`, such as
+   `https://porch.example.com/auth/github/callback`, and generate a client
+   secret.
+2. Write the secret to a file only the server's user can read. The server
+   refuses to start when others may read it:
+
+   ```sh
+   (umask 077 && cat > /etc/openporch/github-client-secret)
+   ```
+
+3. Name the file, the callback URL, and the portal pages a login may return to:
+
+   ```toml
+   [github.browser]
+   client_secret_file = "/etc/openporch/github-client-secret"
+   callback_url = "https://porch.example.com/auth/github/callback"
+   return_urls = ["https://portal.example.com/login/done"]
+   ```
+
+The login runs as [api.md](api.md#login) describes. The server checks that each
+callback carries a `state` it issued, once and within 10 minutes, and comes from
+the browser that started the login. That browser holds an `HttpOnly`,
+`SameSite=Lax` cookie scoped to the callback, which is `Secure` when the
+callback uses `https`. So a link that carries someone else's login cannot sign a
+victim in as them. The browser returns only to a configured page, named exactly,
+with a one-time `login_code` that expires after 2 minutes. The session itself
+never appears in a URL: the portal exchanges the code for it. GitHub's access
+token stays on the server, which drops it once it has read who signed in.
+Invitations work as with the device flow: the exchange takes the
+`invitation_code` on a first login.
 
 ## Roles
 

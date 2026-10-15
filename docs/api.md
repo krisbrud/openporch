@@ -143,6 +143,9 @@ GET /version
 | --- | --- | --- |
 | POST | `/auth/github/device` | public |
 | POST | `/auth/github/token` | public |
+| GET | `/auth/github/authorize` | public |
+| GET | `/auth/github/callback` | public |
+| POST | `/auth/github/session` | public |
 | GET | `/orgs/{org}/current-user` | authenticated |
 | DELETE | `/orgs/{org}/sessions/current` | authenticated |
 
@@ -164,6 +167,29 @@ POST /auth/github/device
 
 {"error": "API-001", "message": "GitHub login is not configured on this server"}
 ```
+
+Browser login, for a web portal, uses GitHub's authorization-code flow and is
+available when the server configures `[github.browser]` (see
+[GitHub sign-in](security.md#browser-login)):
+
+1. The portal sends the browser to `GET /auth/github/authorize?return_to=URL`,
+   where `URL` is exactly one of the server's `return_urls`; it may be left out
+   when only one is configured. The server answers `302` to GitHub, with a
+   `state` and an `HttpOnly` cookie that binds the login to this browser.
+2. GitHub returns the browser to `GET /auth/github/callback`. The callback needs
+   the login's `state` and the cookie of the browser that started it, and it
+   accepts each `state` once, within 10 minutes. Otherwise it answers `401`.
+3. The callback answers `302` to the return URL with `login_code`, or with `error`:
+   `access_denied` when the person declined, `login_failed` when GitHub did not
+   confirm the sign-in, or `unavailable` when GitHub could not be reached.
+4. Within 2 minutes, the portal exchanges the code once with
+   `POST /auth/github/session` and `{"login_code": "…"}`, adding
+   `"invitation_code"` on a first login. The answer is the same session as the
+   device flow's.
+
+Logins in progress are kept in memory, so a restart abandons them. Without
+`[github.browser]` the three routes return `404`. `/version` lists each provider
+with its flows, such as `{"id": "github", "flows": ["device", "browser"]}`.
 
 `current-user` shows who a token belongs to and their effective roles:
 

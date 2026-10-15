@@ -41,6 +41,9 @@ pub fn api(state: AppState) -> Api {
         // Login.
         .route(post(), "/auth/github/device", Public, login::start)
         .route(post(), "/auth/github/token", Public, login::poll)
+        .route(get(), "/auth/github/authorize", Public, login::authorize)
+        .route(get(), "/auth/github/callback", Public, login::callback)
+        .route(post(), "/auth/github/session", Public, login::exchange)
         // Members.
         .route(
             get(),

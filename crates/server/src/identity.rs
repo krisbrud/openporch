@@ -77,6 +77,18 @@ pub trait IdentityProvider: Send + Sync + std::fmt::Debug {
 
     /// Resolves a login name to the identity that holds it now, if any.
     fn resolve_login<'a>(&'a self, login: &'a str) -> ProviderFuture<'a, Option<ExternalIdentity>>;
+
+    /// Where to send a browser to sign in, with the `state` the callback must carry
+    /// back to `callback_url`. `None` when browser login is not configured.
+    fn authorize_url(&self, state: &str, callback_url: &str) -> Option<Url>;
+
+    /// Exchanges the authorization code a browser login returned for the identity
+    /// that signed in. `None` when the code is invalid, expired or already used.
+    fn exchange_code<'a>(
+        &'a self,
+        code: &'a str,
+        callback_url: &'a str,
+    ) -> ProviderFuture<'a, Option<ExternalIdentity>>;
 }
 
 /// Whether `login` is a well-formed GitHub login: 1 to 39 ASCII letters, digits or
@@ -102,10 +114,10 @@ fn is_device_code(code: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Checks a provider base URL: HTTPS, or plain HTTP only on a loopback host for local
-/// development and tests.
-pub fn check_base_url(name: &str, url: &str) -> Result<Url, String> {
-    let mut parsed = Url::parse(url).map_err(|e| format!("`{name}` is not a URL: {e}"))?;
+/// Checks a URL: HTTPS, or plain HTTP only on a loopback host for local development
+/// and tests, with no credentials or fragment.
+pub fn check_url(name: &str, url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url).map_err(|e| format!("`{name}` is not a URL: {e}"))?;
     let host = parsed.host_str().unwrap_or_default();
     let loopback = host == "localhost"
         || host
@@ -122,6 +134,18 @@ pub fn check_base_url(name: &str, url: &str) -> Result<Url, String> {
             ));
         }
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!("`{name}` must not contain credentials"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!("`{name}` must not have a fragment"));
+    }
+    Ok(parsed)
+}
+
+/// Checks a provider base URL as [`check_url`] does, and makes it end with `/`.
+pub fn check_base_url(name: &str, url: &str) -> Result<Url, String> {
+    let mut parsed = check_url(name, url)?;
     // Relative joins keep the whole base path.
     if !parsed.path().ends_with('/') {
         let path = format!("{}/", parsed.path());
@@ -130,13 +154,48 @@ pub fn check_base_url(name: &str, url: &str) -> Result<Url, String> {
     Ok(parsed)
 }
 
-/// GitHub through its OAuth device flow and REST API.
+/// GitHub through its OAuth device and authorization-code flows and REST API.
 #[derive(Debug)]
 pub struct Github {
     client: reqwest::Client,
     client_id: String,
+    /// The OAuth app's client secret, for browser login only.
+    client_secret: Option<Zeroizing<String>>,
     api: Url,
     web: Url,
+}
+
+/// Reads the client secret from a file that only its owner may read.
+fn read_client_secret(path: &std::path::Path) -> Result<Zeroizing<String>, String> {
+    let name = path.display();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("reading the GitHub client secret {name}: {e}"))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "the GitHub client secret {name} may be read by others; \
+                 make it readable by the server's user only (chmod 600)"
+            ));
+        }
+    }
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("reading the GitHub client secret {name}: {e}"))?,
+    );
+    let secret = text.trim();
+    if secret.is_empty() {
+        return Err(format!("the GitHub client secret {name} is empty"));
+    }
+    Ok(Zeroizing::new(secret.to_owned()))
+}
+
+/// Authorization codes are opaque provider strings, like device codes.
+fn is_authorization_code(code: &str) -> bool {
+    is_device_code(code)
 }
 
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -187,9 +246,14 @@ impl Github {
             .https_only(api.scheme() == "https" && web.scheme() == "https")
             .build()
             .map_err(|e| format!("building the GitHub client: {e}"))?;
+        let client_secret = match &config.browser {
+            Some(b) => Some(read_client_secret(&b.client_secret_file)?),
+            None => None,
+        };
         Ok(Self {
             client,
             client_id: config.client_id.clone(),
+            client_secret,
             api,
             web,
         })
@@ -316,6 +380,60 @@ impl IdentityProvider for Github {
                 Some("expired_token" | "incorrect_device_code" | "bad_verification_code") => {
                     Ok(DevicePoll::Expired)
                 }
+                Some(other) => Err(unavailable(format!("GitHub reported `{other}`"))),
+                None => Err(unavailable("GitHub returned neither a token nor an error")),
+            }
+        })
+    }
+
+    fn authorize_url(&self, state: &str, callback_url: &str) -> Option<Url> {
+        self.client_secret.as_ref()?;
+        let mut url = Self::url(&self.web, "login/oauth/authorize").ok()?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", callback_url)
+            .append_pair("scope", SCOPES)
+            .append_pair("state", state)
+            .append_pair("allow_signup", "false");
+        Some(url)
+    }
+
+    fn exchange_code<'a>(
+        &'a self,
+        code: &'a str,
+        callback_url: &'a str,
+    ) -> ProviderFuture<'a, Option<ExternalIdentity>> {
+        Box::pin(async move {
+            let secret = self
+                .client_secret
+                .as_ref()
+                .ok_or_else(|| ProviderError::Invalid("browser login is not configured".into()))?;
+            if !is_authorization_code(code) {
+                return Err(ProviderError::Invalid("`code` is malformed".into()));
+            }
+            let res = self
+                .client
+                .post(Self::url(&self.web, "login/oauth/access_token")?)
+                .header("accept", "application/json")
+                .form(&[
+                    ("client_id", self.client_id.as_str()),
+                    ("client_secret", secret.as_str()),
+                    ("code", code),
+                    ("redirect_uri", callback_url),
+                ])
+                .send()
+                .await
+                .map_err(unavailable)?;
+            if !res.status().is_success() {
+                return Err(unavailable(format!("GitHub answered {}", res.status())));
+            }
+            let body: TokenResponse = res.json().await.map_err(unavailable)?;
+            // As with the device flow, the token is used once and dropped.
+            if let Some(token) = body.access_token.map(Zeroizing::new) {
+                return Ok(Some(self.identity(&token).await?));
+            }
+            match body.error.as_deref() {
+                Some("bad_verification_code") => Ok(None),
                 Some(other) => Err(unavailable(format!("GitHub reported `{other}`"))),
                 None => Err(unavailable("GitHub returned neither a token nor an error")),
             }

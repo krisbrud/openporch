@@ -187,6 +187,9 @@ pub struct GithubConfig {
     /// The web base URL that serves the OAuth endpoints.
     #[serde(default = "default_github_web")]
     pub web_url: String,
+    /// Browser login with the authorization-code flow, for a web portal.
+    #[serde(default)]
+    pub browser: Option<GithubBrowserConfig>,
 }
 
 impl GithubConfig {
@@ -196,7 +199,49 @@ impl GithubConfig {
             client_id: client_id.to_owned(),
             api_url: default_github_api(),
             web_url: default_github_web(),
+            browser: None,
         }
+    }
+}
+
+/// Browser login through GitHub's authorization-code flow. It needs the OAuth app's
+/// client secret, which stays in a file of its own rather than the configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubBrowserConfig {
+    /// A file holding the OAuth app's client secret, readable only by the server's
+    /// user.
+    pub client_secret_file: PathBuf,
+    /// This server's `/auth/github/callback` URL, as registered with the OAuth app.
+    pub callback_url: String,
+    /// The pages a finished login may return the browser to. A login names one of
+    /// them exactly; no other address is accepted.
+    pub return_urls: Vec<String>,
+}
+
+/// The path of the browser login's callback.
+pub const GITHUB_CALLBACK_PATH: &str = "/auth/github/callback";
+
+impl GithubBrowserConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let callback =
+            crate::identity::check_url("github.browser.callback_url", &self.callback_url)
+                .map_err(ConfigError)?;
+        if callback.path() != GITHUB_CALLBACK_PATH || callback.query().is_some() {
+            return Err(ConfigError(format!(
+                "`github.browser.callback_url` must be this server's `{GITHUB_CALLBACK_PATH}`, \
+                 with no query"
+            )));
+        }
+        if self.return_urls.is_empty() {
+            return Err(ConfigError(
+                "`github.browser.return_urls` needs at least one page to return to".into(),
+            ));
+        }
+        for url in &self.return_urls {
+            crate::identity::check_url("github.browser.return_urls", url).map_err(ConfigError)?;
+        }
+        Ok(())
     }
 }
 
@@ -300,6 +345,9 @@ impl Config {
                 .map_err(ConfigError)?;
             crate::identity::check_base_url("github.web_url", &github.web_url)
                 .map_err(ConfigError)?;
+            if let Some(browser) = &github.browser {
+                browser.validate()?;
+            }
         }
         if let StateSettings::S3 {
             bucket,
@@ -516,5 +564,54 @@ mod tests {
         .unwrap();
         let e = Config::load(Some(&path), |_| None).unwrap_err();
         assert!(e.to_string().contains("must use https"), "{e}");
+    }
+
+    #[test]
+    fn github_browser_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openporch.toml");
+        let load = |browser: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    "org = \"acme\"\ndata_dir = \"/d\"\n[github]\nclient_id = \"x\"\n\
+                     [github.browser]\nclient_secret_file = \"/s\"\n{browser}"
+                ),
+            )
+            .unwrap();
+            Config::load(Some(&path), |_| None)
+        };
+        let c = load(
+            "callback_url = \"https://porch.example.com/auth/github/callback\"\n\
+             return_urls = [\"https://portal.example.com/done\"]\n",
+        )
+        .unwrap();
+        let browser = c.github.unwrap().browser.unwrap();
+        assert_eq!(browser.return_urls, ["https://portal.example.com/done"]);
+        for (bad, message) in [
+            (
+                "callback_url = \"https://porch.example.com/callback\"\nreturn_urls = [\"https://p.example.com/\"]\n",
+                "/auth/github/callback",
+            ),
+            (
+                "callback_url = \"http://porch.example.com/auth/github/callback\"\nreturn_urls = [\"https://p.example.com/\"]\n",
+                "must use https",
+            ),
+            (
+                "callback_url = \"https://porch.example.com/auth/github/callback\"\nreturn_urls = []\n",
+                "at least one",
+            ),
+            (
+                "callback_url = \"https://porch.example.com/auth/github/callback\"\nreturn_urls = [\"http://evil.example.com/\"]\n",
+                "must use https",
+            ),
+            (
+                "callback_url = \"https://porch.example.com/auth/github/callback\"\nreturn_urls = [\"https://p.example.com/#x\"]\n",
+                "fragment",
+            ),
+        ] {
+            let e = load(bad).unwrap_err();
+            assert!(e.to_string().contains(message), "{bad}: {e}");
+        }
     }
 }
