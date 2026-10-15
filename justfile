@@ -30,6 +30,7 @@ provider:
     cd provider && { test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }; } && go vet ./... && go test ./...
     cargo build -p openporch-server --bin openporch
     provider/scripts/smoke.sh target/debug/openporch
+    provider/scripts/acceptance.sh target/debug/openporch
 
 # Check dependency licenses, advisories and sources.
 deny:

@@ -6,9 +6,37 @@ platform-side objects as code. It is a thin client of the
 protocol 6. Deployments are not resources: use `porch score deploy` or
 `porch workload deploy` for those.
 
-It is not published to a registry yet. This version has no resources; it
-configures itself, checks its token, and offers the `openporch_current_user`
-data source. Platform resources follow in tasks 7.2 and 7.3.
+It is not published to a registry yet. It offers these resources, each
+importable, and the `openporch_current_user` data source; more follow in tasks
+7.2 and 7.3:
+
+| Resource | Import ID |
+| --- | --- |
+| `openporch_application` | `APP` |
+| `openporch_environment_type` | `TYPE` |
+| `openporch_environment` | `APP/ENV` |
+
+## Deleting applications and environments
+
+Deleting an application or environment deletes the cloud resources it owns, so
+the provider previews the deletion first and deletes nothing unless every
+resource the preview marks is acknowledged in `destroy_acknowledgements`. The
+error lists the entries to add, in the form `porch` prints them:
+
+```hcl
+resource "openporch_application" "shop" {
+  id = "shop"
+  destroy_acknowledgements = [
+    "development:postgres.default#modules.web.externals.db=delete",
+  ]
+}
+```
+
+Add them, apply (which only records them), then remove the resource and apply
+again. An environment takes the same entries without the `ENV:` prefix. The
+`development` environment is created and deleted with its application and is
+not a resource of its own. Deletion waits until the server has deleted every
+resource; if one cannot be deleted, the error says so and the object stays.
 
 ## Configuration
 
@@ -41,6 +69,7 @@ You need the Go version in `go.mod` and, for the smoke test, OpenTofu.
 go test ./...                                      # unit tests
 cargo build -p openporch-server --bin openporch    # from the repository root
 scripts/smoke.sh ../target/debug/openporch         # load it into OpenTofu
+scripts/acceptance.sh ../target/debug/openporch    # acceptance tests with OpenTofu
 ```
 
 To use a local build, point a `dev_overrides` entry at the directory holding

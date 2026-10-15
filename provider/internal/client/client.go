@@ -145,6 +145,11 @@ func (c *Client) OrgPath(segments ...string) string {
 // body encoded as JSON when not nil, and decodes the response into out when not
 // nil. A non-2xx response is an *Error.
 func (c *Client) Do(ctx context.Context, method, path string, body, out any) error {
+	return c.DoWithHeaders(ctx, method, path, nil, body, out)
+}
+
+// DoWithHeaders is Do with extra request headers.
+func (c *Client) DoWithHeaders(ctx context.Context, method, path string, headers map[string]string, body, out any) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("request path %q must start with /", path)
 	}
@@ -164,6 +169,9 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) err
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
 	}
 	if c.userAgent != "" {
 		req.Header.Set("User-Agent", c.userAgent)

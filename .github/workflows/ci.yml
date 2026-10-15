@@ -151,3 +151,5 @@ jobs:
         run: cargo build -p openporch-server --bin openporch
       - name: OpenTofu loads the provider and authenticates
         run: scripts/smoke.sh ../target/debug/openporch
+      - name: Acceptance tests
+        run: scripts/acceptance.sh ../target/debug/openporch

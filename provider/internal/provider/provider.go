@@ -147,7 +147,7 @@ func (p *openporchProvider) Configure(ctx context.Context, req provider.Configur
 }
 
 func (p *openporchProvider) Resources(context.Context) []func() resource.Resource {
-	return nil
+	return []func() resource.Resource{newApplication, newEnvironmentType, newEnvironment}
 }
 
 func (p *openporchProvider) DataSources(context.Context) []func() datasource.DataSource {
