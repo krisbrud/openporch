@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -728,6 +728,19 @@ async fn browser_login_refuses_forged_callbacks_and_unknown_return_urls() {
     // With two configured, one must be named.
     let (status, _, _) = navigate(&s, "/auth/github/authorize", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A malformed query gets the usual JSON error.
+    for path in [
+        "/auth/github/authorize?return_to=a&return_to=b",
+        "/auth/github/callback?state=a&state=b",
+    ] {
+        let (status, body) = s.call(Method::GET, path, None, None).await;
+        assert_error(
+            status,
+            &body,
+            StatusCode::BAD_REQUEST,
+            crate::error::code::INVALID_REQUEST,
+        );
+    }
 
     // Login CSRF: Mallory starts a login and sends the victim the callback with
     // her own code. The victim's browser lacks her cookie, so it is refused.

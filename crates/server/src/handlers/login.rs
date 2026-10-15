@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use reqwest::Url;
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::GithubBrowserConfig;
 
-use crate::api::JsonBody;
+use crate::api::{JsonBody, QueryParams};
 use crate::error::{ApiError, ApiResult, code};
 use crate::identity::{DeviceLogin, DevicePoll, IdentityProvider, ProviderError};
 use crate::login::{self, Session};
@@ -128,11 +128,8 @@ fn browser_config(state: &AppState) -> ApiResult<&GithubBrowserConfig> {
 /// The login cookie: sent back only to the callback, never readable by scripts, and
 /// only over TLS when the callback uses it. `Lax` lets it ride GitHub's redirect.
 fn login_cookie(config: &GithubBrowserConfig, value: &str, max_age: i64) -> HeaderValue {
-    let secure = if config.callback_url.starts_with("https:") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let https = Url::parse(&config.callback_url).is_ok_and(|u| u.scheme() == "https");
+    let secure = if https { "; Secure" } else { "" };
     let cookie = format!(
         "{LOGIN_COOKIE}={value}; Max-Age={max_age}; Path={}; HttpOnly; SameSite=Lax{secure}",
         crate::config::GITHUB_CALLBACK_PATH
@@ -178,7 +175,7 @@ pub struct Authorize {
 pub async fn authorize(
     State(state): State<AppState>,
     ClientAddr(addr): ClientAddr,
-    Query(query): Query<Authorize>,
+    QueryParams(query): QueryParams<Authorize>,
 ) -> ApiResult<Response> {
     state.login_limit.check(&addr)?;
     let config = browser_config(&state)?;
@@ -235,7 +232,7 @@ pub async fn callback(
     State(state): State<AppState>,
     ClientAddr(addr): ClientAddr,
     headers: HeaderMap,
-    Query(query): Query<Callback>,
+    QueryParams(query): QueryParams<Callback>,
 ) -> ApiResult<Response> {
     state.login_limit.check(&addr)?;
     let config = browser_config(&state)?;
@@ -315,4 +312,30 @@ pub async fn exchange(
     )
     .await?;
     Ok(Json(session))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_login_cookie_is_secure_whenever_the_callback_uses_tls() {
+        let config = |callback_url: &str| GithubBrowserConfig {
+            client_secret_file: "secret".into(),
+            callback_url: callback_url.into(),
+            return_urls: vec![],
+        };
+        for (url, secure) in [
+            ("https://porch.example.com/auth/github/callback", true),
+            ("HTTPS://porch.example.com/auth/github/callback", true),
+            ("http://127.0.0.1:8080/auth/github/callback", false),
+        ] {
+            let cookie = login_cookie(&config(url), "v", 600);
+            assert_eq!(
+                cookie.to_str().unwrap().ends_with("; Secure"),
+                secure,
+                "{url}"
+            );
+        }
+    }
 }
