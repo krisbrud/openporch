@@ -289,6 +289,10 @@ async fn opentofu_examples_run() {
 #[test]
 fn opentofu_example_script_matches_its_definition() {
     let text = std::fs::read_to_string(docs().join(FILES[2])).unwrap();
+    let start = text
+        .find("## A DynamoDB table")
+        .expect("the DynamoDB section");
+    let text = &text[start..];
     let hcl = text
         .split("```hcl\n")
         .nth(1)

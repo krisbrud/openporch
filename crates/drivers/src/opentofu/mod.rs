@@ -380,7 +380,7 @@ pub fn check_definition(
     }
     // Secret leaves are references here; only their names are checked.
     let mut stand_ins = Map::new();
-    for key in ["files", "tokens"] {
+    for key in ["files", "tokens", "variables"] {
         if let Some(Value::Object(m)) = secrets.get(key) {
             let names = m.keys().map(|k| (k.clone(), Value::from(""))).collect();
             stand_ins.insert(key.into(), Value::Object(names));
