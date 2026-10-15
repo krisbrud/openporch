@@ -178,8 +178,11 @@ pub async fn delete(
         ))
         .into());
     }
+    let envs = state.store.envs(org, &app).await?;
+    // Room for every environment's deletion is taken before anything is stored.
+    let mut slots = state.runners.slots(envs.len())?;
     let mut permits = std::collections::BTreeMap::new();
-    for env in state.store.envs(org, &app).await? {
+    for env in envs {
         let entries = plans::preflight(&state, &env, String::new(), &snapshot, true).await?;
         let presented: Vec<String> = issued
             .iter()
@@ -205,7 +208,7 @@ pub async fn delete(
     let mut deletions = Vec::with_capacity(accepted.deletions.len());
     let mut failure = None;
     for acceptance in &accepted.deletions {
-        match envs::start_deletion(&state, acceptance, snapshot.clone()).await {
+        match envs::start_deletion(&state, acceptance, snapshot.clone(), slots.pop()).await {
             Ok(d) => deletions.push(d),
             Err(e) => failure = failure.or(Some(e)),
         }

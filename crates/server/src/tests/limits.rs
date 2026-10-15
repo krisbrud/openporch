@@ -129,3 +129,18 @@ async fn token_creation_is_limited_per_principal() {
         "a limited request creates no token: {tokens}"
     );
 }
+
+#[tokio::test]
+async fn oversized_bodies_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::new("acme", dir.path());
+    config.max_body_bytes = 1024;
+    let s = server_with(dir, config).await;
+    let big = json!({"id": "shop", "name": "x".repeat(2048)});
+    let (status, b) = s.post("/orgs/acme/apps", &s.admin, big).await;
+    assert_error(status, &b, StatusCode::PAYLOAD_TOO_LARGE, "API-006");
+    let (status, b) = s
+        .post("/orgs/acme/apps", &s.admin, json!({"id": "shop"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+}

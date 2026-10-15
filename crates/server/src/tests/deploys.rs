@@ -1247,3 +1247,96 @@ async fn shutdown_waits_for_changes_accepted_before_it_began() {
     drop(admitted);
     assert_eq!(drain.await.unwrap(), Vec::<String>::new());
 }
+
+/// A server whose limits `set` adjusts, with deployments held until released.
+async fn limited(set: impl FnOnce(&mut crate::config::WorkLimits)) -> (Server, Arc<Semaphore>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    set(&mut config.limits);
+    let s = super::server_with(dir, config).await;
+    let gate = s.deployable().await;
+    (s, gate)
+}
+
+impl Server {
+    /// A `development` environment `id` of `shop`.
+    async fn dev_env(&self, id: &str) {
+        let (status, b) = self
+            .post(
+                "/orgs/acme/apps/shop/envs",
+                &self.admin,
+                json!({"id": id, "type": "development"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+    }
+}
+
+#[tokio::test]
+async fn running_deployments_are_bounded_and_status_stays_available() {
+    let (s, gate) = limited(|l| l.running_deployments = 2).await;
+    for env in ["staging", "qa"] {
+        s.dev_env(env).await;
+    }
+    let body = json!({"set_id": "0", "expected_generation": 0});
+    let path = |env: &str| format!("/orgs/acme/apps/shop/envs/{env}/deploys");
+    for env in ["development", "staging"] {
+        let (status, d) = s.post(&path(env), &s.admin, body.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    }
+    // Full: the next one is refused before anything is stored.
+    let (status, b) = s.post(&path("qa"), &s.admin, body.clone()).await;
+    assert_error(status, &b, StatusCode::TOO_MANY_REQUESTS, "API-007");
+    let (_, page) = s.get(&path("qa"), &s.admin).await;
+    assert_eq!(page["deployments"], json!([]), "{page}");
+    // So is an environment deletion, which would run too.
+    let (status, b) = s.remove_env("/orgs/acme/apps/shop/envs/qa", &s.admin).await;
+    assert_error(status, &b, StatusCode::TOO_MANY_REQUESTS, "API-007");
+
+    // Status requests keep answering while the deployments run.
+    for _ in 0..10 {
+        let started = std::time::Instant::now();
+        let (status, b) = s.get(&path("development"), &s.admin).await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    // Once they finish, there is room again.
+    gate.add_permits(2);
+    let mut accepted = false;
+    for _ in 0..200 {
+        let (status, _) = s.post(&path("qa"), &s.admin, body.clone()).await;
+        if status == StatusCode::ACCEPTED {
+            accepted = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(accepted, "room was not freed");
+    gate.add_permits(1);
+}
+
+#[tokio::test]
+async fn graphs_over_the_limits_are_refused() {
+    let (s, _gate) = limited(|l| l.graph_nodes = 1).await;
+    // The environment and a workload: two resources.
+    let delta = s.delta("nginx:1").await;
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("more than this server's limits of 1 and 5000"),
+        "{b}"
+    );
+    let (_, page) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(page["deployments"], json!([]), "{page}");
+}

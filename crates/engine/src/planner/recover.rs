@@ -93,6 +93,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 // A resource that existed before the operation says nothing,
                 // by existing, about whether an update took effect.
                 let updating = !deleting && job.existing;
+                // Observing runs the driver too, so it waits for a slot
+                // like any other driver operation.
+                let _permit = self.permits.clone().acquire_owned().await;
                 let observed = self.executor.observe(job, deleting).await;
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),

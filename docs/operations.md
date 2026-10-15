@@ -2,7 +2,7 @@
 
 This page covers running one openporch server: who owns an installation, how
 to tell whether the server can accept changes, what happens when it stops, and
-how to back up, upgrade and uninstall it.
+how much work it takes on, and how to back up, upgrade and uninstall it.
 
 ## One server per installation
 
@@ -41,6 +41,39 @@ While the server is not ready, every request that changes something gets
 `porch` can still show deployments, resources and audit logs. Cloud outages do
 not affect readiness: they fail the deployments that need the cloud, not the
 server.
+
+## Limits
+
+The server bounds the work it takes on, so a burst of deployments cannot use
+up the machine or starve the API. Set them in a `[limits]` table:
+
+```toml
+[limits]
+driver_concurrency = 4         # driver operations at once, OpenTofu runs included
+running_deployments = 64       # deployments and deletions running or waiting at once
+deployment_minutes = 30        # how long one deployment may run
+deployment_log_bytes = 16777216  # log text kept per deployment
+graph_nodes = 500              # resources in one deployment
+graph_edges = 5000             # dependencies in one deployment
+```
+
+| Limit | When it is reached |
+| --- | --- |
+| `driver_concurrency` | Further driver operations, from any environment, wait for a slot. With the default, at most four OpenTofu processes run at once. |
+| `running_deployments` | New deployments and deletions get `429` with `Retry-After: 30`, and nothing is stored. |
+| `deployment_minutes` | Operations still running fail, and resources whose outcome is unknown need recovery. |
+| `deployment_log_bytes` | Later log lines are dropped after a warning line saying so; each resource's final status is still logged. |
+| `graph_nodes`, `graph_edges` | The deployment is refused with `400` before anything is stored. |
+
+Request bodies are limited by `max_body_bytes` (default 1 MiB), answered with
+`413`. Logins and token creation are rate limited per minute by
+`[rate_limits]` `login_per_minute` (default 60) and `tokens_per_minute`
+(default 20), answered with `429` and `Retry-After`.
+
+Waiting deployments hold no request open, so status requests, previews and
+reads keep answering while the driver slots are full. A store that cannot
+write fails the change with `500`; nothing is accepted that could not be
+recorded.
 
 ## Stopping the server
 

@@ -287,19 +287,56 @@ pub struct Runners {
     active: Mutex<std::collections::BTreeSet<String>>,
     /// Signaled whenever a deployment stops running.
     stopped: tokio::sync::Notify,
+    /// One permit per deployment that may run or wait at once.
+    slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// Room for one more running deployment, taken before it is accepted and
+/// held until it stops.
+#[derive(Debug)]
+pub struct Slot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// How long a caller refused for lack of room is asked to wait.
+const FULL_RETRY_SECS: u64 = 30;
 
 impl Default for Runners {
     fn default() -> Self {
-        Self {
-            runner: RwLock::new(Arc::new(Unimplemented)),
-            active: Mutex::default(),
-            stopped: tokio::sync::Notify::new(),
-        }
+        Self::new(crate::config::WorkLimits::default().running_deployments)
     }
 }
 
 impl Runners {
+    /// Runners for at most `capacity` deployments at once.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            runner: RwLock::new(Arc::new(Unimplemented)),
+            active: Mutex::default(),
+            stopped: tokio::sync::Notify::new(),
+            slots: Arc::new(tokio::sync::Semaphore::new(capacity.max(1))),
+        }
+    }
+
+    /// Takes room for `n` more deployments, or refuses with `429` and
+    /// `Retry-After` when there is not that much.
+    pub fn slots(&self, n: usize) -> Result<Vec<Slot>, crate::error::ApiError> {
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.slots.clone().try_acquire_owned() {
+                Ok(permit) => slots.push(Slot { _permit: permit }),
+                Err(_) => {
+                    let mut e = crate::error::ApiError::rate_limited(FULL_RETRY_SECS);
+                    e.message = format!(
+                        "too many deployments are running; retry after {FULL_RETRY_SECS} seconds"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        Ok(slots)
+    }
+
     /// Replaces the runner for deployments accepted from now on.
     pub fn set(&self, runner: Arc<dyn Runner>) {
         let mut current = self.runner.write().unwrap_or_else(|e| e.into_inner());
@@ -359,8 +396,8 @@ impl Runners {
         }
     }
 
-    /// Starts `job` in the background.
-    pub fn spawn(&self, state: AppState, job: Job) {
+    /// Starts `job` in the background, in `slot`.
+    pub fn spawn(&self, state: AppState, job: Job, slot: Slot) {
         let key = format!("{}/{}/{}", job.app, job.env, job.id);
         self.active
             .lock()
@@ -368,6 +405,7 @@ impl Runners {
             .insert(key.clone());
         let run = tokio::spawn(self.current().run(state.clone(), job.clone()));
         tokio::spawn(async move {
+            let _slot = slot;
             // A runner that panics must not leave the environment blocked.
             if run.await.is_err() {
                 finish(
@@ -499,5 +537,23 @@ impl PermitCheck for StorePermits {
                 "{error}; preview the environment again and request a permit for this plan"
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_server_asks_callers_to_retry_later() {
+        let runners = Runners::new(2);
+        let mut held = runners.slots(2).unwrap();
+        let e = runners.slots(1).unwrap_err();
+        assert_eq!(e.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(e.retry_after, Some(FULL_RETRY_SECS));
+        // Asking for more than is free takes nothing.
+        drop(held.pop());
+        assert!(runners.slots(2).is_err());
+        assert_eq!(runners.slots(1).unwrap().len(), 1);
     }
 }
