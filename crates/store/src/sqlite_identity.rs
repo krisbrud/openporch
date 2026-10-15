@@ -74,6 +74,15 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Principal>> + Send;
 
+    /// Changes a principal's display name.
+    fn rename_principal(
+        &self,
+        org: &str,
+        id: &str,
+        name: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Principal>> + Send;
+
     /// Removes a principal with their identities, tokens, sessions and roles, keeping
     /// at least one administrator.
     fn remove_principal(
@@ -429,6 +438,29 @@ impl IdentityStore for SqliteStore {
         }
         sqlx::query("UPDATE principals SET org_role = ? WHERE org_id = ? AND id = ?")
             .bind(role.as_str())
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit_in(&mut tx, &audit).await?;
+        let p = require_principal(&mut tx, org, id).await?;
+        tx.commit().await?;
+        Ok(p)
+    }
+
+    async fn rename_principal(
+        &self,
+        org: &str,
+        id: &str,
+        name: &str,
+        audit: AuditIntent,
+    ) -> Result<Principal> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        require_principal(&mut tx, org, id).await?;
+        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), None).await?;
+        sqlx::query("UPDATE principals SET name = ? WHERE org_id = ? AND id = ?")
+            .bind(name)
             .bind(org)
             .bind(id)
             .execute(&mut *tx)

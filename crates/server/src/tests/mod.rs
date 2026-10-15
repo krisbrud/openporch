@@ -762,6 +762,46 @@ async fn last_administrator_is_kept() {
 }
 
 #[tokio::test]
+async fn members_are_renamed_by_those_who_cover_them() {
+    let s = server().await;
+    let manager = s.member("mgr", "manager").await;
+    s.member("ci", "member").await;
+    s.member("admin-2", "administrator").await;
+    let patch = |user: &str, token: &str, body: Value| {
+        let path = format!("/orgs/acme/users/{user}");
+        let token = token.to_owned();
+        let s = &s;
+        async move { s.call(Method::PATCH, &path, Some(&token), Some(body)).await }
+    };
+    let (status, body) = patch("ci", &manager, json!({"name": "  CI bot "})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["name"].as_str(), body["role"].as_str()),
+        (Some("CI bot"), Some("member"))
+    );
+    let (status, body) = patch("admin-2", &manager, json!({"name": "Admin"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    for bad in [json!({"name": " "}), json!({})] {
+        let (status, body) = patch("ci", &s.admin, bad).await;
+        assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");
+    }
+    let (status, body) = patch("ci", &s.admin, json!({"name": "CI", "role": "manager"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (body["name"].as_str(), body["role"].as_str()),
+        (Some("CI"), Some("manager"))
+    );
+    let (status, body) = s
+        .post(
+            "/orgs/acme/users",
+            &s.admin,
+            json!({"id": "nameless", "type": "service", "name": "", "role": "member"}),
+        )
+        .await;
+    assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");
+}
+
+#[tokio::test]
 async fn members_are_listed_with_type_role_and_identity() {
     let s = server().await;
     logged_in(&s, "583231", "octocat", "orgViewer").await;

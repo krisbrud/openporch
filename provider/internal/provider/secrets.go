@@ -74,16 +74,16 @@ func refFromObject(o types.Object) *client.SecretRef {
 	return &client.SecretRef{Store: str("store"), Ref: str("ref"), Version: str("version")}
 }
 
-// notEmpty rejects an empty string, which the API would read as "no version".
+// notEmpty rejects an empty string, which the API would read as no value.
 type notEmpty struct{}
 
-func (notEmpty) Description(context.Context) string { return "must not be empty" }
+func (notEmpty) Description(context.Context) string { return "must not be empty; leave it out instead" }
 
 func (v notEmpty) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
 
 func (notEmpty) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
 	if !req.ConfigValue.IsNull() && !req.ConfigValue.IsUnknown() && req.ConfigValue.ValueString() == "" {
-		resp.Diagnostics.AddAttributeError(req.Path, "Empty version",
-			"Leave `version` out for the current version, or give one.")
+		resp.Diagnostics.AddAttributeError(req.Path, "Empty value",
+			"An empty string is not allowed here; leave the attribute out instead.")
 	}
 }

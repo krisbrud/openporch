@@ -149,6 +149,7 @@ func (p *openporchProvider) Configure(ctx context.Context, req provider.Configur
 func (p *openporchProvider) Resources(context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		newApplication, newEnvironmentType, newEnvironment, newResourceClass, newValue, newCloudAccount,
+		newUser, newServiceUserToken, newApplicationUser, newEnvironmentTypeUser,
 	}
 }
 

@@ -8,6 +8,7 @@ use openporch_store::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::apps::display_name;
 use super::check_id;
 use crate::api::{Ctx, JsonBody};
 use crate::auth;
@@ -87,7 +88,10 @@ pub async fn create(
         .create_principal(
             org,
             NewPrincipal {
-                name: body.name.unwrap_or_else(|| body.id.clone()),
+                name: match body.name.as_deref() {
+                    Some(name) => display_name("user", name)?.to_owned(),
+                    None => body.id.clone(),
+                },
                 id: body.id.clone(),
                 kind: "service".into(),
                 email: None,
@@ -102,11 +106,13 @@ pub async fn create(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateUser {
-    role: OrgRole,
+    role: Option<OrgRole>,
+    name: Option<String>,
 }
 
-/// Changes a member's organization role. The caller must cover both the current and
-/// the resulting roles; the store keeps at least one administrator.
+/// Changes a member's organization role or display name. The caller must cover the
+/// current roles and, for a role change, the resulting ones; the store keeps at
+/// least one administrator.
 pub async fn update(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -114,21 +120,37 @@ pub async fn update(
     JsonBody(body): JsonBody<UpdateUser>,
 ) -> ApiResult<Json<Principal>> {
     let org = state.org();
-    principal_or_404(&state, &user).await?;
+    let mut p = principal_or_404(&state, &user).await?;
+    let name = body
+        .name
+        .as_deref()
+        .map(|n| display_name("user", n))
+        .transpose()?;
+    if body.role.is_none() && name.is_none() {
+        return Err(ApiError::invalid("give `role`, `name` or both"));
+    }
     let current = state.store.roles(org, &user).await?;
     let resulting = Roles {
-        org: Some(body.role),
+        org: body.role.or(current.org),
         ..current.clone()
     };
     if !may_manage(&ctx, &current) || !may_manage(&ctx, &resulting) {
         return Err(ApiError::forbidden(
-            "changing this member's role requires the `administrator` role",
+            "changing this member requires the `administrator` role",
         ));
     }
-    let p = state
-        .store
-        .set_org_role(org, &user, body.role, ctx.audit(org, "user.update", &user))
-        .await?;
+    if let Some(role) = body.role {
+        p = state
+            .store
+            .set_org_role(org, &user, role, ctx.audit(org, "user.update", &user))
+            .await?;
+    }
+    if let Some(name) = name {
+        p = state
+            .store
+            .rename_principal(org, &user, name, ctx.audit(org, "user.update", &user))
+            .await?;
+    }
     Ok(Json(p))
 }
 
