@@ -106,7 +106,8 @@ logged() {
 }
 step() { echo "== $*"; printf -- '- %s\n' "$*" >>"$results"; }
 fail() {
-  echo "FAILED: $1" >&2
+  # The message too, in case it quotes something that holds the key.
+  echo "FAILED: $1" | redact >&2
   if [ -f "$work/server.log" ]; then
     echo "== server log" >&2
     # A line with the signing key, which a regression could log, is left out.
@@ -394,7 +395,7 @@ step "Check that the functions, table, queue, schedule and event source mapping 
   fail "the worker does not run the first artifact"
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >"$work/worker-env.json"
 jq -e --arg t "$table" '.TABLE == $t and (.SIGNING_KEY_SECRET_REF | startswith("/openporch/")) and (has("SIGNING_KEY") | not)' "$work/worker-env.json" >/dev/null ||
-  fail "the worker's environment is not as expected: $(jq -c 'del(.SIGNING_KEY)' "$work/worker-env.json")"
+  fail "the worker's environment is not as expected; it has the variables $(jq -c 'keys' "$work/worker-env.json")"
 [ "$(aws dynamodb describe-table --table-name "$table" --query Table.TableStatus --output text)" = ACTIVE ] || fail "the table is not active"
 aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names QueueArn >/dev/null || fail "the queue does not exist"
 mapping=$(aws lambda list-event-source-mappings --function-name "$worker_fn" --event-source-arn "$queue_arn" --query 'EventSourceMappings[0]' --output json)
@@ -476,6 +477,9 @@ echo "  ($(grep -o -- "--ack '" "$work/delete-preview.txt" | wc -l) permits)" >>
 
 step "Check that nothing the environment owned is left"
 left=()
+# Until every probe has answered, what is left is unknown, so a failed probe
+# keeps the platform, whose role may be needed to delete it.
+leftovers=" possibly resources of the deleted environment (a check did not finish; look for them by name);"
 # A probe counts a resource as gone only on the service's own not-found error;
 # any other error (throttling, expired credentials, access denied) is a failure.
 # Usage: gone NOT_FOUND_PATTERN AWS_ARGS...
@@ -528,6 +532,7 @@ if [ "${#left[@]}" != 0 ]; then
   leftovers=" ${left[*]} (owned by the deleted environment; delete them by hand);"
   fail "left after the environment was deleted: ${left[*]}"
 fi
+leftovers=
 
 step "List what is kept, and what it costs"
 {
