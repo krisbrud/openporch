@@ -75,9 +75,9 @@ process, for example `TimeoutStopSec=` in a systemd unit.
 | --- | --- |
 | `openporch.db` (with `-wal` and `-shm` while running) | Configuration, deployments, resource records, recovery records, audit log, sealed secrets |
 | `openporch.lock` | The ownership lock |
-| `master.key` | The master keys, unless `master_key_file` or `OPENPORCH_MASTER_KEY` names them elsewhere |
+| `master.key` | The master keys, unless `master_key_file` names another file or `OPENPORCH_MASTER_KEY` holds the key itself |
 | `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state. `[opentofu].root` moves it elsewhere |
-| `bootstrap-token` | The first administrator token, until it is used, unless `bootstrap_token_file` names another place |
+| `bootstrap-token` | The first administrator token, until you delete it, unless `bootstrap_token_file` names another place |
 
 Treat the whole directory, and the master key wherever it lives, as secret.
 With the `s3` state backend, resources' state is in the bucket instead of
@@ -88,7 +88,8 @@ To back up, stop the server and copy:
 - the data directory;
 - the OpenTofu root, when `[opentofu].root` places it outside the data
   directory, since with the `local` backend it holds every resource's state;
-- the master key, wherever it lives;
+- the master key, wherever it lives: its file, or the value of
+  `OPENPORCH_MASTER_KEY`;
 - the bootstrap token file, while it exists and `bootstrap_token_file` places
   it outside the data directory: a restored installation does not issue a new
   one;
@@ -98,16 +99,16 @@ The OpenTofu root keeps, for each resource, the lock file, an inline script
 and `retained.json`, which records the Git source URL, path and commit the
 last apply used. Replays and deletions fetch that commit again, so a backup
 of an installation that uses Git sources also needs the commits themselves,
-in case a repository is deleted or rewritten later. Mirror each repository
-`retained.json` names alongside the copy, with every commit it records kept
-under a ref of its own, since a mirror alone holds only what the remote's
-branches and tags still reach:
+in case a repository is deleted or rewritten later. Keep each repository
+`retained.json` names alongside the copy, with every commit it records under
+a ref of its own, since a mirror holds only what the remote's branches and
+tags still reach:
 
 ```sh
 find "$OPENTOFU_ROOT" -name retained.json \
   -exec jq -r 'select(.source) | "\(.source.url) \(.source.commit)"' {} + \
   | sort -u | { status=0; while read -r url commit; do
-      dir="backup/sources/$(printf %s "$url" | tr -c 'A-Za-z0-9.-' _).git"
+      dir="backup/sources/$(printf %s "$url" | sha256sum | cut -c1-16).git"
       [ -d "$dir" ] || git init -q --bare "$dir"
       printf '%s\n' "$url" > "$dir/openporch-url"
       if ! git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit" ||
@@ -124,10 +125,12 @@ definition uses.
 
 openporch fetches a retained commit from the URL it recorded, so a mirror is
 restored by serving it there again: recreate the repository at that URL and
-push the mirror into it:
+push the kept commits into it:
 
 ```sh
-git -C "$dir" push --mirror "$(cat "$dir/openporch-url")"
+for dir in backup/sources/*.git; do
+  git -C "$dir" push "$(cat "$dir/openporch-url")" 'refs/openporch/*:refs/openporch/*'
+done
 ```
 
 openporch cannot yet be pointed at a different URL for resources it already
@@ -173,7 +176,10 @@ run a compatible openporch version or restore a compatible backup
 
 So downgrading means either going back to the newer release, or restoring a
 backup taken before the upgrade and running the release that made it. Take a
-backup before every upgrade.
+backup before every upgrade. Restoring an older backup forgets every
+deployment made since it was taken, including resources it created; check
+those by hand before deploying again (the backup and restore drill in task
+14.1 covers this).
 
 ## Uninstalling
 

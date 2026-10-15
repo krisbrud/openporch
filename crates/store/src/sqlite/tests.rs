@@ -297,9 +297,15 @@ async fn newer_schema_is_refused_without_changes() {
             .unwrap()
             .map(|e| e.unwrap().path())
             .filter(|p| p.is_file())
-            .map(|p| {
+            // A connection closing in the background may remove the log
+            // between listing and reading it.
+            .filter_map(|p| {
                 let name = p.file_name().unwrap().to_string_lossy().into_owned();
-                (name, std::fs::read(&p).unwrap())
+                match std::fs::read(&p) {
+                    Ok(bytes) => Some((name, bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("{e}"),
+                }
             })
             .collect();
         files.sort();
