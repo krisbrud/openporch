@@ -47,7 +47,10 @@ func (r *definitionCriterion) Schema(_ context.Context, _ resource.SchemaRequest
 		MarkdownDescription: "One matching criterion of a resource definition. A definition matches a " +
 			"resource when any of its criteria matches, and a criterion matches when every attribute it " +
 			"sets matches; one that sets nothing matches every resource of the `default` class. A " +
-			"criterion cannot be changed, so any change replaces it. Import it as `DEFINITION/CRITERION`.",
+			"criterion cannot be changed, so any change replaces it. Replacing the definition (by changing " +
+			"its `type`) deletes its criteria; give each criterion " +
+			"`lifecycle { replace_triggered_by = [openporch_resource_definition.NAME] }` to recreate them " +
+			"in the same apply. Import it as `DEFINITION/CRITERION`.",
 		Attributes: map[string]schema.Attribute{
 			"resource_definition_id": schema.StringAttribute{Required: true, PlanModifiers: replace,
 				MarkdownDescription: "The definition."},

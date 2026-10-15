@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/dynamicplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/krisbrud/openporch/provider/internal/client"
@@ -65,7 +66,7 @@ func (r *resourceDefinition) Schema(_ context.Context, _ resource.SchemaRequest,
 				MarkdownDescription: "The resource type it provisions, such as `postgres`. Changing it replaces the definition."},
 			"driver_type": schema.StringAttribute{Required: true,
 				MarkdownDescription: "The driver, such as `openporch/opentofu`."},
-			"driver_account": schema.StringAttribute{Optional: true,
+			"driver_account": schema.StringAttribute{Optional: true, Validators: []validator.String{notEmpty{}},
 				MarkdownDescription: "The cloud account the driver uses, or a `$${resources....account}` placeholder."},
 			"driver_inputs": schema.DynamicAttribute{Optional: true,
 				MarkdownDescription: "The driver's plain inputs, an object such as `{ script = \"…\", variables = { … } }`."},
@@ -131,6 +132,18 @@ func (r *resourceDefinition) ModifyPlan(ctx context.Context, req resource.Modify
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	if !plan.Type.IsUnknown() && !plan.Type.Equal(state.Type) && r.client != nil {
+		// Replacing the definition deletes its criteria with it, which the
+		// criteria resources only notice on the next refresh.
+		if d, err := r.client.Definition(ctx, state.ID.ValueString()); err == nil && len(d.Criteria) > 0 {
+			resp.Diagnostics.AddAttributeWarning(path.Root("type"), "Criteria are deleted with the definition",
+				"Changing `type` replaces the definition, and the server deletes its criteria with it. "+
+					"Give each `openporch_resource_definition_criteria` of it "+
+					"`lifecycle { replace_triggered_by = [openporch_resource_definition.NAME] }` so they are "+
+					"created again in the same apply; otherwise the definition matches nothing until the "+
+					"next apply recreates them.")
+		}
 	}
 	written := path.Root("written_secret_refs")
 	if plan.DriverSecrets.IsNull() {
@@ -267,6 +280,16 @@ func keepOrSet(ctx context.Context, current types.Dynamic, server map[string]any
 
 func identity(x any) any { return x }
 
+// normalizeRefs rebuilds references as the server returns them: without empty
+// objects or versions.
+func normalizeRefs(x any) any {
+	leaves, err := refLeaves(x)
+	if err != nil {
+		return x
+	}
+	return nest(leaves, refJSON)
+}
+
 // normalizeProvision fills in the defaults the server returns for co-provisioning
 // entries, so a configuration that leaves them out compares equal.
 func normalizeProvision(x any) any {
@@ -295,8 +318,10 @@ func normalizeProvision(x any) any {
 	return out
 }
 
-// apply records the server's definition in m.
-func (m *definitionModel) apply(ctx context.Context, d *client.Definition) diag.Diagnostics {
+// apply records the server's definition in m. fresh says the provider has just
+// written it, so the references the server returns for literal secrets are the
+// ones it wrote; otherwise only references matching `written_secret_refs` are.
+func (m *definitionModel) apply(ctx context.Context, d *client.Definition, fresh bool) diag.Diagnostics {
 	var diags diag.Diagnostics
 	fail := func(err error) diag.Diagnostics {
 		diags.AddError("Unexpected resource definition", err.Error())
@@ -342,7 +367,7 @@ func (m *definitionModel) apply(ctx context.Context, d *client.Definition) diag.
 		if !ok {
 			continue
 		}
-		if old, ok := priorWritten[p]; ok && old != ref {
+		if old, ok := priorWritten[p]; !fresh && (!ok || old != ref) {
 			continue
 		}
 		kept[p] = v
@@ -370,7 +395,7 @@ func (m *definitionModel) apply(ctx context.Context, d *client.Definition) diag.
 			refs[p] = ref
 		}
 	}
-	if m.DriverSecretRefs, err = keepOrSet(ctx, m.DriverSecretRefs, nest(refs, refJSON), identity); err != nil {
+	if m.DriverSecretRefs, err = keepOrSet(ctx, m.DriverSecretRefs, nest(refs, refJSON), normalizeRefs); err != nil {
 		return fail(err)
 	}
 	return diags
@@ -392,8 +417,7 @@ func (r *resourceDefinition) Create(ctx context.Context, req resource.CreateRequ
 		apiError(&resp.Diagnostics, "creating the resource definition", err)
 		return
 	}
-	plan.Written = types.DynamicNull()
-	resp.Diagnostics.Append(plan.apply(ctx, d)...)
+	resp.Diagnostics.Append(plan.apply(ctx, d, true)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -412,7 +436,7 @@ func (r *resourceDefinition) Read(ctx context.Context, req resource.ReadRequest,
 		apiError(&resp.Diagnostics, "reading the resource definition", err)
 		return
 	}
-	resp.Diagnostics.Append(state.apply(ctx, d)...)
+	resp.Diagnostics.Append(state.apply(ctx, d, false)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
@@ -438,8 +462,7 @@ func (r *resourceDefinition) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 	// What was just written is not drift.
-	plan.Written = types.DynamicNull()
-	resp.Diagnostics.Append(plan.apply(ctx, d)...)
+	resp.Diagnostics.Append(plan.apply(ctx, d, true)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 

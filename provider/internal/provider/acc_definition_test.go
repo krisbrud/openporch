@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -45,6 +46,8 @@ resource "openporch_resource_definition" "redis" {
     variables = {
       name = "$${context.app.id}-$${context.env.id}"
       port = %d
+      big  = 9007199254740993
+      many = 1000000
     }
   }
   driver_secrets = {
@@ -94,6 +97,10 @@ resource "openporch_resource_definition_criteria" "staging" {
 		vars, _ := d.DriverInputs.Values["variables"].(map[string]any)
 		if got := vars["name"]; got != "${context.app.id}-${context.env.id}" {
 			return fmt.Errorf("stored name %v", got)
+		}
+		// Integers reach the server as integers, every digit kept.
+		if vars["big"] != json.Number("9007199254740993") || vars["many"] != json.Number("1000000") {
+			return fmt.Errorf("stored integers %v and %v", vars["big"], vars["many"])
 		}
 		if len(d.Criteria) != 1 || d.Criteria[0].EnvType != envType {
 			return fmt.Errorf("stored criteria %+v", d.Criteria)
@@ -182,6 +189,33 @@ resource "openporch_resource_definition_criteria" "staging" {
 				ConfigStateChecks: []statecheck.StateCheck{written("4")},
 			},
 			{
+				// A template replaced outside OpenTofu by a reference is put back.
+				PreConfig: func() {
+					ctx := context.Background()
+					d, err := c.Definition(ctx, id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					vars, _ := d.DriverInputs.SecretRefs["variables"].(map[string]any)
+					vars["upstream"] = map[string]any{"value": "a literal now"}
+					d.DriverInputs.Secrets = nil
+					_, err = c.ReplaceDefinition(ctx, id, client.DefinitionWrite{
+						Name: d.Name, DriverType: d.DriverType, DriverInputs: d.DriverInputs, Provision: d.Provision,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				},
+				Config: config(6380, "second"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("openporch_resource_definition.redis", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check:             stored,
+				ConfigStateChecks: []statecheck.StateCheck{written("4")},
+			},
+			{
 				ResourceName:      "openporch_resource_definition.alias",
 				ImportState:       true,
 				ImportStateId:     id + "-alias",
@@ -206,6 +240,56 @@ resource "openporch_resource_definition_criteria" "staging" {
 					return id + "/" + rs.Primary.Attributes["id"], nil
 				},
 				ImportStateKind: resource.ImportBlockWithID,
+			},
+		},
+	})
+}
+
+func TestAccDefinitionTypeChangeKeepsCriteria(t *testing.T) {
+	c := apiClient(t)
+	id := randomID("acc-def")
+	config := func(ty string) string {
+		return fmt.Sprintf(`
+resource "openporch_resource_definition" "d" {
+  id          = %q
+  type        = %q
+  driver_type = "openporch/none"
+}
+
+resource "openporch_resource_definition_criteria" "app" {
+  resource_definition_id = openporch_resource_definition.d.id
+  app_id                 = "shop"
+
+  lifecycle {
+    replace_triggered_by = [openporch_resource_definition.d]
+  }
+}
+`, id, ty)
+	}
+	criteria := func(s *terraform.State) error {
+		d, err := c.Definition(context.Background(), id)
+		if err != nil {
+			return err
+		}
+		if len(d.Criteria) != 1 || d.Criteria[0].AppID != "shop" {
+			return fmt.Errorf("criteria %+v", d.Criteria)
+		}
+		return nil
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{
+			{Config: config("redis"), Check: criteria},
+			{
+				Config: config("postgres"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("openporch_resource_definition.d", plancheck.ResourceActionReplace),
+						plancheck.ExpectResourceAction("openporch_resource_definition_criteria.app", plancheck.ResourceActionReplace),
+					},
+				},
+				Check: criteria,
 			},
 		},
 	})
