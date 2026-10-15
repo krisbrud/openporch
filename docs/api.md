@@ -185,7 +185,8 @@ available when the server configures `[github.browser]` (see
 4. Within 2 minutes, the portal exchanges the code once with
    `POST /auth/github/session` and `{"login_code": "…"}`, adding
    `"invitation_code"` on a first login. The answer is the same session as the
-   device flow's.
+   device flow's. The server sends no CORS headers, so a portal on another
+   origin exchanges the code from its own backend, which then keeps the session.
 
 Logins in progress are kept in memory, so a restart abandons them. Without
 `[github.browser]` the three routes return `404`. `/version` lists each provider

@@ -155,7 +155,6 @@ pub fn check_base_url(name: &str, url: &str) -> Result<Url, String> {
 }
 
 /// GitHub through its OAuth device and authorization-code flows and REST API.
-#[derive(Debug)]
 pub struct Github {
     client: reqwest::Client,
     client_id: String,
@@ -163,6 +162,21 @@ pub struct Github {
     client_secret: Option<Zeroizing<String>>,
     api: Url,
     web: Url,
+}
+
+/// Leaves out the client secret.
+impl std::fmt::Debug for Github {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Github")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("api", &self.api)
+            .field("web", &self.web)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads the client secret from a file that only its owner may read.
@@ -464,6 +478,21 @@ impl IdentityProvider for Github {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_client_secret_stays_out_of_debug_output() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let github = Github {
+            client: reqwest::Client::new(),
+            client_id: "Iv1.client".into(),
+            client_secret: Some(Zeroizing::new("s3cr3t-client".into())),
+            api: Url::parse("https://api.github.com/").unwrap(),
+            web: Url::parse("https://github.com/").unwrap(),
+        };
+        let debug = format!("{github:?}");
+        assert!(!debug.contains("s3cr3t-client"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+    }
 
     #[test]
     fn github_logins() {

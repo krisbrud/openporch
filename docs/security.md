@@ -97,7 +97,8 @@ the browser that started the login. That browser holds an `HttpOnly`,
 callback uses `https`. So a link that carries someone else's login cannot sign a
 victim in as them. The browser returns only to a configured page, named exactly,
 with a one-time `login_code` that expires after 2 minutes. The session itself
-never appears in a URL: the portal exchanges the code for it. GitHub's access
+never appears in a URL: the portal exchanges the code for it, from its backend
+when it is on another origin, since the server sends no CORS headers. GitHub's access
 token stays on the server, which drops it once it has read who signed in.
 Invitations work as with the device flow: the exchange takes the
 `invitation_code` on a first login.
