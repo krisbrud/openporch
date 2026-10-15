@@ -219,6 +219,63 @@ async fn installation_serves_one_organization() {
     assert!(e.to_string().contains("serves organization `acme`"), "{e}");
 }
 
+/// Every row of every table and the schema, read without writing, including what
+/// is still in the write-ahead log.
+async fn logical_contents(dir: &std::path::Path) -> Vec<String> {
+    use sqlx::Row;
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join("openporch.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut out: Vec<String> =
+        sqlx::query("SELECT type || ' ' || name || ' ' || coalesce(sql, '') FROM sqlite_master")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    let tables: Vec<String> = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.get(0))
+    .collect();
+    assert!(tables.len() > 5, "{tables:?}");
+    for table in tables {
+        let columns: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info(?)")
+            .bind(&table)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("quote(\"{}\")", r.get::<String, _>(0)))
+            .collect();
+        let select = format!(
+            "SELECT '{table}: ' || {} FROM \"{table}\"",
+            columns.join(" || ',' || ")
+        );
+        let mut rows: Vec<String> = sqlx::query(&select)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        rows.sort();
+        out.extend(rows);
+    }
+    pool.close().await;
+    out
+}
+
 #[tokio::test]
 async fn newer_schema_is_refused_without_changes() {
     let f = Fixture::new().await;
@@ -245,6 +302,7 @@ async fn newer_schema_is_refused_without_changes() {
         files
     };
     let before = files(dir.path());
+    let rows_before = logical_contents(dir.path()).await;
     let ownership = Ownership::acquire(dir.path()).unwrap();
     let e = SqliteStore::open(ownership, ORG).await.unwrap_err();
     assert!(
@@ -269,6 +327,8 @@ async fn newer_schema_is_refused_without_changes() {
             .unwrap()
     };
     assert_eq!(db(&after), db(&before));
+    // Nor did anything reach the write-ahead log: every table reads the same.
+    assert_eq!(logical_contents(dir.path()).await, rows_before);
     assert!(
         names(&after)
             .iter()

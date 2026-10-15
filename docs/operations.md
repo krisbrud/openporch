@@ -76,14 +76,25 @@ process, for example `TimeoutStopSec=` in a systemd unit.
 | `openporch.db` (with `-wal` and `-shm` while running) | Configuration, deployments, resource records, recovery records, audit log, sealed secrets |
 | `openporch.lock` | The ownership lock |
 | `master.key` | The master keys, unless `master_key_file` or `OPENPORCH_MASTER_KEY` names them elsewhere |
-| `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state |
+| `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state. `[opentofu].root` moves it elsewhere |
 | `bootstrap-token` | The first administrator token, until it is used |
 
 Treat the whole directory, and the master key wherever it lives, as secret.
 With the `s3` state backend, resources' state is in the bucket instead of
 `opentofu/`.
 
-To back up, stop the server and copy the data directory and the master key.
+To back up, stop the server and copy:
+
+- the data directory;
+- the OpenTofu root, when `[opentofu].root` places it outside the data
+  directory, since with the `local` backend it holds every resource's state;
+- the master key, wherever it lives;
+- the configuration file, or the environment it is set through.
+
+With the `s3` backend, also note the bucket, key prefix and region from
+`[opentofu.state]`, and keep the bucket versioned: the database records which
+resources exist, and the bucket holds their state.
+
 Copying while the server runs can capture a database that does not match the
 state files. Keep the master key apart from the copy: a backup is only useful
 with it, and anyone holding both can read every stored secret.
@@ -119,8 +130,9 @@ deletion you requested runs. Uninstalling is three separate decisions.
    delete app <app> --preview` and then the command it prints (see [Clean
    up](getting-started.md#clean-up)). Wait until `porch get apps` no longer
    lists the application.
-3. **Remove the data.** Delete the data directory, the master key and, with
-   the `s3` backend, the state objects. Without them openporch cannot manage
+3. **Remove the data.** Delete the data directory, the OpenTofu root if it
+   is elsewhere, the master key and, with the `s3` backend, the state
+   objects. Without them openporch cannot manage
    or delete what is left, so do this last, and only for resources you have
    torn down or will manage another way. To keep the option of resuming,
    keep a backup instead.
