@@ -37,8 +37,10 @@ these steps:
    pinned the first one. It also checks that orders are still stored.
    Then it checks that the signing key is in neither function's environment
    or CloudWatch log, the server's log, any deployment's log or the active
-   resources. The deployment commands' output is kept in the working directory
-   and printed with any line holding the key left out.
+   resources. It reads each CloudWatch log once it reports every invocation the
+   test made, since Lambda logs can arrive minutes late. The deployment
+   commands' output is kept in the working directory and printed with any line
+   holding the key left out.
 10. It deletes the environment with `porch delete env`, acknowledging each
     deletion the preview marks for a permit. It waits until the environment is
     gone, then checks that none of these is left. A resource counts as gone

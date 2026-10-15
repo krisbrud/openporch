@@ -355,9 +355,13 @@ version1=$(upload "$zip1") || fail "the artifact bucket did not keep a version o
 registry="$account.dkr.ecr.$region.amazonaws.com"
 aws ecr create-repository --repository-name "$repository" >/dev/null
 repository_created=1
-aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
 docker build -q --platform linux/amd64 --provenance=false -t "$registry/$repository:1" "$repo/examples/lambda-api/app" >/dev/null
-docker push -q "$registry/$repository:1" >/dev/null
+# The registry login goes to a Docker config of its own in the working
+# directory, not the user's, so the token goes away with it.
+mkdir -m 700 "$work/docker"
+aws ecr get-login-password | DOCKER_CONFIG="$work/docker" docker login --username AWS --password-stdin "$registry" >/dev/null
+DOCKER_CONFIG="$work/docker" docker push -q "$registry/$repository:1" >/dev/null
+rm -rf "$work/docker"
 
 # --- First deployments ----------------------------------------------------------
 
@@ -444,10 +448,22 @@ porch get active-resources -o json >"$work/active.json"
 aws lambda get-function-configuration --function-name "$api_fn" --query 'Environment.Variables' --output json >"$work/api-env.json"
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >>"$work/worker-env.json"
 # What the functions logged while they ran: the worker read the key at runtime.
-for fn in "$worker_fn" "$api_fn"; do
-  aws logs filter-log-events --log-group-name "/aws/lambda/$fn" --query 'events[].message' --output json \
-    >"$work/$fn.runtime.json" || fail "could not read the log of $fn"
-done
+# Lambda logs can take minutes to arrive, so each log is read once it has a
+# REPORT line for every invocation the test is sure of: three orders for the
+# worker and three requests for the API.
+runtime_log() {
+  local reports
+  for _ in $(seq 1 60); do
+    aws logs filter-log-events --log-group-name "/aws/lambda/$1" --query 'events[].message' --output json \
+      >"$work/$1.runtime.json" || fail "could not read the log of $1"
+    reports=$(jq '[.[] | select(startswith("REPORT RequestId"))] | length' "$work/$1.runtime.json")
+    [ "$reports" -lt "$2" ] || return 0
+    sleep 10
+  done
+  fail "the log of $1 has $reports invocation reports after 10 minutes, fewer than $2"
+}
+runtime_log "$worker_fn" 3
+runtime_log "$api_fn" 3
 grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" \
   "$work/active.json" "$work"/*.out "$work/$worker_fn.runtime.json" "$work/$api_fn.runtime.json" &&
   fail "the signing key reached a function's environment or log, the server log, a deployment log or the active resources"
