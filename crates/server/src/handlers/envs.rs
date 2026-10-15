@@ -127,6 +127,36 @@ pub async fn get(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UpdateEnv {
+    name: String,
+}
+
+/// `PATCH /orgs/{org}/apps/{app}/envs/{env}`: renames an environment. Needs
+/// `developer` or `owner` on the application and `deployer` on its type.
+pub async fn update(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, app, env)): Path<(String, String, String)>,
+    JsonBody(body): JsonBody<UpdateEnv>,
+) -> ApiResult<Json<EnvView>> {
+    let name = super::apps::display_name("environment", &body.name)?;
+    let org = state.org();
+    state
+        .store
+        .update_env(
+            org,
+            &app,
+            &env,
+            name,
+            ctx.audit(org, "env.update", format!("{app}/{env}")),
+        )
+        .await?;
+    let env = env_or_404(&state, &app, &env).await?;
+    Ok(Json(view(&state, env).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEnv {
     id: String,
     name: Option<String>,

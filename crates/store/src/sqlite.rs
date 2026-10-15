@@ -9,7 +9,9 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditEntry, AuditIntent, AuditOutcome};
 use crate::deploy::*;
-use crate::identity::{check_admin_authority, check_configure_authority, check_env_authority};
+use crate::identity::{
+    check_admin_authority, check_app_authority, check_configure_authority, check_env_authority,
+};
 use crate::secrets::{BUILTIN_STORE, Sealed};
 use crate::{Ownership, Result, Store, StoreError, now_ms};
 
@@ -594,6 +596,94 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(EnvRow::into_record).collect())
+    }
+
+    async fn update_env_type(
+        &self,
+        org: &str,
+        id: &str,
+        description: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        let res = sqlx::query("UPDATE env_types SET description = ? WHERE org_id = ? AND id = ?")
+            .bind(description)
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("environment type `{id}`")));
+        }
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_app(&self, org: &str, id: &str, name: &str, audit: AuditIntent) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM apps WHERE org_id = ? AND id = ?")
+                .bind(org)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match state.as_deref() {
+            None => return Err(StoreError::NotFound(format!("application `{id}`"))),
+            Some("active") => {}
+            Some(_) => {
+                return Err(StoreError::Conflict(format!(
+                    "application `{id}` is being deleted"
+                )));
+            }
+        }
+        check_app_authority(&mut tx, org, audit.actor.as_deref(), id).await?;
+        sqlx::query("UPDATE apps SET name = ? WHERE org_id = ? AND id = ?")
+            .bind(name)
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_env(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        name: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_configure_authority(&mut tx, org, audit.actor.as_deref(), app).await?;
+        let env_type: Option<String> =
+            sqlx::query_scalar("SELECT type FROM envs WHERE org_id = ? AND app_id = ? AND id = ?")
+                .bind(org)
+                .bind(app)
+                .bind(env)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(env_type) = env_type else {
+            return Err(StoreError::NotFound(format!("environment `{app}/{env}`")));
+        };
+        check_env_authority(&mut tx, org, audit.actor.as_deref(), app, &env_type).await?;
+        sqlx::query("UPDATE envs SET name = ? WHERE org_id = ? AND app_id = ? AND id = ?")
+            .bind(name)
+            .bind(org)
+            .bind(app)
+            .bind(env)
+            .execute(&mut *tx)
+            .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn delete_env_type(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {

@@ -347,3 +347,126 @@ async fn environment_types_in_use_are_kept() {
     let (status, b) = s.delete("/orgs/acme/env-types/nope", &s.admin).await;
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 }
+
+#[tokio::test]
+async fn renaming_needs_the_same_roles_as_creating() {
+    let s = server().await;
+    s.app("shop").await;
+    s.env_type("production").await;
+    let dev = s.member("dev", "member").await;
+    let viewer = s.member("viewer", "member").await;
+    let outsider = s.member("outsider", "member").await;
+    s.grant_app("shop", "dev", "developer").await;
+    s.grant_app("shop", "viewer", "viewer").await;
+    let s = &s;
+    let patch = |path: &'static str, token: String, body: serde_json::Value| async move {
+        s.call(Method::PATCH, path, Some(&token), Some(body)).await
+    };
+
+    // Applications: owner only; invisible to members without a role.
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop",
+        dev.clone(),
+        json!({"name": "Web shop"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop",
+        outsider.clone(),
+        json!({"name": "x"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop",
+        s.admin.clone(),
+        json!({"name": "  "}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = patch("/orgs/acme/apps/shop", s.admin.clone(), json!({"id": "x"})).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop",
+        s.admin.clone(),
+        json!({"name": " Web shop "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["name"], "Web shop");
+    assert_eq!(
+        s.get("/orgs/acme/apps/shop", &dev).await.1["name"],
+        "Web shop"
+    );
+
+    // Environments: developer on the application and deployer on the type.
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop/envs/development",
+        viewer.clone(),
+        json!({"name": "Dev"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop/envs/development",
+        dev.clone(),
+        json!({"name": "Dev"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    s.grant_deployer("development", "dev").await;
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop/envs/development",
+        dev.clone(),
+        json!({"name": "Dev"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["name"], "Dev");
+    assert_eq!(b["type"], "development");
+    let (status, b) = patch(
+        "/orgs/acme/apps/shop/envs/missing",
+        dev.clone(),
+        json!({"name": "Dev"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+
+    // Environment types: administrators only.
+    let (status, b) = patch(
+        "/orgs/acme/env-types/production",
+        dev.clone(),
+        json!({"description": "Live"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, b) = patch(
+        "/orgs/acme/env-types/production",
+        s.admin.clone(),
+        json!({"description": "Live"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["description"], "Live");
+    let (status, b) = patch(
+        "/orgs/acme/env-types/missing",
+        s.admin.clone(),
+        json!({"description": "Live"}),
+    )
+    .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+
+    // Each change is audited.
+    let (_, log) = s.get("/orgs/acme/audit-logs", &s.admin).await;
+    for action in ["app.update", "env.update", "env_type.update"] {
+        assert!(
+            log["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == action && e["outcome"] == "accepted"),
+            "no {action} in {log}"
+        );
+    }
+}

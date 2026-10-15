@@ -116,6 +116,35 @@ pub trait Store: Send + Sync {
     /// Lists an application's environments.
     fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
 
+    /// Changes an environment type's description.
+    fn update_env_type(
+        &self,
+        org: &str,
+        id: &str,
+        description: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Renames an application. The actor must hold `owner` on it.
+    fn update_app(
+        &self,
+        org: &str,
+        id: &str,
+        name: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Renames an environment. The actor must hold `developer` or `owner` on the
+    /// application and `deployer` on the environment's type.
+    fn update_env(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        name: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Deletes an environment type no environment uses.
     fn delete_env_type(
         &self,
