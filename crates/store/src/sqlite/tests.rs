@@ -219,6 +219,61 @@ async fn installation_serves_one_organization() {
     assert!(e.to_string().contains("serves organization `acme`"), "{e}");
 }
 
+/// Every row of every table and the schema, read without writing, including what
+/// is still in the write-ahead log.
+async fn logical_contents(dir: &std::path::Path) -> Vec<String> {
+    use sqlx::Row;
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join("openporch.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut out: Vec<String> =
+        sqlx::query("SELECT type || ' ' || name || ' ' || coalesce(sql, '') FROM sqlite_master")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    let tables: Vec<String> = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert!(tables.len() > 5, "{tables:?}");
+    for table in tables {
+        let columns: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info(?)")
+            .bind(&table)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("quote(\"{}\")", r.get::<String, _>(0)))
+            .collect();
+        let select = format!(
+            "SELECT '{table}: ' || {} FROM \"{table}\"",
+            columns.join(" || ',' || ")
+        );
+        let mut rows: Vec<String> = sqlx::query(&select)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        rows.sort();
+        out.extend(rows);
+    }
+    pool.close().await;
+    out
+}
+
 #[tokio::test]
 async fn newer_schema_is_refused_without_changes() {
     let f = Fixture::new().await;
@@ -229,8 +284,41 @@ async fn newer_schema_is_refused_without_changes() {
     .execute(f.store.pool())
     .await
     .unwrap();
+    // Move everything into the main file, so that closing a connection, which
+    // checkpoints, cannot change its bytes; only a write could.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
     let Fixture { dir, store } = f.close().await;
     drop(store);
+    let files = |dir: &std::path::Path| {
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            // A connection closing in the background may remove the log
+            // between listing and reading it.
+            .filter_map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                match std::fs::read(&p) {
+                    Ok(bytes) => Some((name, bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("{e}"),
+                }
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let rows_before = logical_contents(dir.path()).await;
+    let before = files(dir.path());
+    assert!(
+        before
+            .iter()
+            .all(|(n, b)| n != "openporch.db-wal" || b.is_empty()),
+        "the log was checkpointed"
+    );
     let ownership = Ownership::acquire(dir.path()).unwrap();
     let e = SqliteStore::open(ownership, ORG).await.unwrap_err();
     assert!(
@@ -242,6 +330,34 @@ async fn newer_schema_is_refused_without_changes() {
             }
         ),
         "{e}"
+    );
+    // The message names the way out.
+    assert!(e.to_string().contains("restore a compatible backup"), "{e}");
+    // Nothing was migrated or written: the main file is byte for byte the same.
+    let after = files(dir.path());
+    let names = |f: &[(String, Vec<u8>)]| f.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    let db = |f: &[(String, Vec<u8>)]| {
+        f.iter()
+            .find(|(n, _)| n == "openporch.db")
+            .map(|(_, b)| b.clone())
+            .unwrap()
+    };
+    assert_eq!(db(&after), db(&before));
+    assert!(
+        after
+            .iter()
+            .all(|(n, b)| n != "openporch.db-wal" || b.is_empty()),
+        "nothing was written to the log"
+    );
+    // Nor did anything reach the write-ahead log: every table reads the same.
+    assert_eq!(logical_contents(dir.path()).await, rows_before);
+    assert!(
+        names(&after)
+            .iter()
+            .all(|n| names(&before).contains(n) || n.starts_with("openporch.db-")),
+        "{:?} -> {:?}",
+        names(&before),
+        names(&after)
     );
 }
 

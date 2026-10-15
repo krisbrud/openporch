@@ -1,7 +1,8 @@
 # Operating openporch
 
 This page covers running one openporch server: who owns an installation, how
-to tell whether the server can accept changes, and what happens when it stops.
+to tell whether the server can accept changes, what happens when it stops, and
+how to back up, upgrade and uninstall it.
 
 ## One server per installation
 
@@ -67,3 +68,144 @@ shutdown_grace_seconds = 600
 
 A service manager should allow at least that long before it kills the
 process, for example `TimeoutStopSec=` in a systemd unit.
+
+## What the data directory holds
+
+| Path | Holds |
+| --- | --- |
+| `openporch.db` (with `-wal` and `-shm` while running) | Configuration, deployments, resource records, recovery records, audit log, sealed secrets |
+| `openporch.lock` | The ownership lock |
+| `master.key` | The master keys, unless `master_key_file` names another file or `OPENPORCH_MASTER_KEY` holds the key itself |
+| `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state. `[opentofu].root` moves it elsewhere |
+| `bootstrap-token` | The first administrator token, until you delete it, unless `bootstrap_token_file` names another place |
+
+Treat the whole directory, and the master key wherever it lives, as secret.
+With the `s3` state backend, resources' state is in the bucket instead of
+`opentofu/`.
+
+To back up, stop the server and copy:
+
+- the data directory;
+- the OpenTofu root, when `[opentofu].root` places it outside the data
+  directory, since with the `local` backend it holds every resource's state;
+- the master key, wherever it lives: its file, or the value of
+  `OPENPORCH_MASTER_KEY`;
+- the bootstrap token file, while it exists and `bootstrap_token_file` places
+  it outside the data directory: a restored installation does not issue a new
+  one;
+- the configuration file, or the environment it is set through.
+
+The OpenTofu root keeps, for each resource, the lock file, an inline script
+and `retained.json`, which records the Git source URL, path and commit the
+last apply used. Replays and deletions fetch that commit again, so a backup
+of an installation that uses Git sources also needs the commits themselves,
+in case a repository is deleted or rewritten later. Keep each repository
+`retained.json` names alongside the copy, with every commit it records under
+a ref of its own, since a mirror holds only what the remote's branches and
+tags still reach:
+
+```sh
+find "$OPENTOFU_ROOT" -name retained.json \
+  -exec jq -r 'select(.source) | "\(.source.url) \(.source.commit)"' {} + \
+  | sort -u | { status=0; while read -r url commit; do
+      dir="backup/sources/$(printf %s "$url" | sha256sum | cut -c1-16).git"
+      [ -d "$dir" ] || git init -q --bare "$dir"
+      printf '%s\n' "$url" > "$dir/openporch-url"
+      if ! git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit" ||
+         ! git -C "$dir" cat-file -e "$commit^{commit}"; then
+        echo "missing $commit from $url" >&2
+        status=1
+      fi
+    done; exit "$status"; }
+```
+
+It exits non-zero when any commit could not be kept, so the backup is
+incomplete. Fetching a private repository needs the same credentials the
+definition uses.
+
+openporch fetches a retained commit from the URL it recorded, so a mirror is
+restored by serving it there again: recreate the repository at that URL and
+push the kept commits into it:
+
+```sh
+for dir in backup/sources/*.git; do
+  git -C "$dir" push "$(cat "$dir/openporch-url")" 'refs/openporch/*:refs/openporch/*'
+done
+```
+
+openporch cannot yet be pointed at a different URL for resources it already
+applied; the backup and restore drill in task 14.1 covers that.
+
+With the `s3` backend the state lives in the bucket, and later applies
+overwrite it. Keep the bucket versioned and record, while the server is
+stopped, the version ID of every state object under the key prefix. Use the
+region and credentials the server uses. When `[opentofu.state]` sets
+`role_arn`, use an AWS CLI profile that assumes that role (`role_arn` and
+`source_profile` in `~/.aws/config`) and pass it as `PROFILE`; when it sets
+`endpoint`, pass that as `ENDPOINT`:
+
+```sh
+aws s3api list-object-versions --region "$REGION" ${PROFILE:+--profile "$PROFILE"} \
+  ${ENDPOINT:+--endpoint-url "$ENDPOINT"} \
+  --bucket "$BUCKET" --prefix "$PREFIX/" \
+  --query '{versions: Versions[?IsLatest].[Key, VersionId], delete_markers: DeleteMarkers[?IsLatest].[Key, VersionId]}' \
+  --output json > backup/state-versions.json
+```
+
+Current delete markers are part of it: a key whose state was deleted must
+stay deleted. A restore puts those versions back as the current ones (or
+copies the objects into the backup instead), so the database and the state
+it restores match. Secret stores outside openporch keep their own history; record the
+versions you rely on where your store has them.
+
+Copying while the server runs can capture a database that does not match the
+state files. Keep the master key apart from the copy: a backup is only useful
+with it, and anyone holding both can read every stored secret.
+
+## Upgrades and the schema version
+
+Each release knows the database schema versions up to its newest migration. On
+start, a newer release migrates an older database forward. An older release
+started on a database a newer release has migrated refuses to start, before it
+writes anything:
+
+```text
+database schema version <found> is newer than this binary supports (up to <supported>);
+run a compatible openporch version or restore a compatible backup
+```
+
+So downgrading means either going back to the newer release, or restoring a
+backup taken before the upgrade and running the release that made it. Take a
+backup before every upgrade. Restoring an older backup forgets every
+deployment made since it was taken, including resources it created; check
+those by hand before deploying again (the backup and restore drill in task
+14.1 covers this).
+
+## Uninstalling
+
+Stopping the server or removing the `openporch` binary never deletes cloud
+resources: openporch changes infrastructure only when a deployment or a
+deletion you requested runs. Uninstalling is three separate decisions.
+
+1. **Stop managing.** Stop the server and remove the binary. Every resource
+   keeps running and keeps costing what it costs. Keep the data directory and
+   the master key: starting the same or a newer release on them later resumes
+   management where it stopped.
+2. **Tear down infrastructure**, if you want it gone. Do this while the server
+   still runs, with deletions you preview and confirm, for example `porch
+   delete app <app> --preview` and then the command it prints (see [Clean
+   up](getting-started.md#clean-up)). Wait until `porch get apps` no longer
+   lists the application.
+3. **Remove the data.** Delete the data directory, the OpenTofu root if it
+   is elsewhere, the master key and, with the `s3` backend, the state
+   objects. Without them openporch cannot manage
+   or delete what is left, so do this last, and only for resources you have
+   torn down or will manage another way. To keep the option of resuming,
+   keep a backup instead.
+
+## Retention
+
+Nothing in the data directory expires on its own. The audit log is kept
+indefinitely, even for deleted applications. Recovery records and resource
+state are kept for as long as their resources exist. The database grows with
+the number of deployments; a backup copies all of it.

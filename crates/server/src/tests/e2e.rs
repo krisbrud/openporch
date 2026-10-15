@@ -16,7 +16,7 @@ use openporch_store::Store;
 use openporch_store::secrets::BoxFuture;
 use serde_json::{Value, json};
 
-use super::{Server, server, server_from};
+use super::{Server, server, server_from, server_in};
 
 /// S3 and ECR as the account `aws-dev` sees them: bucket `artifacts` keeps
 /// versions, and its objects' current version is `version`; bucket `plain`
@@ -1024,4 +1024,66 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
     for (descriptor, resource) in &dev {
         assert_eq!(current[descriptor]["guresid"], resource["guresid"]);
     }
+}
+
+/// The deployments of `development`.
+async fn deploys(s: &Server) -> Value {
+    let (st, b) = s
+        .get(&format!("{APP}/envs/development/deploys"), &s.admin)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    b
+}
+
+/// Uninstalling, step one: stopping the server and starting it again later
+/// changes no infrastructure. Every resource stays active and no deletion runs.
+#[tokio::test]
+async fn stopping_and_restarting_the_server_deletes_nothing() {
+    let s = server().await;
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let def = json!({"id": id, "type": ty, "driver_type": "openporch/none",
+                         "driver_inputs": {}, "criteria": [{}]});
+        let (st, b) = s.post("/orgs/acme/resources/defs", &s.admin, def).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            &format!("{APP}/deltas"),
+            &s.admin,
+            json!({"modules": {"add": {"web": {"spec": {"containers": {
+                "web": {"image": "nginx:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    s.deploy_to("development", json!({"delta_id": delta["id"]}))
+        .await;
+    let before = s.active("development").await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    let history = deploys(&s).await;
+
+    // Stop the server as a signal would, then start it again on the same data.
+    let Server {
+        dir,
+        state,
+        router,
+        admin,
+        ..
+    } = s;
+    assert!(
+        state
+            .drain(std::time::Duration::from_secs(5))
+            .await
+            .is_empty()
+    );
+    state.store.pool().close().await;
+    drop((state, router));
+    let mut s = server_in(dir).await;
+    s.admin = admin;
+
+    assert_eq!(s.active("development").await, before);
+    assert_eq!(deploys(&s).await, history, "no deployment ran");
+    let (st, apps) = s.get("/orgs/acme/apps", &s.admin).await;
+    assert_eq!(st, StatusCode::OK, "{apps}");
+    assert!(apps.to_string().contains("\"shop\""), "{apps}");
 }
