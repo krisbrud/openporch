@@ -109,6 +109,7 @@ find "$OPENTOFU_ROOT" -name retained.json \
   | sort -u | { status=0; while read -r url commit; do
       dir="backup/sources/$(printf %s "$url" | tr -c 'A-Za-z0-9.-' _).git"
       [ -d "$dir" ] || git init -q --bare "$dir"
+      printf '%s\n' "$url" > "$dir/openporch-url"
       if ! git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit" ||
          ! git -C "$dir" cat-file -e "$commit^{commit}"; then
         echo "missing $commit from $url" >&2
@@ -123,9 +124,14 @@ definition uses.
 
 openporch fetches a retained commit from the URL it recorded, so a mirror is
 restored by serving it there again: recreate the repository at that URL and
-push the mirror into it with `git push --mirror`. openporch cannot yet be
-pointed at a different URL for resources it already applied; the
-backup and restore drill in task 14.1 covers that.
+push the mirror into it:
+
+```sh
+git -C "$dir" push --mirror "$(cat "$dir/openporch-url")"
+```
+
+openporch cannot yet be pointed at a different URL for resources it already
+applied; the backup and restore drill in task 14.1 covers that.
 
 With the `s3` backend the state lives in the bucket, and later applies
 overwrite it. Keep the bucket versioned and record, while the server is
@@ -139,12 +145,14 @@ region and credentials the server uses. When `[opentofu.state]` sets
 aws s3api list-object-versions --region "$REGION" ${PROFILE:+--profile "$PROFILE"} \
   ${ENDPOINT:+--endpoint-url "$ENDPOINT"} \
   --bucket "$BUCKET" --prefix "$PREFIX/" \
-  --query 'Versions[?IsLatest].[Key,VersionId]' --output text > backup/state-versions.txt
+  --query '{versions: Versions[?IsLatest].[Key, VersionId], delete_markers: DeleteMarkers[?IsLatest].[Key, VersionId]}' \
+  --output json > backup/state-versions.json
 ```
 
-A restore puts those versions back as the current ones (or copies the
-objects into the backup instead), so the database and the state it restores
-match. Secret stores outside openporch keep their own history; record the
+Current delete markers are part of it: a key whose state was deleted must
+stay deleted. A restore puts those versions back as the current ones (or
+copies the objects into the backup instead), so the database and the state
+it restores match. Secret stores outside openporch keep their own history; record the
 versions you rely on where your store has them.
 
 Copying while the server runs can capture a database that does not match the
