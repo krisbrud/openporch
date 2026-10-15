@@ -22,6 +22,12 @@ openporch is under active development. The milestone 1 specification lives in [`
 | `crates/client` | Typed API client |
 | `crates/cli` | The `porch` command-line interface |
 
+## Getting started
+
+The [developer quickstart](docs/quickstart.md) runs a server locally and deploys
+a workload with the `porch` command line. The [command reference](docs/cli.md)
+lists every `porch` command, and the [API reference](docs/api.md) every route.
+
 ## Development
 
 You need the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it automatically) and optionally [`just`](https://github.com/casey/just) and [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny).
@@ -31,6 +37,7 @@ just test   # fmt, clippy and unit tests, as CI runs them
 just e2e    # end-to-end tests
 just deny   # dependency license and advisory checks
 just dev    # run the server locally
+just docs   # run the documented examples and the quickstart against a dev server
 ```
 
 ## License

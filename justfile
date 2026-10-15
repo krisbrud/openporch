@@ -14,9 +14,15 @@ test:
 e2e:
     cargo test --workspace -- --ignored
 
-# Run every example in docs/api.md and docs/security.md against a dev server.
+# Run every example in docs/api.md and docs/security.md, and the quickstart,
+# against a dev server, and check that docs/cli.md matches `porch` help.
 docs:
     cargo test -p openporch-server --test docs
+    cargo test -p openporch-cli -- quickstart cli_reference
+
+# Regenerate docs/cli.md from `porch` help.
+cli-docs:
+    OPENPORCH_UPDATE_DOCS=1 cargo test -p openporch-cli cli_reference
 
 # Check dependency licenses, advisories and sources.
 deny:
