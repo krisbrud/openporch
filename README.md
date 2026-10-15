@@ -25,8 +25,10 @@ openporch is under active development. The milestone 1 specification lives in [`
 
 ## Getting started
 
-The [developer quickstart](docs/quickstart.md) runs a server locally and deploys
-a workload with the `porch` command line. The [command reference](docs/cli.md)
+[Getting started](docs/getting-started.md) takes you from a clean machine to a
+Lambda function in your own AWS account, without Kubernetes. The
+[developer quickstart](docs/quickstart.md) runs a server locally and deploys
+a workload with the `porch` command line, without a cloud account. The [command reference](docs/cli.md)
 lists every `porch` command, and the [API reference](docs/api.md) every route.
 
 ## Development
