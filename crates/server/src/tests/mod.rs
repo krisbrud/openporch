@@ -781,6 +781,25 @@ async fn members_are_renamed_by_those_who_cover_them() {
     );
     let (status, body) = patch("admin-2", &manager, json!({"name": "Admin"})).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let member = s.member("dev", "member").await;
+    let (status, body) = patch("ci", &member, json!({"name": "Mine"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = patch("nobody", &s.admin, json!({"name": "Nobody"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // A person's name comes from their identity.
+    logged_in(&s, "583231", "octocat", "member").await;
+    let (_, users) = s.get("/orgs/acme/users", &s.admin).await;
+    let person = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["type"] == "user")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = patch(&person, &s.admin, json!({"name": "Octo"})).await;
+    assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");
     for bad in [json!({"name": " "}), json!({})] {
         let (status, body) = patch("ci", &s.admin, bad).await;
         assert_error(status, &body, StatusCode::BAD_REQUEST, "API-003");

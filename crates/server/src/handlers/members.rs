@@ -110,9 +110,9 @@ pub struct UpdateUser {
     name: Option<String>,
 }
 
-/// Changes a member's organization role or display name. The caller must cover the
-/// current roles and, for a role change, the resulting ones; the store keeps at
-/// least one administrator.
+/// Changes a member's organization role, or a service user's display name. The
+/// caller must cover the current roles and, for a role change, the resulting ones;
+/// the store keeps at least one administrator.
 pub async fn update(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -120,15 +120,7 @@ pub async fn update(
     JsonBody(body): JsonBody<UpdateUser>,
 ) -> ApiResult<Json<Principal>> {
     let org = state.org();
-    let mut p = principal_or_404(&state, &user).await?;
-    let name = body
-        .name
-        .as_deref()
-        .map(|n| display_name("user", n))
-        .transpose()?;
-    if body.role.is_none() && name.is_none() {
-        return Err(ApiError::invalid("give `role`, `name` or both"));
-    }
+    let p = principal_or_404(&state, &user).await?;
     let current = state.store.roles(org, &user).await?;
     let resulting = Roles {
         org: body.role.or(current.org),
@@ -139,18 +131,29 @@ pub async fn update(
             "changing this member requires the `administrator` role",
         ));
     }
-    if let Some(role) = body.role {
-        p = state
-            .store
-            .set_org_role(org, &user, role, ctx.audit(org, "user.update", &user))
-            .await?;
+    let name = body
+        .name
+        .as_deref()
+        .map(|n| display_name("user", n))
+        .transpose()?;
+    if name.is_some() && p.kind != "service" {
+        return Err(ApiError::invalid(
+            "only service users can be renamed; a person's name comes from their identity",
+        ));
     }
-    if let Some(name) = name {
-        p = state
-            .store
-            .rename_principal(org, &user, name, ctx.audit(org, "user.update", &user))
-            .await?;
+    if body.role.is_none() && name.is_none() {
+        return Err(ApiError::invalid("give `role`, `name` or both"));
     }
+    let p = state
+        .store
+        .update_principal(
+            org,
+            &user,
+            body.role,
+            name,
+            ctx.audit(org, "user.update", &user),
+        )
+        .await?;
     Ok(Json(p))
 }
 

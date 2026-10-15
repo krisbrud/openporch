@@ -58,9 +58,9 @@ func (r *serviceUserToken) Schema(_ context.Context, _ resource.SchemaRequest, r
 				MarkdownDescription: "The service user."},
 			"id": schema.StringAttribute{Required: true, PlanModifiers: replace,
 				MarkdownDescription: "The token ID, unique per user."},
-			"description": schema.StringAttribute{Optional: true, PlanModifiers: replace,
+			"description": schema.StringAttribute{Optional: true,
 				Validators: []validator.String{notEmpty{}}, MarkdownDescription: "A description."},
-			"expires_at": schema.StringAttribute{Optional: true, PlanModifiers: replace,
+			"expires_at": schema.StringAttribute{Optional: true,
 				MarkdownDescription: "When the token expires, as an RFC 3339 time such as " +
 					"`2027-01-01T00:00:00Z`. Without it, the token does not expire."},
 			"token": schema.StringAttribute{Computed: true, Sensitive: true,
@@ -94,8 +94,24 @@ func (r *serviceUserToken) ValidateConfig(ctx context.Context, req resource.Vali
 	}
 }
 
-// ModifyPlan refuses to replace a token under the same ID: the server keeps a
-// revoked token's ID, so the new token could not be created.
+// tokenChanged reports whether plan describes a different token than state: a
+// new description or a new expiry instant. The same instant written differently is
+// not a change. Unknown values report false.
+func tokenChanged(plan, state tokenModel) bool {
+	if plan.Description.IsUnknown() || plan.ExpiresAt.IsUnknown() {
+		return false
+	}
+	planned, _ := parseExpiry(plan.ExpiresAt)
+	current, _ := parseExpiry(state.ExpiresAt)
+	sameExpiry := (planned == nil) == (current == nil) && (planned == nil || *planned == *current)
+	return !plan.Description.Equal(state.Description) || !sameExpiry
+}
+
+const newIDNeeded = "A token cannot be changed: a new description or expiry needs a new token, and a " +
+	"revoked token keeps its ID, so give the token a new `id` in the same change."
+
+// ModifyPlan replaces a token whose description or expiry changes, and refuses
+// to do so under the same ID, since the server keeps a revoked token's ID.
 func (r *serviceUserToken) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() || req.State.Raw.IsNull() {
 		return
@@ -103,20 +119,14 @@ func (r *serviceUserToken) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	var plan, state tokenModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() || plan.ID.IsUnknown() || plan.UserID.IsUnknown() {
+	if resp.Diagnostics.HasError() || !tokenChanged(plan, state) {
 		return
 	}
-	if !plan.ID.Equal(state.ID) || !plan.UserID.Equal(state.UserID) {
+	if plan.ID.Equal(state.ID) && plan.UserID.Equal(state.UserID) {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Token needs a new ID", newIDNeeded)
 		return
 	}
-	planned, _ := parseExpiry(plan.ExpiresAt)
-	current, _ := parseExpiry(state.ExpiresAt)
-	sameExpiry := (planned == nil) == (current == nil) && (planned == nil || *planned == *current)
-	if !plan.Description.Equal(state.Description) || !sameExpiry || plan.ExpiresAt.IsUnknown() {
-		resp.Diagnostics.AddAttributeError(path.Root("id"), "Token needs a new ID",
-			"Changing a token's description or expiry issues a new token, and a revoked token keeps its "+
-				"ID, so give the token a new `id` in the same change.")
-	}
+	resp.RequiresReplace = append(resp.RequiresReplace, path.Root("description"), path.Root("expires_at"))
 }
 
 // apply records the server's token in m, keeping a configured expiry that names
@@ -182,9 +192,22 @@ func (r *serviceUserToken) Read(ctx context.Context, req resource.ReadRequest, r
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
-// Update is never called: every configured attribute replaces the token.
-func (r *serviceUserToken) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError("Unexpected update", "A token cannot be changed in place.")
+// Update records an expiry written differently for the same instant. A real
+// change is refused at plan; one only known at apply is refused here, before
+// anything changes on the server.
+func (r *serviceUserToken) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state tokenModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if tokenChanged(plan, state) {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Token needs a new ID", newIDNeeded)
+		return
+	}
+	plan.Token = state.Token
+	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
 func (r *serviceUserToken) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

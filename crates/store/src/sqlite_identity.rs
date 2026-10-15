@@ -74,12 +74,14 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Principal>> + Send;
 
-    /// Changes a principal's display name.
-    fn rename_principal(
+    /// Changes a principal's organization role, display name or both in one
+    /// transaction, keeping at least one administrator.
+    fn update_principal(
         &self,
         org: &str,
         id: &str,
-        name: &str,
+        role: Option<OrgRole>,
+        name: Option<&str>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<Principal>> + Send;
 
@@ -448,23 +450,37 @@ impl IdentityStore for SqliteStore {
         Ok(p)
     }
 
-    async fn rename_principal(
+    async fn update_principal(
         &self,
         org: &str,
         id: &str,
-        name: &str,
+        role: Option<OrgRole>,
+        name: Option<&str>,
         audit: AuditIntent,
     ) -> Result<Principal> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
-        require_principal(&mut tx, org, id).await?;
-        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), None).await?;
-        sqlx::query("UPDATE principals SET name = ? WHERE org_id = ? AND id = ?")
-            .bind(name)
-            .bind(org)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let current = require_principal(&mut tx, org, id).await?;
+        check_authority(&mut tx, org, audit.actor.as_deref(), Some(id), role).await?;
+        if let Some(role) = role {
+            if current.role == OrgRole::Administrator && role != OrgRole::Administrator {
+                guard_last_admin(&mut tx, org, id).await?;
+            }
+            sqlx::query("UPDATE principals SET org_role = ? WHERE org_id = ? AND id = ?")
+                .bind(role.as_str())
+                .bind(org)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(name) = name {
+            sqlx::query("UPDATE principals SET name = ? WHERE org_id = ? AND id = ?")
+                .bind(name)
+                .bind(org)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         audit_in(&mut tx, &audit).await?;
         let p = require_principal(&mut tx, org, id).await?;
         tx.commit().await?;

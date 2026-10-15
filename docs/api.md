@@ -248,7 +248,8 @@ Authorization: Bearer $ADMIN_TOKEN
 {"id": "ci", "type": "service", "name": "CI", "role": "member"}
 ```
 
-`PATCH` changes a member's `role`, their display `name`, or both. Changing a
+`PATCH` changes a member's `role`, a service user's display `name`, or both; a
+person's name comes from their identity. Changing a
 member needs authority over their current role, and a role change also over the
 new one. The last administrator cannot be demoted or removed. Names are trimmed
 and 1 to 100 characters long, on creation too.

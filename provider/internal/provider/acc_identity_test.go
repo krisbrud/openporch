@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-testing/compare"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -48,6 +49,7 @@ func TestAccServiceUserTokenAndRoles(t *testing.T) {
 	ci := randomID("acc-ci")
 	app := randomID("acc-app")
 	envType := randomID("acc-type")
+	sameToken := statecheck.CompareValue(compare.ValuesSame())
 	config := func(name, role, appRole, tokenID, expires string) string {
 		return fmt.Sprintf(`
 resource "openporch_user" "ci" {
@@ -86,6 +88,19 @@ resource "openporch_environment_type_user" "ci" {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { preCheck(t) },
 		ProtoV6ProviderFactories: providers,
+		CheckDestroy: func(*terraform.State) error {
+			ctx := context.Background()
+			if _, err := c.User(ctx, ci); !client.IsNotFound(err) {
+				return fmt.Errorf("service user %s still exists: %v", ci, err)
+			}
+			if _, err := c.Role(ctx, "apps", app, ci); !client.IsNotFound(err) {
+				return fmt.Errorf("application role still exists: %v", err)
+			}
+			if _, err := c.Role(ctx, "env-types", envType, ci); !client.IsNotFound(err) {
+				return fmt.Errorf("environment type role still exists: %v", err)
+			}
+			return nil
+		},
 		Steps: []resource.TestStep{
 			{
 				Config: config("CI", "member", "developer", "deploy", "2099-01-01T00:00:00+01:00"),
@@ -109,7 +124,7 @@ resource "openporch_environment_type_user" "ci" {
 				Check: tokenWorks("openporch_service_user_token.deploy", ci),
 			},
 			{
-				// A token revoked outside OpenTofu is issued again.
+				// A token revoked outside OpenTofu leaves the state, and its ID stays taken.
 				PreConfig: func() {
 					if err := c.RevokeToken(context.Background(), ci, "deploy"); err != nil {
 						t.Fatal(err)
@@ -134,6 +149,9 @@ resource "openporch_environment_type_user" "ci" {
 			},
 			{
 				Config: config("CI bot", "manager", "owner", "deploy-3", "2098-06-01T12:00:00Z"),
+				ConfigStateChecks: []statecheck.StateCheck{
+					sameToken.AddStateValue("openporch_service_user_token.deploy", tfjsonpath.New("token")),
+				},
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						plancheck.ExpectResourceAction("openporch_service_user_token.deploy", plancheck.ResourceActionReplace),
@@ -142,16 +160,37 @@ resource "openporch_environment_type_user" "ci" {
 				Check: tokenWorks("openporch_service_user_token.deploy", ci),
 			},
 			{
+				// The same expiry written with an offset changes nothing on the server.
+				Config: config("CI bot", "manager", "owner", "deploy-3", "2098-06-01T14:00:00+02:00"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("openporch_service_user_token.deploy", plancheck.ResourceActionUpdate),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					sameToken.AddStateValue("openporch_service_user_token.deploy", tfjsonpath.New("token")),
+				},
+			},
+			{
 				ResourceName:      "openporch_user.ci",
 				ImportState:       true,
 				ImportStateId:     ci,
 				ImportStateVerify: true,
 			},
 			{
-				ResourceName:    "openporch_service_user_token.deploy",
-				ImportState:     true,
-				ImportStateId:   ci + "/deploy-3",
-				ImportStateKind: resource.ImportBlockWithID,
+				// An imported token has no value, and its expiry in UTC. Against a
+				// configuration with an offset, that plans an in-place update that
+				// only records the configured form, never a replacement.
+				ResourceName:  "openporch_service_user_token.deploy",
+				ImportState:   true,
+				ImportStateId: ci + "/deploy-3",
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					a := states[0].Attributes
+					if a["expires_at"] != "2098-06-01T12:00:00Z" || a["token"] != "" || a["description"] != "CI deployments" {
+						return fmt.Errorf("imported %v", a)
+					}
+					return nil
+				},
 			},
 			{
 				ResourceName:    "openporch_application_user.ci",
