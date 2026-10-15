@@ -287,8 +287,10 @@ async fn authenticate(
 }
 
 async fn authorize(state: AppState, permission: Permission, req: Request, next: Next) -> Response {
-    let req = match check(&state, permission, req).await {
-        Ok(req) => req,
+    // A change holds its admission until it has answered, so shutdown waits for
+    // it, including any deployment it starts.
+    let (req, _admitted) = match check(&state, permission, req).await {
+        Ok(checked) => checked,
         Err(e) => return e.into_response(),
     };
     let ctx = req.extensions().get::<Ctx>().cloned();
@@ -315,7 +317,7 @@ async fn check(
     state: &AppState,
     permission: Permission,
     req: Request,
-) -> Result<Request, ApiError> {
+) -> Result<(Request, Option<crate::state::Admission>), ApiError> {
     let (mut parts, body) = req.into_parts();
     let params = RawPathParams::from_request_parts(&mut parts, state)
         .await
@@ -334,22 +336,20 @@ async fn check(
         )));
     }
     if permission == Permission::Public {
-        return Ok(Request::from_parts(parts, body));
+        return Ok((Request::from_parts(parts, body), None));
     }
     let token = bearer(&parts).ok_or_else(ApiError::unauthenticated)?;
     let (principal, session) = authenticate(state, token)
         .await?
         .ok_or_else(ApiError::unauthenticated)?;
     let mutating = !matches!(parts.method, Method::GET | Method::HEAD);
-    if mutating {
-        let reasons = state.not_ready_reasons();
-        if !reasons.is_empty() {
-            return Err(ApiError::not_ready(format!(
-                "the server is not ready: {}",
-                reasons.join(", ")
-            )));
-        }
-    }
+    let admitted = if mutating {
+        Some(state.admit_change().map_err(|reasons| {
+            ApiError::not_ready(format!("the server is not ready: {}", reasons.join(", ")))
+        })?)
+    } else {
+        None
+    };
     let roles = state.store.roles(state.org(), &principal.id).await?;
     let request_id = parts
         .extensions
@@ -424,5 +424,5 @@ async fn check(
         path: parts.uri.path().to_owned(),
     };
     parts.extensions.insert(ctx);
-    Ok(Request::from_parts(parts, body))
+    Ok((Request::from_parts(parts, body), admitted))
 }

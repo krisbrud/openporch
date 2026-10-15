@@ -3,6 +3,8 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::executor::LocalExecutor;
@@ -53,6 +55,21 @@ pub struct Inner {
     pub drivers: crate::deploy::Drivers,
     /// Set once shutdown begins: no new changes are accepted.
     pub draining: std::sync::atomic::AtomicBool,
+    /// Changes admitted and still being handled.
+    changes: std::sync::atomic::AtomicUsize,
+    /// Signaled whenever an admitted change has been handled.
+    changes_done: tokio::sync::Notify,
+}
+
+/// An admitted change, held until its request has been answered.
+#[derive(Debug)]
+pub struct Admission(AppState);
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.changes.fetch_sub(1, Ordering::SeqCst);
+        self.0.changes_done.notify_waiters();
+    }
 }
 
 impl std::ops::Deref for AppState {
@@ -81,35 +98,73 @@ impl AppState {
         if reasons.is_empty() && !self.runners.has_executor() {
             reasons.push("executor_unavailable".to_owned());
         }
-        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.draining.load(Ordering::SeqCst) {
             reasons.push("shutting_down".to_owned());
         }
         reasons
     }
 
-    /// Begins shutdown: refuses new changes, then waits up to `grace` for the
-    /// running deployments, and returns those still running. Their operations
-    /// are already recorded, so a restart marks them interrupted and observes
-    /// each resource whose outcome is unknown before anything changes it again.
-    pub async fn drain(&self, grace: std::time::Duration) -> Vec<String> {
-        self.draining
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let running = self.runners.running();
-        if !running.is_empty() {
-            tracing::info!(
-                deployments = ?running,
-                grace_seconds = grace.as_secs(),
-                "shutting down: refusing changes and waiting for running deployments"
-            );
+    /// Admits a change, or returns why the server cannot accept one. Shutdown
+    /// waits for each admission to be dropped.
+    pub fn admit_change(&self) -> Result<Admission, Vec<String>> {
+        // Counted before the check, so a shutdown that begins in between
+        // either is seen here or waits for this change.
+        self.changes.fetch_add(1, Ordering::SeqCst);
+        let admission = Admission(self.clone());
+        let reasons = self.not_ready_reasons();
+        if reasons.is_empty() {
+            Ok(admission)
+        } else {
+            Err(reasons)
         }
-        let left = self.runners.wait_idle(grace).await;
+    }
+
+    /// Waits until no admitted change is being handled, or `deadline`. Returns
+    /// whether none is.
+    async fn wait_for_changes(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            // Created before the check, so a change that ends in between still
+            // wakes it.
+            let done = self.changes_done.notified();
+            if self.changes.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            tokio::select! {
+                () = done => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    return self.changes.load(Ordering::SeqCst) == 0;
+                }
+            }
+        }
+    }
+
+    /// Begins shutdown: refuses new changes, then waits up to `grace` for the
+    /// changes being handled and the running deployments, and returns the
+    /// deployments still running. Their operations are already recorded, so a
+    /// restart marks them interrupted and observes each resource whose outcome
+    /// is unknown before anything changes it again.
+    pub async fn drain(&self, grace: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + grace;
+        self.draining.store(true, Ordering::SeqCst);
+        tracing::info!(
+            grace_seconds = grace.as_secs(),
+            "shutting down: refusing changes and waiting for running deployments"
+        );
+        // A change admitted before the flag may still start a deployment.
+        if !self.wait_for_changes(deadline).await {
+            tracing::warn!("shutting down while changes are still being handled");
+        }
+        let left = self
+            .runners
+            .wait_idle(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
         if !left.is_empty() {
             tracing::warn!(
                 deployments = ?left,
-                "shutting down with deployments still running: the resources they were \
-                 changing may have changed, and OpenTofu processes they started may still \
-                 finish; on restart the deployments are marked failed and resources with an \
-                 unknown outcome are observed before any deployment changes them"
+                "shutting down with deployments still running: their OpenTofu processes are \
+                 stopped and the resources they were changing may be partly changed; on \
+                 restart the deployments are marked failed and resources with an unknown \
+                 outcome are observed before any deployment changes them"
             );
         }
         left
@@ -264,6 +319,8 @@ pub async fn start_with(
         runners: crate::deploy::Runners::default(),
         drivers: crate::deploy::Drivers::default(),
         draining: Default::default(),
+        changes: Default::default(),
+        changes_done: tokio::sync::Notify::new(),
     }));
     prune_sessions(&state);
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {

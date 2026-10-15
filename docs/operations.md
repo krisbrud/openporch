@@ -47,16 +47,16 @@ On `SIGTERM` or Ctrl-C the server:
 
 1. refuses new changes with `503` and `shutting_down`, while status requests
    keep working;
-2. waits up to `shutdown_grace_seconds` (default `60`) for running
-   deployments to finish;
+2. waits up to `shutdown_grace_seconds` (default `60`) for the changes it had
+   already accepted, and for running deployments, to finish;
 3. logs the deployments still running when the wait ends, then exits.
 
-Every cloud operation is recorded before it starts, so nothing is lost when a
-deployment is cut short. On the next start the server marks the interrupted
-deployments `failed`, and observes each resource whose last operation has an
-unknown outcome before any deployment may change it again. An OpenTofu process
-that was running keeps running after the server exits and may still finish its
-change; the observation on restart picks up its result.
+When the server exits, it stops the OpenTofu processes of the deployments
+still running, so the resources they were changing may be partly changed.
+Every cloud operation is recorded before it starts, so nothing is lost: on the
+next start the server marks the interrupted deployments `failed`, and observes
+each resource whose last operation has an unknown outcome before any
+deployment may change it again.
 
 To give long deployments more time, raise the grace period:
 

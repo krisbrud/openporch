@@ -1221,3 +1221,22 @@ async fn shutdown_refuses_changes_and_waits_for_running_deployments() {
     assert_eq!(drain.await.unwrap(), Vec::<String>::new());
     assert_eq!(s.finished(&id).await["status"], "succeeded");
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_changes_accepted_before_it_began() {
+    let s = server().await;
+    // A change admitted just before shutdown may still start a deployment.
+    let admitted = s.state.admit_change().unwrap();
+    let drain = tokio::spawn({
+        let state = s.state.clone();
+        async move { state.drain(std::time::Duration::from_secs(30)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!drain.is_finished());
+    assert_eq!(
+        s.state.admit_change().unwrap_err(),
+        vec!["shutting_down".to_owned()]
+    );
+    drop(admitted);
+    assert_eq!(drain.await.unwrap(), Vec::<String>::new());
+}
