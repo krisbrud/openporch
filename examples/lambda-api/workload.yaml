@@ -1,0 +1,26 @@
+# A small HTTP API as an image function behind a public function URL. Deploy it
+# with the image CI pushed to ECR:
+#
+#   porch workload deploy -f workload.yaml \
+#     --image main=<account>.dkr.ecr.<region>.amazonaws.com/lambda-api:<tag> --wait
+#
+# openporch pins the tag to its digest when it accepts the deployment. The
+# function's URL is the workload's `url` output.
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata:
+  name: lambda-api
+  class: aws-lambda
+function:
+  package:
+    type: image
+    image: .
+  variables:
+    GREETING: Hello from openporch
+  memory: 256Mi
+  timeout: 10s
+triggers:
+  web:
+    http:
+      # A public URL must be asked for; `iam` requires signed requests.
+      auth: none

@@ -75,16 +75,17 @@ impl Sts for ArtifactSts {
             })
         })
     }
-    /// ECR repository `web` has tags `1` and `2`, each at a digest of its
-    /// digit repeated.
+    /// ECR repositories `web` and `lambda-api` have tags `1` and `2`, each at
+    /// a digest of its digit repeated.
     fn image_digest<'a>(
         &'a self,
         credentials: &'a AwsCredentials,
         image: &'a EcrImage,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         assert_eq!(credentials.access_key_id, "AKIAEXAMPLE");
-        let digest = (image.repository == "web" && matches!(image.tag.as_str(), "1" | "2"))
-            .then(|| format!("sha256:{}", image.tag.repeat(64)));
+        let digest = (matches!(image.repository.as_str(), "web" | "lambda-api")
+            && matches!(image.tag.as_str(), "1" | "2"))
+        .then(|| format!("sha256:{}", image.tag.repeat(64)));
         Box::pin(async move { Ok(digest) })
     }
 }
@@ -734,4 +735,288 @@ async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
         set["modules"]["web"]["spec"]["containers"]["web"]["image"],
         format!("{ECR}/web:1")
     );
+}
+
+const ORDER_WORKER: &str = include_str!("../../../../examples/lambda-order-worker/workload.yaml");
+const LAMBDA_API: &str = include_str!("../../../../examples/lambda-api/workload.yaml");
+const WORKER_FN: &str = "workload.aws-lambda#modules.order-worker";
+const API_FN: &str = "workload.aws-lambda#modules.lambda-api";
+const ORDERS: &str = "dynamodb-table.default#modules.order-worker.externals.orders";
+const INBOX: &str = "sqs.default#modules.order-worker.externals.inbox";
+const ORDERS_POLICY: &str = "aws-policy.dynamodb-table#modules.order-worker.externals.orders";
+const INBOX_POLICY: &str = "aws-policy.sqs#modules.order-worker.externals.inbox";
+
+/// The resource inputs each active resource of `env` last ran with, such as a
+/// workload's resolved document, with each secret as `{"secret": <its
+/// expression>}`.
+async fn inputs(s: &Server, env: &str) -> std::collections::BTreeMap<String, Value> {
+    /// A stored `Resolved` as JSON.
+    fn plain(r: &Value) -> Value {
+        if let Some(v) = r.get("value") {
+            v.clone()
+        } else if let Some(secret) = r.get("secret") {
+            json!({"secret": secret})
+        } else if let Some(items) = r.get("array") {
+            items.as_array().unwrap().iter().map(plain).collect()
+        } else {
+            let fields = r["object"].as_array().unwrap();
+            Value::Object(
+                fields
+                    .iter()
+                    .map(|kv| (kv[0].as_str().unwrap().to_owned(), plain(&kv[1])))
+                    .collect(),
+            )
+        }
+    }
+    s.state
+        .store
+        .active_resources("acme", "shop", env)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.descriptor, plain(&r.inputs["resource"])))
+        .collect()
+}
+
+/// Definitions shaped like `examples/aws-platform`'s, with fake drivers: the
+/// `aws-lambda` class stores its resolved document (`openporch/none`), and
+/// tables, queues and their co-provisioned policies echo outputs named like
+/// the real modules'.
+async fn example_platform(s: &Server, queue_url: &str) {
+    for (ty, class) in [
+        ("workload", "aws-lambda"),
+        ("aws-policy", "dynamodb-table"),
+        ("aws-policy", "sqs"),
+    ] {
+        let (st, b) = s
+            .post(
+                &format!("/orgs/acme/resources/types/{ty}/classes"),
+                &s.admin,
+                json!({"id": class}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let name = "${context.app.id}.${context.env.id}.${context.res.id}";
+    let defs = [
+        json!({"id": "base-env", "type": "base-env", "driver_type": "openporch/none", "criteria": [{}]}),
+        json!({"id": "aws-lambda-workload", "type": "workload", "driver_type": "openporch/none",
+               "driver_account": "aws-dev", "criteria": [{"class": "aws-lambda"}]}),
+        json!({"id": "dynamodb-table", "type": "dynamodb-table", "driver_type": "openporch/echo",
+               "driver_inputs": {"values": {
+                   "name": name, "region": "eu-north-1",
+                   "arn": format!("arn:aws:dynamodb:eu-north-1:111122223333:table/{name}")}},
+               "provision": {"aws-policy.dynamodb-table": {"match_dependents": true}},
+               "criteria": [{}]}),
+        json!({"id": "sqs", "type": "sqs", "driver_type": "openporch/echo",
+               "driver_inputs": {"values": {
+                   "url": queue_url, "region": "eu-north-1",
+                   "arn": "arn:aws:sqs:eu-north-1:111122223333:openporch-${context.res.guresid}"}},
+               "provision": {"aws-policy.sqs": {"match_dependents": true}},
+               "criteria": [{}]}),
+        json!({"id": "dynamodb-table-policy", "type": "aws-policy", "driver_type": "openporch/echo",
+               "driver_inputs": {"values": {
+                   "arn": "arn:aws:iam::111122223333:policy/openporch/openporch-${context.res.guresid}",
+                   "table_arn": "${resources.dynamodb-table.default.outputs.arn}"}},
+               "criteria": [{"class": "dynamodb-table"}]}),
+        json!({"id": "sqs-policy", "type": "aws-policy", "driver_type": "openporch/echo",
+               "driver_inputs": {"values": {
+                   "arn": "arn:aws:iam::111122223333:policy/openporch/openporch-${context.res.guresid}",
+                   "queue_arn": "${resources.sqs.default.outputs.arn}"}},
+               "criteria": [{"class": "sqs"}]}),
+    ];
+    for def in defs {
+        let (st, b) = s.post("/orgs/acme/resources/defs", &s.admin, def).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+}
+
+/// 5.7's end-to-end run with the files in `examples/lambda-order-worker` and
+/// `examples/lambda-api`, deployed as CI deploys them, against definitions
+/// shaped like `examples/aws-platform`'s with fake drivers.
+#[tokio::test]
+async fn the_example_lambda_workloads_deploy_and_replay() {
+    let sts = Arc::new(ArtifactSts::default());
+    sts.set("v1");
+    let s = server_with_s3(sts.clone()).await;
+    s.app("shop").await;
+    example_platform(
+        &s,
+        "https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-1",
+    )
+    .await;
+    let (st, b) = s
+        .post(
+            &format!("{APP}/values"),
+            &s.admin,
+            json!({"key": "ORDER_SIGNING_KEY", "description": "",
+                   "secret_ref": {"value": "order-signing-key-1"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+
+    // Each workload is deployed from its file, with what CI supplies.
+    let mut deploys = Vec::new();
+    for (doc, overrides) in [
+        (
+            ORDER_WORKER,
+            json!({"artifacts": {"main": "s3://artifacts/order-worker/0f3a.zip"}}),
+        ),
+        (
+            LAMBDA_API,
+            json!({"images": {"main": format!("{ECR}/lambda-api:1")}}),
+        ),
+    ] {
+        let (st, delta) = s
+            .post(
+                &format!("{APP}/deltas"),
+                &s.admin,
+                json!({"env": "development", "workload": doc, "overrides": overrides}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{delta}");
+        deploys.push(
+            s.deploy_to("development", json!({"delta_id": delta["id"]}))
+                .await,
+        );
+    }
+    let first = deploys.pop().unwrap();
+    let set_id = first["set_id"].as_str().unwrap().to_owned();
+    let dev = s.active("development").await;
+    assert_eq!(
+        dev.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            ORDERS_POLICY,
+            INBOX_POLICY,
+            "base-env.default#base-env",
+            ORDERS,
+            INBOX,
+            API_FN,
+            WORKER_FN,
+        ]
+    );
+
+    // The worker got the table's name, its secret only as a secret, the
+    // queue's outputs on its trigger, its schedule, and both policies.
+    let resolved = inputs(&s, "development").await;
+    let worker = &resolved[WORKER_FN]["spec"];
+    let table = "shop.development.modules.order-worker.externals.orders";
+    assert_eq!(worker["function"]["variables"]["TABLE"], table);
+    assert_eq!(worker["function"]["variables"]["LOG_LEVEL"], "info");
+    assert_eq!(
+        worker["function"]["variables"]["SIGNING_KEY"]["secret"]["parts"][0]["secret"]["ref"],
+        "apps/shop/values/ORDER_SIGNING_KEY"
+    );
+    assert_eq!(
+        worker["function"]["package"]["artifact"],
+        "s3://artifacts/order-worker/0f3a.zip?versionId=v1"
+    );
+    assert_eq!(
+        worker["triggers"]["inbox"]["queue"]["outputs"]["url"],
+        "https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-1"
+    );
+    assert_eq!(
+        worker["triggers"]["nightly"]["schedule"],
+        json!({"cron": "0 3 * * *", "timezone": "Europe/Oslo", "input": {"task": "report"}})
+    );
+    let rendered = serde_json::to_string(&(&dev, &resolved)).unwrap();
+    assert!(!rendered.contains("order-signing-key-1"), "{rendered}");
+    let dependencies = &dev[WORKER_FN]["outputs"]["dependencies"];
+    for policy in [ORDERS_POLICY, INBOX_POLICY] {
+        assert!(
+            dependencies[policy]["arn"]
+                .as_str()
+                .unwrap()
+                .starts_with("arn:aws:iam::111122223333:policy/openporch/"),
+            "{dependencies}"
+        );
+        assert!(
+            dev[WORKER_FN]["dependencies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d == policy)
+        );
+    }
+    // Each policy names its own resource.
+    assert_eq!(
+        dev[ORDERS_POLICY]["outputs"]["table_arn"],
+        dev[ORDERS]["outputs"]["arn"]
+    );
+    assert_eq!(
+        dev[INBOX_POLICY]["outputs"]["queue_arn"],
+        dev[INBOX]["outputs"]["arn"]
+    );
+
+    // The API runs the digest its tag pointed at, behind an explicit public
+    // URL.
+    let api = &resolved[API_FN]["spec"];
+    assert_eq!(
+        api["function"]["package"]["image"],
+        format!("{ECR}/lambda-api@sha256:{}", "1".repeat(64))
+    );
+    assert_eq!(api["triggers"]["web"], json!({"http": {"auth": "none"}}));
+
+    // Deploying the same set again keeps every resource's identity.
+    let again = s.deploy_to("development", json!({"set_id": set_id})).await;
+    assert_eq!(again["set_id"], set_id.as_str());
+    let unchanged = s.active("development").await;
+    for (descriptor, resource) in &dev {
+        assert_eq!(unchanged[descriptor]["guresid"], resource["guresid"]);
+    }
+
+    // The configuration changes: a new queue URL and a new upload of the
+    // worker's zip.
+    let (st, b) = s.get("/orgs/acme/resources/defs/sqs", &s.admin).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let mut queue_inputs = b["driver_inputs"].clone();
+    queue_inputs["values"]["url"] =
+        json!("https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-2");
+    let (st, b) = s
+        .put(
+            "/orgs/acme/resources/defs/sqs",
+            &s.admin,
+            json!({"driver_type": "openporch/echo", "driver_inputs": queue_inputs,
+                   "provision": b["provision"]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    sts.set("v2");
+
+    // Replaying the snapshot runs what it recorded.
+    s.deploy_to(
+        "development",
+        json!({"deploy_id": first["id"], "replay": "snapshot"}),
+    )
+    .await;
+    let old = inputs(&s, "development").await;
+    let worker = &old[WORKER_FN]["spec"];
+    assert_eq!(
+        worker["triggers"]["inbox"]["queue"]["outputs"]["url"],
+        "https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-1"
+    );
+    assert_eq!(
+        worker["function"]["package"]["artifact"],
+        "s3://artifacts/order-worker/0f3a.zip?versionId=v1"
+    );
+    // With the current configuration, the new queue URL and upload.
+    s.deploy_to(
+        "development",
+        json!({"deploy_id": first["id"], "replay": "current"}),
+    )
+    .await;
+    let resolved = inputs(&s, "development").await;
+    let worker = &resolved[WORKER_FN]["spec"];
+    assert_eq!(
+        worker["triggers"]["inbox"]["queue"]["outputs"]["url"],
+        "https://sqs.eu-north-1.amazonaws.com/111122223333/inbox-2"
+    );
+    assert_eq!(
+        worker["function"]["package"]["artifact"],
+        "s3://artifacts/order-worker/0f3a.zip?versionId=v2"
+    );
+    let current = s.active("development").await;
+    for (descriptor, resource) in &dev {
+        assert_eq!(current[descriptor]["guresid"], resource["guresid"]);
+    }
 }

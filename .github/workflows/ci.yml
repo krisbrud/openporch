@@ -29,6 +29,10 @@ jobs:
         run: cargo test --workspace
       - name: SQLite store tests
         run: cargo test -p openporch-store
+      - name: Example function tests
+        run: |
+          python3 -m unittest discover examples/lambda-order-worker/app
+          python3 -m unittest discover examples/lambda-api/app
 
   deny:
     name: cargo deny
