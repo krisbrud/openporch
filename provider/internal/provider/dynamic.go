@@ -50,6 +50,11 @@ func tfToJSON(v tftypes.Value) (any, error) {
 		if err := v.As(&n); err != nil {
 			return nil, err
 		}
+		// Integers keep every digit and no exponent, so the API reads them as
+		// integers.
+		if n.IsInt() {
+			return json.Number(n.Text('f', 0)), nil
+		}
 		return json.Number(n.Text('g', -1)), nil
 	case t.Is(tftypes.Object{}), t.Is(tftypes.Map{}):
 		var m map[string]tftypes.Value

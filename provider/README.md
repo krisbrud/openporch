@@ -7,8 +7,7 @@ protocol 6. Deployments are not resources: use `porch score deploy` or
 `porch workload deploy` for those.
 
 It is not published to a registry yet. It offers these resources, each
-importable, and the `openporch_current_user` data source; resource definitions
-follow in task 7.3:
+importable, and the `openporch_current_user` data source:
 
 | Resource | Import ID |
 | --- | --- |
@@ -22,19 +21,58 @@ follow in task 7.3:
 | `openporch_service_user_token` | `USER/TOKEN` |
 | `openporch_application_user` | `APP/USER` |
 | `openporch_environment_type_user` | `TYPE/USER` |
+| `openporch_resource_definition` | `DEFINITION` |
+| `openporch_resource_definition_criteria` | `DEFINITION/CRITERION` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
 lives only in the configuration, so the first apply after an import that sets
 it records it as an in-place update that changes nothing on the server.
 
+## Resource definitions
+
+A definition's plain inputs go in `driver_inputs`, an object nested as the
+driver expects. Its criteria are separate resources, so a definition matches
+nothing until one exists. openporch placeholders use the same `${…}` syntax as
+OpenTofu, so write them with `$${…}` in HCL:
+
+```hcl
+resource "openporch_resource_definition" "redis" {
+  id          = "redis"
+  type        = "redis"
+  driver_type = "openporch/opentofu"
+  driver_inputs = {
+    source    = { url = "https://github.com/acme/modules", path = "redis" }
+    variables = { name = "$${context.app.id}-$${context.env.id}" }
+  }
+  driver_secrets = {
+    variables = { auth_token = var.redis_auth_token }
+  }
+}
+
+resource "openporch_resource_definition_criteria" "staging" {
+  resource_definition_id = openporch_resource_definition.redis.id
+  env_type               = "staging"
+
+  # Changing the definition's type replaces it, and the server deletes its
+  # criteria with it; this recreates them in the same apply.
+  lifecycle {
+    replace_triggered_by = [openporch_resource_definition.redis]
+  }
+}
+```
+
 ## Secrets
 
-`openporch_value` and `openporch_cloud_account` take secrets in two ways. A
-secret value (`secret_value`, or an entry of `secrets`) is written to the
-built-in store, and the server keeps only a reference to it, which the provider
-records in `written_secret_ref(s)`. A reference (`secret_ref`, or an entry of
-`secret_refs`) points at a secret already in a store.
+`openporch_value`, `openporch_cloud_account` and
+`openporch_resource_definition` take secrets in two ways. A
+secret value (`secret_value`, or an entry of `secrets` or `driver_secrets`) is
+written to the built-in store, and the server keeps only a reference to it,
+which the provider records in `written_secret_ref(s)`. A reference
+(`secret_ref`, or an entry of `secret_refs` or `driver_secret_refs`) points at a
+secret already in a store. In `driver_secrets`, a whole placeholder such as
+`$${resources.db.outputs.password}` is not a value: it stays a template that the
+executor resolves at deployment.
 
 The server never returns a secret value, so the provider cannot compare one
 with the configuration. It writes a secret again only when the configured value
