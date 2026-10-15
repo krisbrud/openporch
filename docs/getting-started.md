@@ -259,14 +259,16 @@ Its ARN with its path comes from IAM:
 aws iam get-role --role-name NAME --query Role.Arn --output text
 ```
 
-Pick a region and a name prefix. The prefix names the role and the buckets,
-whose names are unique across all of AWS, so make it yours. Pin the modules to
-a commit, so that the platform does not change when `main` does:
+Pick a region and a name prefix. Export the region, so that the `aws` commands
+below use it too. The prefix names the role and the buckets, whose names are
+unique across all of AWS, so make it yours. Pin the modules to a commit, so
+that the platform does not change when `main` does:
 
 ```sh
+export AWS_REGION=eu-north-1
 cat > terraform.tfvars.json <<EOF
 {
-  "aws_region": "eu-north-1",
+  "aws_region": "$AWS_REGION",
   "trusted_principal_arn": "arn:aws:iam::111122223333:user/you",
   "name_prefix": "porch-you",
   "modules_rev": "$(git -C "$repo" rev-parse HEAD)"
