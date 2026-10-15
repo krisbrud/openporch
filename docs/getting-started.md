@@ -27,8 +27,9 @@ account.
   them in this guide and assumes the platform's role with them.
 - **Tools** on your `PATH`:
   - [rustup](https://rustup.rs), which installs the Rust version this repository
-    pins;
-  - [Go](https://go.dev/dl/) 1.25 or newer, to build the OpenTofu provider;
+    pins, and a C compiler for the crates that build C code: `build-essential`
+    on Debian and Ubuntu, `gcc` on Fedora, or `xcode-select --install` on macOS;
+  - [Go](https://go.dev/dl/) 1.25.8 or newer, to build the OpenTofu provider;
   - [OpenTofu](https://opentofu.org/docs/intro/install/) 1.8 or newer, as `tofu`;
   - the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html);
   - `git`, `zip`, `openssl` and `jq`.
@@ -46,14 +47,14 @@ The last command prints the identity your credentials belong to. Note its
 
 ## Install openporch
 
-Clone the repository and install the server, `openporch`, and the command
-line, `porch`, into `~/.cargo/bin`. Later steps use `$repo` for the clone, so
-run them in the same shell, or set it again:
+Clone the repository to `~/src/openporch` and install the server, `openporch`,
+and the command line, `porch`, into `~/.cargo/bin`. Later steps refer to the
+clone as `$repo`; set it again in any new terminal:
 
 ```sh
-git clone https://github.com/krisbrud/openporch
-cd openporch
-repo=$PWD
+repo=~/src/openporch
+git clone https://github.com/krisbrud/openporch "$repo"
+cd "$repo"
 cargo install --locked --path crates/server
 cargo install --locked --path crates/cli
 openporch version
@@ -98,13 +99,15 @@ Every other provider, such as `hashicorp/aws`, still comes from the registry.
 
 ### A private data directory
 
-The server keeps everything in one data directory: its SQLite database, the
-master key, the first token, and the OpenTofu state of every cloud resource it
-creates. State holds every value a module handles, secrets included, so create
-the directory readable by you alone:
+The server keeps its SQLite database, the first token, and the OpenTofu state of
+every cloud resource it creates in a data directory. State holds every value a
+module handles, secrets included. This guide keeps everything private in
+`~/porch`, outside the clone so that nothing in it can be committed: the data
+directory, the master key, tokens and the platform's state. Create it readable
+by you alone:
 
 ```sh
-install -d -m 700 ~/openporch ~/openporch/data
+install -d -m 700 ~/porch ~/porch/data
 ```
 
 On a laptop, keep it on an encrypted disk (FileVault, LUKS or BitLocker).
@@ -112,30 +115,30 @@ On a laptop, keep it on an encrypted disk (FileVault, LUKS or BitLocker).
 ### The master key
 
 openporch encrypts the secrets it stores, such as the order worker's signing
-key, with a master key. On its first start the server generates one in
-`data/master.key`, readable only by you. Whoever has the key and a copy of the
-database can read every secret, and without the key the secrets are lost. So
-back the key up once the server has started, somewhere other than where you
-back up the data directory, such as a password manager.
-
-To provide your own key instead, generate it before the first start and name
-it in the configuration with `master_key_file`, or pass it in the
-`OPENPORCH_MASTER_KEY` environment variable:
+key, with a master key. Whoever has the key and a copy of the database can read
+every secret, and without the key the secrets are lost. So keep the key outside
+the data directory, and back it up somewhere other than where the data's
+backups go, such as a password manager. Generate it into a file only you can
+read; the configuration below names it with `master_key_file`:
 
 ```sh
-(umask 077 && openporch keygen > ~/openporch/master.key)
+(umask 077 && openporch keygen > ~/porch/master.key)
 ```
 
-Rotating the key is described in [Master keys](security.md#master-keys).
+Without `master_key_file`, the server generates a key on its first start in
+`data/master.key`. The key can also come from the `OPENPORCH_MASTER_KEY`
+environment variable. Rotating it is described in
+[Master keys](security.md#master-keys).
 
 ### The configuration
 
 Write the configuration file:
 
 ```sh
-cat > ~/openporch/openporch.toml <<EOF
+cat > ~/porch/openporch.toml <<EOF
 org = "acme"
-data_dir = "$HOME/openporch/data"
+data_dir = "$HOME/porch/data"
+master_key_file = "$HOME/porch/master.key"
 listen = "127.0.0.1:8080"
 EOF
 ```
@@ -147,13 +150,16 @@ TLS and set `tls_terminated_by_proxy = true`.
 ### Where cloud resources' state is kept
 
 By default the state of each resource openporch creates is a file under
-`data/opentofu/state/`, readable only by you. Back the data directory up, on
-the same schedule as the key: if a resource's state is lost, openporch refuses
-to touch that resource until the state is restored.
+`data/opentofu/state/`, readable only by you. Back the data directory up: if a
+resource's state is lost, openporch refuses to touch that resource until the
+state is restored.
 
 To keep the state in S3 instead, which suits a server that may move to another
-host, add a state bucket to the configuration. The bucket needs versioning and
-encryption, and access for the server's credentials only:
+host, add a state bucket to the configuration. Create the bucket first, with
+versioning and encryption, and access for the server's credentials only. The
+S3 backend reads static credentials, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, from the server's
+environment, not a profile; `role_arn` makes it assume a role with them:
 
 ```toml
 [opentofu.state]
@@ -167,16 +173,17 @@ Choose before the first deployment: moving state later is a manual step. The
 
 ### Start it
 
-Start the server in its own terminal, with the AWS credentials you checked
-above. Set `AWS_PROFILE` if they come from a profile:
+Open a second terminal for the server, and give it the AWS credentials you
+checked above. Set `AWS_PROFILE` there if they come from a profile:
 
 ```sh
-openporch serve --config ~/openporch/openporch.toml
+openporch serve --config ~/porch/openporch.toml
 ```
 
 It logs JSON lines. On the first start it creates organization `acme`, a
 bootstrap administrator and a token for it, and logs where it wrote the token.
-Check that it is ready from another terminal:
+Leave it running, and continue in the first terminal. Check that the server is
+ready:
 
 ```sh
 curl -s http://127.0.0.1:8080/readyz
@@ -186,7 +193,7 @@ curl -s http://127.0.0.1:8080/readyz
 
 ### The first token
 
-The bootstrap token is in `~/openporch/data/bootstrap-token`, a file only you
+The bootstrap token is in `~/porch/data/bootstrap-token`, a file only you
 can read. It expires after 24 hours, and it is an administrator, so use it only
 to create a lasting credential. Store it in `porch`, which reads it from
 standard input and keeps it in an owner-only file next to
@@ -194,7 +201,7 @@ standard input and keeps it in an owner-only file next to
 
 ```sh
 export OPENPORCH_URL=http://127.0.0.1:8080 OPENPORCH_ORG=acme
-porch login --token < ~/openporch/data/bootstrap-token
+porch login --token < ~/porch/data/bootstrap-token
 porch get apps
 ```
 
@@ -206,15 +213,15 @@ into a file only you can read:
 
 ```sh
 porch users create-service platform --role administrator --name "Platform administrator"
-(umask 077 && porch users tokens create platform --id laptop --expires-in 90d > ~/openporch/platform-token)
-porch login --token < ~/openporch/platform-token
+(umask 077 && porch users tokens create platform --id laptop --expires-in 90d > ~/porch/platform-token)
+porch login --token < ~/porch/platform-token
 ```
 
 Then retire the bootstrap token:
 
 ```sh
 porch users tokens revoke bootstrap bootstrap
-rm ~/openporch/data/bootstrap-token
+rm ~/porch/data/bootstrap-token
 ```
 
 To let teammates sign in with GitHub instead of tokens, see
@@ -237,9 +244,9 @@ Copy it to a directory of your own, outside the repository, since its state
 will hold the external ID and the platform's settings:
 
 ```sh
-install -d -m 700 ~/openporch/platform
-cp "$repo"/examples/aws-platform/*.tf ~/openporch/platform/
-cd ~/openporch/platform
+install -d -m 700 ~/porch/platform
+cp "$repo"/examples/aws-platform/*.tf ~/porch/platform/
+cd ~/porch/platform
 ```
 
 The role trusts the identity the server runs as. For an IAM user, that is the
@@ -278,7 +285,7 @@ in a private file, since a later apply needs the same value:
 Apply it with your token:
 
 ```sh
-export OPENPORCH_TOKEN=$(cat ~/openporch/platform-token)
+export OPENPORCH_TOKEN=$(cat ~/porch/platform-token)
 tofu init
 tofu apply -var external_id="$(cat external-id)"
 ```
@@ -323,7 +330,7 @@ Build the function's zip and upload it to the artifact bucket, under a key that
 names its content:
 
 ```sh
-ARTIFACT_BUCKET=$(tofu -chdir="$HOME/openporch/platform" output -raw artifact_bucket)
+ARTIFACT_BUCKET=$(tofu -chdir="$HOME/porch/platform" output -raw artifact_bucket)
 mkdir -p build && rm -f build/order-worker.zip
 (cd app && zip -X -q ../build/order-worker.zip app.py secret_refs.py)
 key="order-worker/$(openssl dgst -sha256 -r build/order-worker.zip | cut -c1-64).zip"
@@ -390,16 +397,20 @@ Once the application is gone, delete the platform. Empty the artifact bucket
 first, every version included, then destroy:
 
 ```sh
-cd ~/openporch/platform
-aws s3api list-object-versions --bucket "$ARTIFACT_BUCKET" --output json |
-  jq '{Objects: [(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}], Quiet: true}' > delete.json
-jq -e '.Objects | length > 0' delete.json >/dev/null &&
+cd ~/porch/platform
+ARTIFACT_BUCKET=$(tofu output -raw artifact_bucket)
+# A thousand versions at a time, the most one delete-objects call takes.
+while
+  aws s3api list-object-versions --bucket "$ARTIFACT_BUCKET" --max-items 1000 --output json |
+    jq '{Objects: [(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}][:1000], Quiet: true}' > delete.json
+  jq -e '.Objects | length > 0' delete.json >/dev/null
+do
   aws s3api delete-objects --bucket "$ARTIFACT_BUCKET" --delete file://delete.json
+done
 tofu destroy -var external_id="$(cat external-id)"
 ```
 
-`delete-objects` takes up to 1000 versions a call; repeat it if the bucket has
-more. Destroy the platform only after every environment is deleted: it does not
+Destroy the platform only after every environment is deleted: it does not
 remove what deployments created.
 
 ## What it costs
@@ -411,9 +422,11 @@ platform with an idle application costs a few cents a month:
 
 - Lambda, SQS, EventBridge Scheduler, SSM standard parameters and DynamoDB
   on-demand charge per request, and their free tiers cover a hobby project's
-  traffic;
+  traffic. A queue trigger polls its queue even while idle, about 650,000
+  requests a month per queue, which the SQS free tier's million covers;
 - S3 storage for the artifacts: every version is kept, so that every deployment
-  can be replayed, unless you set `artifact_noncurrent_days`;
+  can be replayed, unless you set `artifact_noncurrent_days` in
+  `terraform.tfvars.json`;
 - DynamoDB storage for what the table holds;
 - CloudWatch Logs, kept for 14 days.
 
