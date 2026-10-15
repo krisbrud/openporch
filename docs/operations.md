@@ -77,7 +77,7 @@ process, for example `TimeoutStopSec=` in a systemd unit.
 | `openporch.lock` | The ownership lock |
 | `master.key` | The master keys, unless `master_key_file` or `OPENPORCH_MASTER_KEY` names them elsewhere |
 | `opentofu/` | Run directories, the provider cache and, with the default `local` state backend, every resource's OpenTofu state. `[opentofu].root` moves it elsewhere |
-| `bootstrap-token` | The first administrator token, until it is used |
+| `bootstrap-token` | The first administrator token, until it is used, unless `bootstrap_token_file` names another place |
 
 Treat the whole directory, and the master key wherever it lives, as secret.
 With the `s3` state backend, resources' state is in the bucket instead of
@@ -89,6 +89,9 @@ To back up, stop the server and copy:
 - the OpenTofu root, when `[opentofu].root` places it outside the data
   directory, since with the `local` backend it holds every resource's state;
 - the master key, wherever it lives;
+- the bootstrap token file, while it exists and `bootstrap_token_file` places
+  it outside the data directory: a restored installation does not issue a new
+  one;
 - the configuration file, or the environment it is set through.
 
 With the `s3` backend, also note the bucket, key prefix and region from
