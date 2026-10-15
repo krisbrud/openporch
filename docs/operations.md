@@ -99,12 +99,18 @@ and `retained.json`, which records the Git source URL, path and commit the
 last apply used. Replays and deletions fetch that commit again, so a backup
 of an installation that uses Git sources also needs the commits themselves,
 in case a repository is deleted or rewritten later. Mirror each repository
-`retained.json` names alongside the copy:
+`retained.json` names alongside the copy, with every commit it records kept
+under a ref of its own, since a mirror alone holds only what the remote's
+branches and tags still reach:
 
 ```sh
-find "$OPENTOFU_ROOT" -name retained.json -exec jq -r '.source.url // empty' {} + \
-  | sort -u | while read -r url; do
-      git clone --mirror "$url" "backup/sources/$(echo "$url" | tr -c 'A-Za-z0-9.-' _)"
+find "$OPENTOFU_ROOT" -name retained.json \
+  -exec jq -r 'select(.source) | "\(.source.url) \(.source.commit)"' {} + \
+  | sort -u | while read -r url commit; do
+      dir="backup/sources/$(echo "$url" | tr -c 'A-Za-z0-9.-' _).git"
+      [ -d "$dir" ] || git init -q --bare "$dir"
+      git -C "$dir" fetch -q "$url" "$commit:refs/openporch/$commit"
+      git -C "$dir" cat-file -e "$commit^{commit}" || echo "missing $commit from $url"
     done
 ```
 

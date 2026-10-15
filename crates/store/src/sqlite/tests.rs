@@ -239,15 +239,13 @@ async fn logical_contents(dir: &std::path::Path) -> Vec<String> {
             .iter()
             .map(|r| r.get(0))
             .collect();
-    let tables: Vec<String> = sqlx::query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .iter()
-    .map(|r| r.get(0))
-    .collect();
+    let tables: Vec<String> = sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     assert!(tables.len() > 5, "{tables:?}");
     for table in tables {
         let columns: Vec<String> = sqlx::query("SELECT name FROM pragma_table_info(?)")
@@ -339,6 +337,12 @@ async fn newer_schema_is_refused_without_changes() {
             .unwrap()
     };
     assert_eq!(db(&after), db(&before));
+    assert!(
+        after
+            .iter()
+            .all(|(n, b)| n != "openporch.db-wal" || b.is_empty()),
+        "nothing was written to the log"
+    );
     // Nor did anything reach the write-ahead log: every table reads the same.
     assert_eq!(logical_contents(dir.path()).await, rows_before);
     assert!(
