@@ -9,7 +9,8 @@
 # to tfplugindocs under the short name `openporch`.
 #
 # Usage: provider/scripts/docs.sh
-# Needs `go`, `tofu` and `jq` on PATH.
+# Needs `go`, `tofu` and `jq` on PATH. CI uses OpenTofu 1.11.5; another version
+# may export a slightly different schema, which shows up as a diff in docs/.
 set -euo pipefail
 
 provider_dir=$(cd "$(dirname "$0")/.." && pwd)
@@ -40,10 +41,10 @@ tofu fmt -check -recursive "$provider_dir/examples"
 # The examples form one configuration: each refers to objects of the others.
 mkdir "$work/examples"
 n=0
-for f in $(cd "$provider_dir" && find examples -name '*.tf' | sort); do
+while IFS= read -r -d '' f; do
   n=$((n + 1))
-  cp "$provider_dir/$f" "$work/examples/$n.tf"
-done
+  cp "$f" "$work/examples/$n.tf"
+done < <(find "$provider_dir/examples" -name '*.tf' -print0)
 cat >"$work/examples/variables.tf" <<'TF'
 variable "payment_api_key" { sensitive = true }
 variable "aws_secret_access_key" { sensitive = true }

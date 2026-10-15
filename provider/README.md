@@ -185,8 +185,9 @@ build into a `filesystem_mirror` instead, as `scripts/smoke.sh` does.
 unmodified, on HashiCorp's MPL-2.0 plugin libraries (`terraform-plugin-framework`,
 `terraform-plugin-go`, `terraform-plugin-log`, `go-plugin`, `yamux` and their
 registry helpers), which every OpenTofu provider in Go needs (design D11).
-The documentation generator `terraform-plugin-docs` (MPL-2.0) is a build tool
-declared with `tool` in `go.mod` and is not part of the provider binary.
+The documentation generator `terraform-plugin-docs` and its dependency
+`hashicorp/cli` (both MPL-2.0) are build tools
+declared with `tool` in `go.mod` and are not part of the provider binary.
 MPL-2.0 is accepted for `provider/` only; check new Go dependencies by hand
 with `go list -m all` until a license check runs in CI.
 
