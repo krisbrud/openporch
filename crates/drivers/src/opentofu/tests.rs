@@ -1368,6 +1368,16 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     req.pin = Some(pin.clone());
     d.check_pin(&req).await.unwrap();
     assert_eq!(std::fs::read_to_string(&record).unwrap(), "");
+    // A source the planner could not resolve before the deployment ran
+    // cannot be checked, so the replay is refused.
+    let mut unknown = request(
+        json!({"source": {"url": "(not known before the deployment runs)", "path": "modules/pw"}}),
+        json!({}),
+    );
+    unknown.pin = Some(pin.clone());
+    let (code, message) = invalid(d.check_pin(&unknown).await.unwrap_err());
+    assert_eq!(code, "TOFU-003", "{message}");
+    assert!(message.contains("source.url"), "{message}");
     // An observation reports the version the last apply ran.
     let Observation::Ready { outputs, .. } =
         d.get(&request(values.clone(), json!({}))).await.unwrap()

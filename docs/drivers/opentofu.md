@@ -250,9 +250,9 @@ one fails with `TOFU-003`, as does one whose commit can no longer be fetched.
 Before a replay changes anything, the driver checks every recorded commit this
 way, fetching it without running OpenTofu; if one fails, its resource fails
 with that error, every other resource is left `pending`, and nothing is
-applied. A definition whose driver inputs read another resource's outputs
-cannot be checked before that resource provisions, so its failure comes when
-its turn comes. The providers the recorded lock file names are not checked
+applied. Driver inputs that read other resources' outputs are not known yet
+then; the check runs without them, and a `source` that depends on them cannot
+be checked, so the replay is refused, saying so. The providers the recorded lock file names are not checked
 ahead: one no longer available from its registry fails `tofu init` when its
 resource's turn comes. A resource recovered after a restart
 records the commit and lock file its interrupted apply started with. Replaying

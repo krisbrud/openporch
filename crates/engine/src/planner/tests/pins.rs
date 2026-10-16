@@ -85,8 +85,8 @@ async fn a_replay_whose_pinned_version_is_gone_changes_nothing() {
         .insert("postgres-commit".into());
     let outcomes = planner(&f, &fake, fast()).run(replay).await;
 
-    // Every pin was checked with its definition's driver inputs, except the
-    // route's, which come from the DNS's outputs; nothing ran.
+    // Every pin was checked with its definition's driver inputs, the DNS's
+    // outputs the route reads still unknown; nothing ran.
     let checked: BTreeSet<String> = fake
         .pin_checks
         .lock()
@@ -94,7 +94,10 @@ async fn a_replay_whose_pinned_version_is_gone_changes_nothing() {
         .iter()
         .map(|j| j.descriptor.to_string())
         .collect();
-    assert_eq!(checked, [BASE, DB, DNS, WORKLOAD].map(String::from).into());
+    assert_eq!(
+        checked,
+        [BASE, DB, DNS, ROUTE, WORKLOAD].map(String::from).into()
+    );
     let db = fake
         .pin_checks
         .lock()
@@ -105,6 +108,18 @@ async fn a_replay_whose_pinned_version_is_gone_changes_nothing() {
         .unwrap();
     assert_eq!(db.guresid.as_str(), f.active(DB).await.unwrap().guresid);
     assert_eq!(db.inputs.values["id"], db.guresid.as_str());
+    let route = fake
+        .pin_checks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|j| j.descriptor.to_string() == ROUTE)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        route.inputs.values["host"],
+        "(not known before the deployment runs)"
+    );
     assert!(fake.jobs.lock().unwrap().is_empty());
     let Outcome::Failed(reason) = &outcomes[&Descriptor::parse(DB).unwrap()] else {
         panic!("{outcomes:?}");
@@ -117,4 +132,44 @@ async fn a_replay_whose_pinned_version_is_gone_changes_nothing() {
         panic!("{outcomes:?}");
     };
     assert!(reason.contains("a version of the code"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_pin_that_cannot_be_checked_before_the_run_is_refused_saying_why() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let first = f.accept().await;
+    planner(&f, &fake, fast()).run(first.clone()).await;
+    let recorded = f
+        .store
+        .deployment_snapshot(ORG, "shop", f.env, &first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let next = f.accept().await;
+    let replay = Deployment::from_snapshot(
+        next.org.clone(),
+        next.app.clone(),
+        next.env.clone(),
+        next.env_type.clone(),
+        next.id.clone(),
+        next.set_id.clone(),
+        &recorded,
+    )
+    .unwrap();
+    // The route's driver inputs read the DNS's outputs, and its check fails.
+    let fake = Fake::with(&[]);
+    fake.lost_commits
+        .lock()
+        .unwrap()
+        .insert("route-commit".into());
+    let outcomes = planner(&f, &fake, fast()).run(replay).await;
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    let Outcome::Failed(reason) = &outcomes[&Descriptor::parse(ROUTE).unwrap()] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(
+        reason.contains("not known before the deployment runs"),
+        "{reason}"
+    );
 }

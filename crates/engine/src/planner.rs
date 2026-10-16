@@ -922,9 +922,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
 
     /// Checks that the version of the drivers' code each resource of a
     /// replay ran can still run; why each resource whose version cannot
-    /// cannot deploy. A resource whose driver inputs come from other
-    /// resources' outputs, which are not known before they provision, is left
-    /// to its driver.
+    /// cannot deploy.
     async fn check_pins(
         &self,
         deployment: &Deployment,
@@ -939,8 +937,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 continue;
             };
             let mut scope = scope_for(deployment, node, &BTreeMap::new());
-            // A resource the replay finds removed gets a new identity when it
-            // provisions; a definition that names it is left to its driver.
+            // A resource the replay finds removed gets a new identity only
+            // when it provisions.
             let guresid = match self
                 .store
                 .active_resource(
@@ -970,9 +968,18 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 scope: &scope,
                 seen: std::sync::Mutex::new(BTreeSet::new()),
             };
-            let Ok((values, secrets, secret_refs)) = driver_inputs(def, &recording) else {
-                continue;
-            };
+            // What is not known before the deployment runs, such as other
+            // resources' outputs, is checked as unknown: a version that
+            // depends on it, such as a source URL, cannot be checked and is
+            // refused.
+            let (values, secrets, secret_refs) =
+                match driver_inputs(def, &Unknown(recording.scope), &Unknown(&recording)) {
+                    Ok(inputs) => inputs,
+                    Err(e) => {
+                        missing.insert(node.descriptor.clone(), e);
+                        continue;
+                    }
+                };
             let job = ProvisionJob {
                 operation_id: format!("{}-check", deployment.id),
                 attempt: 0,
@@ -1001,11 +1008,19 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 deadline,
                 log: JobLog::discard(),
             };
+            let unknown = serde_json::to_string(&job.inputs).is_ok_and(|s| s.contains(UNKNOWN));
             let what = format!("the pinned version of `{}`", node.descriptor);
-            if let Err(reason) = self
+            if let Err(mut reason) = self
                 .check_with_retries(&what, deadline, || self.executor.check_pin(job.clone()))
                 .await
             {
+                if unknown {
+                    reason.push_str(
+                        " (some of its driver inputs come from other resources, which are not \
+                         known before the deployment runs; deploy the current configuration \
+                         instead)",
+                    );
+                }
                 missing.insert(node.descriptor.clone(), reason);
             }
         }
@@ -1542,13 +1557,14 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
 /// secrets and secret references.
 fn driver_inputs(
     def: &ResourceDefinition,
-    recording: &Recording,
+    plain: &dyn Scope,
+    recording: &dyn Scope,
 ) -> Result<(Value, Resolved, Resolved), String> {
     let at = |what: &str| format!("definition `{}`: {what}", def.id);
     let values = resolve_value(
         &Value::Object(def.driver_inputs.values.clone()),
         Dialect::Definition,
-        recording.scope,
+        plain,
         Sink::Plain,
         "driver_inputs.values",
     )
@@ -1566,6 +1582,23 @@ fn driver_inputs(
     .map_err(|e| at(&e.to_string()))?;
     let secret_refs = references(&Value::Object(def.driver_inputs.secret_refs.clone()));
     Ok((values, secrets, secret_refs))
+}
+
+/// What a placeholder not known before the deployment runs resolves to when a
+/// replay's pinned versions are checked.
+const UNKNOWN: &str = "(not known before the deployment runs)";
+
+/// A scope that resolves every placeholder its inner scope cannot to
+/// [`UNKNOWN`].
+struct Unknown<'a, S: ?Sized>(&'a S);
+
+impl<S: Scope + ?Sized> Scope for Unknown<'_, S> {
+    fn lookup(&self, expr: &Expr) -> Result<Lookup, String> {
+        Ok(self
+            .0
+            .lookup(expr)
+            .unwrap_or_else(|_| Lookup::Value(json!(UNKNOWN))))
+    }
 }
 
 /// A scope that records where each secret reference it hands out came from.
@@ -1869,7 +1902,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             scope,
             seen: std::sync::Mutex::new(BTreeSet::new()),
         };
-        let (values, secrets, secret_refs) = driver_inputs(def, &recording)?;
+        let (values, secrets, secret_refs) = driver_inputs(def, scope, &recording)?;
         let driver_account = driver_account(def, scope)?;
         // Params from a set use the set's placeholders; co-provisioning params
         // use the definition's.
