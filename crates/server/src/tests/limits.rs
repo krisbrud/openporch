@@ -15,6 +15,7 @@ use crate::Config;
 async fn limited(login: u32, tokens: u32, proxy: bool) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     config.rate_limits.login_per_minute = login;
     config.rate_limits.tokens_per_minute = tokens;
     config.tls_terminated_by_proxy = proxy;
@@ -134,6 +135,7 @@ async fn token_creation_is_limited_per_principal() {
 async fn oversized_bodies_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     config.max_body_bytes = 1024;
     let s = server_with(dir, config).await;
     let big = json!({"id": "shop", "name": "x".repeat(2048)});

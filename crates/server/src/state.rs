@@ -9,6 +9,7 @@ use std::time::Duration;
 use openporch_drivers::DriverRegistry;
 use openporch_engine::executor::LocalExecutor;
 use openporch_engine::planner::{Limits, PermitCheck, Planner};
+use openporch_engine::registry::HttpRegistry;
 use openporch_store::secrets::{BuiltinSecretStore, Keyring, MasterKey, Sealed, SecretError};
 use openporch_store::{
     AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError, UncertainOperation,
@@ -419,7 +420,7 @@ fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
         keyring.clone(),
         state.org(),
     ));
-    let executor = LocalExecutor::new(
+    let mut executor = LocalExecutor::new(
         Arc::new(store.clone()),
         registry,
         secrets,
@@ -427,6 +428,16 @@ fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
         state.cloud.clone(),
         checks.clone(),
     );
+    let images = &state.config.images;
+    if images.pin_other_registries {
+        match HttpRegistry::new(
+            images.insecure_registries.iter().cloned(),
+            images.private_registries.iter().cloned(),
+        ) {
+            Ok(registry) => executor = executor.with_registry(Arc::new(registry)),
+            Err(e) => tracing::error!(error = %e, "images in other registries are not pinned"),
+        }
+    }
     let configured = &state.config.limits;
     let limits = Limits {
         concurrency: configured.driver_concurrency,

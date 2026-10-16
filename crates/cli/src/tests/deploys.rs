@@ -444,7 +444,8 @@ async fn lose_first_deploy(lost: Arc<AtomicBool>, req: Request, next: Next) -> R
 #[tokio::test]
 async fn lost_acceptance_response_returns_the_original_deployment() {
     let data = tempfile::tempdir().unwrap();
-    let config = openporch_server::Config::new("acme", data.path());
+    let mut config = openporch_server::Config::new("acme", data.path());
+    config.images.pin_other_registries = false;
     let state = openporch_server::start(config, None).await.unwrap();
     let (router, _) = openporch_server::router(state);
     let lost = Arc::new(AtomicBool::new(false));

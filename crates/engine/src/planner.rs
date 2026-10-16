@@ -477,6 +477,31 @@ pub trait Executor: Send + Sync + 'static {
         }
     }
 
+    /// Pins `image`, an image named by tag in a registry other than ECR, to
+    /// the digest its tag points at now, as `<image>@sha256:<digest>`. An
+    /// executor that does not read such registries returns it unchanged.
+    fn pin_registry_image(
+        &self,
+        descriptor: Descriptor,
+        image: String,
+    ) -> impl Future<Output = Result<String, ExecFailure>> + Send {
+        let _ = descriptor;
+        async { Ok(image) }
+    }
+
+    /// Checks that `images`, named by digest in registries other than ECR,
+    /// still exist, before the deployment changes anything. An executor that
+    /// cannot check accepts them, and a missing one fails when its workload
+    /// deploys.
+    fn check_registry_images(
+        &self,
+        descriptor: Descriptor,
+        images: Vec<String>,
+    ) -> impl Future<Output = Result<(), ExecFailure>> + Send {
+        let _ = (descriptor, images);
+        async { Ok(()) }
+    }
+
     /// Pins `pin.image` to the digest its tag points at now, such as
     /// `<registry>/<repository>@sha256:<digest>`.
     fn pin_image(&self, pin: ImagePin) -> impl Future<Output = Result<String, ExecFailure>> + Send {
@@ -685,10 +710,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
 
     /// Checks every artifact the deployment's workloads name as an S3 object
     /// version, and every image they name as an ECR digest, with their
-    /// definitions' cloud accounts; why each workload with a missing one
-    /// cannot deploy. A workload whose definition has no
-    /// cloud account, or one that comes from resources not yet provisioned,
-    /// is left to its driver.
+    /// definitions' cloud accounts, and every image they name by digest in
+    /// another registry; why each workload with a missing one cannot deploy.
+    /// What needs a cloud account a workload's definition does not name, or
+    /// comes from resources not yet provisioned, is left to its driver.
     async fn check_artifacts(
         &self,
         deployment: &Deployment,
@@ -696,6 +721,25 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     ) -> BTreeMap<Descriptor, String> {
         let mut missing = BTreeMap::new();
         for node in deployment.graph.nodes.values() {
+            // Images in other registries need no cloud account.
+            let elsewhere: Vec<String> = images(node)
+                .into_iter()
+                .map(|(_, image)| image)
+                .filter(|i| pinned_image(i) && !in_ecr(i))
+                .collect();
+            if !elsewhere.is_empty() {
+                let what = format!("the images of `{}`", node.descriptor);
+                if let Err(reason) = self
+                    .check_with_retries(&what, deadline, || {
+                        self.executor
+                            .check_registry_images(node.descriptor.clone(), elsewhere.clone())
+                    })
+                    .await
+                {
+                    missing.insert(node.descriptor.clone(), reason);
+                    continue;
+                }
+            }
             let artifacts: Vec<String> = artifacts(node)
                 .into_iter()
                 .filter(|a| S3Version::parse(a).is_some())
@@ -820,12 +864,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         Ok(pinned)
     }
 
-    /// Pins every ECR image the deployment's workloads name by tag to the
-    /// digest the tag points at now: for each such workload, the pinned image
-    /// by its JSON pointer in the workload's node, with shared values
-    /// resolved. Images already pinned by digest are kept, and images in other
-    /// registries, or built from other resources' outputs outside ECR, are
-    /// not pinned.
+    /// Pins every image the deployment's workloads name by tag to the digest
+    /// the tag points at now: for each such workload, the pinned image by its
+    /// JSON pointer in the workload's node, with shared values resolved. ECR
+    /// images are read with the workload definition's cloud account, and
+    /// images in other registries as the executor can. Images already pinned
+    /// by digest are kept, and images built from other resources' outputs
+    /// outside ECR are not pinned.
     pub async fn pin_images(
         &self,
         deployment: &Deployment,
@@ -870,8 +915,21 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         "names a digest that is not `sha256:` and 64 hex digits: `{image}`"
                     )));
                 }
-                // Only ECR images can be read with the workload's account.
+                // Only ECR images are read with the workload's account; images
+                // in other registries are read without credentials.
                 if EcrImage::parse(&image).is_none() {
+                    let image = self
+                        .with_retries("images", &node.descriptor, deadline, || {
+                            self.executor
+                                .pin_registry_image(node.descriptor.clone(), image.clone())
+                        })
+                        .await?;
+                    if image != named {
+                        pinned
+                            .entry(node.descriptor.clone())
+                            .or_default()
+                            .insert(pointer, image);
+                    }
                     continue;
                 }
                 let (def, account) = pin_account(

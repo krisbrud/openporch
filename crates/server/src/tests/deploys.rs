@@ -1252,6 +1252,7 @@ async fn shutdown_waits_for_changes_accepted_before_it_began() {
 async fn limited(set: impl FnOnce(&mut crate::config::WorkLimits)) -> (Server, Arc<Semaphore>) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     set(&mut config.limits);
     let s = super::server_with(dir, config).await;
     let gate = s.deployable().await;

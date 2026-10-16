@@ -174,9 +174,10 @@ async fn run(file: &Path) {
     assert!(!examples.is_empty(), "{name} has no examples");
 
     let dir = tempfile::tempdir().unwrap();
-    let state = openporch_server::start(openporch_server::Config::new("acme", dir.path()), None)
-        .await
-        .unwrap();
+    let mut config = openporch_server::Config::new("acme", dir.path());
+    // The examples' registries do not exist.
+    config.images.pin_other_registries = false;
+    let state = openporch_server::start(config, None).await.unwrap();
     let token = std::fs::read_to_string(dir.path().join("bootstrap-token")).unwrap();
     let (router, _) = openporch_server::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

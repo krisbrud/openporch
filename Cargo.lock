@@ -2074,10 +2074,13 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sts",
  "aws-smithy-http-client",
+ "axum",
  "openporch-core",
  "openporch-drivers",
  "openporch-store",
  "rand 0.8.8",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2086,6 +2089,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

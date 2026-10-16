@@ -688,7 +688,8 @@ impl Sts for FakeSts {
 #[tokio::test]
 async fn account_check_returns_the_caller_identity() {
     let dir = tempfile::tempdir().unwrap();
-    let config = crate::Config::new("acme", dir.path());
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     let state = crate::start_with(config, None, std::sync::Arc::new(FakeSts))
         .await
         .unwrap();

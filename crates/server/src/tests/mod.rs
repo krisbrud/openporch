@@ -40,7 +40,9 @@ mod tls;
 mod values;
 
 async fn server_in(dir: TempDir) -> Server {
-    let config = Config::new("acme", dir.path());
+    let mut config = Config::new("acme", dir.path());
+    // Tests never reach public registries.
+    config.images.pin_other_registries = false;
     server_with(dir, config).await
 }
 
