@@ -1481,3 +1481,84 @@ async fn a_failed_operation_is_correlated_with_its_request() {
     assert!(of_request.len() >= 2, "{page}");
     assert!(!page.to_string().contains(SECRET), "{page}");
 }
+
+/// The value of the sample `name` (with its labels) in metrics `text`.
+fn sample(text: &str, name: &str) -> f64 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no `{name}` in:\n{text}"))
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn metrics_count_work_outcomes_and_storage() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    *fake.leak.lock().unwrap() = Some("hunter2-metrics".into());
+    let env_path = "/orgs/acme/apps/shop/envs/development";
+    let (_, env) = s.get(env_path, &s.admin).await;
+    let (status, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "nginx:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delta}");
+    let (status, d) = s
+        .post(
+            &format!("{env_path}/deploys"),
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": env["generation"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let d = s
+        .finished_at(&format!("{env_path}/deploys/{}", d["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(d["status"], "failed", "{d}");
+
+    let (status, text) = s.get_text("/orgs/acme/metrics", Some(&s.admin)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains("hunter2"), "{text}");
+    // Counters are process-wide and other tests run alongside, so they are
+    // at least this test's work.
+    assert!(
+        sample(
+            &text,
+            r#"openporch_deployments_finished_total{outcome="failed"}"#
+        ) >= 1.0
+    );
+    assert!(sample(&text, "openporch_deployment_run_seconds_count") >= 1.0);
+    let failed = r#"{action="provision",outcome="failed"}"#;
+    assert!(
+        sample(
+            &text,
+            &format!("openporch_driver_call_seconds_count{failed}")
+        ) >= 1.0
+    );
+    assert!(sample(&text, &format!("openporch_driver_call_seconds_sum{failed}")) >= 0.0);
+    // The rest describe this server alone.
+    assert_eq!(
+        sample(&text, r#"openporch_resources{status="failed"}"#),
+        1.0,
+        "{text}"
+    );
+    assert_eq!(sample(&text, "openporch_resources_needing_recovery"), 0.0);
+    assert_eq!(sample(&text, "openporch_deployments_queued"), 0.0);
+    assert_eq!(sample(&text, "openporch_deployments_running"), 0.0);
+    assert_eq!(sample(&text, "openporch_ready"), 1.0);
+    assert!(sample(&text, "openporch_database_bytes") > 0.0);
+    assert!(sample(&text, "openporch_audit_entries") >= 2.0);
+    assert!(sample(&text, "openporch_deployment_log_lines") >= 1.0);
+
+    // Metrics are for administrators and org viewers.
+    let member = s.member("mia", "member").await;
+    let (status, _) = s.get_text("/orgs/acme/metrics", Some(&member)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = s.get_text("/orgs/acme/metrics", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

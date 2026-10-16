@@ -9,6 +9,7 @@ mod envs;
 mod health;
 mod login;
 mod members;
+mod metrics;
 mod plans;
 mod resources;
 mod sets;
@@ -687,6 +688,13 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/audit-logs",
             Org(OrgPerm::ReadAll),
             audit::query,
+        )
+        // Metrics.
+        .route(
+            get(),
+            "/orgs/{org}/metrics",
+            Org(OrgPerm::ReadAll),
+            metrics::get,
         )
 }
 

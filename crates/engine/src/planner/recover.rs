@@ -129,12 +129,17 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     ));
                 };
                 let span = super::operation_span(&job, "observe");
+                let (started, running) = (
+                    tokio::time::Instant::now(),
+                    crate::metrics::METRICS.driver_started(),
+                );
                 let observed = self
                     .executor
                     .observe(job, deleting)
                     .instrument(span.clone())
                     .await;
-                span.in_scope(|| super::log_outcome(&observed));
+                drop(running);
+                span.in_scope(|| super::log_outcome("observe", started, &observed));
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
                     Ok(Observed::Absent { .. }) if deleting => (

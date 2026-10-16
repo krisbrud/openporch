@@ -363,19 +363,32 @@ pub(crate) fn record_operation_ids(operation: &str, guresid: &str) {
 /// result, not the recorded one: a checkpoint that fails afterwards logs
 /// "could not checkpoint an operation" and leaves the outcome unknown.
 /// Executor failures are already redacted.
-pub(crate) fn log_outcome<T>(result: &Result<T, ExecFailure>) {
-    match result {
-        Ok(_) => tracing::info!(outcome = "succeeded", "driver finished"),
+/// The call, for `action`, began at `started`; it is counted in
+/// [`crate::metrics::METRICS`].
+pub(crate) fn log_outcome<T>(
+    action: &'static str,
+    started: Instant,
+    result: &Result<T, ExecFailure>,
+) {
+    let outcome = match result {
+        Ok(_) => {
+            tracing::info!(outcome = "succeeded", "driver finished");
+            "succeeded"
+        }
         Err(ExecFailure::Permanent(e)) => {
             tracing::warn!(outcome = "failed", error = %e, "driver finished");
+            "failed"
         }
         Err(ExecFailure::Retryable { error, .. }) => {
             tracing::warn!(outcome = "retryable", error = %error, "driver finished");
+            "retryable"
         }
         Err(ExecFailure::Uncertain(e)) => {
             tracing::warn!(outcome = "unknown", error = %e, "driver finished");
+            "unknown"
         }
-    }
+    };
+    crate::metrics::METRICS.driver_finished(action, outcome, started.elapsed());
 }
 
 /// Provisions resources: resolves secrets, obtains credentials and calls drivers.
@@ -1139,10 +1152,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             Err(e) => {
                 tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
             }
-            Ok(()) => match &error {
-                None => tracing::info!(outcome = "succeeded", "deployment finished"),
-                Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
-            },
+            Ok(()) => {
+                crate::metrics::METRICS.deployment_finished(error.is_some());
+                match &error {
+                    None => tracing::info!(outcome = "succeeded", "deployment finished"),
+                    Some(e) => {
+                        tracing::warn!(outcome = "failed", error = %e, "deployment finished");
+                    }
+                }
+            }
         }
         outcomes
     }
@@ -1797,8 +1815,9 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
     /// outcome uncertain, since the driver may have changed something.
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let span = operation_span(&job, "provision");
+        let (started, _running) = (Instant::now(), crate::metrics::METRICS.driver_started());
         let result = self.provision_in_span(job).instrument(span.clone()).await;
-        span.in_scope(|| log_outcome(&result));
+        span.in_scope(|| log_outcome("provision", started, &result));
         result
     }
 

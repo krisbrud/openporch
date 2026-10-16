@@ -2,5 +2,6 @@
 
 pub mod cloud;
 pub mod executor;
+pub mod metrics;
 pub mod planner;
 pub mod preview;
