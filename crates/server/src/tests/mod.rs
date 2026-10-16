@@ -1419,6 +1419,14 @@ async fn audit_entries_expire_only_when_an_administrator_expires_them() {
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["expired"], old, "{b}");
     assert_eq!(b["dry_run"], true, "{b}");
+    assert_eq!(b["retained"]["resources"], 0, "{b}");
+    assert!(
+        b["note"]
+            .as_str()
+            .unwrap()
+            .contains("may keep costing money"),
+        "{b}"
+    );
     let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
     assert_eq!(report["audit"]["expirable"], old, "{report}");
 

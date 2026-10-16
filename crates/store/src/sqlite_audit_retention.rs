@@ -38,6 +38,19 @@ pub struct Expiry {
     pub reason: Option<String>,
 }
 
+/// What audit expiry keeps: everything but audit entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Retained {
+    /// Active resources, whose cloud counterparts may keep costing money.
+    pub resources: i64,
+    /// Active resources by driver, such as `openporch/opentofu`.
+    pub by_driver: std::collections::BTreeMap<String, i64>,
+    /// Resources whose outcome is unknown, with their recovery records.
+    pub needing_recovery: i64,
+    /// Resources whose deletion still has to be cleaned up.
+    pub cleanup_pending: i64,
+}
+
 /// The audit action an expiry records.
 pub const EXPIRY_ACTION: &str = "audit_log.expire";
 
@@ -89,5 +102,29 @@ impl SqliteStore {
             .await?;
         tx.commit().await?;
         Ok((removed, kept))
+    }
+
+    /// What expiry keeps.
+    pub async fn retained(&self) -> Result<Retained> {
+        let by_driver: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(driver_type, 'none'), COUNT(*) FROM active_resources \
+             WHERE org_id = ? GROUP BY 1",
+        )
+        .bind(self.org())
+        .fetch_all(self.pool())
+        .await?;
+        let (needing_recovery, cleanup_pending): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(status IN ('unknown', 'recovery_required')), 0), \
+             COALESCE(SUM(cleanup_pending != 0), 0) FROM active_resources WHERE org_id = ?",
+        )
+        .bind(self.org())
+        .fetch_one(self.pool())
+        .await?;
+        Ok(Retained {
+            resources: by_driver.iter().map(|(_, n)| n).sum(),
+            by_driver: by_driver.into_iter().collect(),
+            needing_recovery,
+            cleanup_pending,
+        })
     }
 }

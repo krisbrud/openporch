@@ -343,17 +343,21 @@ retention_days = 365
 To keep entries longer than that, export them before expiring:
 
 ```sh
+set -e
 BEFORE=$(porch expire-audit-logs --dry-run -o json | jq .before)
 porch audit-logs --all --to "$BEFORE" -o json > "audit-before-$BEFORE.json"
 porch expire-audit-logs --before "$BEFORE"
 ```
 
 The dry run reports `before`: entries written earlier are past the retention
-period. Passing the same `before` to the expiry removes exactly what was
+period. It also lists what expiry keeps: active resources by driver, those
+needing recovery and those awaiting cleanup, whose cloud resources keep running
+and may keep costing money until they are deleted. Passing the same `before` to the expiry removes exactly what was
 exported, even though time has passed; a `before` inside the retention period
-is refused. `porch audit-logs --all` follows every page, newest first,
-and fails rather than writing a partial export when a page cannot be
-read. Run expiry from cron or a systemd timer if you want it regular. Each
+is refused. `porch audit-logs --all -o json` follows every page, newest first, and
+writes each page as it arrives, so exports of any size fit in memory. If a page
+cannot be read the command fails and the file is left as incomplete JSON;
+check the exit status before expiring. Run expiry from cron or a systemd timer if you want it regular. Each
 expiry is recorded in the audit log (`audit_log.expire`) in the same
 transaction as the removal, so no entry disappears without a record of who
 removed it. A failed expiry removes nothing, is recorded as `failed` and shows

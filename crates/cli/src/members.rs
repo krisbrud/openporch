@@ -605,10 +605,13 @@ pub(crate) async fn audit_logs(
     args: AuditLogs,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
+    if args.all && args.output.output != Format::Json {
+        return Err("`--all` exports JSON: add `-o json`".into());
+    }
     let client = session.client()?;
     let mut before = args.before;
-    let mut entries = Vec::new();
-    let mut next = loop {
+    let mut first = true;
+    loop {
         let path = with_query(
             &format!("{}/audit-logs", org(session)?),
             &[
@@ -628,46 +631,53 @@ pub(crate) async fn audit_logs(
             .request(Method::GET, &path, None)
             .await
             .map_err(api)?;
-        if let Some(page) = page["entries"].as_array() {
-            entries.extend(page.iter().cloned());
-        }
         let next = page["next"].as_i64();
-        match next {
-            Some(seq) if args.all => before = Some(seq),
-            _ => break next,
+        if !args.all {
+            output::print(
+                io.out,
+                args.output.output,
+                &page,
+                &[
+                    ("SEQ", "seq"),
+                    ("AT", "at"),
+                    ("USER", "user_id"),
+                    ("METHOD", "method"),
+                    ("PATH", "path"),
+                    ("ACTION", "action"),
+                    ("OUTCOME", "outcome"),
+                ],
+            )?;
+            if args.output.output == Format::Table
+                && let Some(next) = next
+            {
+                writeln!(
+                    io.err,
+                    "More entries: add `--before {next}`, or `--all -o json` for every one"
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
         }
-    };
-    if args.all {
-        next = None;
+        // Each page is written as it arrives, so an export of any size
+        // needs only one page in memory. An export cut short by an error
+        // is not valid JSON, and the command fails.
+        let write = |out: &mut dyn std::io::Write, text: &str| {
+            out.write_all(text.as_bytes()).map_err(|e| e.to_string())
+        };
+        if first {
+            write(io.out, "{\"entries\": [")?;
+        }
+        for entry in page["entries"].as_array().into_iter().flatten() {
+            let text = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+            write(io.out, if first { "\n" } else { ",\n" })?;
+            write(io.out, &text)?;
+            first = false;
+        }
+        match next {
+            Some(seq) => before = Some(seq),
+            None => return write(io.out, "\n]}\n"),
+        }
     }
-    let mut page = json!({ "entries": entries });
-    if let Some(next) = next {
-        page["next"] = json!(next);
-    }
-    output::print(
-        io.out,
-        args.output.output,
-        &page,
-        &[
-            ("SEQ", "seq"),
-            ("AT", "at"),
-            ("USER", "user_id"),
-            ("METHOD", "method"),
-            ("PATH", "path"),
-            ("ACTION", "action"),
-            ("OUTCOME", "outcome"),
-        ],
-    )?;
-    if args.output.output == Format::Table
-        && let Some(next) = next
-    {
-        writeln!(
-            io.err,
-            "More entries: add `--before {next}`, or `--all` for every one"
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 pub(crate) async fn expire_audit_logs(
@@ -693,9 +703,26 @@ pub(crate) async fn expire_audit_logs(
         } else {
             "expired"
         };
+        let retained = &result["retained"];
+        let drivers: Vec<String> = retained["by_driver"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(driver, n)| format!("{n} {driver}"))
+            .collect();
         writeln!(
             io.out,
-            "{expired} entries older than {days} days {verb}; {remaining} kept"
+            "{expired} entries older than {days} days {verb}; {remaining} kept\n\
+             Kept: {} resources ({}), {} needing recovery, {} awaiting cleanup\n{}",
+            retained["resources"].as_i64().unwrap_or(0),
+            if drivers.is_empty() {
+                "none".to_owned()
+            } else {
+                drivers.join(", ")
+            },
+            retained["needing_recovery"].as_i64().unwrap_or(0),
+            retained["cleanup_pending"].as_i64().unwrap_or(0),
+            result["note"].as_str().unwrap_or_default(),
         )
         .map_err(|e| e.to_string())
     } else {

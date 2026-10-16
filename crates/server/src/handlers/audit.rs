@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::extract::State;
-use openporch_store::{AuditEntry, AuditFilter, AuditOutcome, EXPIRY_ACTION, IdentityStore, Store};
+use openporch_store::{
+    AuditEntry, AuditFilter, AuditOutcome, EXPIRY_ACTION, IdentityStore, Retained, Store,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{Ctx, JsonBody, QueryParams};
@@ -98,7 +100,15 @@ pub struct Expired {
     expired: i64,
     /// Entries kept.
     remaining: i64,
+    /// Everything else, which expiry never removes.
+    retained: Retained,
+    /// What keeping it means.
+    note: &'static str,
 }
+
+const RETAINED_NOTE: &str = "Expiry removes only audit entries. Resources, their state and \
+     recovery records, and the artifacts and secrets they reference are kept, and the cloud \
+     resources behind them keep running and may keep costing money until they are deleted.";
 
 /// Removes the entries older than the retention period, recording the
 /// expiry in the audit log in the same transaction.
@@ -120,6 +130,8 @@ pub async fn expire(
         None => start,
     };
     let retention_days = state.config.audit.retention_days;
+    // Reported before anything is removed.
+    let retained = state.store.retained().await?;
     if req.dry_run {
         let status = state.store.audit_retention(before).await?;
         return Ok(Json(Expired {
@@ -128,6 +140,8 @@ pub async fn expire(
             before,
             expired: status.expirable,
             remaining: status.entries - status.expirable,
+            retained,
+            note: RETAINED_NOTE,
         }));
     }
     let mut audit = ctx.audit(org, EXPIRY_ACTION, String::new());
@@ -143,6 +157,8 @@ pub async fn expire(
                 before,
                 expired: i64::try_from(removed).unwrap_or(i64::MAX),
                 remaining: kept,
+                retained,
+                note: RETAINED_NOTE,
             }))
         }
         Err(e) => {

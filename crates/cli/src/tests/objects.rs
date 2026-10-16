@@ -476,6 +476,9 @@ async fn members_roles_secret_stores_and_audit_logs() {
     assert!(r.err.contains("--before"), "{r:?}");
     assert_no_secret(&r, &server.admin);
     // `--all` follows the pages, for export.
+    let r = m.porch(&["audit-logs", "--all"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("-o json"), "{r:?}");
     let r = m
         .porch(&["audit-logs", "--all", "--limit", "2", "-o", "json"], "")
         .await;
@@ -491,6 +494,7 @@ async fn members_roles_secret_stores_and_audit_logs() {
             .starts_with("0 entries older than 30 days would expire"),
         "{r:?}"
     );
+    assert!(r.out.contains("may keep costing money"), "{r:?}");
     let r = m.porch(&["expire-audit-logs", "-o", "json"], "").await;
     assert_eq!(r.code, 0, "{r:?}");
     let expired: Value = serde_json::from_str(&r.out).unwrap();

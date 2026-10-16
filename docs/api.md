@@ -2312,7 +2312,9 @@ the audit log in the same transaction, and a failed expiry removes nothing and
 is recorded as `failed`. `dry_run` reports how many entries would expire and
 `before`, the time entries written earlier are past retention; export them with
 `to` set to `before`, then expire with the same `before`. A `before` inside
-the retention period is refused with `400`.
+the retention period is refused with `400`. `retained` lists what expiry keeps:
+active resources, by driver, and those needing recovery or awaiting cleanup,
+which may keep costing money until they are deleted.
 
 ```http
 POST /orgs/acme/audit-logs/expire
@@ -2330,7 +2332,9 @@ Content-Type: application/json
   "retention_days": 30,
   "before": "…",
   "expired": "…",
-  "remaining": "…"
+  "remaining": "…",
+  "retained": "…",
+  "note": "…"
 }
 ```
 
