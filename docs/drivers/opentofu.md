@@ -381,7 +381,7 @@ Deleting again after a successful delete does nothing.
 Before a deployment changes anything, the driver also checks the retained
 version of every resource the deployment will delete, such as a removed
 workload: it fetches the retained commit and runs `tofu init -backend=false`
-with the retained lock file, as for a replay's pins. If the commit can no longer
+with the retained lock file, as the deletion does. If the commit can no longer
 be fetched or a provider can no longer be installed, that resource fails with
 the error, every other resource is left `pending` and nothing is applied, so the
 deployment does not provision the rest and then fail at the deletion. A

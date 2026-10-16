@@ -19,7 +19,7 @@ use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_core::placeholder::Resolved;
 use openporch_store::{
-    ActiveResource, CheckpointResult, OperationKind, OperationStart, Store, StoreError,
+    ActiveResource, CheckpointResult, OperationKind, OperationStart, Store, StoreError, Tombstone,
 };
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -732,4 +732,53 @@ pub fn deletion_candidates(
         }
     }
     (candidates, mandatory)
+}
+
+/// The candidates of a deployment of `graph` that something staying will
+/// still use once it converges, so that the deployment keeps them rather than
+/// deletes them. Resources in the graph are excluded as users: once they
+/// provision, they use only other resources in the graph.
+pub(super) fn kept_candidates(
+    graph: &ResourceGraph,
+    active: &[ActiveResource],
+    tombstones: &[Tombstone],
+    candidates: &BTreeMap<Descriptor, ActiveResource>,
+    mandatory: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let in_graph: BTreeSet<String> = graph.nodes.keys().map(ToString::to_string).collect();
+    let mut users: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for r in active.iter().filter(|r| !in_graph.contains(&r.descriptor)) {
+        for dep in &r.dependencies {
+            users.entry(dep).or_default().insert(r.descriptor.clone());
+        }
+    }
+    // A detached resource still uses what it depended on.
+    for t in tombstones.iter().filter(|t| t.reason == "detached") {
+        for dep in t.body["dependencies"].as_array().into_iter().flatten() {
+            if let Some(dep) = dep.as_str() {
+                users.entry(dep).or_default().insert(t.descriptor.clone());
+            }
+        }
+    }
+    let names: BTreeSet<&str> = candidates.values().map(|r| r.descriptor.as_str()).collect();
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for r in candidates.values() {
+            if kept.contains(&r.descriptor) || mandatory.contains(&r.descriptor) {
+                continue;
+            }
+            let stays = users.get(r.descriptor.as_str()).is_some_and(|u| {
+                u.iter()
+                    .any(|u| !names.contains(u.as_str()) || kept.contains(u))
+            });
+            if stays {
+                kept.insert(r.descriptor.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return kept;
+        }
+    }
 }

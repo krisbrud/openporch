@@ -1328,24 +1328,30 @@ async fn a_removal_whose_retained_version_is_gone_changes_nothing() {
     let checks = Arc::new(AllowAll::default());
     deleting(&f, &fake, &checks).run(f.accept().await).await;
     let workload = f.active(WORKLOAD).await.unwrap();
-    // DB is only scheduled, so it may be kept and is not checked ahead.
+    // DB is scheduled and only the removed workload uses it, so it is deleted
+    // too and checked. DNS is scheduled, but the route that stays uses it, so
+    // it is kept and not checked.
     f.schedule(DB).await;
+    f.schedule(DNS).await;
     let fake = Fake::with(&[]);
     fake.lost_retained.lock().unwrap().insert(WORKLOAD.into());
     let deployment = f.accept_set(None, definitions()).await.unwrap();
     let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
 
     let checked = fake.retained_checks.lock().unwrap().clone();
-    assert_eq!(
-        checked
-            .iter()
-            .map(|j| j.job.descriptor.to_string())
-            .collect::<Vec<_>>(),
-        [WORKLOAD]
-    );
+    let mut names: Vec<String> = checked
+        .iter()
+        .map(|j| j.job.descriptor.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, [DB, WORKLOAD]);
     // Checked with what the workload was provisioned with.
-    assert_eq!(checked[0].job.guresid.as_str(), workload.guresid);
-    assert_eq!(checked[0].snapshot, workload.snapshot);
+    let checked = checked
+        .iter()
+        .find(|j| j.job.descriptor.to_string() == WORKLOAD)
+        .unwrap();
+    assert_eq!(checked.job.guresid.as_str(), workload.guresid);
+    assert_eq!(checked.snapshot, workload.snapshot);
     let Outcome::Failed(reason) = &outcomes[&d(WORKLOAD)] else {
         panic!("{outcomes:?}");
     };
@@ -1362,6 +1368,74 @@ async fn a_removal_whose_retained_version_is_gone_changes_nothing() {
         "{outcomes:?}"
     );
     assert!(f.active(WORKLOAD).await.is_some());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_scheduled_deletion_is_checked_unless_something_staying_uses_it() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // Kept: the retained route still uses DNS, so its lost version does not
+    // stop the deployment.
+    f.schedule(DNS).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(DNS.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert!(
+        matches!(outcomes[&d(DNS)], Outcome::Kept(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+
+    // Deleted: nothing that stays uses DB once the workload is gone, so its
+    // lost version stops the deployment before anything runs.
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    f.schedule(DB).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(DB.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    let Outcome::Failed(reason) = &outcomes[&d(DB)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("can no longer be fetched"), "{reason}");
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_removal_whose_record_is_unreadable_changes_nothing() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    sqlx::query(
+        "UPDATE active_resources SET driver_account = 'not an account' WHERE descriptor = ?",
+    )
+    .bind(WORKLOAD)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let fake = Fake::with(&[]);
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    let Outcome::Failed(reason) = &outcomes[&d(WORKLOAD)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("cloud account is invalid"), "{reason}");
+    assert!(fake.retained_checks.lock().unwrap().is_empty());
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
     assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
 }
 

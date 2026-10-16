@@ -1042,7 +1042,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 
     /// Checks that the version of the drivers' code each resource the
-    /// deployment must delete was last applied with can still run; why each
+    /// deployment deletes was last applied with can still run; why each
     /// whose version cannot stops the deployment.
     async fn check_deletions(
         &self,
@@ -1051,28 +1051,74 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     ) -> BTreeMap<Descriptor, String> {
         let d = deployment;
         let mut missing = BTreeMap::new();
+        // Without the inventory nothing can be checked, so nothing runs.
+        let unlisted = |e: &dyn std::fmt::Display| -> BTreeMap<Descriptor, String> {
+            let reason =
+                format!("the resources the deployment deletes could not be listed to check: {e}");
+            d.graph
+                .nodes
+                .keys()
+                .map(|k| (k.clone(), reason.clone()))
+                .collect()
+        };
         let active = match self
             .store
             .active_resources(d.org.as_str(), d.app.as_str(), d.env.as_str())
             .await
         {
             Ok(active) => active,
-            // The deletions report it when their turn comes.
-            Err(_) => return missing,
+            Err(e) => return unlisted(&e),
         };
-        // Only removals the deployment must complete: a resource merely
-        // scheduled for deletion may be kept, and fails only when deleted.
         let (candidates, mandatory) = deletion_candidates(&d.graph, d.teardown, &active);
+        if candidates.is_empty() {
+            return missing;
+        }
+        let kept = if candidates
+            .values()
+            .all(|r| r.cleanup_pending || mandatory.contains(&r.descriptor))
+        {
+            BTreeSet::new()
+        } else {
+            match self
+                .store
+                .tombstones(d.org.as_str(), d.app.as_str(), d.env.as_str())
+                .await
+            {
+                Ok(tombstones) => deprovision::kept_candidates(
+                    &d.graph,
+                    &active,
+                    &tombstones,
+                    &candidates,
+                    &mandatory,
+                ),
+                Err(e) => return unlisted(&e),
+            }
+        };
         for (descriptor, r) in candidates {
-            // A confirmed deletion only has its record left to remove.
-            if r.cleanup_pending || !mandatory.contains(&r.descriptor) {
+            // A confirmed deletion only has its record left to remove, and a
+            // kept resource is not deleted.
+            if r.cleanup_pending || kept.contains(&r.descriptor) {
                 continue;
             }
             let (recorded, guresid) =
                 match (deprovision::Recorded::of(&r), r.guresid.parse::<Guresid>()) {
                     (Ok(recorded), Ok(guresid)) => (recorded, guresid),
-                    // The deletion reports it when its turn comes.
-                    _ => continue,
+                    (Err(e), _) => {
+                        missing.insert(
+                            descriptor,
+                            format!("the deployment deletes this resource, but {e}"),
+                        );
+                        continue;
+                    }
+                    (_, Err(_)) => {
+                        missing.insert(
+                            descriptor,
+                            "the deployment deletes this resource, but its recorded GUResID is \
+                             invalid"
+                                .into(),
+                        );
+                        continue;
+                    }
                 };
             let job = DeprovisionJob {
                 job: ProvisionJob {
