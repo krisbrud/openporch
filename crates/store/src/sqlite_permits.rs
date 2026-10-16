@@ -401,6 +401,9 @@ impl PermitStore for SqliteStore {
         if permits.iter().any(|p| p.action == "detach") {
             check_admin_authority(&mut tx, org, Some(&issuer)).await?;
         }
+        for p in &permits {
+            check_protection(&mut tx, org, &env_type, &p.action, &issuer).await?;
+        }
         let mut records = Vec::new();
         for p in permits {
             let record = PermitRecord {
@@ -684,10 +687,49 @@ async fn issuer_lost(
     } else {
         check_env_authority(&mut *conn, org, Some(issuer), app, env_type).await
     };
+    let authority = match authority {
+        Ok(()) => check_protection(&mut *conn, org, env_type, action, issuer).await,
+        e => e,
+    };
     match authority {
         Ok(()) => Ok(None),
         Err(StoreError::Forbidden(e)) => Ok(Some(e)),
         Err(e) => Err(e),
+    }
+}
+
+/// In an environment of a protected type, a destructive permit needs an
+/// administrator, and a change of unknown impact gets none until its driver
+/// has planned it.
+async fn check_protection(
+    conn: &mut SqliteConnection,
+    org: &str,
+    env_type: &str,
+    action: &str,
+    issuer: &str,
+) -> Result<()> {
+    let protected: Option<bool> =
+        sqlx::query_scalar("SELECT protected FROM env_types WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(env_type)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if protected != Some(true) {
+        return Ok(());
+    }
+    if action == "unknown" {
+        return Err(StoreError::Forbidden(format!(
+            "environment type `{env_type}` is protected: a change whose impact its driver \
+             cannot preview gets no permit; deploy it where its driver can plan it, or remove \
+             the protection"
+        )));
+    }
+    match check_admin_authority(conn, org, Some(issuer)).await {
+        Err(StoreError::Forbidden(_)) => Err(StoreError::Forbidden(format!(
+            "environment type `{env_type}` is protected: `{issuer}` is not an administrator, \
+             which a {action} permit there needs"
+        ))),
+        other => other,
     }
 }
 

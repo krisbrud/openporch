@@ -307,6 +307,9 @@ Options:
       --org <ORG>
           The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
 
+      --protected
+          Protect its environments: destructive permits there need an administrator, and changes of unknown impact get none
+
       --app <APP>
           The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
 

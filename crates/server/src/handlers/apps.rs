@@ -382,6 +382,8 @@ pub struct CreateEnvType {
     id: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    protected: bool,
 }
 
 pub async fn create_env_type(
@@ -397,6 +399,7 @@ pub async fn create_env_type(
             org,
             &body.id,
             &body.description,
+            body.protected,
             ctx.audit(org, "env_type.create", &body.id),
         )
         .await?;
@@ -409,10 +412,14 @@ pub async fn create_env_type(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateEnvType {
-    description: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    protected: Option<bool>,
 }
 
-/// `PATCH /orgs/{org}/env-types/{type}`: changes the description.
+/// `PATCH /orgs/{org}/env-types/{type}`: changes the description, whether the
+/// type is protected, or both.
 pub async fn update_env_type(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -420,12 +427,18 @@ pub async fn update_env_type(
     JsonBody(body): JsonBody<UpdateEnvType>,
 ) -> ApiResult<Json<EnvTypeRecord>> {
     let org = state.org();
+    if body.description.is_none() && body.protected.is_none() {
+        return Err(ApiError::invalid(
+            "give `description`, `protected` or both to change",
+        ));
+    }
     state
         .store
         .update_env_type(
             org,
             &id,
-            &body.description,
+            body.description.as_deref(),
+            body.protected,
             ctx.audit(org, "env_type.update", &id),
         )
         .await?;

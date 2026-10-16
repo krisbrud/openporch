@@ -16,6 +16,7 @@ type App struct {
 type EnvType struct {
 	ID          string `json:"id"`
 	Description string `json:"description"`
+	Protected   bool   `json:"protected"`
 }
 
 // Env is an environment.
@@ -50,9 +51,10 @@ func (c *Client) RenameApp(ctx context.Context, id, name string) (*App, error) {
 }
 
 // CreateEnvType creates an environment type.
-func (c *Client) CreateEnvType(ctx context.Context, id, description string) (*EnvType, error) {
+func (c *Client) CreateEnvType(ctx context.Context, id, description string, protected bool) (*EnvType, error) {
 	var t EnvType
-	err := c.Do(ctx, http.MethodPost, c.OrgPath("env-types"), map[string]string{"id": id, "description": description}, &t)
+	body := map[string]any{"id": id, "description": description, "protected": protected}
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("env-types"), body, &t)
 	return &t, err
 }
 
@@ -63,10 +65,12 @@ func (c *Client) EnvType(ctx context.Context, id string) (*EnvType, error) {
 	return &t, err
 }
 
-// DescribeEnvType changes an environment type's description.
-func (c *Client) DescribeEnvType(ctx context.Context, id, description string) (*EnvType, error) {
+// UpdateEnvType changes an environment type's description and whether it is
+// protected.
+func (c *Client) UpdateEnvType(ctx context.Context, id, description string, protected bool) (*EnvType, error) {
 	var t EnvType
-	err := c.Do(ctx, http.MethodPatch, c.OrgPath("env-types", id), map[string]string{"description": description}, &t)
+	body := map[string]any{"description": description, "protected": protected}
+	err := c.Do(ctx, http.MethodPatch, c.OrgPath("env-types", id), body, &t)
 	return &t, err
 }
 

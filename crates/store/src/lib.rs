@@ -87,12 +87,14 @@ pub trait Store: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<AuditEntry>>> + Send;
 
-    /// Creates an environment type.
+    /// Creates an environment type, `protected` or not. The actor must be an
+    /// administrator.
     fn create_env_type(
         &self,
         org: &str,
         id: &str,
         description: &str,
+        protected: bool,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -120,12 +122,14 @@ pub trait Store: Send + Sync {
     /// Lists an application's environments.
     fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
 
-    /// Changes an environment type's description.
+    /// Changes an environment type's description, whether it is protected,
+    /// or both. The actor must be an administrator.
     fn update_env_type(
         &self,
         org: &str,
         id: &str,
-        description: &str,
+        description: Option<&str>,
+        protected: Option<bool>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 

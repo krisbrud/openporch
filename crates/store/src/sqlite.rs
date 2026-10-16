@@ -474,18 +474,20 @@ impl Store for SqliteStore {
         org: &str,
         id: &str,
         description: &str,
+        protected: bool,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         crate::identity::check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
-            "INSERT INTO env_types (org_id, id, description, created_at, created_by) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO env_types (org_id, id, description, protected, created_at, created_by) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(org)
         .bind(id)
         .bind(description)
+        .bind(protected)
         .bind(now_ms())
         .bind(&audit.actor)
         .execute(&mut *tx)
@@ -663,18 +665,23 @@ impl Store for SqliteStore {
         &self,
         org: &str,
         id: &str,
-        description: &str,
+        description: Option<&str>,
+        protected: Option<bool>,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        let res = sqlx::query("UPDATE env_types SET description = ? WHERE org_id = ? AND id = ?")
-            .bind(description)
-            .bind(org)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let res = sqlx::query(
+            "UPDATE env_types SET description = COALESCE(?, description), \
+             protected = COALESCE(?, protected) WHERE org_id = ? AND id = ?",
+        )
+        .bind(description)
+        .bind(protected)
+        .bind(org)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("environment type `{id}`")));
         }

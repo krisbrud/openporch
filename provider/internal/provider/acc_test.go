@@ -60,27 +60,34 @@ func randomID(prefix string) string {
 
 func TestAccEnvironmentType(t *testing.T) {
 	id := randomID("acc-type")
-	config := func(description string) string {
+	config := func(description string, protected bool) string {
 		return fmt.Sprintf(`
 resource "openporch_environment_type" "t" {
   id          = %q
   description = %q
+  protected   = %t
 }
-`, id, description)
+`, id, description, protected)
 	}
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { preCheck(t) },
 		ProtoV6ProviderFactories: providers,
 		Steps: []resource.TestStep{
 			{
-				Config: config("Live traffic"),
+				Config: config("Live traffic", false),
 				ConfigStateChecks: []statecheck.StateCheck{
 					statecheck.ExpectKnownValue("openporch_environment_type.t", tfjsonpath.New("description"),
 						knownvalue.StringExact("Live traffic")),
+					statecheck.ExpectKnownValue("openporch_environment_type.t", tfjsonpath.New("protected"),
+						knownvalue.Bool(false)),
 				},
 			},
 			{
-				Config: config("Live customer traffic"),
+				Config: config("Live customer traffic", true),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_environment_type.t", tfjsonpath.New("protected"),
+						knownvalue.Bool(true)),
+				},
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						plancheck.ExpectResourceAction("openporch_environment_type.t", plancheck.ResourceActionUpdate),
