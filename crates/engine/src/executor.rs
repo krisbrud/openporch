@@ -935,6 +935,13 @@ where
                  name the image by digest as `<image>@sha256:<digest>`",
                 parsed.host
             ))),
+            Ok(Lookup::Unresolved) => Err(ExecFailure::Retryable {
+                error: format!(
+                    "registry `{}` of image `{image}` does not resolve",
+                    parsed.host
+                ),
+                retry_after: None,
+            }),
             Err(e) => Err(cloud_failure(e)),
         }
     }
@@ -967,6 +974,18 @@ where
                 // registry on a private address not listed, is not checked
                 // here.
                 Ok(Lookup::Private | Lookup::Unlisted) => {}
+                Ok(Lookup::Unresolved) if pinned_from_tag(named) => {
+                    return Err(ExecFailure::Retryable {
+                        error: format!(
+                            "registry `{}` of image `{named}` of `{descriptor}` does not resolve",
+                            image.host
+                        ),
+                        retry_after: None,
+                    });
+                }
+                // One named by digest in a registry the server cannot resolve
+                // is left to its driver.
+                Ok(Lookup::Unresolved) => {}
                 Ok(Lookup::Missing) => {
                     return Err(ExecFailure::Permanent(format!(
                         "image `{named}` of `{descriptor}` no longer exists; nothing changed"

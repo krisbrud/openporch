@@ -184,7 +184,8 @@ changes anything if the registry no longer shows it without credentials.
 Registries on loopback, private or link-local addresses are not read, so an
 image name cannot make the server probe its own network, and redirects are not
 followed. A tag in such a registry is refused with `400`; an image named there
-by digest is not checked. List a registry on such an address to read it, as
+by digest is not checked, nor is one in a registry whose name the server
+cannot resolve, such as one known only inside a cluster. List a registry on such an address to read it, as
 `host[:port]` exactly as images name it. The listing covers that port only,
 and a token service the registry names is read on a private address only when
 it is listed too:

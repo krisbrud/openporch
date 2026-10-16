@@ -325,6 +325,41 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
 }
 
 #[tokio::test]
+async fn a_registry_cannot_point_its_token_service_at_a_listed_host() {
+    // `127.0.0.1:5000` is listed; a public registry names it as its realm.
+    let registry = HttpRegistry::new([], ["127.0.0.1:5000".to_owned()]).unwrap();
+    let image = OciImage::parse("ghcr.io/acme/web:1").unwrap();
+    let e = registry
+        .anonymous_token(
+            &image,
+            Some(r#"Bearer realm="https://127.0.0.1:5000/token""#),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, CloudError::Rejected(m) if m.contains("not listed")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_digest_in_a_registry_that_does_not_resolve_is_not_looked_up() {
+    let registry = HttpRegistry::new([], []).unwrap();
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let lookup = async |image: String| registry.lookup(&OciImage::parse(&image).unwrap()).await;
+    assert_eq!(
+        lookup(format!("nowhere.invalid/web@{digest}"))
+            .await
+            .unwrap(),
+        Lookup::Unresolved
+    );
+    assert!(matches!(
+        lookup("nowhere.invalid/web:1".into()).await,
+        Err(CloudError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
 async fn names_resolve_to_public_addresses_only_unless_listed() {
     use reqwest::dns::Resolve as _;
     let name = |n: &str| n.parse::<reqwest::dns::Name>().unwrap();

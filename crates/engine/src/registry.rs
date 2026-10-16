@@ -190,6 +190,18 @@ pub enum Lookup {
     /// The registry is on a private address it is not listed for, so it is
     /// not read.
     Unlisted,
+    /// The registry's name does not resolve; only digests are looked up so.
+    Unresolved,
+}
+
+/// Whether a URL may be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Yes,
+    /// On a private address that is not listed.
+    Private,
+    /// The name does not resolve.
+    Unresolved,
 }
 
 /// Reads images from registries.
@@ -375,25 +387,37 @@ impl HttpRegistry {
     }
 
     /// Whether `url` may be read: its host is listed, or is a public address
-    /// literal, or a name with a public address. A name that does not
-    /// resolve is left to the request to report; the resolver still refuses
-    /// private addresses it resolves to then.
-    async fn reachable(&self, url: &reqwest::Url, listed: bool) -> bool {
+    /// literal, or a name with a public address. The resolver still refuses
+    /// private addresses a name resolves to when it is read.
+    async fn reachable(&self, url: &reqwest::Url, listed: bool) -> Reach {
         if listed {
-            return true;
+            return Reach::Yes;
         }
+        let public = |ip| {
+            if is_public(ip) {
+                Reach::Yes
+            } else {
+                Reach::Private
+            }
+        };
         match url.host() {
-            Some(url::Host::Ipv4(ip)) => is_public(IpAddr::V4(ip)),
-            Some(url::Host::Ipv6(ip)) => is_public(IpAddr::V6(ip)),
+            Some(url::Host::Ipv4(ip)) => public(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => public(IpAddr::V6(ip)),
             Some(url::Host::Domain(name)) => {
                 match tokio::net::lookup_host((name, url.port_or_known_default().unwrap_or(443)))
                     .await
                 {
-                    Ok(mut addrs) => addrs.any(|a| is_public(a.ip())),
-                    Err(_) => true,
+                    Ok(mut addrs) => {
+                        if addrs.any(|a| is_public(a.ip())) {
+                            Reach::Yes
+                        } else {
+                            Reach::Private
+                        }
+                    }
+                    Err(_) => Reach::Unresolved,
                 }
             }
-            None => false,
+            None => Reach::Private,
         }
     }
 
@@ -428,8 +452,16 @@ impl HttpRegistry {
         );
         let parsed = reqwest::Url::parse(&url)
             .map_err(|_| CloudError::Rejected(format!("`{image}` names no valid registry")))?;
-        if !self.reachable(&parsed, self.private.contains(host)).await {
-            return Ok(Lookup::Unlisted);
+        match self.reachable(&parsed, self.private.contains(host)).await {
+            Reach::Yes => {}
+            Reach::Private => return Ok(Lookup::Unlisted),
+            // A digest in a registry the server cannot even resolve, such as
+            // one only a cluster knows, is left to its driver; a tag's lookup
+            // reports the failure.
+            Reach::Unresolved if matches!(image.reference, Reference::Digest(_)) => {
+                return Ok(Lookup::Unresolved);
+            }
+            Reach::Unresolved => {}
         }
         let unavailable = |e: reqwest::Error| unreachable_registry(host, &e);
         let request = |method: reqwest::Method, token: Option<&str>| {
@@ -572,7 +604,7 @@ impl HttpRegistry {
         if realm.scheme() != "https" && !insecure {
             return Ok(None);
         }
-        if !self.reachable(&realm, listed).await {
+        if self.reachable(&realm, listed).await == Reach::Private {
             return Err(CloudError::Rejected(format!(
                 "the token service of registry `{}` is on a private address that is not listed \
                  for it",
