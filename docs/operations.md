@@ -333,16 +333,21 @@ database schema version <found> is newer than this binary supports (up to <suppo
 run a compatible openporch version or restore a compatible backup
 ```
 
-Each build reads and writes exactly one schema version, its newest migration,
-and `openporch version` names the release and that schema version, as in
-`openporch 0.1.0 (schema 9)`. A newer schema is never opened by
-an older build, even when the newer migrations only added columns: no
-downgrade pair is supported. The tested pairs are:
+Each build runs on one schema version, its newest migration, and migrates
+older databases forward to it on start. `openporch version` names the release
+and that schema version, as in `openporch 0.1.0 (schema 9)`. A newer schema is
+never opened by an older build, even when the newer migrations only added
+columns: no downgrade pair is supported. The tested pairs are:
 
-| Schema written by | Upgraded by this build | Opened by an older build |
+| Schema written by | Upgraded to schema 9 | Opened by the build of the schema before |
 | --- | --- | --- |
-| 8 (milestone 1 before protected environment types) | yes, tested from a fixture | not applicable |
-| 9 (protected environment types) | yes, tested from a fixture | refused before any write, tested |
+| 8 (milestone 1 before protected environment types) | yes, from a fixture | refused, simulated |
+| 9 (protected environment types) | not applicable | refused, simulated, and checked once by running the schema 8 build |
+
+A refused start writes nothing to the database; it only takes the
+installation lock. "Simulated" means a test runs the current build's version
+check with the older version, which is the check every build since the schema
+guard runs before it migrates.
 
 Every schema version a build ships gets a fixture in
 `crates/server/fixtures/schema`: a data directory that build wrote, which every

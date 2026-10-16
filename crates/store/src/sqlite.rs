@@ -225,13 +225,14 @@ fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
         .busy_timeout(std::time::Duration::from_secs(5))
 }
 
-/// Connects to the database at `path` as [`SqliteStore::open`] does and checks
-/// whether a build whose schema version is `supported` could open it, which
-/// is how a test plays an older build.
+/// Connects to the existing database at `path` as [`SqliteStore::open`] does
+/// and checks whether a build whose schema version is `supported` could open
+/// it, which is how a test plays an older build.
+#[doc(hidden)]
 pub async fn check_schema(path: &std::path::Path, supported: i64) -> Result<()> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(connect_options(path))
+        .connect_with(connect_options(path).create_if_missing(false))
         .await?;
     let checked = check_schema_version(&pool, supported).await;
     pool.close().await;

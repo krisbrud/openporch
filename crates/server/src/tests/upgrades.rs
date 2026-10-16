@@ -281,6 +281,11 @@ fn schema_version(dir: &Path) -> i64 {
 #[ignore = "writes a fixture; run when a release changes the schema"]
 async fn write_schema_fixture() {
     let out = PathBuf::from(std::env::var("OPENPORCH_SCHEMA_FIXTURE").unwrap());
+    assert!(
+        !out.exists(),
+        "{} exists: a fixture records what an older build wrote, so it is never rewritten",
+        out.display()
+    );
     let s = server().await;
     populate(&s).await;
     let observed = observe(&s).await;
@@ -358,6 +363,8 @@ async fn every_schema_fixture_upgrades_to_this_build() {
             serde_json::from_str(&std::fs::read_to_string(fixture.join("observed.json")).unwrap())
                 .unwrap();
         let actual = observe(&s).await;
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&expected), keys(&actual), "fixture {version}");
         contains(&expected, &actual, "")
             .unwrap_or_else(|e| panic!("fixture {version} after upgrade: {e}"));
         assert_eq!(read_secret(&s, "shop/key").await, "fixture-secret");
@@ -386,7 +393,9 @@ async fn every_schema_fixture_upgrades_to_this_build() {
 }
 
 /// A build that knows only the schema before a fixture's refuses that
-/// fixture, before it changes anything, and names the way out.
+/// fixture, before it changes anything, and names the way out. The older build
+/// is played by this build's check with the older version: every build since
+/// the schema guard checks the version this way before it migrates.
 #[tokio::test]
 async fn an_older_build_refuses_every_newer_fixture_unchanged() {
     let dirs = fixture_dirs();
