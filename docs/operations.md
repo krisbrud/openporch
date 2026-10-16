@@ -68,6 +68,40 @@ Set `RUST_LOG` to change the level, for example `RUST_LOG=info,openporch_engine=
 The request, deployment and operation fields stay on every line at any level,
 `RUST_LOG=warn` included.
 
+## Metrics
+
+`GET /orgs/{org}/metrics` returns metrics in the Prometheus text format. It
+needs a token for an administrator or org viewer, for example a service user
+with the `orgViewer` role. The server sends nothing anywhere on its own; a
+scraper has to ask.
+
+```yaml
+scrape_configs:
+  - job_name: openporch
+    metrics_path: /orgs/acme/metrics
+    authorization:
+      credentials_file: /etc/prometheus/openporch-token
+    static_configs:
+      - targets: ["openporch.example.com:8080"]
+```
+
+| Metric | What it measures |
+| --- | --- |
+| `openporch_deployments_queued`, `openporch_deployments_running`, `openporch_deployments_capacity` | Accepted deployments waiting for room, running now, and how many may run at once |
+| `openporch_deployments_finished_total{outcome}` | Finished deployments, `succeeded` or `failed` |
+| `openporch_deployment_run_seconds_sum`, `_count` | How long deployments ran |
+| `openporch_driver_calls_running`, `openporch_driver_concurrency` | Driver calls running now, and the limit |
+| `openporch_driver_call_seconds_sum`, `_count{action,outcome}` | Finished driver calls and their duration; `outcome="retryable"` counts the calls that were retried |
+| `openporch_resources{status}` | Active resources by status |
+| `openporch_resources_needing_recovery` | Resources with an unknown outcome; see [`porch resources recover`](cli.md#porch-resources-recover) |
+| `openporch_database_bytes`, `openporch_database_wal_bytes`, `openporch_database_free_bytes` | The database's files on disk (write-ahead log included), the write-ahead log alone, and the free space inside the database |
+| `openporch_audit_entries`, `openporch_deployment_log_lines` | Stored audit entries and deployment log lines |
+| `openporch_ready`, `openporch_build_info{version}` | Readiness, as `/readyz` reports it, and the version |
+
+Counters start at zero when the server starts. Alert on
+`openporch_resources_needing_recovery > 0`, on deployments that stay queued,
+and on `openporch_database_bytes` approaching the free space of the disk.
+
 ## Limits
 
 The server bounds the work it takes on, so a burst of deployments cannot use

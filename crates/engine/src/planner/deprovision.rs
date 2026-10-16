@@ -606,8 +606,9 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
     /// outcome uncertain.
     async fn execute(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let span = super::operation_span(&job.job, "delete");
+        let (started, _running) = (Instant::now(), crate::metrics::METRICS.driver_started());
         let result = self.execute_in_span(job).instrument(span.clone()).await;
-        span.in_scope(|| super::log_outcome(&result));
+        span.in_scope(|| super::log_outcome("delete", started, &result));
         result
     }
 

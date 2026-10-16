@@ -164,6 +164,8 @@ struct Fake {
     observations: Mutex<BTreeMap<String, Observed>>,
     /// The descriptors observed, in order.
     observed: Mutex<Vec<String>>,
+    /// Whether observations panic.
+    observe_panics: std::sync::atomic::AtomicBool,
 }
 
 /// The secret references in `r`.
@@ -474,6 +476,12 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push(job.descriptor.to_string());
+        assert!(
+            !self
+                .observe_panics
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the driver crashed while observing"
+        );
         if let Some(observed) = self.observations.lock().unwrap().get(&ty) {
             return Ok(observed.clone());
         }

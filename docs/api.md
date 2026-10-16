@@ -2303,6 +2303,27 @@ Authorization: Bearer $ADMIN_TOKEN
 }
 ```
 
+## Metrics
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/orgs/{org}/metrics` | org read all |
+
+Returns metrics in the Prometheus text format: queued and running deployments,
+deployment and driver call outcomes and durations, resources by status and
+storage use. [Operations](operations.md#metrics) lists them.
+
+```http
+GET /orgs/acme/metrics
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+"…"
+```
+
 ## Deleting
 
 Deletes return `204` and refuse with `409` while something still uses the object.

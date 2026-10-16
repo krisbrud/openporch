@@ -305,6 +305,9 @@ pub async fn start_with(
     };
 
     let report = store.recover_interrupted().await?;
+    for _ in &report.failed_deployments {
+        openporch_engine::metrics::METRICS.deployment_finished(true);
+    }
     if !report.failed_deployments.is_empty() || !report.uncertain.is_empty() {
         tracing::warn!(
             failed_deployments = report.failed_deployments.len(),

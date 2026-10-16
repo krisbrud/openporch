@@ -111,6 +111,23 @@ impl Server {
         (status, value)
     }
 
+    /// Gets `path` as text.
+    async fn get_text(&self, path: &str, token: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().method(Method::GET).uri(path);
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let res = self
+            .router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
     async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
         self.call(Method::GET, path, Some(token), None).await
     }

@@ -6,6 +6,7 @@
 //! default runner fails every deployment it is handed, which keeps the
 //! environment free for the next one.
 
+use openporch_engine::metrics::METRICS;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -268,6 +269,18 @@ pub(crate) async fn planned(
     Ok(deployment)
 }
 
+/// Runs deployment `run`, counting how long it took, even if it panics.
+async fn timed(run: impl Future<Output = ()>) {
+    struct Ran(std::time::Instant);
+    impl Drop for Ran {
+        fn drop(&mut self) {
+            METRICS.deployment_ran(self.0.elapsed());
+        }
+    }
+    let _ran = Ran(std::time::Instant::now());
+    run.await;
+}
+
 /// Finishes `job`'s deployment, which ends its log with the outcome; a
 /// failure to record it leaves the deployment running until restart recovery
 /// fails it.
@@ -290,8 +303,12 @@ pub fn log_finished(id: &str, finished: Result<(), String>, error: Option<&str>)
         (Err(e), _) => {
             tracing::error!(deployment = %id, error = %e, "could not finish a deployment");
         }
-        (Ok(()), None) => tracing::info!(outcome = "succeeded", "deployment finished"),
+        (Ok(()), None) => {
+            METRICS.deployment_finished(false);
+            tracing::info!(outcome = "succeeded", "deployment finished");
+        }
         (Ok(()), Some(e)) => {
+            METRICS.deployment_finished(true);
             tracing::warn!(outcome = "failed", error = %e, "deployment finished");
         }
     }
@@ -309,6 +326,8 @@ pub struct Runners {
     /// One permit per deployment that may run or wait at once.
     slots: Arc<tokio::sync::Semaphore>,
     capacity: usize,
+    /// Accepted deployments waiting for a slot.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Room for one more running deployment, taken before it is accepted and
@@ -336,6 +355,7 @@ impl Runners {
             stopped: tokio::sync::Notify::new(),
             slots: Arc::new(tokio::sync::Semaphore::new(capacity.max(1))),
             capacity: capacity.max(1),
+            queued: Arc::default(),
         }
     }
 
@@ -417,6 +437,11 @@ impl Runners {
         }
     }
 
+    /// How many accepted deployments wait for a slot.
+    pub fn queued(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many deployments may run at once.
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -432,6 +457,7 @@ impl Runners {
             .insert(key.clone());
         let runner = self.current();
         let slots = self.slots.clone();
+        let queued = self.queued.clone();
         // Every event the deployment logs, the planner's and drivers'
         // included, names it and the request that accepted it.
         // Spans are at error level so they stay on whatever `RUST_LOG` hides.
@@ -449,11 +475,12 @@ impl Runners {
                 let _slot = match slot {
                     Some(slot) => Some(slot),
                     // The semaphore is never closed; were it, the job runs anyway.
-                    None => slots
-                        .acquire_owned()
-                        .await
-                        .ok()
-                        .map(|p| Slot { _permit: p }),
+                    None => {
+                        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let slot = slots.acquire_owned().await.ok();
+                        queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        slot.map(|p| Slot { _permit: p })
+                    }
                 };
                 // A job that waited for room does not start once the server is
                 // stopping: it has changed nothing, so it fails and can be repeated.
@@ -468,9 +495,11 @@ impl Runners {
                         ),
                     )
                     .await;
-                } else if tokio::spawn(runner.run(state.clone(), job.clone()).instrument(inner))
-                    .await
-                    .is_err()
+                } else if tokio::spawn(
+                    timed(runner.run(state.clone(), job.clone())).instrument(inner),
+                )
+                .await
+                .is_err()
                 {
                     // A runner that panics must not leave the environment blocked.
                     finish(

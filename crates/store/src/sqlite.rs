@@ -26,6 +26,23 @@ pub struct SqliteStore {
     ownership: Arc<Ownership>,
 }
 
+/// What [`SqliteStore::stats`] counts.
+#[derive(Debug, Clone, Default)]
+pub struct StoreStats {
+    /// Active resources by status.
+    pub resources: std::collections::BTreeMap<String, i64>,
+    /// The database's files on disk, its write-ahead log included.
+    pub database_bytes: i64,
+    /// The write-ahead log, which a checkpoint folds into the database.
+    pub wal_bytes: i64,
+    /// The database's free pages, which new data reuses.
+    pub free_bytes: i64,
+    /// Audit log entries.
+    pub audit_entries: i64,
+    /// Deployment log lines.
+    pub log_lines: i64,
+}
+
 impl SqliteStore {
     /// Opens (creating if needed) `openporch.db` in the owned data directory, applies
     /// migrations, records the owner and makes sure the organization, the default
@@ -131,6 +148,50 @@ impl SqliteStore {
     pub async fn ping(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Counts for the server's metrics: how much is stored and in what state.
+    pub async fn stats(&self) -> Result<StoreStats> {
+        let resources: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM active_resources WHERE org_id = ? GROUP BY status",
+        )
+        .bind(&self.org)
+        .fetch_all(&self.pool)
+        .await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let free: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let audit_entries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE org_id = ?")
+                .bind(&self.org)
+                .fetch_one(&self.pool)
+                .await?;
+        let log_lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE org_id = ?")
+            .bind(&self.org)
+            .fetch_one(&self.pool)
+            .await?;
+        // The files, not the pages: the write-ahead log grows on its own
+        // while checkpoints are held up.
+        let size = |name: &str| {
+            std::fs::metadata(self.ownership.dir().join(name))
+                .map_or(0, |m| i64::try_from(m.len()).unwrap_or(i64::MAX))
+        };
+        let wal_bytes = size("openporch.db-wal");
+        let database_bytes = size("openporch.db").max(pages * page_size) + wal_bytes;
+        Ok(StoreStats {
+            resources: resources.into_iter().collect(),
+            database_bytes,
+            wal_bytes,
+            free_bytes: free * page_size,
+            audit_entries,
+            log_lines,
+        })
     }
 
     /// Whether the installation was created by this start, i.e. it has no principals yet.
