@@ -85,8 +85,8 @@ pub async fn backup(config: &Config, dest: &Path) -> Result<Manifest, BackupErro
             config.data_dir.display()
         )));
     }
-    prepare_empty(dest)?;
     let ownership = Ownership::acquire(&config.data_dir)?;
+    prepare_empty(dest)?;
     let data = dest.join(DATA);
     create_private_dir(&data)?;
     let copy = openporch_store::copy_database(&ownership, &data.join("openporch.db")).await?;
