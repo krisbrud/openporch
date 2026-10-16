@@ -605,6 +605,43 @@ async fn real_artifact_check() {
 }
 
 #[test]
+fn ecr_images_pinned_to_digests_are_recognized() {
+    let hex = "0F".repeat(32);
+    let image = EcrDigest::parse(&format!(
+        "111122223333.dkr.ecr-fips.us-east-1.amazonaws.com/team/web@sha256:{hex}"
+    ))
+    .unwrap();
+    assert_eq!(
+        (image.account.as_str(), image.region.as_str(), image.fips),
+        ("111122223333", "us-east-1", true)
+    );
+    assert_eq!(image.repository, "team/web");
+    assert_eq!(image.digest, format!("sha256:{}", "0f".repeat(32)));
+    assert_eq!(
+        image.to_string(),
+        format!(
+            "111122223333.dkr.ecr-fips.us-east-1.amazonaws.com/team/web@sha256:{}",
+            "0f".repeat(32)
+        )
+    );
+    // A tag before the digest is dropped.
+    let tagged = EcrDigest::parse(&format!(
+        "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web:1@sha256:{hex}"
+    ))
+    .unwrap();
+    assert_eq!(tagged.repository, "web");
+    // Tags, other registries and malformed digests are not.
+    for image in [
+        "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web:1".to_owned(),
+        format!("docker.io/library/nginx@sha256:{hex}"),
+        "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web@sha256:abc".to_owned(),
+        format!("111122223333.dkr.ecr.eu-west-1.amazonaws.com/@sha256:{hex}"),
+    ] {
+        assert_eq!(EcrDigest::parse(&image), None, "{image}");
+    }
+}
+
+#[test]
 fn ecr_images_named_by_tag_are_recognized() {
     let image =
         EcrImage::parse("111122223333.dkr.ecr.eu-west-1.amazonaws.com/team/web:1.2").unwrap();

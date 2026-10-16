@@ -24,7 +24,8 @@ use serde_json::json;
 
 use super::*;
 use crate::cloud::{
-    AssumeRole, AwsCredentials, CallerIdentity, EcrImage, Latest, S3Object, S3Version, Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, EcrDigest, EcrImage, Latest, S3Object, S3Version,
+    Sts,
 };
 use crate::planner::{
     Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
@@ -290,6 +291,19 @@ impl Sts for FakeSts {
         let digest = (image.repository == "web" && image.tag == "1")
             .then(|| format!("sha256:{}", "ab".repeat(32)));
         Box::pin(async move { Ok(digest) })
+    }
+    /// Every digest exists except one of zeros.
+    fn image_exists<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrDigest,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .push((Some(credentials.access_key_id.clone()), image.to_string()));
+        let exists = image.digest != format!("sha256:{}", "0".repeat(64));
+        Box::pin(async move { Ok(exists) })
     }
 }
 
@@ -1315,6 +1329,30 @@ async fn pinned_artifacts_are_checked_with_the_workloads_account() {
     );
     assert_eq!(checked().len(), 2);
 
+    // An ECR image pinned to a digest is checked too; one named by tag, or in
+    // another registry, is not.
+    let ecr = "111122223333.dkr.ecr.eu-west-1.amazonaws.com/web";
+    let kept = format!("{ecr}@sha256:{}", "ab".repeat(32));
+    executor
+        .check_artifacts(check(&[
+            &kept,
+            &format!("{ecr}:1"),
+            &format!("docker.io/library/nginx@sha256:{}", "0".repeat(64)),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(checked()[2..], [(Some("AKIATEST".to_owned()), kept)]);
+    let deleted = format!("{ecr}@sha256:{}", "0".repeat(64));
+    let failure = executor
+        .check_artifacts(check(&[&deleted]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&failure, ExecFailure::Permanent(e)
+            if e.contains(&format!("image `{deleted}`")) && e.contains("no longer exists")),
+        "{failure:?}"
+    );
+
     // A definition that no longer matches does not get its account.
     sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
         .execute(f.store.pool())
@@ -1328,7 +1366,7 @@ async fn pinned_artifacts_are_checked_with_the_workloads_account() {
         matches!(&failure, ExecFailure::Permanent(e) if e.contains("no longer matches")),
         "{failure:?}"
     );
-    assert_eq!(checked().len(), 2);
+    assert_eq!(checked().len(), 4);
 }
 
 #[tokio::test]

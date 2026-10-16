@@ -374,6 +374,61 @@ impl fmt::Display for EcrImage {
     }
 }
 
+/// A container image in an Amazon ECR repository pinned to a content digest,
+/// as `<registry>/<repository>@sha256:<64 hex>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcrDigest {
+    /// The registry host.
+    pub registry: String,
+    /// The account that owns the registry.
+    pub account: String,
+    /// The registry's region.
+    pub region: String,
+    /// Whether the registry is a FIPS endpoint, so ECR is asked through one.
+    pub fips: bool,
+    /// The repository.
+    pub repository: String,
+    /// The digest, `sha256:<64 hex>`.
+    pub digest: String,
+}
+
+impl EcrDigest {
+    /// `image` as an ECR image pinned to a digest; `None` for an image named
+    /// by tag, or one in another registry.
+    pub fn parse(image: &str) -> Option<Self> {
+        if !pinned_image(image) {
+            return None;
+        }
+        let (name, hex) = image.rsplit_once("@sha256:")?;
+        let (registry, repository) = name.split_once('/')?;
+        let (account, region, fips) = ecr_registry(registry)?;
+        // A tag before the digest is ignored by registries; ECR is asked by
+        // digest alone.
+        let last = repository.rsplit('/').next().unwrap_or(repository);
+        let repository = match last.rsplit_once(':') {
+            Some((_, tag)) => &repository[..repository.len() - tag.len() - 1],
+            None => repository,
+        };
+        if repository.is_empty() || repository.ends_with('/') {
+            return None;
+        }
+        Some(Self {
+            registry: registry.to_owned(),
+            account,
+            region,
+            fips,
+            repository: repository.to_owned(),
+            digest: format!("sha256:{}", hex.to_ascii_lowercase()),
+        })
+    }
+}
+
+impl fmt::Display for EcrDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}@{}", self.registry, self.repository, self.digest)
+    }
+}
+
 /// Whether `image` is pinned to a content digest (`...@sha256:<64 hex>`),
 /// which names the same content wherever it is pulled from.
 pub fn pinned_image(image: &str) -> bool {
@@ -424,6 +479,17 @@ pub trait Sts: Send + Sync {
         credentials: &'a AwsCredentials,
         image: &'a EcrImage,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        let _ = (credentials, image);
+        Box::pin(async { Err(CloudError::Unavailable("ECR cannot be reached".into())) })
+    }
+
+    /// Whether `image`'s digest is still in its repository, read with
+    /// `credentials`.
+    fn image_exists<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrDigest,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
         let _ = (credentials, image);
         Box::pin(async { Err(CloudError::Unavailable("ECR cannot be reached".into())) })
     }
@@ -547,6 +613,19 @@ impl CredentialResolver {
     ) -> Result<Option<String>, CloudError> {
         self.sts
             .image_digest(credentials, image)
+            .await
+            .map_err(|e| redacted(e, credentials))
+    }
+
+    /// Whether `image`'s digest is still in its repository, read with
+    /// `credentials`.
+    pub async fn image_exists(
+        &self,
+        credentials: &AwsCredentials,
+        image: &EcrDigest,
+    ) -> Result<bool, CloudError> {
+        self.sts
+            .image_exists(credentials, image)
             .await
             .map_err(|e| redacted(e, credentials))
     }

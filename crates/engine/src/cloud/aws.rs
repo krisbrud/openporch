@@ -13,8 +13,8 @@ use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
 use super::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrImage, Latest, S3Object, S3Version,
-    Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrDigest, EcrImage, Latest, S3Object,
+    S3Version, Sts,
 };
 
 /// The region STS is called in when neither the account nor the host names one.
@@ -91,14 +91,14 @@ impl AwsSts {
         aws_sdk_s3::Client::from_conf(config.build())
     }
 
-    /// An ECR client for `image`'s region, through a FIPS endpoint for a
-    /// FIPS registry, with `credentials`.
-    async fn ecr(&self, image: &EcrImage, credentials: Credentials) -> aws_sdk_ecr::Client {
+    /// An ECR client for `region`, through a FIPS endpoint for a FIPS
+    /// registry, with `credentials`.
+    async fn ecr(&self, region: &str, fips: bool, credentials: Credentials) -> aws_sdk_ecr::Client {
         let host = self.host().await;
         let mut config = aws_sdk_ecr::config::Builder::from(host)
-            .region(Region::new(image.region.clone()))
+            .region(Region::new(region.to_owned()))
             .credentials_provider(credentials);
-        if image.fips {
+        if fips {
             config = config.use_fips(true);
         }
         aws_sdk_ecr::Client::from_conf(config.build())
@@ -234,7 +234,9 @@ impl Sts for AwsSts {
         image: &'a EcrImage,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
-            let client = self.ecr(image, provider(credentials)).await;
+            let client = self
+                .ecr(&image.region, image.fips, provider(credentials))
+                .await;
             let id = aws_sdk_ecr::types::ImageIdentifier::builder()
                 .image_tag(&image.tag)
                 .build();
@@ -275,6 +277,51 @@ impl Sts for AwsSts {
                 .first()
                 .and_then(|d| d.image_digest())
                 .map(str::to_owned))
+        })
+    }
+
+    fn image_exists<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrDigest,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        Box::pin(async move {
+            let client = self
+                .ecr(&image.region, image.fips, provider(credentials))
+                .await;
+            let id = aws_sdk_ecr::types::ImageIdentifier::builder()
+                .image_digest(&image.digest)
+                .build();
+            match client
+                .describe_images()
+                .registry_id(&image.account)
+                .repository_name(&image.repository)
+                .image_ids(id)
+                .send()
+                .await
+            {
+                Ok(out) => Ok(!out.image_details().is_empty()),
+                Err(SdkError::ServiceError(e))
+                    if matches!(
+                        e.err().code(),
+                        Some("ImageNotFoundException" | "RepositoryNotFoundException")
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(SdkError::ServiceError(e)) => {
+                    let err = e.err();
+                    Err(CloudError::Rejected(format!(
+                        "ECR DescribeImages of `{image}` failed: {}: {}",
+                        err.code().unwrap_or("Unknown"),
+                        err.message().unwrap_or("no message")
+                    )))
+                }
+                Err(e) => Err(CloudError::Unavailable(format!(
+                    "ECR DescribeImages of `{image}` failed: {}",
+                    DisplayErrorContext(&e)
+                ))),
+            }
         })
     }
 }

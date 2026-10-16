@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::cloud::{EcrImage, S3Object, S3Version, in_ecr, pinned_image};
+use crate::cloud::{EcrDigest, EcrImage, S3Object, S3Version, in_ecr, pinned_image};
 
 mod deprovision;
 mod log;
@@ -549,7 +549,8 @@ pub struct ArtifactCheck {
     /// The cloud account the workload's driver gets credentials for, which
     /// reads the artifacts.
     pub account: AccountId,
-    /// The artifact URIs, such as `s3://bucket/key?versionId=v`.
+    /// The artifact URIs, such as `s3://bucket/key?versionId=v`, and the
+    /// images pinned to digests in ECR.
     pub artifacts: Vec<String>,
 }
 
@@ -683,8 +684,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
     }
 
     /// Checks every artifact the deployment's workloads name as an S3 object
-    /// version, with their definitions' cloud accounts; why each workload
-    /// with a missing one cannot deploy. A workload whose definition has no
+    /// version, and every image they name as an ECR digest, with their
+    /// definitions' cloud accounts; why each workload with a missing one
+    /// cannot deploy. A workload whose definition has no
     /// cloud account, or one that comes from resources not yet provisioned,
     /// is left to its driver.
     async fn check_artifacts(
@@ -697,6 +699,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             let artifacts: Vec<String> = artifacts(node)
                 .into_iter()
                 .filter(|a| S3Version::parse(a).is_some())
+                .chain(
+                    images(node)
+                        .into_iter()
+                        .map(|(_, image)| image)
+                        .filter(|i| EcrDigest::parse(i).is_some()),
+                )
                 .collect();
             if artifacts.is_empty() {
                 continue;
