@@ -6,6 +6,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -26,6 +27,15 @@ func newEnvironmentType() resource.Resource { return &environmentType{} }
 type environmentTypeModel struct {
 	ID          types.String `tfsdk:"id"`
 	Description types.String `tfsdk:"description"`
+	Protected   types.Bool   `tfsdk:"protected"`
+}
+
+func environmentTypeState(t *client.EnvType) environmentTypeModel {
+	return environmentTypeModel{
+		ID:          types.StringValue(t.ID),
+		Description: types.StringValue(t.Description),
+		Protected:   types.BoolValue(t.Protected),
+	}
 }
 
 func (r *environmentType) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -49,6 +59,14 @@ func (r *environmentType) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Default:             stringdefault.StaticString(""),
 				MarkdownDescription: "A description.",
 			},
+			"protected": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+				MarkdownDescription: "Whether environments of this type are protected: a permit to delete, replace or " +
+					"detach resources there needs an administrator, and a change whose impact its driver " +
+					"cannot preview gets no permit. Only administrators change it.",
+			},
 		},
 	}
 }
@@ -63,14 +81,12 @@ func (r *environmentType) Create(ctx context.Context, req resource.CreateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	t, err := r.client.CreateEnvType(ctx, plan.ID.ValueString(), plan.Description.ValueString())
+	t, err := r.client.CreateEnvType(ctx, plan.ID.ValueString(), plan.Description.ValueString(), plan.Protected.ValueBool())
 	if err != nil {
 		apiError(&resp.Diagnostics, "creating the environment type", err)
 		return
 	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeModel{
-		ID: types.StringValue(t.ID), Description: types.StringValue(t.Description),
-	})...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeState(t))...)
 }
 
 func (r *environmentType) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -88,9 +104,7 @@ func (r *environmentType) Read(ctx context.Context, req resource.ReadRequest, re
 		apiError(&resp.Diagnostics, "reading the environment type", err)
 		return
 	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeModel{
-		ID: types.StringValue(t.ID), Description: types.StringValue(t.Description),
-	})...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeState(t))...)
 }
 
 func (r *environmentType) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
@@ -99,14 +113,12 @@ func (r *environmentType) Update(ctx context.Context, req resource.UpdateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	t, err := r.client.DescribeEnvType(ctx, plan.ID.ValueString(), plan.Description.ValueString())
+	t, err := r.client.UpdateEnvType(ctx, plan.ID.ValueString(), plan.Description.ValueString(), plan.Protected.ValueBool())
 	if err != nil {
 		apiError(&resp.Diagnostics, "updating the environment type", err)
 		return
 	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeModel{
-		ID: types.StringValue(t.ID), Description: types.StringValue(t.Description),
-	})...)
+	resp.Diagnostics.Append(resp.State.Set(ctx, environmentTypeState(t))...)
 }
 
 func (r *environmentType) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

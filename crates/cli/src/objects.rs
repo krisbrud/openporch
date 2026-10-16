@@ -103,6 +103,10 @@ pub enum Create {
         /// A description.
         #[arg(long)]
         description: Option<String>,
+        /// Protect its environments: destructive permits there need an
+        /// administrator, and changes of unknown impact get none.
+        #[arg(long)]
+        protected: bool,
     },
     /// A resource definition from a `kind: Definition` YAML document.
     ResourceDefinition(FileArg),
@@ -188,7 +192,11 @@ fn columns(kind: Kind) -> &'static [(&'static str, &'static str)] {
             ("LAST SUCCESSFUL DEPLOY", "last_successful_deploy_id"),
             ("STATE", "state"),
         ],
-        Kind::EnvTypes => &[("ID", "id"), ("DESCRIPTION", "description")],
+        Kind::EnvTypes => &[
+            ("ID", "id"),
+            ("DESCRIPTION", "description"),
+            ("PROTECTED", "protected"),
+        ],
         Kind::Deploys => &[
             ("ID", "id"),
             ("KIND", "kind"),
@@ -431,8 +439,12 @@ pub(crate) async fn create(session: &Session, what: Create, io: &mut Io<'_>) -> 
                 "environment",
             )
         }
-        Create::EnvType { id, description } => {
-            let mut body = json!({"id": id});
+        Create::EnvType {
+            id,
+            description,
+            protected,
+        } => {
+            let mut body = json!({"id": id, "protected": protected});
             if let Some(d) = description {
                 body["description"] = json!(d);
             }

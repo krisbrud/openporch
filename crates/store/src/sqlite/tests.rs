@@ -560,7 +560,13 @@ async fn failed_audit_write_rejects_the_mutation() {
 
     let e = f
         .store
-        .create_env_type(ORG, "staging", "", system("POST", "/orgs/acme/env-types"))
+        .create_env_type(
+            ORG,
+            "staging",
+            "",
+            false,
+            system("POST", "/orgs/acme/env-types"),
+        )
         .await
         .unwrap_err();
     assert!(e.to_string().contains("audit storage unavailable"), "{e}");

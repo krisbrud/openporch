@@ -30,6 +30,9 @@ pub struct EnvTypeRecord {
     pub id: String,
     /// Description.
     pub description: String,
+    /// Whether destructive permits in its environments need an administrator
+    /// and changes of unknown impact are refused until a driver plans them.
+    pub protected: bool,
     /// Creation time.
     pub created_at: i64,
 }
@@ -1044,8 +1047,9 @@ impl IdentityStore for SqliteStore {
 
     async fn env_types(&self, org: &str) -> Result<Vec<EnvTypeRecord>> {
         self.check_org(org)?;
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT id, description, created_at FROM env_types WHERE org_id = ? ORDER BY id",
+        let rows: Vec<(String, String, bool, i64)> = sqlx::query_as(
+            "SELECT id, description, protected, created_at FROM env_types WHERE org_id = ? \
+             ORDER BY id",
         )
         .bind(org)
         .fetch_all(self.pool())
@@ -1055,7 +1059,8 @@ impl IdentityStore for SqliteStore {
             .map(|r| EnvTypeRecord {
                 id: r.0,
                 description: r.1,
-                created_at: r.2,
+                protected: r.2,
+                created_at: r.3,
             })
             .collect())
     }
