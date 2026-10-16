@@ -2324,6 +2324,31 @@ Authorization: Bearer $ADMIN_TOKEN
 "…"
 ```
 
+## Diagnostics
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/orgs/{org}/diagnostics` | org read all |
+
+Returns a report to save and share when something goes wrong: the version,
+readiness, sanitized configuration, work in progress, storage, resources by
+status and the operations of resources that need recovery. With `app`, `env`
+and `deployment` together it also describes that deployment: its request ID,
+operations, audit entries and the last 200 lines of its log. The report never
+holds tokens, key material, secret values, resource inputs or outputs, or
+driver state. [Operations](operations.md#diagnostics) describes it.
+
+```http
+GET /orgs/acme/diagnostics
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+"…"
+```
+
 ## Deleting
 
 Deletes return `204` and refuse with `409` while something still uses the object.

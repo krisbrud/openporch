@@ -102,6 +102,31 @@ Counters start at zero when the server starts. Alert on
 `openporch_resources_needing_recovery > 0`, on deployments that stay queued,
 and on `openporch_database_bytes` approaching the free space of the disk.
 
+## Diagnostics
+
+`GET /orgs/{org}/diagnostics` returns a JSON report for administrators and org
+viewers to save and attach to a bug report:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://openporch.example.com/orgs/acme/diagnostics?app=shop&env=production&deployment=$DEPLOYMENT" \
+  > diagnostics.json
+```
+
+| Field | What it holds |
+| --- | --- |
+| `version`, `contract`, `generated_at` | The server's version, API contract and when the report was made |
+| `ready`, `not_ready` | Readiness, as `/readyz` reports it |
+| `config` | The configuration, with paths to key and secret files reported only as configured or not |
+| `work`, `storage`, `resources` | What the metrics report: queued and running work, database and log storage, resources by status |
+| `needing_recovery` | The latest operation of every resource whose outcome is unknown: its ID, deployment, GUResID, attempt, error and the resource's status |
+| `deployment` | Only with `app`, `env` and `deployment`: its status and error, the request ID that started it, its operations, its audit entries and the last 200 lines of its log |
+
+The operation, deployment and request IDs are the ones in the [logs](#logs),
+so a report and the server's log can be read together. Errors and log lines
+are redacted before they are stored, and the report never reads resource
+inputs, outputs or driver state, so it holds no secret values.
+
 ## Limits
 
 The server bounds the work it takes on, so a burst of deployments cannot use
