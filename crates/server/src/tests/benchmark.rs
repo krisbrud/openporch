@@ -32,6 +32,9 @@ const SAMPLES: usize = 100;
 const STATUS_INTERVAL: Duration = Duration::from_millis(100);
 const DRIVER: &str = "bench/delayed";
 
+/// Provisionings the delayed driver has started.
+static PUTS: AtomicUsize = AtomicUsize::new(0);
+
 /// `bench/delayed`: `openporch/echo`, slowed down. It waits before it
 /// provisions anything, and previews, so redeployments need no permits.
 #[derive(Debug)]
@@ -62,6 +65,7 @@ impl Driver for Delayed {
 
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
         Box::pin(async move {
+            PUTS.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(PUT_DELAY).await;
             self.0.put(req).await
         })
@@ -220,10 +224,10 @@ async fn reference_capacity_benchmark() {
     platform(&s).await;
     let s = Arc::new(s);
 
-    // The previewed application, and one whose deployment status is polled.
+    // The previewed application, and one deployed once to count its graph.
     let bench = app(&s, "bench").await;
     let watched = app(&s, "watched").await;
-    let status_path = deploy(&s, "watched", json!({"delta_id": watched})).await;
+    deploy(&s, "watched", json!({"delta_id": watched})).await;
     let (st, g) = s
         .get(
             "/orgs/acme/apps/watched/envs/development/resources/graph",
@@ -239,17 +243,21 @@ async fn reference_capacity_benchmark() {
     let disk_before = dir_size(s.dir.path());
     let stop = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
     let mut load = Vec::new();
     for i in 0..LOAD {
         let id = format!("load{i}");
         let delta = app(&s, &id).await;
-        let (s, stop, completed) = (s.clone(), stop.clone(), completed.clone());
+        let (s, stop, completed, active) =
+            (s.clone(), stop.clone(), completed.clone(), active.clone());
         load.push(tokio::spawn(async move {
             // The first deployment creates everything; later ones redeploy
             // its set, which converges every resource again.
             let mut source = json!({"delta_id": delta});
             while !stop.load(Ordering::Relaxed) {
+                active.fetch_add(1, Ordering::Relaxed);
                 let path = deploy(&s, &id, source).await;
+                active.fetch_sub(1, Ordering::Relaxed);
                 completed.fetch_add(1, Ordering::Relaxed);
                 source = json!({"deploy_id": path.rsplit('/').next().unwrap(),
                                 "replay": "current"});
@@ -259,14 +267,24 @@ async fn reference_capacity_benchmark() {
     // Let the deployments get going before measuring.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    let sent = Arc::new(AtomicUsize::new(0));
+    // Status requests read the environments being deployed, in turn, and
+    // record how many deployments are running at each tick.
     let status = {
-        let (s, stop) = (s.clone(), stop.clone());
+        let (s, stop, active, sent) = (s.clone(), stop.clone(), active.clone(), sent.clone());
         tokio::spawn(async move {
             let mut requests = Vec::new();
+            let mut running = Vec::new();
             let mut tick = tokio::time::interval(STATUS_INTERVAL);
-            while !stop.load(Ordering::Relaxed) || requests.len() < SAMPLES {
+            while !stop.load(Ordering::Relaxed) {
                 tick.tick().await;
-                let (s, path) = (s.clone(), status_path.clone());
+                sent.fetch_add(1, Ordering::Relaxed);
+                running.push(active.load(Ordering::Relaxed));
+                let path = format!(
+                    "/orgs/acme/apps/load{}/envs/development",
+                    requests.len() % LOAD
+                );
+                let s = s.clone();
                 requests.push(tokio::spawn(async move {
                     let start = Instant::now();
                     let (st, b) = s.get(&path, &s.admin).await;
@@ -278,7 +296,7 @@ async fn reference_capacity_benchmark() {
             for r in requests {
                 out.push(r.await.unwrap());
             }
-            out
+            (out, running)
         })
     };
 
@@ -286,6 +304,7 @@ async fn reference_capacity_benchmark() {
     let body = json!({"kind": "deploy", "delta_id": bench,
                       "expected_generation": generation(&s, env).await});
     let mut planning = Vec::with_capacity(SAMPLES);
+    let puts_before = PUTS.load(Ordering::Relaxed);
     for _ in 0..SAMPLES {
         let start = Instant::now();
         let (st, plan) = s
@@ -295,9 +314,14 @@ async fn reference_capacity_benchmark() {
         assert_eq!(st, StatusCode::CREATED, "{plan}");
         assert_eq!(plan["resources"].as_array().unwrap().len(), graph.0);
     }
+    let puts_while_planning = PUTS.load(Ordering::Relaxed) - puts_before;
+    // The load runs until there are enough status samples too.
+    while sent.load(Ordering::Relaxed) < SAMPLES {
+        tokio::time::sleep(STATUS_INTERVAL).await;
+    }
     let peak_during = proc_status("VmHWM:");
     stop.store(true, Ordering::Relaxed);
-    let mut status = status.await.unwrap();
+    let (mut status, running) = status.await.unwrap();
     for l in load {
         l.await.unwrap();
     }
@@ -306,6 +330,20 @@ async fn reference_capacity_benchmark() {
     let planning_p95 = p95(&mut planning);
     let status_p95 = p95(&mut status);
     let report = json!({
+        "config": {
+            "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
+            "runtime_workers": 2,
+            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "driver_put_delay_ms": PUT_DELAY.as_millis(),
+            "deploying_applications": LOAD,
+            "driver_concurrency": s.state.config.limits.driver_concurrency,
+            "status_interval_ms": STATUS_INTERVAL.as_millis(),
+        },
+        "driver_load": {
+            "provisionings_while_planning": puts_while_planning,
+            "mean_running_deployments": running.iter().sum::<usize>() as f64
+                / running.len() as f64,
+        },
         "graph": {"nodes": graph.0, "edges": graph.1},
         "deployments_completed_under_load": completed.load(Ordering::Relaxed),
         "planning": {"samples": planning.len(), "p95_ms": ms(planning_p95),
@@ -322,6 +360,8 @@ async fn reference_capacity_benchmark() {
     }
     assert_eq!(graph.0, 100, "{report}");
     assert!(graph.1 >= 1000, "{report}");
+    // The driver load was real: the delayed driver kept provisioning.
+    assert!(puts_while_planning >= SAMPLES, "{report}");
     assert!(planning_p95 < Duration::from_secs(2), "{report}");
     assert!(status_p95 < Duration::from_millis(500), "{report}");
 }
