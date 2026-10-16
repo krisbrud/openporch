@@ -25,6 +25,7 @@ struct Server {
 }
 
 mod accounts;
+mod benchmark;
 mod catalog;
 mod deploys;
 mod e2e;

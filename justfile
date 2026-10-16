@@ -32,6 +32,12 @@ provider:
     provider/scripts/smoke.sh target/debug/openporch
     provider/scripts/acceptance.sh target/debug/openporch
 
+# Run the reference capacity benchmark in release mode on two CPUs, as
+# docs/benchmark.md describes. Needs Linux and `taskset`.
+bench:
+    cargo test --release -p openporch-server --lib --no-run
+    OPENPORCH_BENCH_OUT=target/benchmark.json taskset -c 0,1 cargo test --release -p openporch-server --lib reference_capacity_benchmark -- --ignored --nocapture
+
 # Check dependency licenses, advisories and sources.
 deny:
     cargo deny check
