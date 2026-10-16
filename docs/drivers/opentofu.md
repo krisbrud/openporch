@@ -252,7 +252,9 @@ way, fetching it without running OpenTofu; if one fails, its resource fails
 with that error, every other resource is left `pending`, and nothing is
 applied. A definition whose driver inputs read another resource's outputs
 cannot be checked before that resource provisions, so its failure comes when
-its turn comes. A resource recovered after a restart
+its turn comes. The providers the recorded lock file names are not checked
+ahead: one no longer available from its registry fails `tofu init` when its
+resource's turn comes. A resource recovered after a restart
 records the commit and lock file its interrupted apply started with. Replaying
 a deployment that is still running copies only the pins recorded so far; the
 rest resolve `source.rev`.

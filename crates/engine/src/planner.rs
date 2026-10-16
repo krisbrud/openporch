@@ -952,7 +952,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 .await
             {
                 Ok(Some(active)) => Guresid::new(active.guresid).ok(),
-                _ => None,
+                Ok(None) => None,
+                Err(e) => {
+                    missing.insert(
+                        node.descriptor.clone(),
+                        format!("the resource could not be read to check its pinned version: {e}"),
+                    );
+                    continue;
+                }
             };
             if let Some(guresid) = &guresid {
                 scope
@@ -1057,8 +1064,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // in a replay, every version of the drivers' code it ran can run again.
         let mut missing = self.check_artifacts(&deployment, deadline).await;
         let artifacts_missing = !missing.is_empty();
-        for (d, reason) in self.check_pins(&deployment, deadline).await {
-            missing.entry(d).or_insert(reason);
+        if !artifacts_missing {
+            missing = self.check_pins(&deployment, deadline).await;
         }
         let why = if artifacts_missing {
             "not started: an artifact the deployment needs is missing"
