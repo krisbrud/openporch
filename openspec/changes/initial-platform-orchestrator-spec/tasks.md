@@ -122,7 +122,7 @@ Before archiving the first release, move unimplemented later-stage requirements/
 - [ ] 13.4 Add SNS/RDS examples and complete the Kubernetes/EKS slice in group 9; verify each enabled target's ownership, readiness, safe removal and integration checks
 
 ## 14. First-release hardening — after milestone 1
-- [ ] 14.1 Document and execute a protected backup/restore drill covering SQLite, state, keys, source/locks and external references; verify restore starts in recovery mode, preserves identities and avoids duplicate cloud objects
+- [x] 14.1 Document and execute a protected backup/restore drill covering SQLite, state, keys, source/locks and external references; verify restore starts in recovery mode, preserves identities and avoids duplicate cloud objects
 - [x] 14.2 Add upgrade/downgrade fixtures for every supported schema pair; verify migration from the preceding release and refusal of untested downgrades
 - [x] 14.3 Run the declared reference benchmark and record p95 planning/API latency and peak memory/disk results; verify the thresholds in `control-plane-operations`
 - [x] 14.4 Implement protected environment types; verify destructive permits in a protected environment require an administrator and unknown-impact changes are denied until planned

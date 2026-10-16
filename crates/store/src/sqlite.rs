@@ -215,7 +215,7 @@ impl SqliteStore {
 /// migrates older databases forward and refuses newer ones.
 pub const SCHEMA_VERSION: i64 = 9;
 
-fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
+pub(crate) fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -1611,15 +1611,34 @@ impl Store for SqliteStore {
         audit: AuditIntent,
     ) -> Result<()> {
         let mut tx = self.begin().await?;
-        let op: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind FROM operations \
-             WHERE id = ?",
+        #[allow(clippy::type_complexity)]
+        let op: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind, \
+             CASE WHEN json_extract(recovery, '$.restored') = 1 \
+             THEN COALESCE(json_extract(recovery, '$.restored_status'), 'provisioned') END \
+             FROM operations WHERE id = ?",
         )
         .bind(operation_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (org, app, env, deployment_id, guresid, state, kind) =
+        let (org, app, env, deployment_id, guresid, state, kind, restored) =
             op.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        // A restore's operation belongs to no deployment: the deployment it
+        // names is history, which its outcome leaves as it was.
+        let deployment_id = if restored.is_some() {
+            String::new()
+        } else {
+            deployment_id
+        };
         self.check_org(&org)?;
         if state != "unknown" {
             return Err(StoreError::Conflict(format!(
@@ -1642,6 +1661,32 @@ impl Store for SqliteStore {
         let repeat = match resolution {
             Resolution::Observed(result) => {
                 self.checkpoint_in_tx(&mut tx, operation_id, result).await?;
+                None
+            }
+            Resolution::Confirmed => {
+                let Some(status) = restored else {
+                    return Err(StoreError::Conflict(format!(
+                        "operation `{operation_id}` was not restored from a backup"
+                    )));
+                };
+                sqlx::query(
+                    "UPDATE operations SET state = 'succeeded', error = NULL, finished_at = ? \
+                     WHERE id = ?",
+                )
+                .bind(now)
+                .bind(operation_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE active_resources SET status = ?, observed_at = ?, updated_at = ? \
+                     WHERE guresid = ?",
+                )
+                .bind(status)
+                .bind(now)
+                .bind(now)
+                .bind(&guresid)
+                .execute(&mut *tx)
+                .await?;
                 None
             }
             Resolution::Repeatable { reason } => Some(format!("recovered: {reason}")),

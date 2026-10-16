@@ -34,6 +34,7 @@ cloud resources, so do not start one while the original runs.
 | `master_key_missing` | No master key was found for an existing installation | As above |
 | `database_unavailable` | The database does not answer | Check the disk and the data directory |
 | `executor_unavailable` | There is no executor to run deployments with | Restart once the keys load; the executor starts with them |
+| `restore_reconciling` | The installation was restored from a backup and its resources are being observed | Wait; see [Backup and restore](#backup-and-restore) |
 | `shutting_down` | Shutdown has begun | Wait for the restart |
 
 While the server is not ready, every request that changes something gets
@@ -242,24 +243,104 @@ Treat the whole directory, and the master key wherever it lives, as secret.
 With the `s3` state backend, resources' state is in the bucket instead of
 `opentofu/`.
 
-To back up, stop the server and copy:
+## Backup and restore
 
-- the data directory;
-- the OpenTofu root, when `[opentofu].root` places it outside the data
-  directory, since with the `local` backend it holds every resource's state;
+Stop the server, then take a backup into a new or empty directory:
+
+```sh
+openporch backup --config /etc/openporch/openporch.toml /backups/2026-10-16
+```
+
+It refuses while the server runs, since the database and the state files must
+match. The backup directory, readable by its owner only, holds:
+
+- `backup.json`, the manifest: when and by which version it was taken, the
+  schema version, the organization, the number of active resources, where
+  OpenTofu state is kept, and the master key IDs a restore needs;
+- `data/`, a consistent copy of the database (with its recovery records, audit
+  log and sealed secrets) and every other file of the data directory except
+  the lock, the master key and the bootstrap token;
+- `opentofu-state/`, the OpenTofu root's `state` directory, wherever
+  `[opentofu].root` places it: with the `local` backend every resource's
+  state, and with either backend each resource's lock file, inline script and
+  `retained.json`. Run directories and the provider cache are rebuilt, so they
+  are left out.
+
+The backup leaves out, and you keep alongside it:
+
 - the master key, wherever it lives: its file, or the value of
-  `OPENPORCH_MASTER_KEY`;
-- the bootstrap token file, while it exists and `bootstrap_token_file` places
-  it outside the data directory: a restored installation does not issue a new
-  one;
-- the configuration file, or the environment it is set through.
+  `OPENPORCH_MASTER_KEY`. Keep it apart from the backup: a backup is only
+  useful with it, and anyone holding both can read every stored secret;
+- the configuration file, or the environment it is set through;
+- the commits Git sources were applied from, and with the `s3` backend the
+  state object versions, as below;
+- versions of secrets kept in stores outside openporch.
+
+To restore, on the same or a new host, with the same configuration (the
+organization and the state backend must match the manifest) and an absent or
+empty data directory, and OpenTofu state directory when `[opentofu].root`
+places it outside the data directory:
+
+```sh
+openporch restore --config /etc/openporch/openporch.toml /backups/2026-10-16
+```
+
+Put the master key back where the configuration expects it, then start the
+server. A restored server starts read-only: until the driver of every
+resource the backup records has observed it, `/healthz` reports
+`restore_reconciling` and every change is refused with `503` `SRV-002`, while
+reads keep working. Each resource is then:
+
+- unchanged, when it still exists: the backup's record of it stands, with its
+  GUResID, outputs and status;
+- `recovery_required`, when nothing exists for its identity: it was deleted
+  after the backup, or its state was not restored. openporch does not create
+  it again on its own; check the cloud, then `POST .../resolve` (an
+  administrator) lets the next deployment provision it again with the same
+  identity;
+- `recovery_required` too when its driver cannot observe it or reports a
+  failure it cannot repeat safely.
+
+A resource whose observation fails, for example because the cloud is
+unreachable, is tried again a few times; after that the server accepts
+changes, and that resource stays blocked until `POST .../recover` observes it.
+The audit log records each observation as `resource.recover` with reason
+`restore`. Without the master keys the server is not ready at all; the
+restored resources are observed on the first start that has them.
+
+A backup only knows what existed when it was taken. Resources created after
+it are not in the restored records, and a deployment that needs them again
+creates new ones beside them, so after restoring an older backup find what
+deployments made since then created (by the tags or names your definitions
+give cloud objects) and remove or import it before deploying again.
+
+### The drill
+
+`backup_and_restore_drill` in `crates/server/src/tests/restore.rs` runs this
+procedure on every `cargo test`: it deploys an application with resources,
+refuses a backup while the server runs, backs up the stopped installation
+and restores it into a new data directory with the master key copied on its
+own, refuses a second restore into it, and starts it with one resource
+deleted after the backup and observations held. While they are held,
+readiness names `restore_reconciling`, reads work and a change gets `503`.
+Once observed, every resource keeps its GUResID, the existing ones keep their
+status, the deleted one is `recovery_required` and blocks deployments with
+`DPL-004`, and after an administrator resolves it the next deployment
+provisions it again with its old GUResID, so nothing is duplicated.
+
+Run the drill against a real installation before relying on backups: restore
+the latest backup into a scratch data directory on another host or port,
+start it with the master key and the state backend's credentials, and check
+that `/healthz` becomes ready and every resource is as expected.
+
+### Git sources and S3 state
 
 The OpenTofu root keeps, for each resource, the lock file, an inline script
 and `retained.json`, which records the Git source URL, path and commit the
 last apply used. Replays and deletions fetch that commit again, so a backup
 of an installation that uses Git sources also needs the commits themselves,
 in case a repository is deleted or rewritten later. Keep each repository
-`retained.json` names alongside the copy, with every commit it records under
+`retained.json` names alongside the backup, with every commit it records under
 a ref of its own, since a mirror holds only what the remote's branches and
 tags still reach:
 
@@ -292,8 +373,8 @@ for dir in backup/sources/*.git; do
 done
 ```
 
-openporch cannot yet be pointed at a different URL for resources it already
-applied; the backup and restore drill in task 14.1 covers that.
+openporch cannot be pointed at a different URL for resources it already
+applied.
 
 With the `s3` backend the state lives in the bucket, and later applies
 overwrite it. Keep the bucket versioned and record, while the server is
@@ -317,9 +398,6 @@ copies the objects into the backup instead), so the database and the state
 it restores match. Secret stores outside openporch keep their own history; record the
 versions you rely on where your store has them.
 
-Copying while the server runs can capture a database that does not match the
-state files. Keep the master key apart from the copy: a backup is only useful
-with it, and anyone holding both can read every stored secret.
 
 ## Upgrades and the schema version
 
@@ -359,8 +437,8 @@ So downgrading means either going back to the newer release, or restoring a
 backup taken before the upgrade and running the release that made it. Take a
 backup before every upgrade. Restoring an older backup forgets every
 deployment made since it was taken, including resources it created; check
-those by hand before deploying again (the backup and restore drill in task
-14.1 covers this).
+those by hand before deploying again, as [Backup and
+restore](#backup-and-restore) describes.
 
 ## Uninstalling
 

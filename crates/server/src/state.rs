@@ -56,6 +56,9 @@ pub struct Inner {
     pub drivers: crate::deploy::Drivers,
     /// Set once shutdown begins: no new changes are accepted.
     pub draining: std::sync::atomic::AtomicBool,
+    /// Set while resources restored from a backup are being observed: no
+    /// changes are accepted until each has been.
+    pub restoring: std::sync::atomic::AtomicBool,
     /// Changes admitted and still being handled.
     changes: std::sync::atomic::AtomicUsize,
     /// Signaled whenever an admitted change has been handled.
@@ -98,6 +101,9 @@ impl AppState {
         let mut reasons = self.not_ready.clone();
         if reasons.is_empty() && !self.runners.has_executor() {
             reasons.push("executor_unavailable".to_owned());
+        }
+        if self.restoring.load(Ordering::SeqCst) {
+            reasons.push("restore_reconciling".to_owned());
         }
         if self.draining.load(Ordering::SeqCst) {
             reasons.push("shutting_down".to_owned());
@@ -276,6 +282,17 @@ pub async fn start_with(
     env_key: Option<String>,
     sts: Arc<dyn Sts>,
 ) -> Result<AppState, StartupError> {
+    start_with_drivers(config, env_key, sts, None).await
+}
+
+/// [`start_with`] with the drivers in `drivers` instead of the built-in ones
+/// and OpenTofu.
+pub(crate) async fn start_with_drivers(
+    config: Config,
+    env_key: Option<String>,
+    sts: Arc<dyn Sts>,
+    drivers: Option<Arc<DriverRegistry>>,
+) -> Result<AppState, StartupError> {
     let github = match &config.github {
         Some(c) => {
             Some(Arc::new(Github::new(c).map_err(StartupError::Io)?) as Arc<dyn IdentityProvider>)
@@ -317,6 +334,21 @@ pub async fn start_with(
         );
     }
 
+    // A restored installation's resources may have changed, or gone, since
+    // the backup: each is blocked until it has been observed.
+    let marker = config.data_dir.join(crate::backup::RESTORE_MARKER);
+    let restoring = marker.exists();
+    let restored = if restoring {
+        let restored = store.mark_restored().await?;
+        tracing::warn!(
+            resources = restored.len(),
+            "restored from a backup; observing every resource before accepting changes"
+        );
+        restored
+    } else {
+        Vec::new()
+    };
+
     if store.is_new().await? {
         bootstrap(&config, &store).await?;
     } else {
@@ -340,6 +372,7 @@ pub async fn start_with(
         runners,
         drivers: crate::deploy::Drivers::default(),
         draining: Default::default(),
+        restoring: restoring.into(),
         changes: Default::default(),
         changes_done: tokio::sync::Notify::new(),
     }));
@@ -357,64 +390,138 @@ pub async fn start_with(
         None
     };
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {
-        run_deployments(&state, keyring, image_registry);
-        recover_uncertain(&state, report.uncertain);
+        match drivers {
+            Some(registry) => run_with_drivers(&state, keyring, image_registry, registry, None),
+            None => run_deployments(&state, keyring, image_registry),
+        }
+        recover_uncertain(
+            &state,
+            report.uncertain,
+            restored,
+            restoring.then_some(marker),
+        );
     }
     Ok(state)
 }
 
 /// Observes, in the background, each resource whose operation the restart
-/// left with an unknown outcome, and records what the observation
-/// establishes. Nothing is mutated; a resource observation cannot settle
-/// stays blocked for an operator.
-fn recover_uncertain(state: &AppState, uncertain: Vec<UncertainOperation>) {
-    if uncertain.is_empty() {
+/// left with an unknown outcome, and then each resource restored from a
+/// backup, and records what the observation establishes. Nothing is mutated;
+/// a resource observation cannot settle stays blocked for an operator.
+///
+/// Once every restored resource has been observed, or could not be after a
+/// few attempts, the restore `marker` is removed and changes are accepted.
+fn recover_uncertain(
+    state: &AppState,
+    uncertain: Vec<UncertainOperation>,
+    restored: Vec<UncertainOperation>,
+    marker: Option<std::path::PathBuf>,
+) {
+    if uncertain.is_empty() && marker.is_none() {
         return;
     }
     let state = state.clone();
     tokio::spawn(async move {
         for op in uncertain {
-            let org = state.org();
-            let mut audit = AuditIntent::accepted(
-                org,
-                "system",
-                "POST",
-                &format!(
-                    "/orgs/{org}/apps/{}/envs/{}/resources/{}/recover",
-                    op.app, op.env, op.descriptor
-                ),
-                "resource.recover",
-            );
-            audit.actor = None;
-            audit.target = Some(format!("{}/{}/{}", op.app, op.env, op.descriptor));
-            audit.reason = Some("restart".into());
-            let recovered = state
-                .runners
-                .recover(Recovery {
-                    app: op.app.clone(),
-                    env: op.env.clone(),
-                    descriptor: op.descriptor.clone(),
-                    audit,
-                })
-                .await;
-            match recovered {
-                Ok(outcome) => tracing::info!(
-                    resource = %op.descriptor,
-                    guresid = %op.guresid,
-                    operation = %op.operation_id,
-                    ?outcome,
-                    "recovered a resource after the restart"
-                ),
-                Err(e) => tracing::warn!(
-                    resource = %op.descriptor,
-                    guresid = %op.guresid,
-                    operation = %op.operation_id,
-                    error = %e,
-                    "could not recover a resource after the restart; recover it explicitly"
-                ),
+            recover_one(&state, &op, "restart").await;
+        }
+        let Some(marker) = marker else {
+            return;
+        };
+        let mut pending = restored;
+        for delay in RESTORE_RETRIES {
+            let mut left = Vec::new();
+            for op in pending {
+                if !recover_one(&state, &op, "restore").await {
+                    left.push(op);
+                }
             }
+            pending = left;
+            if pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(*delay).await;
+        }
+        if let Err(e) = std::fs::remove_file(&marker)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(
+                error = %e,
+                path = %marker.display(),
+                "could not remove the restore marker; changes stay refused"
+            );
+            return;
+        }
+        state.restoring.store(false, Ordering::SeqCst);
+        if pending.is_empty() {
+            tracing::info!("every restored resource has been observed; accepting changes");
+        } else {
+            tracing::warn!(
+                unobserved = pending.len(),
+                "accepting changes; restored resources that could not be observed stay blocked \
+                 until they are recovered explicitly"
+            );
         }
     });
+}
+
+/// How long to wait before observing again the restored resources that could
+/// not be observed.
+const RESTORE_RETRIES: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+/// Observes the resource of `op`; whether its outcome is now known.
+async fn recover_one(state: &AppState, op: &UncertainOperation, reason: &str) -> bool {
+    let org = state.org();
+    let mut audit = AuditIntent::accepted(
+        org,
+        "system",
+        "POST",
+        &format!(
+            "/orgs/{org}/apps/{}/envs/{}/resources/{}/recover",
+            op.app, op.env, op.descriptor
+        ),
+        "resource.recover",
+    );
+    audit.actor = None;
+    audit.target = Some(format!("{}/{}/{}", op.app, op.env, op.descriptor));
+    audit.reason = Some(reason.into());
+    let recovered = state
+        .runners
+        .recover(Recovery {
+            app: op.app.clone(),
+            env: op.env.clone(),
+            descriptor: op.descriptor.clone(),
+            audit,
+        })
+        .await;
+    match recovered {
+        Ok(outcome) => {
+            tracing::info!(
+                resource = %op.descriptor,
+                guresid = %op.guresid,
+                operation = %op.operation_id,
+                ?outcome,
+                reason,
+                "recovered a resource"
+            );
+            !matches!(outcome, openporch_engine::planner::Recovered::InProgress)
+        }
+        Err(e) => {
+            tracing::warn!(
+                resource = %op.descriptor,
+                guresid = %op.guresid,
+                operation = %op.operation_id,
+                error = %e,
+                reason,
+                "could not recover a resource; recover it explicitly"
+            );
+            false
+        }
+    }
 }
 
 /// Runs accepted deployments with the built-in drivers and the OpenTofu
