@@ -37,6 +37,7 @@ mod resources;
 mod secret_use;
 mod sets;
 mod tls;
+mod upgrades;
 mod values;
 
 async fn server_in(dir: TempDir) -> Server {
