@@ -41,7 +41,7 @@ impl Executor for Fake {
             .push((job.descriptor.to_string(), job.guresid.to_string()));
         let chatter = *self.chatter.lock().unwrap();
         if chatter > 0 {
-            let mut log = job.log.redacting();
+            let log = job.log.redacting();
             for i in 0..chatter {
                 log.info(&format!("{ty} line {i}"));
             }
