@@ -353,7 +353,7 @@ pub async fn delete(
             audit: ctx.audit(org, "env.delete", format!("{app}/{env}")),
         })
         .await?;
-    let deletion = start_deletion(&state, &acceptance, snapshot, slot).await?;
+    let deletion = start_deletion(&state, &acceptance, snapshot, slot, &ctx.request_id).await?;
     Ok((StatusCode::ACCEPTED, Json(deletion)))
 }
 
@@ -375,6 +375,7 @@ pub(super) async fn start_deletion(
     acceptance: &Acceptance,
     snapshot: Value,
     slot: Option<crate::deploy::Slot>,
+    request_id: &str,
 ) -> ApiResult<EnvDeletion> {
     let org = state.org();
     let mut deployment = acceptance.deployment().clone();
@@ -409,6 +410,7 @@ pub(super) async fn start_deletion(
                 env: env.clone(),
                 id: d.id.clone(),
                 snapshot,
+                request_id: Some(request_id.to_owned()),
             },
             slot,
         );

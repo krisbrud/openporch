@@ -2874,17 +2874,21 @@ async fn finish_in_tx(
             }
         }
     }
-    let accepted: Option<(String, Option<String>, String, String)> = sqlx::query_as(
-        "SELECT id, actor_id, method, path FROM audit_log WHERE org_id = ? AND operation_id = ? \
+    /// The accepted entry's ID, actor, request ID, method and path.
+    type Accepted = (String, Option<String>, Option<String>, String, String);
+    let accepted: Option<Accepted> = sqlx::query_as(
+        "SELECT id, actor_id, request_id, method, path FROM audit_log WHERE org_id = ? \
+         AND operation_id = ? \
          AND outcome = 'accepted' ORDER BY seq LIMIT 1",
     )
     .bind(org)
     .bind(id)
     .fetch_optional(&mut *conn)
     .await?;
-    let (correlates, actor, method, path) = match accepted {
-        Some((a, actor, m, p)) => (Some(a), actor, m, p),
+    let (correlates, actor, request_id, method, path) = match accepted {
+        Some((a, actor, r, m, p)) => (Some(a), actor, r, m, p),
         None => (
+            None,
             None,
             None,
             "POST".to_owned(),
@@ -2894,7 +2898,7 @@ async fn finish_in_tx(
     let intent = AuditIntent {
         org: org.to_owned(),
         actor,
-        request_id: None,
+        request_id,
         method,
         path,
         action: "deployment.finish".to_owned(),

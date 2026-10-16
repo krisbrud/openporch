@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
@@ -224,7 +225,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     log: log.resource(descriptor),
                 };
                 let id = running
-                    .spawn(async move { (run.descriptor.clone(), run.run().await) })
+                    .spawn(
+                        async move { (run.descriptor.clone(), run.run().await) }.in_current_span(),
+                    )
                     .id();
                 tasks.insert(id, descriptor.clone());
             }
@@ -596,8 +599,15 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
     /// Runs the executor until the deadline; a panic or the deadline leaves the
     /// outcome uncertain.
     async fn execute(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let span = super::operation_span(&job.job, "delete");
+        let result = self.execute_in_span(job).instrument(span.clone()).await;
+        span.in_scope(|| super::log_outcome(&result));
+        result
+    }
+
+    async fn execute_in_span(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let executor = self.executor.clone();
-        let task = tokio::spawn(async move { executor.deprovision(job).await });
+        let task = tokio::spawn(async move { executor.deprovision(job).await }.in_current_span());
         let abort = task.abort_handle();
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,

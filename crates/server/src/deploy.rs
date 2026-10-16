@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::planner::{
@@ -37,6 +38,8 @@ pub struct Job {
     pub id: String,
     /// The execution snapshot, with the resource graph to converge.
     pub snapshot: Value,
+    /// The request that accepted the deployment, for correlating its events.
+    pub request_id: Option<String>,
 }
 
 /// A resource to recover.
@@ -269,6 +272,10 @@ pub(crate) async fn planned(
 /// failure to record it leaves the deployment running until restart recovery
 /// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
+    match &error {
+        None => tracing::info!(outcome = "succeeded", "deployment finished"),
+        Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
+    }
     if let Err(e) = state
         .store
         .finish_deployment(state.org(), &job.app, &job.env, &job.id, error)
@@ -413,6 +420,15 @@ impl Runners {
             .insert(key.clone());
         let runner = self.current();
         let slots = self.slots.clone();
+        // Every event the deployment logs, the planner's and drivers'
+        // included, names it and the request that accepted it.
+        let span = tracing::info_span!(
+            "deployment",
+            app = %job.app,
+            env = %job.env,
+            deployment = %job.id,
+            request_id = job.request_id.as_deref().unwrap_or_default(),
+        );
         tokio::spawn(async move {
             let waited = slot.is_none();
             let _slot = match slot {
@@ -437,7 +453,7 @@ impl Runners {
                     ),
                 )
                 .await;
-            } else if tokio::spawn(runner.run(state.clone(), job.clone()))
+            } else if tokio::spawn(runner.run(state.clone(), job.clone()).instrument(span))
                 .await
                 .is_err()
             {

@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_store::{
     AuditIntent, CheckpointResult, OperationKind, Provisioned, Resolution, Store, StoreError,
@@ -106,7 +108,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         "every driver slot is busy; try the recovery again later".into(),
                     ));
                 };
-                let observed = self.executor.observe(job, deleting).await;
+                let span = super::operation_span(&job, "observe");
+                let observed = self
+                    .executor
+                    .observe(job, deleting)
+                    .instrument(span.clone())
+                    .await;
+                span.in_scope(|| super::log_outcome(&observed));
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
                     Ok(Observed::Absent { .. }) if deleting => (

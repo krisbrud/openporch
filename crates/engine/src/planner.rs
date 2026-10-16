@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ResourceUse, builtin_types};
@@ -313,6 +314,37 @@ pub enum ExecFailure {
     },
     /// Infrastructure may have changed; recovery must observe it first.
     Uncertain(String),
+}
+
+/// The span an operation's events are logged in: they name the operation, the
+/// resource's GUResID and descriptor, and, through the enclosing deployment
+/// span, the deployment and the request that accepted it.
+pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "operation",
+        operation = %job.operation_id,
+        guresid = %job.guresid.as_str(),
+        resource = %job.descriptor,
+        driver = %job.driver_type,
+        attempt = job.attempt,
+        action,
+    )
+}
+
+/// Logs how an operation ended. Executor failures are already redacted.
+pub(crate) fn log_outcome<T>(result: &Result<T, ExecFailure>) {
+    match result {
+        Ok(_) => tracing::info!(outcome = "succeeded", "operation finished"),
+        Err(ExecFailure::Permanent(e)) => {
+            tracing::warn!(outcome = "failed", error = %e, "operation finished");
+        }
+        Err(ExecFailure::Retryable { error, .. }) => {
+            tracing::warn!(outcome = "retryable", error = %error, "operation finished");
+        }
+        Err(ExecFailure::Uncertain(e)) => {
+            tracing::warn!(outcome = "unknown", error = %e, "operation finished");
+        }
+    }
 }
 
 /// Provisions resources: resolves secrets, obtains credentials and calls drivers.
@@ -922,7 +954,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 let d = node.descriptor.clone();
                 let task = running.spawn({
                     let d = d.clone();
-                    async move { (d, ctx.run().await) }
+                    async move { (d, ctx.run().await) }.in_current_span()
                 });
                 tasks.insert(task.id(), d);
             }
@@ -1056,6 +1088,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // its outcome as the last line. A log with lines missing is reported,
         // not presented as complete.
         let error = with_lost_lines(error, log.close().await);
+        match &error {
+            None => tracing::info!(outcome = "succeeded", "deployment finished"),
+            Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
+        }
         if let Err(e) = self
             .store
             .finish_deployment(
@@ -1720,8 +1756,15 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
     /// Runs the executor until the deadline. A panic or the deadline leaves the
     /// outcome uncertain, since the driver may have changed something.
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
+        let span = operation_span(&job, "provision");
+        let result = self.provision_in_span(job).instrument(span.clone()).await;
+        span.in_scope(|| log_outcome(&result));
+        result
+    }
+
+    async fn provision_in_span(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let executor = self.executor.clone();
-        let task = tokio::spawn(async move { executor.provision(job).await });
+        let task = tokio::spawn(async move { executor.provision(job).await }.in_current_span());
         let abort = task.abort_handle();
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,

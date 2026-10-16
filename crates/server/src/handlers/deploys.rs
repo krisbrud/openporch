@@ -234,6 +234,7 @@ pub async fn trigger(
                 env,
                 id: d.id.clone(),
                 snapshot: resolved.snapshot,
+                request_id: Some(ctx.request_id.clone()),
             },
             slot,
         );
