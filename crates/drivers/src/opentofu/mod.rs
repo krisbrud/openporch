@@ -1047,6 +1047,101 @@ impl OpenTofu {
         Ok(())
     }
 
+    /// Fetches the pinned commit and installs the providers the pinned lock
+    /// file selects, without a backend: nothing is planned or applied, and no
+    /// state is read.
+    async fn check_pin_run(&self, run: &mut Run, req: &DriverRequest) -> Result<(), Failure> {
+        let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
+        let Some(pinned) = pinned(&inputs, req)? else {
+            return Ok(());
+        };
+        let home = run.dir.join("home");
+        files::private_dir(&home).map_err(Failure::io)?;
+        match (&inputs.source, &pinned.source) {
+            (Some((current, path)), Some(recorded)) => {
+                let source = git::Source {
+                    url: current.url.clone(),
+                    rev: recorded.commit.clone(),
+                    username: current.username.clone(),
+                    password: current.password.clone(),
+                    ssh_key: current.ssh_key.clone(),
+                };
+                let checkout = run.dir.join("source");
+                git::fetch(
+                    &self.config,
+                    &mut run.log,
+                    &run.stop,
+                    &source,
+                    &source.rev,
+                    &checkout,
+                    &home,
+                )
+                .await
+                .map_err(|e| unfetchable(&source, e))?;
+                run.module = match path {
+                    Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
+                    None => checkout.canonicalize().map_err(Failure::io)?,
+                };
+                if !run.module.is_dir() {
+                    return Err(input("`source.path` is not a directory in the repository"));
+                }
+            }
+            _ => files::private_dir(&run.module).map_err(Failure::io)?,
+        }
+        let Some(lock) = &pinned.lock else {
+            return Ok(());
+        };
+        if let Some(script) = &inputs.script {
+            let name = if inputs.source.is_some() {
+                "override.tf"
+            } else {
+                "main.tf"
+            };
+            files::write_private(&run.module.join(name), script.as_bytes()).map_err(Failure::io)?;
+        }
+        for (path, content, _) in &inputs.files {
+            let target = files::inside(&run.module, path).map_err(Failure::Input)?;
+            files::write_private(&target, content.as_bytes()).map_err(Failure::io)?;
+        }
+        files::write_private(&run.module.join(LOCK_FILE), lock.as_bytes()).map_err(Failure::io)?;
+        run.env.insert("HOME".into(), home.display().to_string());
+        run.env.insert("TF_IN_AUTOMATION".into(), "1".into());
+        run.env.insert("TF_INPUT".into(), "0".into());
+        let cache = self.config.root.join("plugin-cache");
+        files::private_dir(&cache).map_err(Failure::io)?;
+        run.env
+            .insert("TF_PLUGIN_CACHE_DIR".into(), cache.display().to_string());
+        for (host, token) in &inputs.tokens {
+            let name = host.replace('-', "__").replace('.', "_");
+            run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
+        }
+        self.tofu(
+            run,
+            "init failed",
+            &[
+                "init",
+                "-input=false",
+                "-backend=false",
+                "-lockfile=readonly",
+            ],
+            exec::Stdout::Logged,
+        )
+        .await
+        .map(drop)
+        .map_err(|e| match e {
+            Failure::Command { stderr, .. } => input(format!(
+                "the providers or modules the pinned version selects can no longer be \
+                 installed; deploy the current configuration instead: {}",
+                stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or_default()
+            )),
+            e => e,
+        })
+    }
+
     /// Points the module at orchestrator state, which lives outside the run
     /// directory, and sets the environment every run shares.
     fn prepare_backend(
@@ -1797,39 +1892,7 @@ impl Driver for OpenTofu {
                 Ok(run) => run,
                 Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
             };
-            let result = async {
-                let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
-                let pinned = pinned(&inputs, req)?;
-                let (Some((current, _)), Some(recorded)) = (
-                    &inputs.source,
-                    pinned.as_ref().and_then(|p| p.source.as_ref()),
-                ) else {
-                    // A script alone has nothing to fetch.
-                    return Ok(());
-                };
-                let source = git::Source {
-                    url: current.url.clone(),
-                    rev: recorded.commit.clone(),
-                    username: current.username.clone(),
-                    password: current.password.clone(),
-                    ssh_key: current.ssh_key.clone(),
-                };
-                let home = run.dir.join("home");
-                files::private_dir(&home).map_err(Failure::io)?;
-                git::fetch(
-                    &self.config,
-                    &mut run.log,
-                    &run.stop,
-                    &source,
-                    &source.rev,
-                    &run.dir.join("source"),
-                    &home,
-                )
-                .await
-                .map(drop)
-                .map_err(|e| unfetchable(&source, e))
-            }
-            .await;
+            let result = self.check_pin_run(&mut run, req).await;
             self.finish(req, &run.log, result, false)
         })
     }

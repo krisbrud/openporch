@@ -247,14 +247,14 @@ deployment replayed from that snapshot fetches the recorded commit rather than
 file, so it applies the same module with the same provider versions. A replay
 whose definition names another `source.url` or `source.path` than the recorded
 one fails with `TOFU-003`, as does one whose commit can no longer be fetched.
-Before a replay changes anything, the driver checks every recorded commit this
-way, fetching it without running OpenTofu; if one fails, its resource fails
+Before a replay changes anything, the driver checks every recorded version:
+it fetches the commit and runs `tofu init -backend=false -lockfile=readonly`
+with the recorded lock file, which installs the providers and modules it
+selects without reading state, planning or applying. If one fails, its resource fails
 with that error, every other resource is left `pending`, and nothing is
 applied. Driver inputs that read other resources' outputs are not known yet
 then; the check runs without them, and a `source` that depends on them cannot
-be checked, so the replay is refused, saying so. The providers the recorded lock file names are not checked
-ahead: one no longer available from its registry fails `tofu init` when its
-resource's turn comes. A resource recovered after a restart
+be checked, so the replay is refused, saying so. A resource recovered after a restart
 records the commit and lock file its interrupted apply started with. Replaying
 a deployment that is still running copies only the pins recorded so far; the
 rest resolve `source.rev`.

@@ -1617,7 +1617,7 @@ of:
   as the OpenTofu driver's commit and lock file, gets that version back for
   each resource the earlier deployment provisioned; before the replay changes
   anything, each driver checks that its version is still there (the OpenTofu
-  driver fetches the commit), and if one is not, that resource fails, every other is left `pending`, and the
+  driver fetches the commit and installs the providers its lock file selects), and if one is not, that resource fails, every other is left `pending`, and the
   deployment fails with nothing changed. Cloud-account credentials are not pinned; every
   deployment gets fresh ones. Since a preview covers the pinned secret
   versions too, writing a new version of a secret a resource reads makes the

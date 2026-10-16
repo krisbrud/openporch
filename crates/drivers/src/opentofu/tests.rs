@@ -167,7 +167,7 @@ async fn inputs_are_checked_before_anything_runs() {
 const FAKE_TOFU: &str = r#"#!/bin/sh
 { echo "ARGS $*"; env | sort; for f in "$@"; do case "$f" in -var-file=*) echo "VARFILE ${f#-var-file=}"; cat "${f#-var-file=}"; echo; esac; done; } >> "$FAKE_TOFU_LOG"
 case "$1" in
-  init) cat zzzz_openporch_backend_override.tf >> "$FAKE_TOFU_LOG" ;;
+  init) { cat zzzz_openporch_backend_override.tf 2>/dev/null || [ "$3" = -backend=false ]; } >> "$FAKE_TOFU_LOG" ;;
   show) echo '{"resource_changes":[{"address":"random_password.p","change":{"actions":["create"]}}]}' ;;
   output) echo '{"password":{"sensitive":true,"value":"generated-pw-123"},"length":{"sensitive":false,"value":12}}' ;;
   apply) echo "applied password generated-pw-123 with token hunter2-token" ;;
@@ -1300,7 +1300,8 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
         script.replace(
             "  init) ",
             &format!(
-                "  init) [ -f .terraform.lock.hcl ] || echo 'generated lock' > .terraform.lock.hcl; \
+                "  init) grep -q yanked .terraform.lock.hcl 2>/dev/null && {{ echo 'Error: provider yanked' >&2; exit 1; }}; \
+                 [ -f .terraform.lock.hcl ] || echo 'generated lock' > .terraform.lock.hcl; \
                  echo \"LOCK $(cat .terraform.lock.hcl)\" >> {log}; \
                  echo \"MAIN $(head -1 main.tf)\" >> {log}; "
             ),
@@ -1362,12 +1363,29 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     );
     assert!(init.contains("-lockfile=readonly"), "{init}");
     assert_eq!(repinned, pin);
-    // Checking the pin before a replay fetches it and runs nothing.
+    // Checking the pin before a replay fetches it and installs its providers
+    // with its lock file, without a backend, and runs nothing else.
     std::fs::write(&record, "").unwrap();
     let mut req = request(values.clone(), json!({}));
     req.pin = Some(pin.clone());
     d.check_pin(&req).await.unwrap();
-    assert_eq!(std::fs::read_to_string(&record).unwrap(), "");
+    let log = std::fs::read_to_string(&record).unwrap();
+    let args: Vec<&str> = log.lines().filter(|l| l.starts_with("ARGS")).collect();
+    assert_eq!(
+        args,
+        ["ARGS init -input=false -backend=false -lockfile=readonly -no-color"],
+        "{log}"
+    );
+    assert!(log.contains("LOCK generated lock\nMAIN # first"), "{log}");
+    // A provider the lock file selects is gone: the check refuses it.
+    let mut yanked = pin.clone();
+    yanked["lock"] = json!("yanked lock\n");
+    req.pin = Some(yanked);
+    let (code, message) = invalid(d.check_pin(&req).await.unwrap_err());
+    assert_eq!(code, "TOFU-003", "{message}");
+    assert!(message.contains("can no longer be installed"), "{message}");
+    assert!(message.contains("provider yanked"), "{message}");
+    req.pin = Some(pin.clone());
     // A source the planner could not resolve before the deployment ran
     // cannot be checked, so the replay is refused.
     let mut unknown = request(
