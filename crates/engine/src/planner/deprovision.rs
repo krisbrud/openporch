@@ -19,7 +19,7 @@ use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_core::placeholder::Resolved;
 use openporch_store::{
-    ActiveResource, CheckpointResult, OperationKind, OperationStart, Store, StoreError,
+    ActiveResource, CheckpointResult, OperationKind, OperationStart, Store, StoreError, Tombstone,
 };
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -148,13 +148,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             return Ok(());
         }
         if !converged {
+            // One whose deletion was checked and refused keeps that reason.
             for descriptor in candidates.into_keys() {
-                outcomes.insert(
-                    descriptor,
+                outcomes.entry(descriptor).or_insert_with(|| {
                     Outcome::Pending(
                         "deleted only once the deployment's other resources provision".into(),
-                    ),
-                );
+                    )
+                });
             }
             return Ok(());
         }
@@ -354,40 +354,12 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
         let d = &self.deployment;
         let r = &self.resource;
         let failed = |e: String| Outcome::Failed(e);
-        let driver_type = r
-            .driver_type
-            .clone()
-            .ok_or_else(|| failed("the resource has no recorded driver".into()))?;
-        let definition_id: DefinitionId = r
-            .definition_id
-            .as_deref()
-            .unwrap_or_default()
-            .parse()
-            .map_err(|_| failed("the resource has no valid recorded definition".into()))?;
-        // A resource that never provisioned has no recorded inputs; its driver
-        // deletes whatever an attempt left behind from the GUResID alone.
-        let absent = r.inputs.is_null() || r.inputs.as_object().is_some_and(|o| o.is_empty());
-        let inputs: JobInputs = if absent {
-            JobInputs {
-                values: Value::Null,
-                secrets: Resolved::Value(Value::Null),
-                secret_refs: Resolved::Value(Value::Null),
-                resource: Resolved::Value(Value::Null),
-                sources: Vec::new(),
-            }
-        } else {
-            serde_json::from_value(r.inputs.clone()).map_err(|e| {
-                failed(format!(
-                    "the resource's recorded inputs are unreadable: {e}"
-                ))
-            })?
-        };
-        let driver_account = r
-            .driver_account
-            .as_deref()
-            .map(str::parse::<AccountId>)
-            .transpose()
-            .map_err(|_| failed("the resource's recorded cloud account is invalid".into()))?;
+        let Recorded {
+            driver_type,
+            definition_id,
+            inputs,
+            driver_account,
+        } = Recorded::of(r).map_err(failed)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -645,6 +617,56 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
     }
 }
 
+/// What a resource recorded when it last provisioned, which deleting it uses.
+pub(super) struct Recorded {
+    pub driver_type: String,
+    pub definition_id: DefinitionId,
+    pub inputs: JobInputs,
+    pub driver_account: Option<AccountId>,
+}
+
+impl Recorded {
+    pub(super) fn of(r: &ActiveResource) -> Result<Self, String> {
+        let driver_type = r
+            .driver_type
+            .clone()
+            .ok_or_else(|| "the resource has no recorded driver".to_owned())?;
+        let definition_id: DefinitionId = r
+            .definition_id
+            .as_deref()
+            .unwrap_or_default()
+            .parse()
+            .map_err(|_| "the resource has no valid recorded definition".to_owned())?;
+        // A resource that never provisioned has no recorded inputs; its driver
+        // deletes whatever an attempt left behind from the GUResID alone.
+        let absent = r.inputs.is_null() || r.inputs.as_object().is_some_and(|o| o.is_empty());
+        let inputs: JobInputs = if absent {
+            JobInputs {
+                values: Value::Null,
+                secrets: Resolved::Value(Value::Null),
+                secret_refs: Resolved::Value(Value::Null),
+                resource: Resolved::Value(Value::Null),
+                sources: Vec::new(),
+            }
+        } else {
+            serde_json::from_value(r.inputs.clone())
+                .map_err(|e| format!("the resource's recorded inputs are unreadable: {e}"))?
+        };
+        let driver_account = r
+            .driver_account
+            .as_deref()
+            .map(str::parse::<AccountId>)
+            .transpose()
+            .map_err(|_| "the resource's recorded cloud account is invalid".to_owned())?;
+        Ok(Self {
+            driver_type,
+            definition_id,
+            inputs,
+            driver_account,
+        })
+    }
+}
+
 /// The resources a deployment of `graph` deletes among `active`, if it
 /// converges: owned resources it leaves out that are workloads or scheduled
 /// for deletion (everything owned in a `teardown`), and what removed
@@ -710,4 +732,53 @@ pub fn deletion_candidates(
         }
     }
     (candidates, mandatory)
+}
+
+/// The candidates of a deployment of `graph` that something staying will
+/// still use once it converges, so that the deployment keeps them rather than
+/// deletes them. Resources in the graph are excluded as users: once they
+/// provision, they use only other resources in the graph.
+pub(super) fn kept_candidates(
+    graph: &ResourceGraph,
+    active: &[ActiveResource],
+    tombstones: &[Tombstone],
+    candidates: &BTreeMap<Descriptor, ActiveResource>,
+    mandatory: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let in_graph: BTreeSet<String> = graph.nodes.keys().map(ToString::to_string).collect();
+    let mut users: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for r in active.iter().filter(|r| !in_graph.contains(&r.descriptor)) {
+        for dep in &r.dependencies {
+            users.entry(dep).or_default().insert(r.descriptor.clone());
+        }
+    }
+    // A detached resource still uses what it depended on.
+    for t in tombstones.iter().filter(|t| t.reason == "detached") {
+        for dep in t.body["dependencies"].as_array().into_iter().flatten() {
+            if let Some(dep) = dep.as_str() {
+                users.entry(dep).or_default().insert(t.descriptor.clone());
+            }
+        }
+    }
+    let names: BTreeSet<&str> = candidates.values().map(|r| r.descriptor.as_str()).collect();
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for r in candidates.values() {
+            if kept.contains(&r.descriptor) || mandatory.contains(&r.descriptor) {
+                continue;
+            }
+            let stays = users.get(r.descriptor.as_str()).is_some_and(|u| {
+                u.iter()
+                    .any(|u| !names.contains(u.as_str()) || kept.contains(u))
+            });
+            if stays {
+                kept.insert(r.descriptor.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return kept;
+        }
+    }
 }

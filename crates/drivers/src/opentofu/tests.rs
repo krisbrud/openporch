@@ -1464,4 +1464,36 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
         assert_eq!(code, "TOFU-003", "{message}");
         assert!(message.contains(want), "{message}");
     }
+
+    // Before a deployment deletes the resource, the check installs the
+    // modules and providers of the version it retained, without a backend.
+    let req = request(values.clone(), json!({}));
+    std::fs::write(&record, "").unwrap();
+    d.check_retained(&req).await.unwrap();
+    let log = std::fs::read_to_string(&record).unwrap();
+    let args: Vec<&str> = log.lines().filter(|l| l.starts_with("ARGS")).collect();
+    assert_eq!(args.len(), 1, "{log}");
+    assert!(
+        args[0].starts_with("ARGS init -input=false -backend=false"),
+        "{log}"
+    );
+    assert!(log.contains("MAIN # first"), "{log}");
+    // A retained commit that can no longer be fetched is refused.
+    let retained_file = state.join("retained.json");
+    let kept = std::fs::read_to_string(&retained_file).unwrap();
+    let mut lost: Value = serde_json::from_str(&kept).unwrap();
+    lost["source"]["commit"] = json!("0".repeat(40));
+    std::fs::write(&retained_file, lost.to_string()).unwrap();
+    let message = d.check_retained(&req).await.unwrap_err().to_string();
+    assert!(message.contains("fetch"), "{message}");
+    // A provider in the retained lock file is gone: refused too.
+    std::fs::write(&retained_file, &kept).unwrap();
+    std::fs::write(state.join(LOCK_FILE), "yanked lock\n").unwrap();
+    let message = d.check_retained(&req).await.unwrap_err().to_string();
+    assert!(message.contains("provider yanked"), "{message}");
+    // Nothing applied: nothing to delete, so nothing to check.
+    std::fs::remove_dir_all(&state).unwrap();
+    std::fs::write(&record, "").unwrap();
+    d.check_retained(&req).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "");
 }

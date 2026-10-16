@@ -455,6 +455,14 @@ pub trait Driver: Send + Sync + fmt::Debug {
         Box::pin(async { Ok(()) })
     }
 
+    /// Checks, without changing anything, that the version of the code the
+    /// resource was last applied with, which deleting it runs, can still run,
+    /// so that a deployment refuses before any resource changes rather than
+    /// when the deletion's turn comes. Drivers that retain no code accept.
+    fn check_retained<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Stops the operation `req` identifies after a timeout, and observes the
     /// result. Drivers that declare the `cancel` capability implement it; an
     /// in-process call is cancelled by dropping its future.

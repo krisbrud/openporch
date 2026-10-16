@@ -146,6 +146,10 @@ struct Fake {
     /// The pins checked before a replay, and the commits that can no longer
     /// be fetched.
     pin_checks: Mutex<Vec<ProvisionJob>>,
+    /// The retained versions checked before deletions, and the resources
+    /// whose retained version is gone.
+    retained_checks: Mutex<Vec<DeprovisionJob>>,
+    lost_retained: Mutex<BTreeSet<String>>,
     lost_commits: Mutex<BTreeSet<String>>,
     /// How many artifact checks fail in a way that may pass before one
     /// answers.
@@ -310,6 +314,17 @@ fn none_outputs(
 }
 
 impl Executor for Fake {
+    async fn check_retained(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let descriptor = job.job.descriptor.to_string();
+        self.retained_checks.lock().unwrap().push(job);
+        if self.lost_retained.lock().unwrap().contains(&descriptor) {
+            return Err(ExecFailure::Permanent(
+                "the retained commit can no longer be fetched".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn check_pin(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
         let commit = job.pin.as_ref().unwrap()["commit"]
             .as_str()
@@ -1304,6 +1319,124 @@ async fn a_removed_workload_is_deleted_before_what_it_used() {
     );
     assert!(at(ROUTE) < at(DNS), "{order:?}");
     assert!(f.active(BASE).await.is_some());
+}
+
+#[tokio::test]
+async fn a_removal_whose_retained_version_is_gone_changes_nothing() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let workload = f.active(WORKLOAD).await.unwrap();
+    // DB is scheduled and only the removed workload uses it, so it is deleted
+    // too and checked. DNS is scheduled, but the route that stays uses it, so
+    // it is kept and not checked.
+    f.schedule(DB).await;
+    f.schedule(DNS).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(WORKLOAD.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+
+    let checked = fake.retained_checks.lock().unwrap().clone();
+    let mut names: Vec<String> = checked
+        .iter()
+        .map(|j| j.job.descriptor.to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, [DB, WORKLOAD]);
+    // Checked with what the workload was provisioned with.
+    let checked = checked
+        .iter()
+        .find(|j| j.job.descriptor.to_string() == WORKLOAD)
+        .unwrap();
+    assert_eq!(checked.job.guresid.as_str(), workload.guresid);
+    assert_eq!(checked.snapshot, workload.snapshot);
+    let Outcome::Failed(reason) = &outcomes[&d(WORKLOAD)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("can no longer be fetched"), "{reason}");
+    assert!(
+        reason.contains("the deployment deletes this resource"),
+        "{reason}"
+    );
+    // Nothing ran, nothing was deleted, and the deployment failed.
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
+    assert!(
+        matches!(outcomes[&d(BASE)], Outcome::Pending(_)),
+        "{outcomes:?}"
+    );
+    assert!(f.active(WORKLOAD).await.is_some());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_scheduled_deletion_is_checked_unless_something_staying_uses_it() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    // Kept: the retained route still uses DNS, so its lost version does not
+    // stop the deployment.
+    f.schedule(DNS).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(DNS.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Deleted);
+    assert!(
+        matches!(outcomes[&d(DNS)], Outcome::Kept(_)),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        f.status(&deployment).await,
+        (DeploymentStatus::Succeeded, None)
+    );
+
+    // Deleted: nothing that stays uses DB once the workload is gone, so its
+    // lost version stops the deployment before anything runs.
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    f.schedule(DB).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(DB.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    let Outcome::Failed(reason) = &outcomes[&d(DB)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("can no longer be fetched"), "{reason}");
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_removal_whose_record_is_unreadable_changes_nothing() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    sqlx::query(
+        "UPDATE active_resources SET driver_account = 'not an account' WHERE descriptor = ?",
+    )
+    .bind(WORKLOAD)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let fake = Fake::with(&[]);
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+    let Outcome::Failed(reason) = &outcomes[&d(WORKLOAD)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("cloud account is invalid"), "{reason}");
+    assert!(fake.retained_checks.lock().unwrap().is_empty());
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
 }
 
 #[tokio::test]
