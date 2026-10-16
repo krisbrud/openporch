@@ -65,7 +65,8 @@ func (r *environmentType) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Default:  booldefault.StaticBool(false),
 				MarkdownDescription: "Whether environments of this type are protected: a permit to delete, replace or " +
 					"detach resources there needs an administrator, and a change whose impact its driver " +
-					"cannot preview gets no permit. Only administrators change it.",
+					"cannot preview gets no permit. Only administrators change it. Defaults to `false`, so leaving it " +
+					"out unprotects a type protected outside OpenTofu.",
 			},
 		},
 	}

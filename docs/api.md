@@ -479,8 +479,10 @@ the environments of the type. In them, a destructive-action
 [permit](#previews-and-permits) for a `delete`, `replace` or `detach` needs an
 administrator, even for a developer holding the `deployer` role, and a change of
 unknown impact gets no permit at all: deploy it where its driver can plan it
-first. A permit issued before the type was protected stops binding (`DPL-003`)
-unless its issuer is an administrator.
+first. Protecting a type rechecks the permits already issued there whenever a
+deployment binds or uses one, retries included: a permit whose issuer is not an
+administrator, and every `unknown` permit, stops holding (`DPL-003`), which can
+fail a deployment already running.
 
 ```http
 PATCH /orgs/acme/env-types/production
@@ -1968,7 +1970,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | --- | --- | --- |
 | POST | `/orgs/{org}/apps/{app}/envs/{env}/plans` | app deploy |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}` | app read |
-| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits` | app deploy; `detach`, and any permit in a protected environment, needs administer |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits` | app deploy; `detach`, and any permit in a protected environment, needs administer (`unknown` is refused there) |
 
 A preview runs a deployment's preflight without provisioning anything: it
 resolves the set, builds the resource graph and classifies each resource's

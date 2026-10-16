@@ -28,7 +28,7 @@ resource "openporch_environment_type" "staging" {
 ### Optional
 
 - `description` (String) A description.
-- `protected` (Boolean) Whether environments of this type are protected: a permit to delete, replace or detach resources there needs an administrator, and a change whose impact its driver cannot preview gets no permit. Only administrators change it.
+- `protected` (Boolean) Whether environments of this type are protected: a permit to delete, replace or detach resources there needs an administrator, and a change whose impact its driver cannot preview gets no permit. Only administrators change it. Defaults to `false`, so leaving it out unprotects a type protected outside OpenTofu.
 
 ## Import
 
