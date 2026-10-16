@@ -42,6 +42,32 @@ While the server is not ready, every request that changes something gets
 not affect readiness: they fail the deployments that need the cloud, not the
 server.
 
+## Logs
+
+The server writes one JSON object per line to standard output. Each line
+carries the fields of the spans it happened in, so lines about the same work
+can be found together:
+
+| Field | Where it comes from |
+| --- | --- |
+| `request_id` | The caller's `x-request-id` header, or one the server generates; it is returned in the same header and stored on audit entries |
+| `app`, `env`, `deployment` | The deployment the line belongs to |
+| `operation`, `guresid`, `resource`, `driver`, `attempt`, `action` | One driver operation (`provision`, `delete` or `observe`) |
+| `outcome` | `succeeded`, `failed`, `retryable` or `unknown` on `driver finished` and `deployment finished` lines |
+
+`driver finished` reports what the driver returned. If the result cannot be
+recorded afterwards, a `could not checkpoint an operation` line follows and the
+resource's outcome becomes unknown until it is recovered. `deployment finished`
+is logged only once the deployment's outcome is recorded.
+
+A deployment keeps the `request_id` of the request that started it, so a
+failure reported later can be traced to that request, and the audit entry for
+the deployment's outcome carries the same `request_id`. Secret values never
+appear in logs: driver output and errors are redacted before they are written.
+Set `RUST_LOG` to change the level, for example `RUST_LOG=info,openporch_engine=debug`.
+The request, deployment and operation fields stay on every line at any level,
+`RUST_LOG=warn` included.
+
 ## Limits
 
 The server bounds the work it takes on, so a burst of deployments cannot use

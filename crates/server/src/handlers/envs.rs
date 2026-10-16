@@ -2,6 +2,7 @@
 //! summary and deletion.
 
 use std::collections::BTreeMap;
+use tracing::Instrument;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -353,7 +354,7 @@ pub async fn delete(
             audit: ctx.audit(org, "env.delete", format!("{app}/{env}")),
         })
         .await?;
-    let deletion = start_deletion(&state, &acceptance, snapshot, slot).await?;
+    let deletion = start_deletion(&state, &acceptance, snapshot, slot, &ctx.request_id).await?;
     Ok((StatusCode::ACCEPTED, Json(deletion)))
 }
 
@@ -375,6 +376,7 @@ pub(super) async fn start_deletion(
     acceptance: &Acceptance,
     snapshot: Value,
     slot: Option<crate::deploy::Slot>,
+    request_id: &str,
 ) -> ApiResult<EnvDeletion> {
     let org = state.org();
     let mut deployment = acceptance.deployment().clone();
@@ -394,11 +396,23 @@ pub(super) async fn start_deletion(
     // deletion, so a store error never leaves it unstarted.
     let resources = state.store.active_resources(org, app, env).await;
     let finished = match &resources {
-        Ok(resources) if resources.is_empty() => state
-            .store
-            .finish_deployment(org, app, env, &d.id, None)
+        Ok(resources) if resources.is_empty() => {
+            let span = tracing::error_span!(
+                "deployment", app = %app, env = %env, deployment = %d.id
+            );
+            async {
+                let finished = state
+                    .store
+                    .finish_deployment(org, app, env, &d.id, None)
+                    .await
+                    .map_err(|e| e.to_string());
+                let ok = finished.is_ok();
+                crate::deploy::log_finished(&d.id, finished, None);
+                ok
+            }
+            .instrument(span)
             .await
-            .is_ok(),
+        }
         _ => false,
     };
     if !finished {
@@ -409,6 +423,7 @@ pub(super) async fn start_deletion(
                 env: env.clone(),
                 id: d.id.clone(),
                 snapshot,
+                request_id: Some(request_id.to_owned()),
             },
             slot,
         );

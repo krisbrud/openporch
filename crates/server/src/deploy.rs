@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_drivers::DriverRegistry;
 use openporch_engine::planner::{
@@ -37,6 +38,8 @@ pub struct Job {
     pub id: String,
     /// The execution snapshot, with the resource graph to converge.
     pub snapshot: Value,
+    /// The request that accepted the deployment, for correlating its events.
+    pub request_id: Option<String>,
 }
 
 /// A resource to recover.
@@ -269,12 +272,28 @@ pub(crate) async fn planned(
 /// failure to record it leaves the deployment running until restart recovery
 /// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
-    if let Err(e) = state
+    let finished = state
         .store
-        .finish_deployment(state.org(), &job.app, &job.env, &job.id, error)
-        .await
-    {
-        tracing::error!(deployment = %job.id, error = %e, "could not finish a deployment");
+        .finish_deployment(state.org(), &job.app, &job.env, &job.id, error.clone())
+        .await;
+    log_finished(
+        &job.id,
+        finished.map_err(|e| e.to_string()),
+        error.as_deref(),
+    );
+}
+
+/// Logs how deployment `id` ended once `finished` says whether its outcome
+/// was recorded; an unrecorded outcome is logged as that, not as the outcome.
+pub fn log_finished(id: &str, finished: Result<(), String>, error: Option<&str>) {
+    match (finished, error) {
+        (Err(e), _) => {
+            tracing::error!(deployment = %id, error = %e, "could not finish a deployment");
+        }
+        (Ok(()), None) => tracing::info!(outcome = "succeeded", "deployment finished"),
+        (Ok(()), Some(e)) => {
+            tracing::warn!(outcome = "failed", error = %e, "deployment finished");
+        }
     }
 }
 
@@ -413,36 +432,48 @@ impl Runners {
             .insert(key.clone());
         let runner = self.current();
         let slots = self.slots.clone();
-        tokio::spawn(async move {
-            let waited = slot.is_none();
-            let _slot = match slot {
-                Some(slot) => Some(slot),
-                // The semaphore is never closed; were it, the job runs anyway.
-                None => slots
-                    .acquire_owned()
-                    .await
-                    .ok()
-                    .map(|p| Slot { _permit: p }),
-            };
-            // A job that waited for room does not start once the server is
-            // stopping: it has changed nothing, so it fails and can be repeated.
-            if waited && state.draining.load(std::sync::atomic::Ordering::SeqCst) {
-                finish(
-                    &state,
-                    &job,
-                    Some(
-                        "the server stopped before this started; nothing was changed, so \
+        // Every event the deployment logs, the planner's and drivers'
+        // included, names it and the request that accepted it.
+        // Spans are at error level so they stay on whatever `RUST_LOG` hides.
+        let span = tracing::error_span!(
+            "deployment",
+            app = %job.app,
+            env = %job.env,
+            deployment = %job.id,
+            request_id = job.request_id.as_deref().unwrap_or_default(),
+        );
+        let inner = span.clone();
+        tokio::spawn(
+            async move {
+                let waited = slot.is_none();
+                let _slot = match slot {
+                    Some(slot) => Some(slot),
+                    // The semaphore is never closed; were it, the job runs anyway.
+                    None => slots
+                        .acquire_owned()
+                        .await
+                        .ok()
+                        .map(|p| Slot { _permit: p }),
+                };
+                // A job that waited for room does not start once the server is
+                // stopping: it has changed nothing, so it fails and can be repeated.
+                if waited && state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                    finish(
+                        &state,
+                        &job,
+                        Some(
+                            "the server stopped before this started; nothing was changed, so \
                          repeat the request"
-                            .into(),
-                    ),
-                )
-                .await;
-            } else if tokio::spawn(runner.run(state.clone(), job.clone()))
-                .await
-                .is_err()
-            {
-                // A runner that panics must not leave the environment blocked.
-                finish(
+                                .into(),
+                        ),
+                    )
+                    .await;
+                } else if tokio::spawn(runner.run(state.clone(), job.clone()).instrument(inner))
+                    .await
+                    .is_err()
+                {
+                    // A runner that panics must not leave the environment blocked.
+                    finish(
                     &state,
                     &job,
                     Some(
@@ -452,15 +483,17 @@ impl Runners {
                     ),
                 )
                 .await;
+                }
+                state
+                    .runners
+                    .active
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                state.runners.stopped.notify_waiters();
             }
-            state
-                .runners
-                .active
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            state.runners.stopped.notify_waiters();
-        });
+            .instrument(span),
+        );
     }
 }
 

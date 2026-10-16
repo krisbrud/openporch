@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_core::graph::ResourceGraph;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
@@ -223,10 +224,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     deadline,
                     log: log.resource(descriptor),
                 };
+                let span = super::resource_span(descriptor);
                 let id = running
-                    .spawn(async move { (run.descriptor.clone(), run.run().await) })
+                    .spawn(
+                        async move { (run.descriptor.clone(), run.run().await) }
+                            .instrument(span.clone()),
+                    )
                     .id();
-                tasks.insert(id, descriptor.clone());
+                tasks.insert(id, (descriptor.clone(), span));
             }
             let Some(joined) = running.join_next_with_id().await else {
                 break;
@@ -237,13 +242,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // The deletion may have started: only an observation can
                     // tell, and a restart marks its open operation unknown.
                     // A panic message could hold a secret, so it is not logged.
-                    tracing::error!(
-                        panicked = e.is_panic(),
-                        "a deletion task stopped unexpectedly"
-                    );
-                    let Some(descriptor) = tasks.get(&e.id()).cloned() else {
+                    let Some((descriptor, span)) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
+                    // Logged in the resource's span, which names the operation.
+                    span.in_scope(|| {
+                        tracing::error!(
+                            panicked = e.is_panic(),
+                            "a deletion task stopped unexpectedly"
+                        );
+                    });
                     (
                         descriptor,
                         Outcome::Unknown("the deletion stopped unexpectedly".into()),
@@ -428,6 +436,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                     )),
                     other => failed(format!("the deletion was not recorded: {other}")),
                 })?;
+            super::record_operation(&started);
             let guresid: Guresid = started.guresid.clone();
             let log = self
                 .log
@@ -596,8 +605,15 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
     /// Runs the executor until the deadline; a panic or the deadline leaves the
     /// outcome uncertain.
     async fn execute(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let span = super::operation_span(&job.job, "delete");
+        let result = self.execute_in_span(job).instrument(span.clone()).await;
+        span.in_scope(|| super::log_outcome(&result));
+        result
+    }
+
+    async fn execute_in_span(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let executor = self.executor.clone();
-        let task = tokio::spawn(async move { executor.deprovision(job).await });
+        let task = tokio::spawn(async move { executor.deprovision(job).await }.in_current_span());
         let abort = task.abort_handle();
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,

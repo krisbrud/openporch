@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
 use openporch_store::{AuditIntent, AuditOutcome, IdentityStore, Principal, Roles, Store};
 use serde::de::DeserializeOwned;
+use tracing::Instrument;
 
 use crate::auth::{self, SESSION_PREFIX, TOKEN_PREFIX};
 use crate::error::{ApiError, code};
@@ -157,7 +158,10 @@ async fn request_id(mut req: Request, next: Next) -> Response {
         .map(str::to_owned)
         .unwrap_or_else(|| auth::random_id(16));
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut res = next.run(req).await;
+    // Every event logged while serving the request carries its ID, at any
+    // log level.
+    let span = tracing::error_span!("request", request_id = %id);
+    let mut res = next.run(req).instrument(span).await;
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);
     }
@@ -412,6 +416,12 @@ async fn check(
     match rbac::evaluate(permission, &roles, &scope) {
         Decision::Allow => {}
         Decision::Hidden => {
+            if mutating {
+                state
+                    .store
+                    .record_audit(deny(404, "hidden from the caller".into()))
+                    .await?;
+            }
             return Err(ApiError::not_found(format!(
                 "application `{}` not found",
                 app.unwrap_or_default()

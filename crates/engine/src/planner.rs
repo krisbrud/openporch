@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ResourceUse, builtin_types};
@@ -313,6 +314,68 @@ pub enum ExecFailure {
     },
     /// Infrastructure may have changed; recovery must observe it first.
     Uncertain(String),
+}
+
+/// The span an operation's events are logged in: they name the operation, the
+/// resource's GUResID and descriptor, and, through the enclosing deployment
+/// span, the request that accepted the deployment. The deployment is named
+/// here too, for recovery, which runs outside it. It is at error
+/// level so it is kept whatever `RUST_LOG` hides.
+pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracing::Span {
+    tracing::error_span!(
+        "operation",
+        deployment = %job.context.deployment_id,
+        operation = %job.operation_id,
+        guresid = %job.guresid.as_str(),
+        resource = %job.descriptor,
+        driver = %job.driver_type,
+        attempt = job.attempt,
+        action,
+    )
+}
+
+/// The span a resource's work in a deployment is logged in, so events outside
+/// the driver call, such as a failed checkpoint, name the resource and, once
+/// [`record_operation`] runs, its current operation and GUResID.
+pub(crate) fn resource_span(descriptor: &Descriptor) -> tracing::Span {
+    tracing::error_span!(
+        "resource",
+        resource = %descriptor,
+        operation = tracing::field::Empty,
+        guresid = tracing::field::Empty,
+    )
+}
+
+/// Records the operation just started on the current [`resource_span`].
+pub(crate) fn record_operation(started: &openporch_store::OperationStarted) {
+    record_operation_ids(&started.operation_id, started.guresid.as_str());
+}
+
+/// Records operation `operation` on GUResID `guresid` on the current
+/// [`resource_span`].
+pub(crate) fn record_operation_ids(operation: &str, guresid: &str) {
+    let span = tracing::Span::current();
+    span.record("operation", operation);
+    span.record("guresid", guresid);
+}
+
+/// Logs what the executor returned for an operation. This is the driver's
+/// result, not the recorded one: a checkpoint that fails afterwards logs
+/// "could not checkpoint an operation" and leaves the outcome unknown.
+/// Executor failures are already redacted.
+pub(crate) fn log_outcome<T>(result: &Result<T, ExecFailure>) {
+    match result {
+        Ok(_) => tracing::info!(outcome = "succeeded", "driver finished"),
+        Err(ExecFailure::Permanent(e)) => {
+            tracing::warn!(outcome = "failed", error = %e, "driver finished");
+        }
+        Err(ExecFailure::Retryable { error, .. }) => {
+            tracing::warn!(outcome = "retryable", error = %error, "driver finished");
+        }
+        Err(ExecFailure::Uncertain(e)) => {
+            tracing::warn!(outcome = "unknown", error = %e, "driver finished");
+        }
+    }
 }
 
 /// Provisions resources: resolves secrets, obtains credentials and calls drivers.
@@ -876,7 +939,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut done: BTreeMap<Descriptor, Done> = BTreeMap::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
-        let mut tasks: BTreeMap<tokio::task::Id, Descriptor> = BTreeMap::new();
+        let mut tasks: BTreeMap<tokio::task::Id, (Descriptor, tracing::Span)> = BTreeMap::new();
         // Nothing runs unless every artifact the deployment names exists.
         let missing = self.check_artifacts(&deployment, deadline).await;
         for (d, reason) in &missing {
@@ -920,11 +983,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     log: log.resource(&node.descriptor),
                 };
                 let d = node.descriptor.clone();
+                let span = resource_span(&d);
                 let task = running.spawn({
                     let d = d.clone();
-                    async move { (d, ctx.run().await) }
+                    async move { (d, ctx.run().await) }.instrument(span.clone())
                 });
-                tasks.insert(task.id(), d);
+                tasks.insert(task.id(), (d, span));
             }
             let Some(joined) = running.join_next_with_id().await else {
                 break;
@@ -936,13 +1000,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // Its operation, if one started, stays open for restart
                     // recovery, and the resource may have changed.
                     // A panic message could hold a secret, so it is not logged.
-                    tracing::error!(
-                        panicked = e.is_panic(),
-                        "a provisioning task stopped unexpectedly"
-                    );
-                    let Some(d) = tasks.get(&e.id()).cloned() else {
+                    let Some((d, span)) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
+                    // Logged in the resource's span, which names the operation.
+                    span.in_scope(|| {
+                        tracing::error!(
+                            panicked = e.is_panic(),
+                            "a provisioning task stopped unexpectedly"
+                        );
+                    });
                     (
                         d,
                         Err(Outcome::Unknown(
@@ -1056,18 +1123,26 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // its outcome as the last line. A log with lines missing is reported,
         // not presented as complete.
         let error = with_lost_lines(error, log.close().await);
-        if let Err(e) = self
+        // The outcome is logged once it is recorded, so the log never
+        // contradicts the deployment and its audit entry.
+        match self
             .store
             .finish_deployment(
                 deployment.org.as_str(),
                 deployment.app.as_str(),
                 deployment.env.as_str(),
                 &deployment.id,
-                error,
+                error.clone(),
             )
             .await
         {
-            tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
+            Err(e) => {
+                tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
+            }
+            Ok(()) => match &error {
+                None => tracing::info!(outcome = "succeeded", "deployment finished"),
+                Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
+            },
         }
         outcomes
     }
@@ -1464,6 +1539,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     }
                     other => Outcome::Failed(format!("the operation was not recorded: {other}")),
                 })?;
+            record_operation(&started);
             self.scope
                 .context
                 .insert(ContextKey::ResGuresid, json!(started.guresid.as_str()));
@@ -1720,8 +1796,15 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
     /// Runs the executor until the deadline. A panic or the deadline leaves the
     /// outcome uncertain, since the driver may have changed something.
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
+        let span = operation_span(&job, "provision");
+        let result = self.provision_in_span(job).instrument(span.clone()).await;
+        span.in_scope(|| log_outcome(&result));
+        result
+    }
+
+    async fn provision_in_span(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         let executor = self.executor.clone();
-        let task = tokio::spawn(async move { executor.provision(job).await });
+        let task = tokio::spawn(async move { executor.provision(job).await }.in_current_span());
         let abort = task.abort_handle();
         match tokio::time::timeout_at(self.deadline, task).await {
             Ok(Ok(result)) => result,

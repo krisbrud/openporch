@@ -219,7 +219,9 @@ pub async fn delete(
             Acceptance::Created(_) => slots.pop(),
             _ => None,
         };
-        match envs::start_deletion(&state, acceptance, snapshot.clone(), slot).await {
+        match envs::start_deletion(&state, acceptance, snapshot.clone(), slot, &ctx.request_id)
+            .await
+        {
             Ok(d) => deletions.push(d),
             Err(e) => failure = failure.or(Some(e)),
         }

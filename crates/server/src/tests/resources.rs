@@ -1313,3 +1313,171 @@ async fn conflicting_shared_parameters_provision_nothing() {
         .collect();
     assert_eq!(tables.len(), 1, "{tables:?}");
 }
+
+/// Collects formatted log output for assertions.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+thread_local! {
+    /// Where log lines written on this thread go, if anywhere.
+    static CAPTURE: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Writes to this thread's capture, or nowhere.
+struct ToCapture;
+
+impl std::io::Write for ToCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE.with_borrow(|c| {
+            if let Some(c) = c {
+                c.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Captures the JSON log lines written on this thread from now on. The
+    /// subscriber is global: a thread-local one misses spans whose interest
+    /// tests on other threads cached first.
+    fn start() -> Self {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(|| ToCapture)
+                    .finish(),
+            );
+        });
+        let c = Self::default();
+        CAPTURE.set(Some(c.clone()));
+        c
+    }
+
+    /// The captured JSON log events.
+    fn events(&self) -> Vec<Value> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn a_failed_operation_is_correlated_with_its_request() {
+    const SECRET: &str = "hunter2-correlated-17";
+    const REQUEST: &str = "req-correlate-1";
+    // The test runtime is single-threaded, so spawned deployments log here too.
+    let logs = Captured::start();
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    *fake.leak.lock().unwrap() = Some(SECRET.into());
+
+    let env_path = "/orgs/acme/apps/shop/envs/development";
+    let (_, env) = s.get(env_path, &s.admin).await;
+    let (status, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "nginx:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delta}");
+    let (status, d) = s
+        .call_with(
+            Method::POST,
+            &format!("{env_path}/deploys"),
+            Some(&s.admin),
+            Some(json!({"delta_id": delta["id"], "expected_generation": env["generation"]})),
+            &[("x-request-id", REQUEST)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let d = s.finished_at(&format!("{env_path}/deploys/{id}")).await;
+    assert_eq!(d["status"], "failed", "{d}");
+
+    let events = logs.events();
+    let text = serde_json::to_string(&events).unwrap();
+    assert!(!text.contains(SECRET), "a secret reached the logs");
+    // Fields of an event and of every span it is inside.
+    let fields = |e: &Value| {
+        let mut all = e["fields"].as_object().cloned().unwrap_or_default();
+        for span in e["spans"].as_array().into_iter().flatten() {
+            all.extend(span.as_object().cloned().unwrap_or_default());
+        }
+        Value::Object(all)
+    };
+    let failed: Vec<_> = events
+        .iter()
+        .map(fields)
+        .filter(|f| f["message"] == "driver finished" && f["outcome"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{text}");
+    let op = &failed[0];
+    assert_eq!(op["request_id"], REQUEST, "{op:?}");
+    assert_eq!(op["deployment"], id.as_str(), "{op:?}");
+    assert_eq!(op["resource"], DB, "{op:?}");
+    assert!(
+        op["operation"].is_string() && op["guresid"].is_string(),
+        "{op:?}"
+    );
+    assert!(
+        op["error"].as_str().unwrap().contains("[REDACTED]"),
+        "{op:?}"
+    );
+    // The resource's span names the operation too, for events outside the
+    // driver call such as a failed checkpoint.
+    let resource_spans: Vec<_> = events
+        .iter()
+        .filter(|e| e["fields"]["message"] == "driver finished")
+        .flat_map(|e| e["spans"].as_array().cloned().unwrap_or_default())
+        .filter(|s| s["name"] == "resource" && s["resource"] == DB)
+        .collect();
+    assert!(!resource_spans.is_empty(), "{text}");
+    assert!(
+        resource_spans
+            .iter()
+            .all(|s| s["guresid"] == op["guresid"] && s["operation"] == op["operation"]),
+        "{resource_spans:?}"
+    );
+    let finished: Vec<_> = events
+        .iter()
+        .map(fields)
+        .filter(|f| f["message"] == "deployment finished")
+        .collect();
+    assert!(!finished.is_empty(), "{text}");
+    assert!(
+        finished
+            .iter()
+            .all(|f| f["request_id"] == REQUEST && f["deployment"] == id.as_str()),
+        "{finished:?}"
+    );
+
+    // The audited outcome carries the request that started it.
+    let (_, page) = s.get("/orgs/acme/audit-logs?limit=100", &s.admin).await;
+    let of_request: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["request_id"] == REQUEST)
+        .collect();
+    assert!(
+        of_request
+            .iter()
+            .any(|e| e["action"] == "deployment.finish" && e["outcome"] == "failed"),
+        "{page}"
+    );
+    assert!(of_request.len() >= 2, "{page}");
+    assert!(!page.to_string().contains(SECRET), "{page}");
+}
