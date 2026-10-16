@@ -507,6 +507,14 @@ async fn members_roles_secret_stores_and_audit_logs() {
         r.out.contains("would expire") && r.out.contains("0 entries older than 30 days expired"),
         "{r:?}"
     );
+    // As JSON, stdout holds only the result; the report goes to stderr.
+    let r = m
+        .porch(&["expire-audit-logs", "--yes", "-o", "json"], "")
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let result: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(result["dry_run"], false, "{r:?}");
+    assert!(r.err.contains("\"dry_run\": true"), "{r:?}");
     let r = m
         .porch(&["expire-audit-logs", "--dry-run", "-o", "json"], "")
         .await;

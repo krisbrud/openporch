@@ -704,11 +704,17 @@ pub(crate) async fn expire_audit_logs(
     let format = args.output.output;
     if args.dry_run || args.before.is_some() {
         let result = expire(args.dry_run, args.before).await?;
-        return print_expiry(io, format, &result, args.dry_run);
+        return print_expiry(io.out, format, &result, args.dry_run);
     }
     // What is kept is reported before anything is removed.
+    // In table form it goes before the result; as JSON or YAML it goes to
+    // stderr, so stdout holds one document.
     let report = expire(true, None).await?;
-    print_expiry(io, format, &report, true)?;
+    if format == Format::Table {
+        print_expiry(io.out, format, &report, true)?;
+    } else {
+        print_expiry(io.err, format, &report, true)?;
+    }
     let before = report["before"]
         .as_i64()
         .ok_or("the server's dry run did not report `before`")?;
@@ -719,11 +725,11 @@ pub(crate) async fn expire_audit_logs(
         ));
     }
     let result = expire(false, Some(before)).await?;
-    print_expiry(io, format, &result, false)
+    print_expiry(io.out, format, &result, false)
 }
 
 fn print_expiry(
-    io: &mut Io<'_>,
+    out: &mut dyn std::io::Write,
     format: Format,
     result: &Value,
     dry_run: bool,
@@ -741,7 +747,7 @@ fn print_expiry(
             .map(|(driver, n)| format!("{n} {driver}"))
             .collect();
         writeln!(
-            io.out,
+            out,
             "{expired} entries older than {days} days {verb}; {remaining} kept\n\
              Kept: {} resources ({}), {} needing recovery, {} awaiting cleanup\n{}",
             retained["resources"].as_i64().unwrap_or(0),
@@ -756,6 +762,6 @@ fn print_expiry(
         )
         .map_err(|e| e.to_string())
     } else {
-        output::print(io.out, format, result, &[])
+        output::print(out, format, result, &[])
     }
 }
