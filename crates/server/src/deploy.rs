@@ -272,16 +272,28 @@ pub(crate) async fn planned(
 /// failure to record it leaves the deployment running until restart recovery
 /// fails it.
 pub async fn finish(state: &AppState, job: &Job, error: Option<String>) {
-    match &error {
-        None => tracing::info!(outcome = "succeeded", "deployment finished"),
-        Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
-    }
-    if let Err(e) = state
+    let finished = state
         .store
-        .finish_deployment(state.org(), &job.app, &job.env, &job.id, error)
-        .await
-    {
-        tracing::error!(deployment = %job.id, error = %e, "could not finish a deployment");
+        .finish_deployment(state.org(), &job.app, &job.env, &job.id, error.clone())
+        .await;
+    log_finished(
+        &job.id,
+        finished.map_err(|e| e.to_string()),
+        error.as_deref(),
+    );
+}
+
+/// Logs how deployment `id` ended once `finished` says whether its outcome
+/// was recorded; an unrecorded outcome is logged as that, not as the outcome.
+pub fn log_finished(id: &str, finished: Result<(), String>, error: Option<&str>) {
+    match (finished, error) {
+        (Err(e), _) => {
+            tracing::error!(deployment = %id, error = %e, "could not finish a deployment");
+        }
+        (Ok(()), None) => tracing::info!(outcome = "succeeded", "deployment finished"),
+        (Ok(()), Some(e)) => {
+            tracing::warn!(outcome = "failed", error = %e, "deployment finished");
+        }
     }
 }
 

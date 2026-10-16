@@ -318,11 +318,13 @@ pub enum ExecFailure {
 
 /// The span an operation's events are logged in: they name the operation, the
 /// resource's GUResID and descriptor, and, through the enclosing deployment
-/// span, the deployment and the request that accepted it. It is at error
+/// span, the request that accepted the deployment. The deployment is named
+/// here too, for recovery, which runs outside it. It is at error
 /// level so it is kept whatever `RUST_LOG` hides.
 pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracing::Span {
     tracing::error_span!(
         "operation",
+        deployment = %job.context.deployment_id,
         operation = %job.operation_id,
         guresid = %job.guresid.as_str(),
         resource = %job.descriptor,
@@ -1089,22 +1091,26 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         // its outcome as the last line. A log with lines missing is reported,
         // not presented as complete.
         let error = with_lost_lines(error, log.close().await);
-        match &error {
-            None => tracing::info!(outcome = "succeeded", "deployment finished"),
-            Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
-        }
-        if let Err(e) = self
+        // The outcome is logged once it is recorded, so the log never
+        // contradicts the deployment and its audit entry.
+        match self
             .store
             .finish_deployment(
                 deployment.org.as_str(),
                 deployment.app.as_str(),
                 deployment.env.as_str(),
                 &deployment.id,
-                error,
+                error.clone(),
             )
             .await
         {
-            tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
+            Err(e) => {
+                tracing::error!(deployment = %deployment.id, error = %e, "could not finish a deployment");
+            }
+            Ok(()) => match &error {
+                None => tracing::info!(outcome = "succeeded", "deployment finished"),
+                Some(e) => tracing::warn!(outcome = "failed", error = %e, "deployment finished"),
+            },
         }
         outcomes
     }
