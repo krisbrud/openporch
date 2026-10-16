@@ -1047,8 +1047,8 @@ impl OpenTofu {
         Ok(())
     }
 
-    /// Fetches the pinned commit and installs the providers the pinned lock
-    /// file selects, without a backend: nothing is planned or applied, and no
+    /// Fetches the pinned commit and installs the modules it calls and the
+    /// providers the pinned lock file selects, without a backend: nothing is planned or applied, and no
     /// state is read.
     async fn check_pin_run(&self, run: &mut Run, req: &DriverRequest) -> Result<(), Failure> {
         let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
@@ -1088,9 +1088,6 @@ impl OpenTofu {
             }
             _ => files::private_dir(&run.module).map_err(Failure::io)?,
         }
-        let Some(lock) = &pinned.lock else {
-            return Ok(());
-        };
         if let Some(script) = &inputs.script {
             let name = if inputs.source.is_some() {
                 "override.tf"
@@ -1103,7 +1100,14 @@ impl OpenTofu {
             let target = files::inside(&run.module, path).map_err(Failure::Input)?;
             files::write_private(&target, content.as_bytes()).map_err(Failure::io)?;
         }
-        files::write_private(&run.module.join(LOCK_FILE), lock.as_bytes()).map_err(Failure::io)?;
+        // Remote child modules are not in the lock file, so `init` runs
+        // without one too.
+        let mut args = vec!["init", "-input=false", "-backend=false"];
+        if let Some(lock) = &pinned.lock {
+            files::write_private(&run.module.join(LOCK_FILE), lock.as_bytes())
+                .map_err(Failure::io)?;
+            args.push("-lockfile=readonly");
+        }
         run.env.insert("HOME".into(), home.display().to_string());
         run.env.insert("TF_IN_AUTOMATION".into(), "1".into());
         run.env.insert("TF_INPUT".into(), "0".into());
@@ -1115,31 +1119,21 @@ impl OpenTofu {
             let name = host.replace('-', "__").replace('.', "_");
             run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
         }
-        self.tofu(
-            run,
-            "init failed",
-            &[
-                "init",
-                "-input=false",
-                "-backend=false",
-                "-lockfile=readonly",
-            ],
-            exec::Stdout::Logged,
-        )
-        .await
-        .map(drop)
-        .map_err(|e| match e {
-            Failure::Command { stderr, .. } => input(format!(
-                "the providers or modules the pinned version selects can no longer be \
+        self.tofu(run, "init failed", &args, exec::Stdout::Logged)
+            .await
+            .map(drop)
+            .map_err(|e| match e {
+                Failure::Command { stderr, .. } => input(format!(
+                    "the providers or modules the pinned version selects can no longer be \
                  installed; deploy the current configuration instead: {}",
-                stderr
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or_default()
-            )),
-            e => e,
-        })
+                    stderr
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or_default()
+                )),
+                e => e,
+            })
     }
 
     /// Points the module at orchestrator state, which lives outside the run

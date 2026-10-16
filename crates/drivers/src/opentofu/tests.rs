@@ -1385,6 +1385,17 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     assert_eq!(code, "TOFU-003", "{message}");
     assert!(message.contains("can no longer be installed"), "{message}");
     assert!(message.contains("provider yanked"), "{message}");
+    // Without a recorded lock file, `init` still installs the modules.
+    let mut unlocked = pin.clone();
+    unlocked["lock"] = Value::Null;
+    req.pin = Some(unlocked);
+    std::fs::write(&record, "").unwrap();
+    d.check_pin(&req).await.unwrap();
+    let log = std::fs::read_to_string(&record).unwrap();
+    assert!(
+        log.contains("ARGS init -input=false -backend=false -no-color"),
+        "{log}"
+    );
     req.pin = Some(pin.clone());
     // A source the planner could not resolve before the deployment ran
     // cannot be checked, so the replay is refused.
