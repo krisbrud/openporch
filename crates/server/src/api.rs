@@ -158,8 +158,9 @@ async fn request_id(mut req: Request, next: Next) -> Response {
         .map(str::to_owned)
         .unwrap_or_else(|| auth::random_id(16));
     req.extensions_mut().insert(RequestId(id.clone()));
-    // Every event logged while serving the request carries its ID.
-    let span = tracing::info_span!("request", request_id = %id);
+    // Every event logged while serving the request carries its ID, at any
+    // log level.
+    let span = tracing::error_span!("request", request_id = %id);
     let mut res = next.run(req).instrument(span).await;
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);

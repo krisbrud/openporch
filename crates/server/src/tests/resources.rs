@@ -1351,6 +1351,7 @@ impl Captured {
             let _ = tracing::subscriber::set_global_default(
                 tracing_subscriber::fmt()
                     .json()
+                    .with_max_level(tracing::Level::INFO)
                     .with_writer(|| ToCapture)
                     .finish(),
             );

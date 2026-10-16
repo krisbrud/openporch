@@ -422,43 +422,46 @@ impl Runners {
         let slots = self.slots.clone();
         // Every event the deployment logs, the planner's and drivers'
         // included, names it and the request that accepted it.
-        let span = tracing::info_span!(
+        // Spans are at error level so they stay on whatever `RUST_LOG` hides.
+        let span = tracing::error_span!(
             "deployment",
             app = %job.app,
             env = %job.env,
             deployment = %job.id,
             request_id = job.request_id.as_deref().unwrap_or_default(),
         );
-        tokio::spawn(async move {
-            let waited = slot.is_none();
-            let _slot = match slot {
-                Some(slot) => Some(slot),
-                // The semaphore is never closed; were it, the job runs anyway.
-                None => slots
-                    .acquire_owned()
-                    .await
-                    .ok()
-                    .map(|p| Slot { _permit: p }),
-            };
-            // A job that waited for room does not start once the server is
-            // stopping: it has changed nothing, so it fails and can be repeated.
-            if waited && state.draining.load(std::sync::atomic::Ordering::SeqCst) {
-                finish(
-                    &state,
-                    &job,
-                    Some(
-                        "the server stopped before this started; nothing was changed, so \
+        let inner = span.clone();
+        tokio::spawn(
+            async move {
+                let waited = slot.is_none();
+                let _slot = match slot {
+                    Some(slot) => Some(slot),
+                    // The semaphore is never closed; were it, the job runs anyway.
+                    None => slots
+                        .acquire_owned()
+                        .await
+                        .ok()
+                        .map(|p| Slot { _permit: p }),
+                };
+                // A job that waited for room does not start once the server is
+                // stopping: it has changed nothing, so it fails and can be repeated.
+                if waited && state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                    finish(
+                        &state,
+                        &job,
+                        Some(
+                            "the server stopped before this started; nothing was changed, so \
                          repeat the request"
-                            .into(),
-                    ),
-                )
-                .await;
-            } else if tokio::spawn(runner.run(state.clone(), job.clone()).instrument(span))
-                .await
-                .is_err()
-            {
-                // A runner that panics must not leave the environment blocked.
-                finish(
+                                .into(),
+                        ),
+                    )
+                    .await;
+                } else if tokio::spawn(runner.run(state.clone(), job.clone()).instrument(inner))
+                    .await
+                    .is_err()
+                {
+                    // A runner that panics must not leave the environment blocked.
+                    finish(
                     &state,
                     &job,
                     Some(
@@ -468,15 +471,17 @@ impl Runners {
                     ),
                 )
                 .await;
+                }
+                state
+                    .runners
+                    .active
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                state.runners.stopped.notify_waiters();
             }
-            state
-                .runners
-                .active
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            state.runners.stopped.notify_waiters();
-        });
+            .instrument(span),
+        );
     }
 }
 

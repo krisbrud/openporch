@@ -52,7 +52,7 @@ can be found together:
 | --- | --- |
 | `request_id` | The caller's `x-request-id` header, or one the server generates; it is returned in the same header and stored on audit entries |
 | `app`, `env`, `deployment` | The deployment the line belongs to |
-| `operation`, `guresid`, `resource`, `driver`, `attempt`, `action` | One driver operation (`create`, `delete` or `observe`) |
+| `operation`, `guresid`, `resource`, `driver`, `attempt`, `action` | One driver operation (`provision`, `delete` or `observe`) |
 | `outcome` | `succeeded`, `failed`, `retryable` or `unknown` on `operation finished` and `deployment finished` lines |
 
 A deployment keeps the `request_id` of the request that started it, so a
@@ -60,6 +60,8 @@ failure reported later can be traced to that request, and the audit entry for
 the deployment's outcome carries the same `request_id`. Secret values never
 appear in logs: driver output and errors are redacted before they are written.
 Set `RUST_LOG` to change the level, for example `RUST_LOG=info,openporch_engine=debug`.
+The request, deployment and operation fields stay on every line at any level,
+`RUST_LOG=warn` included.
 
 ## Limits
 

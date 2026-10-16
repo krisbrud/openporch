@@ -318,9 +318,10 @@ pub enum ExecFailure {
 
 /// The span an operation's events are logged in: they name the operation, the
 /// resource's GUResID and descriptor, and, through the enclosing deployment
-/// span, the deployment and the request that accepted it.
+/// span, the deployment and the request that accepted it. It is at error
+/// level so it is kept whatever `RUST_LOG` hides.
 pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracing::Span {
-    tracing::info_span!(
+    tracing::error_span!(
         "operation",
         operation = %job.operation_id,
         guresid = %job.guresid.as_str(),
