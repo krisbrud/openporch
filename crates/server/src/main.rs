@@ -38,7 +38,10 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Version => {
-            println!("openporch {VERSION}");
+            println!(
+                "openporch {VERSION} (schema {})",
+                openporch_store::SCHEMA_VERSION
+            );
             ExitCode::SUCCESS
         }
         Command::Serve { config } => {

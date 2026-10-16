@@ -38,7 +38,7 @@ pub use identity::{
 };
 pub use ownership::Ownership;
 pub use secret_use::{SecretOwner, SecretUseStore};
-pub use sqlite::{SqliteStore, StoreStats};
+pub use sqlite::{SCHEMA_VERSION, SqliteStore, StoreStats, check_schema};
 pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_audit_retention::{AuditRetention, EXPIRY_ACTION, Expiry, Retained};
 pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};

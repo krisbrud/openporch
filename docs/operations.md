@@ -333,6 +333,23 @@ database schema version <found> is newer than this binary supports (up to <suppo
 run a compatible openporch version or restore a compatible backup
 ```
 
+Each build reads and writes exactly one schema version, its newest migration,
+and `openporch version` names the release and that schema version, as in
+`openporch 0.1.0 (schema 9)`. A newer schema is never opened by
+an older build, even when the newer migrations only added columns: no
+downgrade pair is supported. The tested pairs are:
+
+| Schema written by | Upgraded by this build | Opened by an older build |
+| --- | --- | --- |
+| 8 (milestone 1 before protected environment types) | yes, tested from a fixture | not applicable |
+| 9 (protected environment types) | yes, tested from a fixture | refused before any write, tested |
+
+Every schema version a build ships gets a fixture in
+`crates/server/fixtures/schema`: a data directory that build wrote, which every
+later build must upgrade while serving the same applications, environments,
+resources, deployments and values, reading the same secrets and deploying
+again.
+
 So downgrading means either going back to the newer release, or restoring a
 backup taken before the upgrade and running the release that made it. Take a
 backup before every upgrade. Restoring an older backup forgets every

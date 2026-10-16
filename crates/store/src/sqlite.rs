@@ -54,18 +54,11 @@ impl SqliteStore {
     /// The store keeps `ownership` for as long as it or any clone of it lives, so the
     /// installation lock cannot be released while the database is still in use.
     pub async fn open(ownership: Ownership, org: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(ownership.dir().join("openporch.db"))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
-            .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect_with(options)
+            .connect_with(connect_options(&ownership.dir().join("openporch.db")))
             .await?;
-        check_schema_version(&pool).await?;
+        check_schema_version(&pool, SCHEMA_VERSION).await?;
         MIGRATOR.run(&pool).await?;
         let store = Self {
             pool,
@@ -218,8 +211,35 @@ impl SqliteStore {
     }
 }
 
+/// The schema version this build reads and writes: its newest migration. It
+/// migrates older databases forward and refuses newer ones.
+pub const SCHEMA_VERSION: i64 = 9;
+
+fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5))
+}
+
+/// Connects to the database at `path` as [`SqliteStore::open`] does and checks
+/// whether a build whose schema version is `supported` could open it, which
+/// is how a test plays an older build.
+pub async fn check_schema(path: &std::path::Path, supported: i64) -> Result<()> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options(path))
+        .await?;
+    let checked = check_schema_version(&pool, supported).await;
+    pool.close().await;
+    checked
+}
+
 /// Refuses databases written by a newer binary before any migration runs.
-async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
+async fn check_schema_version(pool: &SqlitePool, supported: i64) -> Result<()> {
     let has_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
@@ -231,7 +251,6 @@ async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
     let found: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(pool)
         .await?;
-    let supported = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
     match found {
         Some(found) if found > supported => Err(StoreError::SchemaTooNew { found, supported }),
         _ => Ok(()),
