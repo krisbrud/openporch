@@ -349,6 +349,8 @@ impl HttpRegistry {
             Client::builder()
                 .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
                 .redirect(reqwest::redirect::Policy::none())
+                // A proxy would resolve names itself, past the resolver.
+                .no_proxy()
                 .timeout(REQUEST_TIMEOUT)
                 .dns_resolver(Arc::new(PublicOnly { allowed }))
                 .build()

@@ -170,7 +170,8 @@ points at, and a deployment checks that each pinned digest still exists
 before it changes anything. Images in Amazon ECR are read with the workload
 definition's cloud account. Images in other registries, such as Docker Hub or
 `ghcr.io`, are read over HTTPS without credentials, so the server needs
-outbound access to them. A tag that does not exist is refused with `400`. An
+direct outbound access to them: these reads ignore `HTTPS_PROXY` and the other
+proxy variables, since a proxy would reach addresses the server refuses. A tag that does not exist is refused with `400`. An
 image the registry shows only with credentials is refused too; name it by
 digest (`<image>@sha256:<digest>`) instead. Its digest is then not checked
 before a run, and its driver reports it when it is gone. An image pinned from a
