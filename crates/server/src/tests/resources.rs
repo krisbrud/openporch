@@ -28,6 +28,8 @@ pub(super) struct Fake {
     uncertain: Mutex<BTreeSet<String>>,
     /// What observing a resource finds.
     observation: Mutex<Option<Observed>>,
+    /// How many lines provisioning writes to the log first.
+    chatter: Mutex<usize>,
 }
 
 impl Executor for Fake {
@@ -37,6 +39,13 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push((job.descriptor.to_string(), job.guresid.to_string()));
+        let chatter = *self.chatter.lock().unwrap();
+        if chatter > 0 {
+            let log = job.log.redacting();
+            for i in 0..chatter {
+                log.info(&format!("{ty} line {i}"));
+            }
+        }
         let leak = self.leak.lock().unwrap().clone();
         if let Some(secret) = leak.filter(|_| ty == "postgres") {
             let mut log = job.log.redacting();
@@ -1562,4 +1571,110 @@ async fn metrics_count_work_outcomes_and_storage() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = s.get_text("/orgs/acme/metrics", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    fake.uncertain.lock().unwrap().insert("postgres".into());
+    // A long log is cut to its last lines.
+    *fake.chatter.lock().unwrap() = 250;
+    let timed_out = s.deploy_web("nginx:1", true).await;
+    assert_eq!(timed_out["status"], "failed", "{timed_out}");
+    let id = timed_out["id"].as_str().unwrap();
+    let db = s.resource(DB).await;
+
+    let (status, report) = s
+        .get(
+            &format!("/orgs/acme/diagnostics?app=shop&env=development&deployment={id}"),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert!(report["version"].is_string(), "{report}");
+    assert_eq!(report["ready"], true, "{report}");
+    assert_eq!(report["config"]["org"], "acme", "{report}");
+    assert_eq!(report["resources"]["unknown"], 1, "{report}");
+    // The operation whose outcome is unknown, and the resource waiting on it.
+    let waiting = report["needing_recovery"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1, "{report}");
+    assert_eq!(waiting[0]["id"], db["unknown_operation"], "{report}");
+    assert_eq!(waiting[0]["deployment_id"], id, "{report}");
+    assert_eq!(waiting[0]["resource"], DB, "{report}");
+    assert_eq!(waiting[0]["state"], "unknown", "{report}");
+    assert_eq!(waiting[0]["resource_status"], "unknown", "{report}");
+    // The deployment, with its request, its operations, audit and log.
+    let d = &report["deployment"];
+    assert_eq!(d["id"], id, "{report}");
+    assert_eq!(d["status"], "failed", "{report}");
+    assert!(d["request_id"].is_string(), "{report}");
+    let ops = d["operations"].as_array().unwrap();
+    assert!(
+        ops.iter().any(|o| o["id"] == db["unknown_operation"]),
+        "{report}"
+    );
+    let audit = d["audit"].as_array().unwrap();
+    assert!(audit.iter().any(|a| a["outcome"] == "accepted"), "{report}");
+    assert!(audit.iter().any(|a| a["outcome"] == "failed"), "{report}");
+    let log = d["log"].as_array().unwrap();
+    assert_eq!(log.len(), 200, "{report}");
+    assert!(
+        log.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("deployment failed"),
+        "{report}"
+    );
+    assert_eq!(d["log_truncated"], true, "{report}");
+
+    // A deployment whose driver leaks a secret keeps it out of the report.
+    fake.uncertain.lock().unwrap().clear();
+    *fake.chatter.lock().unwrap() = 0;
+    let (status, _) = s
+        .post(
+            &format!("{RESOURCES}/postgres/modules.web.externals.db/resolve"),
+            &s.admin,
+            json!({"reason": "nothing was created"}),
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+    *fake.leak.lock().unwrap() = Some("hunter2-diagnostics".into());
+    let leaked = s.deploy_web("nginx:2", true).await;
+    assert_eq!(leaked["status"], "failed", "{leaked}");
+    let (status, report) = s
+        .get(
+            &format!(
+                "/orgs/acme/diagnostics?app=shop&env=development&deployment={}",
+                leaked["id"].as_str().unwrap()
+            ),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert!(!report.to_string().contains("hunter2"), "{report}");
+    assert!(
+        report["deployment"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["state"] == "failed"),
+        "{report}"
+    );
+
+    // Naming a deployment takes all three of app, env and deployment.
+    let (status, b) = s.get("/orgs/acme/diagnostics?app=shop", &s.admin).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = s
+        .get(
+            "/orgs/acme/diagnostics?app=shop&env=development&deployment=nope",
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{b}");
+    // Diagnostics are for administrators and org viewers.
+    let member = s.member("mia", "member").await;
+    let (status, _) = s.get("/orgs/acme/diagnostics", &member).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

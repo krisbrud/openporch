@@ -5,6 +5,7 @@ mod apps;
 mod audit;
 mod catalog;
 mod deploys;
+mod diagnostics;
 mod envs;
 mod health;
 mod login;
@@ -688,6 +689,13 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/audit-logs",
             Org(OrgPerm::ReadAll),
             audit::query,
+        )
+        // Diagnostics.
+        .route(
+            get(),
+            "/orgs/{org}/diagnostics",
+            Org(OrgPerm::ReadAll),
+            diagnostics::get,
         )
         // Metrics.
         .route(
