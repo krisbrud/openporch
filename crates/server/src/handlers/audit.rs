@@ -127,12 +127,18 @@ pub async fn expire(
             )));
         }
         Some(before) => before,
+        // What is kept is reported before anything is removed: a dry run
+        // reports it with the `before` to expire.
+        None if !req.dry_run => {
+            return Err(ApiError::invalid(
+                "expiring takes `before`, from a dry run that reports what is kept",
+            ));
+        }
         None => start,
     };
     let retention_days = state.config.audit.retention_days;
-    // Reported before anything is removed.
-    let retained = state.store.retained().await?;
     if req.dry_run {
+        let retained = state.store.retained().await?;
         let status = state.store.audit_retention(before).await?;
         return Ok(Json(Expired {
             dry_run: true,
@@ -144,6 +150,10 @@ pub async fn expire(
             note: RETAINED_NOTE,
         }));
     }
+    let retained = match state.store.retained().await {
+        Ok(retained) => retained,
+        Err(e) => return Err(expiry_failed(&state, &ctx, before, e).await),
+    };
     let mut audit = ctx.audit(org, EXPIRY_ACTION, String::new());
     audit.outcome = AuditOutcome::Succeeded;
     match state.store.expire_audit(before, audit).await {
@@ -161,21 +171,33 @@ pub async fn expire(
                 note: RETAINED_NOTE,
             }))
         }
-        Err(e) => {
-            let error = ApiError::from(e);
-            // A refusal, such as a principal without administrator
-            // authority, is not a failed expiry.
-            if error.status.is_server_error() {
-                EXPIRY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(before, "audit expiry failed");
-                let mut failed = ctx.audit(org, EXPIRY_ACTION, format!("entries before {before}"));
-                failed.outcome = AuditOutcome::Failed;
-                failed.reason = Some("storage_error".into());
-                if let Err(e) = state.store.record_audit(failed).await {
-                    tracing::error!(error = %e, "could not record the failed audit expiry");
-                }
-            }
-            Err(error)
+        Err(e) => Err(expiry_failed(&state, &ctx, before, e).await),
+    }
+}
+
+/// Counts and audits an expiry that failed, unless it was refused.
+async fn expiry_failed(
+    state: &AppState,
+    ctx: &Ctx,
+    before: i64,
+    e: openporch_store::StoreError,
+) -> ApiError {
+    let error = ApiError::from(e);
+    // A refusal, such as a principal without administrator authority, is
+    // not a failed expiry.
+    if error.status.is_server_error() {
+        EXPIRY_FAILURES.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(before, "audit expiry failed");
+        let mut failed = ctx.audit(
+            state.org(),
+            EXPIRY_ACTION,
+            format!("entries before {before}"),
+        );
+        failed.outcome = AuditOutcome::Failed;
+        failed.reason = Some("storage_error".into());
+        if let Err(e) = state.store.record_audit(failed).await {
+            tracing::error!(error = %e, "could not record the failed audit expiry");
         }
     }
+    error
 }

@@ -2311,8 +2311,9 @@ default) with `POST /orgs/{org}/audit-logs/expire`; the expiry is recorded in
 the audit log in the same transaction, and a failed expiry removes nothing and
 is recorded as `failed`. `dry_run` reports how many entries would expire and
 `before`, the time entries written earlier are past retention; export them with
-`to` set to `before`, then expire with the same `before`. A `before` inside
-the retention period is refused with `400`. `retained` lists what expiry keeps:
+`to` set to `before`, then expire with the same `before`. Expiring without a
+`before`, or with one inside the retention period, is refused with `400`, so
+what is kept is always reported before anything is removed. `retained` lists what expiry keeps:
 active resources, by driver, and those needing recovery or awaiting cleanup,
 which may keep costing money until they are deleted.
 

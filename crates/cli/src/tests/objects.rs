@@ -495,10 +495,33 @@ async fn members_roles_secret_stores_and_audit_logs() {
         "{r:?}"
     );
     assert!(r.out.contains("may keep costing money"), "{r:?}");
-    let r = m.porch(&["expire-audit-logs", "-o", "json"], "").await;
+    // Expiring reports what is kept first, and removes nothing without
+    // `--before` or `--yes`.
+    let r = m.porch(&["expire-audit-logs"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.out.contains("may keep costing money"), "{r:?}");
+    assert!(r.err.contains("--before"), "{r:?}");
+    let r = m.porch(&["expire-audit-logs", "--yes"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("would expire") && r.out.contains("0 entries older than 30 days expired"),
+        "{r:?}"
+    );
+    let r = m
+        .porch(&["expire-audit-logs", "--dry-run", "-o", "json"], "")
+        .await;
+    let report: Value = serde_json::from_str(&r.out).unwrap();
+    let before = report["before"].as_i64().unwrap().to_string();
+    let r = m
+        .porch(
+            &["expire-audit-logs", "--before", &before, "-o", "json"],
+            "",
+        )
+        .await;
     assert_eq!(r.code, 0, "{r:?}");
     let expired: Value = serde_json::from_str(&r.out).unwrap();
     assert_eq!(expired["expired"], 0, "{r:?}");
+    assert_eq!(expired["dry_run"], false, "{r:?}");
 
     // An ID of `..` cannot redirect a request to another route.
     let r = m.porch(&["apps", "users", "..", "revoke", "dev"], "").await;

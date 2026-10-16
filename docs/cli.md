@@ -1645,6 +1645,12 @@ Options:
       --app <APP>
           The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
 
+      --yes
+          Without `--before`, expire what the dry run reports without asking for a second run, as from cron
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
   -o, --output <OUTPUT>
           The output format
 
@@ -1654,9 +1660,6 @@ Options:
           - yaml:  YAML
           
           [default: table]
-
-      --env <ENV>
-          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
 
       --config <FILE>
           The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it

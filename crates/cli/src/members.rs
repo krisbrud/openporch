@@ -229,6 +229,10 @@ pub struct ExpireAuditLogs {
     /// such as the `before` of a dry run whose entries were exported.
     #[arg(long, value_name = "MS")]
     pub before: Option<i64>,
+    /// Without `--before`, expire what the dry run reports without asking
+    /// for a second run, as from cron.
+    #[arg(long)]
+    pub yes: bool,
     #[command(flatten)]
     pub output: OutputArg,
 }
@@ -685,24 +689,50 @@ pub(crate) async fn expire_audit_logs(
     args: ExpireAuditLogs,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let result: Value = session
-        .client()?
-        .request(
-            Method::POST,
-            &format!("{}/audit-logs/expire", org(session)?),
-            Some(&json!({ "dry_run": args.dry_run, "before": args.before })),
-        )
-        .await
-        .map_err(api)?;
-    if args.output.output == Format::Table {
+    let client = session.client()?;
+    let path = format!("{}/audit-logs/expire", org(session)?);
+    let expire = |dry_run: bool, before: Option<i64>| {
+        let body = json!({ "dry_run": dry_run, "before": before });
+        let (client, path) = (&client, &path);
+        async move {
+            client
+                .request(Method::POST, path, Some(&body))
+                .await
+                .map_err(api)
+        }
+    };
+    let format = args.output.output;
+    if args.dry_run || args.before.is_some() {
+        let result = expire(args.dry_run, args.before).await?;
+        return print_expiry(io, format, &result, args.dry_run);
+    }
+    // What is kept is reported before anything is removed.
+    let report = expire(true, None).await?;
+    print_expiry(io, format, &report, true)?;
+    let before = report["before"]
+        .as_i64()
+        .ok_or("the server's dry run did not report `before`")?;
+    if !args.yes {
+        return Err(format!(
+            "nothing was removed; run `porch expire-audit-logs --before {before}` \
+             (or add `--yes`) to expire these entries"
+        ));
+    }
+    let result = expire(false, Some(before)).await?;
+    print_expiry(io, format, &result, false)
+}
+
+fn print_expiry(
+    io: &mut Io<'_>,
+    format: Format,
+    result: &Value,
+    dry_run: bool,
+) -> Result<(), String> {
+    if format == Format::Table {
         let expired = result["expired"].as_i64().unwrap_or(0);
         let remaining = result["remaining"].as_i64().unwrap_or(0);
         let days = result["retention_days"].as_i64().unwrap_or(0);
-        let verb = if args.dry_run {
-            "would expire"
-        } else {
-            "expired"
-        };
+        let verb = if dry_run { "would expire" } else { "expired" };
         let retained = &result["retained"];
         let drivers: Vec<String> = retained["by_driver"]
             .as_object()
@@ -726,6 +756,6 @@ pub(crate) async fn expire_audit_logs(
         )
         .map_err(|e| e.to_string())
     } else {
-        output::print(io.out, args.output.output, &result, &[])
+        output::print(io.out, format, result, &[])
     }
 }

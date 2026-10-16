@@ -1419,6 +1419,7 @@ async fn audit_entries_expire_only_when_an_administrator_expires_them() {
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["expired"], old, "{b}");
     assert_eq!(b["dry_run"], true, "{b}");
+    let cutoff = b["before"].clone();
     assert_eq!(b["retained"]["resources"], 0, "{b}");
     assert!(
         b["note"]
@@ -1432,7 +1433,7 @@ async fn audit_entries_expire_only_when_an_administrator_expires_them() {
 
     // Only administrators expire entries.
     for token in [&viewer, &developer] {
-        let (status, _) = s.post(expire, token, json!({})).await;
+        let (status, _) = s.post(expire, token, json!({"before": cutoff})).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
@@ -1444,7 +1445,7 @@ async fn audit_entries_expire_only_when_an_administrator_expires_them() {
     .execute(pool)
     .await
     .unwrap();
-    let (status, b) = s.post(expire, &s.admin, json!({})).await;
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
     assert_error(status, &b, StatusCode::INTERNAL_SERVER_ERROR, "SRV-001");
     let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
     assert_eq!(report["audit"]["expirable"], old, "{report}");
@@ -1472,8 +1473,11 @@ async fn audit_entries_expire_only_when_an_administrator_expires_them() {
         )
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
-    // Expiry removes the old entries and records itself.
+    // Expiry takes the `before` of a dry run, which reports what is kept.
     let (status, b) = s.post(expire, &s.admin, json!({})).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    // Expiry removes the old entries and records itself.
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["expired"], old, "{b}");
     let before = b["before"].as_i64().unwrap();

@@ -357,7 +357,9 @@ exported, even though time has passed; a `before` inside the retention period
 is refused. `porch audit-logs --all -o json` follows every page, newest first, and
 writes each page as it arrives, so exports of any size fit in memory. If a page
 cannot be read the command fails and the file is left as incomplete JSON;
-check the exit status before expiring. Run expiry from cron or a systemd timer if you want it regular. Each
+check the exit status before expiring. `porch expire-audit-logs` on its own prints the dry run's report and removes
+nothing; add `--yes` to expire what it reports, for example from cron or a
+systemd timer. Each
 expiry is recorded in the audit log (`audit_log.expire`) in the same
 transaction as the removal, so no entry disappears without a record of who
 removed it. A failed expiry removes nothing, is recorded as `failed` and shows
