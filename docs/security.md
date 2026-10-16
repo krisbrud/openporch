@@ -294,8 +294,8 @@ Authorization: Bearer $LEAD_TOKEN
 ## Tokens
 
 A token is returned only by the request that creates it. Listing and reading show
-its metadata and when it was last used. Revoking it takes effect on the next
-request:
+its metadata and when it was last used, roughly to the minute. Revoking it takes
+effect on the next request:
 
 ```http
 GET /orgs/acme/users/dev/tokens
