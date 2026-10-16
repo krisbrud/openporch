@@ -2270,6 +2270,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | Method | Path | Permission |
 | --- | --- | --- |
 | GET | `/orgs/{org}/audit-logs` | org read all |
+| POST | `/orgs/{org}/audit-logs/expire` | org administer |
 
 Every change and every denied change is recorded with who made it, the request and
 the outcome. Entries never contain secret values. Filter with `from`, `to`,
@@ -2300,6 +2301,36 @@ Authorization: Bearer $ADMIN_TOKEN
     }
   ],
   "next": "…"
+}
+```
+
+Entries cannot be changed or deleted through the API: `DELETE` returns `405`.
+Nothing expires on its own either. An administrator expires the entries older
+than the server's retention period (`[audit] retention_days`, 30 days by
+default) with `POST /orgs/{org}/audit-logs/expire`; the expiry is recorded in
+the audit log in the same transaction, and a failed expiry removes nothing and
+is recorded as `failed`. `dry_run` reports how many entries would expire and
+`before`, the time entries written earlier are past retention; export them with
+`to` set to `before`, then expire with the same `before`. A `before` inside
+the retention period is refused with `400`.
+
+```http
+POST /orgs/acme/audit-logs/expire
+Authorization: Bearer $ADMIN_TOKEN
+Content-Type: application/json
+
+{"dry_run": true}
+```
+
+```http-response
+200 OK
+
+{
+  "dry_run": true,
+  "retention_days": 30,
+  "before": "…",
+  "expired": "…",
+  "remaining": "…"
 }
 ```
 

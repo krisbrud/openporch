@@ -690,6 +690,12 @@ pub fn api(state: AppState) -> Api {
             Org(OrgPerm::ReadAll),
             audit::query,
         )
+        .route(
+            post(),
+            "/orgs/{org}/audit-logs/expire",
+            Org(OrgPerm::Administer),
+            audit::expire,
+        )
         // Diagnostics.
         .route(
             get(),

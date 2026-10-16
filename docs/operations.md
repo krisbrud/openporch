@@ -96,6 +96,8 @@ scrape_configs:
 | `openporch_resources_needing_recovery` | Resources with an unknown outcome; see [`porch resources recover`](cli.md#porch-resources-recover) |
 | `openporch_database_bytes`, `openporch_database_wal_bytes`, `openporch_database_free_bytes` | The database's files on disk (write-ahead log included), the write-ahead log alone, and the free space inside the database |
 | `openporch_audit_entries`, `openporch_deployment_log_lines` | Stored audit entries and deployment log lines |
+| `openporch_audit_expirable_entries`, `openporch_audit_oldest_entry_timestamp_seconds` | Audit entries older than the retention period, and when the oldest entry was written |
+| `openporch_audit_last_expiry_timestamp_seconds{outcome}`, `openporch_audit_expiry_failures_total` | When audit entries were last expired and whether that succeeded, and failed expiries since the server started |
 | `openporch_ready`, `openporch_build_info{version}` | Readiness, as `/readyz` reports it, and the version |
 
 Counters start at zero when the server starts. Alert on
@@ -120,6 +122,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 | `config` | The configuration, with paths to key and secret files reported only as configured or not |
 | `work`, `storage`, `resources` | What the metrics report: queued and running work, database and log storage, resources by status |
 | `needing_recovery` | The latest operation of every resource whose outcome is unknown: its ID, deployment, GUResID, attempt, error and the resource's status |
+| `audit` | The retention period, how many entries are kept and how many could expire, the oldest entry, the last expiry and failed expiries |
 | `deployment` | Only with `app`, `env` and `deployment`: its status and error, the request ID that started it, its operations, its audit entries and the last 200 lines of its log |
 
 The operation, deployment and request IDs are the ones in the [logs](#logs),
@@ -323,7 +326,42 @@ deletion you requested runs. Uninstalling is three separate decisions.
 
 ## Retention
 
-Nothing in the data directory expires on its own. The audit log is kept
-indefinitely, even for deleted applications. Recovery records and resource
-state are kept for as long as their resources exist. The database grows with
-the number of deployments; a backup copies all of it.
+Nothing in the data directory expires on its own. Recovery records and
+resource state are kept for as long as their resources exist, and expiring
+the audit log never touches them. The database grows with the number of
+deployments; a backup copies all of it.
+
+The audit log is kept until an administrator expires it, even for deleted
+applications. `[audit] retention_days` (30 by default) sets how much expiry
+keeps; set it to 365 or more to keep a year:
+
+```toml
+[audit]
+retention_days = 365
+```
+
+To keep entries longer than that, export them before expiring:
+
+```sh
+BEFORE=$(porch expire-audit-logs --dry-run -o json | jq .before)
+porch audit-logs --all --to "$BEFORE" -o json > "audit-before-$BEFORE.json"
+porch expire-audit-logs --before "$BEFORE"
+```
+
+The dry run reports `before`: entries written earlier are past the retention
+period. Passing the same `before` to the expiry removes exactly what was
+exported, even though time has passed; a `before` inside the retention period
+is refused. `porch audit-logs --all` follows every page, newest first,
+and fails rather than writing a partial export when a page cannot be
+read. Run expiry from cron or a systemd timer if you want it regular. Each
+expiry is recorded in the audit log (`audit_log.expire`) in the same
+transaction as the removal, so no entry disappears without a record of who
+removed it. A failed expiry removes nothing, is recorded as `failed` and shows
+in the metrics (`openporch_audit_expiry_failures_total`,
+`openporch_audit_last_expiry_timestamp_seconds{outcome="failed"}`) and in
+[diagnostics](#diagnostics). Alert on `openporch_audit_expirable_entries > 0`
+for longer than your expiry schedule.
+
+When the disk is full, mutations are refused rather than accepted without an
+audit entry. The audit log is not tamper-proof against someone with access to
+the host and its data directory.

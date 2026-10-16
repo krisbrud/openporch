@@ -49,6 +49,34 @@ pub struct Config {
     /// Bounds on work and storage.
     #[serde(default)]
     pub limits: WorkLimits,
+    /// Audit log retention.
+    #[serde(default)]
+    pub audit: AuditSettings,
+}
+
+/// The longest audit retention a server accepts: a hundred years.
+const MAX_RETENTION_DAYS: u32 = 36_500;
+
+/// Audit log retention. Nothing expires on its own: entries older than
+/// `retention_days` are removed only when an administrator expires them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSettings {
+    /// How many days of entries expiry keeps.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for AuditSettings {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+fn default_retention_days() -> u32 {
+    30
 }
 
 /// The longest deployment time a server accepts: a week.
@@ -365,6 +393,7 @@ impl Config {
             rate_limits: RateLimits::default(),
             opentofu: OpenTofuSettings::default(),
             limits: WorkLimits::default(),
+            audit: AuditSettings::default(),
         }
     }
 
@@ -435,6 +464,11 @@ impl Config {
                     "`limits.{name}` must be at most {MAX_SLOTS}"
                 )));
             }
+        }
+        if !(1..=MAX_RETENTION_DAYS).contains(&self.audit.retention_days) {
+            return Err(ConfigError(format!(
+                "`audit.retention_days` must be between 1 and {MAX_RETENTION_DAYS}"
+            )));
         }
         if !self.listen.ip().is_loopback() && !self.tls_terminated_by_proxy {
             return Err(ConfigError(format!(
@@ -577,6 +611,22 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.to_string().contains("org `Acme Corp` is invalid"), "{e}");
+    }
+
+    #[test]
+    fn audit_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openporch.toml");
+        let load = |text: &str| {
+            std::fs::write(&path, format!("org = \"acme\"\ndata_dir = \"/x\"\n{text}")).unwrap();
+            Config::load(Some(&path), |_| None)
+        };
+        assert_eq!(load("").unwrap().audit.retention_days, 30);
+        let c = load("[audit]\nretention_days = 365\n").unwrap();
+        assert_eq!(c.audit.retention_days, 365);
+        let e = load("[audit]\nretention_days = 0\n").unwrap_err();
+        assert!(e.to_string().contains("audit.retention_days"), "{e}");
+        assert!(load("[audit]\nkeep = true\n").is_err());
     }
 
     #[test]

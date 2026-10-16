@@ -1,5 +1,5 @@
 //! `porch users`, `porch apps users`, `porch env-types users`, `porch secretstores`
-//! and `porch audit-logs`. The server applies the same permission rules as for the
+//! `porch audit-logs` and `porch expire-audit-logs`. The server applies the same permission rules as for the
 //! API; the CLI only shapes requests and output.
 
 use clap::{Args, Subcommand};
@@ -211,6 +211,23 @@ pub struct AuditLogs {
     pub limit: Option<u32>,
     /// Entries older than this sequence number, to page back.
     #[arg(long, value_name = "SEQ")]
+    pub before: Option<i64>,
+    /// Every matching entry, following the pages, for export.
+    #[arg(long)]
+    pub all: bool,
+    #[command(flatten)]
+    pub output: OutputArg,
+}
+
+/// `porch expire-audit-logs`.
+#[derive(Debug, Args)]
+pub struct ExpireAuditLogs {
+    /// Report how many entries would expire without removing any.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Expire only entries written before this time, in Unix milliseconds,
+    /// such as the `before` of a dry run whose entries were exported.
+    #[arg(long, value_name = "MS")]
     pub before: Option<i64>,
     #[command(flatten)]
     pub output: OutputArg,
@@ -588,23 +605,45 @@ pub(crate) async fn audit_logs(
     args: AuditLogs,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let path = with_query(
-        &format!("{}/audit-logs", org(session)?),
-        &[
-            ("user_id", args.user),
-            ("path_prefix", args.path_prefix),
-            ("method", args.method.map(|m| m.to_ascii_uppercase())),
-            ("from", args.from.map(|v| v.to_string())),
-            ("to", args.to.map(|v| v.to_string())),
-            ("limit", args.limit.map(|v| v.to_string())),
-            ("before", args.before.map(|v| v.to_string())),
-        ],
-    );
-    let page: Value = session
-        .client()?
-        .request(Method::GET, &path, None)
-        .await
-        .map_err(api)?;
+    let client = session.client()?;
+    let mut before = args.before;
+    let mut entries = Vec::new();
+    let mut next = loop {
+        let path = with_query(
+            &format!("{}/audit-logs", org(session)?),
+            &[
+                ("user_id", args.user.clone()),
+                ("path_prefix", args.path_prefix.clone()),
+                (
+                    "method",
+                    args.method.as_ref().map(|m| m.to_ascii_uppercase()),
+                ),
+                ("from", args.from.map(|v| v.to_string())),
+                ("to", args.to.map(|v| v.to_string())),
+                ("limit", args.limit.map(|v| v.to_string())),
+                ("before", before.map(|v| v.to_string())),
+            ],
+        );
+        let page: Value = client
+            .request(Method::GET, &path, None)
+            .await
+            .map_err(api)?;
+        if let Some(page) = page["entries"].as_array() {
+            entries.extend(page.iter().cloned());
+        }
+        let next = page["next"].as_i64();
+        match next {
+            Some(seq) if args.all => before = Some(seq),
+            _ => break next,
+        }
+    };
+    if args.all {
+        next = None;
+    }
+    let mut page = json!({ "entries": entries });
+    if let Some(next) = next {
+        page["next"] = json!(next);
+    }
     output::print(
         io.out,
         args.output.output,
@@ -620,9 +659,46 @@ pub(crate) async fn audit_logs(
         ],
     )?;
     if args.output.output == Format::Table
-        && let Some(next) = page["next"].as_i64()
+        && let Some(next) = next
     {
-        writeln!(io.err, "More entries: add `--before {next}`").map_err(|e| e.to_string())?;
+        writeln!(
+            io.err,
+            "More entries: add `--before {next}`, or `--all` for every one"
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+pub(crate) async fn expire_audit_logs(
+    session: &Session,
+    args: ExpireAuditLogs,
+    io: &mut Io<'_>,
+) -> Result<(), String> {
+    let result: Value = session
+        .client()?
+        .request(
+            Method::POST,
+            &format!("{}/audit-logs/expire", org(session)?),
+            Some(&json!({ "dry_run": args.dry_run, "before": args.before })),
+        )
+        .await
+        .map_err(api)?;
+    if args.output.output == Format::Table {
+        let expired = result["expired"].as_i64().unwrap_or(0);
+        let remaining = result["remaining"].as_i64().unwrap_or(0);
+        let days = result["retention_days"].as_i64().unwrap_or(0);
+        let verb = if args.dry_run {
+            "would expire"
+        } else {
+            "expired"
+        };
+        writeln!(
+            io.out,
+            "{expired} entries older than {days} days {verb}; {remaining} kept"
+        )
+        .map_err(|e| e.to_string())
+    } else {
+        output::print(io.out, args.output.output, &result, &[])
+    }
 }

@@ -12,24 +12,25 @@ The openporch command line
 Usage: porch [OPTIONS] <COMMAND>
 
 Commands:
-  login         Logs in with GitHub through the server, or stores an API token with `--token`. The server URL and organization are saved to the config file when it has none
-  logout        Ends the session and forgets the stored token for the server
-  get           Lists objects, or shows one
-  create        Creates an object
-  delete        Deletes an object. Sets and deployment records are kept for good
-  users         Manages the organization's members and their tokens
-  apps          Manages application users
-  env-types     Manages environment type deployers
-  secretstores  Manages secret stores
-  audit-logs    Queries the audit log, newest first
-  workload      Deploys or previews workload documents
-  score         Deploys Score files
-  deploy        Deploys a delta, or an earlier deployment again
-  logs          Prints logs
-  diff          Compares deployment sets
-  resources     Shows and recovers an environment's resources
-  api           Sends an authenticated request to the API and prints the JSON response
-  help          Print this message or the help of the given subcommand(s)
+  login              Logs in with GitHub through the server, or stores an API token with `--token`. The server URL and organization are saved to the config file when it has none
+  logout             Ends the session and forgets the stored token for the server
+  get                Lists objects, or shows one
+  create             Creates an object
+  delete             Deletes an object. Sets and deployment records are kept for good
+  users              Manages the organization's members and their tokens
+  apps               Manages application users
+  env-types          Manages environment type deployers
+  secretstores       Manages secret stores
+  audit-logs         Queries the audit log, newest first
+  expire-audit-logs  Removes the audit entries older than the server's retention period
+  workload           Deploys or previews workload documents
+  score              Deploys Score files
+  deploy             Deploys a delta, or an earlier deployment again
+  logs               Prints logs
+  diff               Compares deployment sets
+  resources          Shows and recovers an environment's resources
+  api                Sends an authenticated request to the API and prints the JSON response
+  help               Print this message or the help of the given subcommand(s)
 
 Options:
       --url <URL>
@@ -1604,6 +1605,9 @@ Options:
       --before <SEQ>
           Entries older than this sequence number, to page back
 
+      --all
+          Every matching entry, following the pages, for export
+
   -o, --output <OUTPUT>
           The output format
 
@@ -1613,6 +1617,49 @@ Options:
           - yaml:  YAML
           
           [default: table]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## `porch expire-audit-logs`
+
+```text
+Removes the audit entries older than the server's retention period
+
+Usage: porch expire-audit-logs [OPTIONS]
+
+Options:
+      --dry-run
+          Report how many entries would expire without removing any
+
+      --url <URL>
+          The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
+
+      --before <MS>
+          Expire only entries written before this time, in Unix milliseconds, such as the `before` of a dry run whose entries were exported
+
+      --org <ORG>
+          The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
+
+      --app <APP>
+          The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+  -o, --output <OUTPUT>
+          The output format
+
+          Possible values:
+          - table: Aligned columns
+          - json:  JSON
+          - yaml:  YAML
+          
+          [default: table]
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
+      --config <FILE>
+          The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it
 
   -h, --help
           Print help (see a summary with '-h')

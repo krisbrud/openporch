@@ -75,6 +75,9 @@ fn sanitized(config: &Config) -> Value {
             "graph_nodes": limits.graph_nodes,
             "graph_edges": limits.graph_edges,
         },
+        "audit": {
+            "retention_days": config.audit.retention_days,
+        },
         "opentofu": {
             "root_configured": config.opentofu.root.is_some(),
             "state": state,
@@ -97,6 +100,10 @@ pub async fn get(
     };
     let stats = state.store.stats().await?;
     let recovery = state.store.operations_needing_recovery().await?;
+    let audit_retention = state
+        .store
+        .audit_retention(super::audit::retention_start(&state))
+        .await?;
     let not_ready = state.not_ready_reasons();
     let queued = state.runners.queued();
     Ok(Json(json!({
@@ -117,6 +124,14 @@ pub async fn get(
             "free_bytes": stats.free_bytes,
             "audit_entries": stats.audit_entries,
             "log_lines": stats.log_lines,
+        },
+        "audit": {
+            "retention_days": state.config.audit.retention_days,
+            "entries": audit_retention.entries,
+            "oldest_at": audit_retention.oldest_at,
+            "expirable": audit_retention.expirable,
+            "last_expiry": audit_retention.last_expiry,
+            "expiry_failures": super::audit::expiry_failures(),
         },
         "resources": stats.resources,
         "needing_recovery": recovery,

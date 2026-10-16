@@ -405,6 +405,7 @@ async fn members_roles_secret_stores_and_audit_logs() {
         &["env-types", "users", "development", "grant", "dev"][..],
         &["apps", "users", "shop", "grant", "dev", "owner"][..],
         &["audit-logs"][..],
+        &["expire-audit-logs"][..],
     ] {
         let r = dev.porch(args, "").await;
         assert_eq!(r.code, 1, "{args:?}: {r:?}");
@@ -474,6 +475,26 @@ async fn members_roles_secret_stores_and_audit_logs() {
     assert_eq!(r.out.lines().count(), 3, "{r:?}");
     assert!(r.err.contains("--before"), "{r:?}");
     assert_no_secret(&r, &server.admin);
+    // `--all` follows the pages, for export.
+    let r = m
+        .porch(&["audit-logs", "--all", "--limit", "2", "-o", "json"], "")
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let all: Value = serde_json::from_str(&r.out).unwrap();
+    assert!(all["entries"].as_array().unwrap().len() > 2, "{r:?}");
+    assert!(all.get("next").is_none(), "{r:?}");
+    // Nothing here is older than the retention period.
+    let r = m.porch(&["expire-audit-logs", "--dry-run"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out
+            .starts_with("0 entries older than 30 days would expire"),
+        "{r:?}"
+    );
+    let r = m.porch(&["expire-audit-logs", "-o", "json"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let expired: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(expired["expired"], 0, "{r:?}");
 
     // An ID of `..` cannot redirect a request to another route.
     let r = m.porch(&["apps", "users", "..", "revoke", "dev"], "").await;
