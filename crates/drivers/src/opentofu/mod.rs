@@ -373,6 +373,62 @@ fn unfetchable(source: &git::Source, e: Failure) -> Failure {
     }
 }
 
+/// Puts the request's cloud credentials where the definition's
+/// `credentials_config` says, or in the default AWS environment; returns the
+/// secret variables they fill.
+fn credentials(
+    run: &mut Run,
+    inputs: &Inputs,
+    req: &DriverRequest,
+) -> Result<Map<String, Value>, Failure> {
+    let mut secret_variables = Map::new();
+    let Some(creds) = &req.credentials else {
+        return Ok(secret_variables);
+    };
+    let creds = creds.expose();
+    let field = |name: &str| -> Result<String, Failure> {
+        match creds.get(name) {
+            Some(Value::String(s)) => Ok(s.clone()),
+            _ => Err(input(format!(
+                "the cloud account has no credential field `{name}`"
+            ))),
+        }
+    };
+    match &inputs.credentials_config {
+        Some(cc) => {
+            for (env, name) in &cc.environment {
+                check_env_name(env)?;
+                run.env.insert(env.clone(), field(name)?);
+            }
+            for (var, name) in &cc.variables {
+                secret_variables.insert(var.clone(), Value::String(field(name)?));
+            }
+            if let Some(var) = &cc.file {
+                let path = run.dir.join("credentials.json");
+                files::write_private(&path, Value::Object(creds.clone()).to_string().as_bytes())
+                    .map_err(Failure::io)?;
+                secret_variables.insert(var.clone(), Value::String(path.display().to_string()));
+            }
+        }
+        None if creds.contains_key("AccessKeyId") => {
+            for (env, name) in [
+                ("AWS_ACCESS_KEY_ID", "AccessKeyId"),
+                ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"),
+                ("AWS_SESSION_TOKEN", "SessionToken"),
+                ("AWS_REGION", "Region"),
+            ] {
+                if let Some(Value::String(v)) = creds.get(name)
+                    && !v.is_empty()
+                {
+                    run.env.insert(env.into(), v.clone());
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(secret_variables)
+}
+
 fn input(message: impl Into<String>) -> Failure {
     Failure::Input(message.into())
 }
@@ -960,52 +1016,8 @@ impl OpenTofu {
 
         // Credentials: as configured, or the default AWS environment.
         let mut secret_variables = inputs.secret_variables.clone();
-        if let Some(creds) = &req.credentials {
-            let creds = creds.expose();
-            let field = |name: &str| -> Result<String, Failure> {
-                match creds.get(name) {
-                    Some(Value::String(s)) => Ok(s.clone()),
-                    _ => Err(input(format!(
-                        "the cloud account has no credential field `{name}`"
-                    ))),
-                }
-            };
-            match &inputs.credentials_config {
-                Some(cc) => {
-                    for (env, name) in &cc.environment {
-                        check_env_name(env)?;
-                        run.env.insert(env.clone(), field(name)?);
-                    }
-                    for (var, name) in &cc.variables {
-                        secret_variables.insert(var.clone(), Value::String(field(name)?));
-                    }
-                    if let Some(var) = &cc.file {
-                        let path = run.dir.join("credentials.json");
-                        files::write_private(
-                            &path,
-                            Value::Object(creds.clone()).to_string().as_bytes(),
-                        )
-                        .map_err(Failure::io)?;
-                        secret_variables
-                            .insert(var.clone(), Value::String(path.display().to_string()));
-                    }
-                }
-                None if creds.contains_key("AccessKeyId") => {
-                    for (env, name) in [
-                        ("AWS_ACCESS_KEY_ID", "AccessKeyId"),
-                        ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"),
-                        ("AWS_SESSION_TOKEN", "SessionToken"),
-                        ("AWS_REGION", "Region"),
-                    ] {
-                        if let Some(Value::String(v)) = creds.get(name)
-                            && !v.is_empty()
-                        {
-                            run.env.insert(env.into(), v.clone());
-                        }
-                    }
-                }
-                None => {}
-            }
+        if req.credentials.is_some() {
+            secret_variables.extend(credentials(run, &inputs, req)?);
         } else if inputs.credentials_config.is_some() {
             return Err(input("`credentials_config` needs a `driver_account`"));
         }
@@ -1119,6 +1131,8 @@ impl OpenTofu {
             let name = host.replace('-', "__").replace('.', "_");
             run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
         }
+        // Child modules in S3 are installed with the cloud credentials.
+        credentials(run, &inputs, req)?;
         self.tofu(run, "init failed", &args, exec::Stdout::Logged)
             .await
             .map(drop)

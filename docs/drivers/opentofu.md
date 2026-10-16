@@ -251,7 +251,8 @@ Before a replay changes anything, the driver checks every recorded version:
 it fetches the commit and runs `tofu init -backend=false`, with
 `-lockfile=readonly` and the recorded lock file when there is one, which
 installs the modules the configuration calls and the providers it selects
-without reading state, planning or applying. If one fails, its resource fails
+with the same credentials a run has, without reading state, planning or
+applying. If one fails, its resource fails
 with that error, every other resource is left `pending`, and nothing is
 applied. Driver inputs that read other resources' outputs are not known yet
 then; the check runs without them, and a `source` that depends on them cannot

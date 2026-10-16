@@ -991,8 +991,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 definition_id: def.id.clone(),
                 definition_version: *version,
                 driver_type: def.driver_type.clone(),
-                // Fetching code needs no cloud credentials.
-                driver_account: None,
+                // Modules can be fetched with the cloud credentials, such as
+                // from S3; an account that comes from another resource is
+                // not known yet.
+                driver_account: driver_account(def, &Unknown(&scope)).ok().flatten(),
                 inputs: JobInputs {
                     values,
                     secrets,
@@ -1342,7 +1344,10 @@ fn summary(outcomes: &BTreeMap<Descriptor, Outcome>) -> Option<String> {
 /// The placeholder scope of `node`: context, the outputs of finished
 /// resources, its workload's dependencies and shared resources, and values.
 /// The cloud account `def` gets credentials for, resolved in `scope`.
-fn driver_account(def: &ResourceDefinition, scope: &MapScope) -> Result<Option<AccountId>, String> {
+fn driver_account(
+    def: &ResourceDefinition,
+    scope: &dyn Scope,
+) -> Result<Option<AccountId>, String> {
     let at = |what: &str| format!("definition `{}`: {what}", def.id);
     let Some(account) = &def.driver_account else {
         return Ok(None);

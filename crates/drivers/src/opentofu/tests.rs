@@ -1385,6 +1385,19 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     assert_eq!(code, "TOFU-003", "{message}");
     assert!(message.contains("can no longer be installed"), "{message}");
     assert!(message.contains("provider yanked"), "{message}");
+    // With the cloud account's credentials, `init` gets them, as for a run.
+    let mut with_creds = req.clone();
+    with_creds.pin = Some(pin.clone());
+    with_creds.credentials = Some(SecretMap::new(
+        json!({"AccessKeyId": "AKIACHECK", "SecretAccessKey": "check-secret"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    ));
+    std::fs::write(&record, "").unwrap();
+    d.check_pin(&with_creds).await.unwrap();
+    let log = std::fs::read_to_string(&record).unwrap();
+    assert!(log.contains("AWS_ACCESS_KEY_ID=AKIACHECK"), "{log}");
     // Without a recorded lock file, `init` still installs the modules.
     let mut unlocked = pin.clone();
     unlocked["lock"] = Value::Null;

@@ -120,6 +120,18 @@ async fn a_replay_whose_pinned_version_is_gone_changes_nothing() {
         route.inputs.values["host"],
         "(not known before the deployment runs)"
     );
+    // Modules may be fetched with the cloud account, unless it comes from
+    // another resource.
+    let account = |d: &str| {
+        let checks = fake.pin_checks.lock().unwrap();
+        let job = checks
+            .iter()
+            .find(|j| j.descriptor.to_string() == d)
+            .unwrap();
+        job.driver_account.as_ref().map(ToString::to_string)
+    };
+    assert_eq!(account(DNS).as_deref(), Some("aws-dns"));
+    assert_eq!(account(ROUTE), None);
     assert!(fake.jobs.lock().unwrap().is_empty());
     let Outcome::Failed(reason) = &outcomes[&Descriptor::parse(DB).unwrap()] else {
         panic!("{outcomes:?}");
