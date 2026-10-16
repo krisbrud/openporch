@@ -447,6 +447,14 @@ pub trait Driver: Send + Sync + fmt::Debug {
     /// Removes the resource.
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome>;
 
+    /// Checks, without changing anything, that the version `req.pin` names can
+    /// still run, so that a replay refuses before any resource changes rather
+    /// than when this one's turn comes. Drivers that run no pinned code accept
+    /// any pin.
+    fn check_pin<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Stops the operation `req` identifies after a timeout, and observes the
     /// result. Drivers that declare the `cancel` capability implement it; an
     /// in-process call is cancelled by dropping its future.

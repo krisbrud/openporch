@@ -327,6 +327,108 @@ fn is_commit(commit: &str) -> bool {
     matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The version a replay must run, when the request names one: refused when
+/// it came from another source or names no commit.
+fn pinned(inputs: &Inputs, req: &DriverRequest) -> Result<Option<Pinned>, Failure> {
+    let Some(pin) = &req.pin else {
+        return Ok(None);
+    };
+    let pinned: Pinned = serde_json::from_value(pin.clone())
+        .map_err(|_| input("the pinned module version is unreadable"))?;
+    let current = inputs
+        .source
+        .as_ref()
+        .map(|(s, path)| (s.url.as_str(), path.as_deref()));
+    let recorded = pinned
+        .source
+        .as_ref()
+        .map(|s| (s.url.as_str(), s.path.as_deref()));
+    if current != recorded {
+        return Err(input(
+            "the definition's `source` is not the one the pinned version came from",
+        ));
+    }
+    if pinned
+        .source
+        .as_ref()
+        .is_some_and(|s| !is_commit(&s.commit))
+    {
+        return Err(input("the pinned module version names no commit"));
+    }
+    Ok(Some(pinned))
+}
+
+/// Why a pinned commit failed to fetch: a replay cannot run another commit in
+/// its place.
+fn unfetchable(source: &git::Source, e: Failure) -> Failure {
+    match e {
+        Failure::Command { stderr, .. } => input(format!(
+            "the pinned commit `{}` of `{}` can no longer be fetched; deploy the current \
+             configuration instead: {}",
+            source.rev,
+            source.url,
+            stderr.lines().last().unwrap_or_default()
+        )),
+        e => e,
+    }
+}
+
+/// Puts the request's cloud credentials where the definition's
+/// `credentials_config` says, or in the default AWS environment; returns the
+/// secret variables they fill.
+fn credentials(
+    run: &mut Run,
+    inputs: &Inputs,
+    req: &DriverRequest,
+) -> Result<Map<String, Value>, Failure> {
+    let mut secret_variables = Map::new();
+    let Some(creds) = &req.credentials else {
+        return Ok(secret_variables);
+    };
+    let creds = creds.expose();
+    let field = |name: &str| -> Result<String, Failure> {
+        match creds.get(name) {
+            Some(Value::String(s)) => Ok(s.clone()),
+            _ => Err(input(format!(
+                "the cloud account has no credential field `{name}`"
+            ))),
+        }
+    };
+    match &inputs.credentials_config {
+        Some(cc) => {
+            for (env, name) in &cc.environment {
+                check_env_name(env)?;
+                run.env.insert(env.clone(), field(name)?);
+            }
+            for (var, name) in &cc.variables {
+                secret_variables.insert(var.clone(), Value::String(field(name)?));
+            }
+            if let Some(var) = &cc.file {
+                let path = run.dir.join("credentials.json");
+                files::write_private(&path, Value::Object(creds.clone()).to_string().as_bytes())
+                    .map_err(Failure::io)?;
+                secret_variables.insert(var.clone(), Value::String(path.display().to_string()));
+            }
+        }
+        None if creds.contains_key("AccessKeyId") => {
+            for (env, name) in [
+                ("AWS_ACCESS_KEY_ID", "AccessKeyId"),
+                ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"),
+                ("AWS_SESSION_TOKEN", "SessionToken"),
+                ("AWS_REGION", "Region"),
+            ] {
+                if let Some(Value::String(v)) = creds.get(name)
+                    && !v.is_empty()
+                {
+                    run.env.insert(env.into(), v.clone());
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(secret_variables)
+}
+
 fn input(message: impl Into<String>) -> Failure {
     Failure::Input(message.into())
 }
@@ -777,33 +879,9 @@ impl OpenTofu {
     ) -> Result<(), Failure> {
         let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
         // A replay runs the version its deployment ran, from the same source.
-        let pinned = match (at, &req.pin) {
-            (SourceAt::Current, Some(pin)) => {
-                let pinned: Pinned = serde_json::from_value(pin.clone())
-                    .map_err(|_| input("the pinned module version is unreadable"))?;
-                let current = inputs
-                    .source
-                    .as_ref()
-                    .map(|(s, path)| (s.url.as_str(), path.as_deref()));
-                let recorded = pinned
-                    .source
-                    .as_ref()
-                    .map(|s| (s.url.as_str(), s.path.as_deref()));
-                if current != recorded {
-                    return Err(input(
-                        "the definition's `source` is not the one the pinned version came from",
-                    ));
-                }
-                if pinned
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| !is_commit(&s.commit))
-                {
-                    return Err(input("the pinned module version names no commit"));
-                }
-                Some(pinned)
-            }
-            _ => None,
+        let pinned = match at {
+            SourceAt::Current => pinned(&inputs, req)?,
+            SourceAt::Retained(_) => None,
         };
         let home = run.dir.join("home");
         files::private_dir(&home).map_err(Failure::io)?;
@@ -864,7 +942,7 @@ impl OpenTofu {
         match &source {
             Some((s, path)) => {
                 let checkout = run.dir.join("source");
-                let commit = git::fetch(
+                let fetched = git::fetch(
                     &self.config,
                     &mut run.log,
                     &run.stop,
@@ -873,18 +951,11 @@ impl OpenTofu {
                     &checkout,
                     &home,
                 )
-                .await
-                .map_err(|e| match (&pinned, e) {
-                    // A replay cannot run another commit in its place.
-                    (Some(_), Failure::Command { stderr, .. }) => input(format!(
-                        "the pinned commit `{}` of `{}` can no longer be fetched; deploy the \
-                         current configuration instead: {}",
-                        s.rev,
-                        s.url,
-                        stderr.lines().last().unwrap_or_default()
-                    )),
-                    (_, e) => e,
-                })?;
+                .await;
+                let commit = match pinned {
+                    Some(_) => fetched.map_err(|e| unfetchable(s, e))?,
+                    None => fetched?,
+                };
                 run.module = match path {
                     Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
                     None => checkout.canonicalize().map_err(Failure::io)?,
@@ -945,52 +1016,8 @@ impl OpenTofu {
 
         // Credentials: as configured, or the default AWS environment.
         let mut secret_variables = inputs.secret_variables.clone();
-        if let Some(creds) = &req.credentials {
-            let creds = creds.expose();
-            let field = |name: &str| -> Result<String, Failure> {
-                match creds.get(name) {
-                    Some(Value::String(s)) => Ok(s.clone()),
-                    _ => Err(input(format!(
-                        "the cloud account has no credential field `{name}`"
-                    ))),
-                }
-            };
-            match &inputs.credentials_config {
-                Some(cc) => {
-                    for (env, name) in &cc.environment {
-                        check_env_name(env)?;
-                        run.env.insert(env.clone(), field(name)?);
-                    }
-                    for (var, name) in &cc.variables {
-                        secret_variables.insert(var.clone(), Value::String(field(name)?));
-                    }
-                    if let Some(var) = &cc.file {
-                        let path = run.dir.join("credentials.json");
-                        files::write_private(
-                            &path,
-                            Value::Object(creds.clone()).to_string().as_bytes(),
-                        )
-                        .map_err(Failure::io)?;
-                        secret_variables
-                            .insert(var.clone(), Value::String(path.display().to_string()));
-                    }
-                }
-                None if creds.contains_key("AccessKeyId") => {
-                    for (env, name) in [
-                        ("AWS_ACCESS_KEY_ID", "AccessKeyId"),
-                        ("AWS_SECRET_ACCESS_KEY", "SecretAccessKey"),
-                        ("AWS_SESSION_TOKEN", "SessionToken"),
-                        ("AWS_REGION", "Region"),
-                    ] {
-                        if let Some(Value::String(v)) = creds.get(name)
-                            && !v.is_empty()
-                        {
-                            run.env.insert(env.into(), v.clone());
-                        }
-                    }
-                }
-                None => {}
-            }
+        if req.credentials.is_some() {
+            secret_variables.extend(credentials(run, &inputs, req)?);
         } else if inputs.credentials_config.is_some() {
             return Err(input("`credentials_config` needs a `driver_account`"));
         }
@@ -1030,6 +1057,97 @@ impl OpenTofu {
             run.var_files.push(format!("-var-file={}", path.display()));
         }
         Ok(())
+    }
+
+    /// Fetches the pinned commit and installs the modules it calls and the
+    /// providers the pinned lock file selects, without a backend: nothing is planned or applied, and no
+    /// state is read.
+    async fn check_pin_run(&self, run: &mut Run, req: &DriverRequest) -> Result<(), Failure> {
+        let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
+        let Some(pinned) = pinned(&inputs, req)? else {
+            return Ok(());
+        };
+        let home = run.dir.join("home");
+        files::private_dir(&home).map_err(Failure::io)?;
+        match (&inputs.source, &pinned.source) {
+            (Some((current, path)), Some(recorded)) => {
+                let source = git::Source {
+                    url: current.url.clone(),
+                    rev: recorded.commit.clone(),
+                    username: current.username.clone(),
+                    password: current.password.clone(),
+                    ssh_key: current.ssh_key.clone(),
+                };
+                let checkout = run.dir.join("source");
+                git::fetch(
+                    &self.config,
+                    &mut run.log,
+                    &run.stop,
+                    &source,
+                    &source.rev,
+                    &checkout,
+                    &home,
+                )
+                .await
+                .map_err(|e| unfetchable(&source, e))?;
+                run.module = match path {
+                    Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
+                    None => checkout.canonicalize().map_err(Failure::io)?,
+                };
+                if !run.module.is_dir() {
+                    return Err(input("`source.path` is not a directory in the repository"));
+                }
+            }
+            _ => files::private_dir(&run.module).map_err(Failure::io)?,
+        }
+        if let Some(script) = &inputs.script {
+            let name = if inputs.source.is_some() {
+                "override.tf"
+            } else {
+                "main.tf"
+            };
+            files::write_private(&run.module.join(name), script.as_bytes()).map_err(Failure::io)?;
+        }
+        for (path, content, _) in &inputs.files {
+            let target = files::inside(&run.module, path).map_err(Failure::Input)?;
+            files::write_private(&target, content.as_bytes()).map_err(Failure::io)?;
+        }
+        // Remote child modules are not in the lock file, so `init` runs
+        // without one too.
+        let mut args = vec!["init", "-input=false", "-backend=false"];
+        if let Some(lock) = &pinned.lock {
+            files::write_private(&run.module.join(LOCK_FILE), lock.as_bytes())
+                .map_err(Failure::io)?;
+            args.push("-lockfile=readonly");
+        }
+        run.env.insert("HOME".into(), home.display().to_string());
+        run.env.insert("TF_IN_AUTOMATION".into(), "1".into());
+        run.env.insert("TF_INPUT".into(), "0".into());
+        let cache = self.config.root.join("plugin-cache");
+        files::private_dir(&cache).map_err(Failure::io)?;
+        run.env
+            .insert("TF_PLUGIN_CACHE_DIR".into(), cache.display().to_string());
+        for (host, token) in &inputs.tokens {
+            let name = host.replace('-', "__").replace('.', "_");
+            run.env.insert(format!("TF_TOKEN_{name}"), token.clone());
+        }
+        // Child modules in S3 are installed with the cloud credentials.
+        credentials(run, &inputs, req)?;
+        self.tofu(run, "init failed", &args, exec::Stdout::Logged)
+            .await
+            .map(drop)
+            .map_err(|e| match e {
+                Failure::Command { stderr, .. } => input(format!(
+                    "the providers or modules the pinned version selects can no longer be \
+                 installed; deploy the current configuration instead: {}",
+                    stderr
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or_default()
+                )),
+                e => e,
+            })
     }
 
     /// Points the module at orchestrator state, which lives outside the run
@@ -1770,6 +1888,20 @@ impl Driver for OpenTofu {
                 })
                 .await?;
             Ok(to_plan(planned))
+        })
+    }
+
+    fn check_pin<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            if req.pin.is_none() {
+                return Ok(());
+            }
+            let mut run = match self.start(req).await {
+                Ok(run) => run,
+                Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
+            };
+            let result = self.check_pin_run(&mut run, req).await;
+            self.finish(req, &run.log, result, false)
         })
     }
 
