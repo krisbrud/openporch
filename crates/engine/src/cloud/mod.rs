@@ -440,7 +440,10 @@ impl fmt::Display for EcrDigest {
 /// which names the same content wherever it is pulled from.
 pub fn pinned_image(image: &str) -> bool {
     image.rsplit_once("@sha256:").is_some_and(|(name, hex)| {
-        !name.is_empty() && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        !name.is_empty()
+            && !name.contains('@')
+            && hex.len() == 64
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })
 }
 

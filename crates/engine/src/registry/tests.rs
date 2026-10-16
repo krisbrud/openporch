@@ -94,6 +94,7 @@ fn image_references_are_parsed_like_docker_does() {
         "${resources.registry.outputs.host}/web:1",
         "web@sha256:abc",
         "web@md5:0123",
+        "x@/../a@sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "[::1/web:1",
         "[nope]:5000/web:1",
         "[::1]x/web:1",
@@ -281,23 +282,17 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
     // Named neither, it is not reached at all, by address or by a name that
     // resolves to it.
     let strict = HttpRegistry::new([], []).unwrap();
-    let e = strict
-        .lookup(&OciImage::parse(&format!("{host}/web:1")).unwrap())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&e, CloudError::Rejected(m) if m.contains("private address")),
-        "{e:?}"
-    );
     let port = host.rsplit_once(':').unwrap().1;
-    let e = strict
-        .lookup(&OciImage::parse(&format!("localhost:{port}/web:1")).unwrap())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&e, CloudError::Unavailable(m) if m.contains("no public address")),
-        "{e:?}"
-    );
+    for image in [format!("{host}/web:1"), format!("localhost:{port}/web:1")] {
+        assert_eq!(
+            strict
+                .lookup(&OciImage::parse(&image).unwrap())
+                .await
+                .unwrap(),
+            Lookup::Unlisted,
+            "{image}"
+        );
+    }
     // Listed with one port, a name reaches its private address on that port
     // only.
     let named = format!("localhost:{port}");
@@ -311,14 +306,40 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
         Lookup::Found(web_digest())
     );
     let other = HttpRegistry::new(["localhost:1".to_owned()], []).unwrap();
-    let e = other
-        .lookup(&OciImage::parse(&format!("{named}/web:1")).unwrap())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&e, CloudError::Unavailable(m) if m.contains("no public address")),
-        "{e:?}"
+    assert_eq!(
+        other
+            .lookup(&OciImage::parse(&format!("{named}/web:1")).unwrap())
+            .await
+            .unwrap(),
+        Lookup::Unlisted
     );
+    // A listing does not extend to a token service that is not listed.
+    let registry_only = HttpRegistry::new([named.clone()], []).unwrap();
+    assert_eq!(
+        registry_only
+            .lookup(&OciImage::parse(&format!("{named}/web:1")).unwrap())
+            .await
+            .unwrap(),
+        Lookup::Private
+    );
+}
+
+#[tokio::test]
+async fn names_resolve_to_public_addresses_only_unless_listed() {
+    use reqwest::dns::Resolve as _;
+    let name = |n: &str| n.parse::<reqwest::dns::Name>().unwrap();
+    let strict = PublicOnly {
+        allowed: BTreeSet::new(),
+    };
+    let e = match strict.resolve(name("localhost")).await {
+        Ok(_) => panic!("localhost resolved"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("no public address"), "{e}");
+    let allowed = PublicOnly {
+        allowed: ["localhost".to_owned()].into(),
+    };
+    assert!(allowed.resolve(name("localhost")).await.is_ok());
 }
 
 #[test]

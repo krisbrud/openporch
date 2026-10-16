@@ -929,6 +929,12 @@ where
                 "image `{image}` of `{descriptor}` cannot be read without credentials, so its \
                  tag cannot be pinned; name it by digest as `<image>@sha256:<digest>`"
             ))),
+            Ok(Lookup::Unlisted) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{descriptor}` is in registry `{}` on a private address, so \
+                 its tag cannot be pinned; list the registry in `images.private_registries`, or \
+                 name the image by digest as `<image>@sha256:<digest>`",
+                parsed.host
+            ))),
             Err(e) => Err(cloud_failure(e)),
         }
     }
@@ -951,15 +957,16 @@ where
             match registry.lookup(&image).await {
                 Ok(Lookup::Found(_)) => {}
                 // One pinned here from a public tag must stay readable.
-                Ok(Lookup::Private) if pinned_from_tag(named) => {
+                Ok(Lookup::Private | Lookup::Unlisted) if pinned_from_tag(named) => {
                     return Err(ExecFailure::Permanent(format!(
                         "image `{named}` of `{descriptor}` was pinned from a public tag, but its \
                          registry no longer shows it without credentials; nothing changed"
                     )));
                 }
-                // One named by digest that needs credentials cannot be
-                // checked here.
-                Ok(Lookup::Private) => {}
+                // One named by digest that needs credentials, or is in a
+                // registry on a private address not listed, is not checked
+                // here.
+                Ok(Lookup::Private | Lookup::Unlisted) => {}
                 Ok(Lookup::Missing) => {
                     return Err(ExecFailure::Permanent(format!(
                         "image `{named}` of `{descriptor}` no longer exists; nothing changed"

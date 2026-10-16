@@ -170,20 +170,24 @@ points at, and a deployment checks that each pinned digest still exists
 before it changes anything. Images in Amazon ECR are read with the workload
 definition's cloud account. Images in other registries, such as Docker Hub or
 `ghcr.io`, are read over HTTPS without credentials, so the server needs
-direct outbound access to them: these reads ignore `HTTPS_PROXY` and the other
-proxy variables, since a proxy would reach addresses the server refuses. A tag that does not exist is refused with `400`. An
-image the registry shows only with credentials is refused too; name it by
-digest (`<image>@sha256:<digest>`) instead. Its digest is then not checked
-before a run, and its driver reports it when it is gone. An image pinned from a
-public tag keeps the tag (`<image>:<tag>@sha256:<digest>`), and a run fails
-before it changes anything if the registry no longer shows it without
-credentials.
+direct outbound access to them. These reads ignore `HTTPS_PROXY` and the other
+proxy variables, since a proxy would reach addresses the server refuses; a
+server whose only way out is a proxy sets `pin_other_registries = false`.
+
+A tag that does not exist is refused with `400`. An image the registry shows
+only with credentials is refused too; name it by digest
+(`<image>@sha256:<digest>`) instead. Its digest is then not checked before a
+run, and its driver reports it when it is gone. An image pinned from a public
+tag keeps the tag (`<image>:<tag>@sha256:<digest>`), and a run fails before it
+changes anything if the registry no longer shows it without credentials.
 
 Registries on loopback, private or link-local addresses are not read, so an
 image name cannot make the server probe its own network, and redirects are not
-followed. List a registry on such an address to read it, as `host[:port]`
-exactly as images name it; the listing covers that port only, and a token
-service on another host or port needs its own entry:
+followed. A tag in such a registry is refused with `400`; an image named there
+by digest is not checked. List a registry on such an address to read it, as
+`host[:port]` exactly as images name it. The listing covers that port only,
+and a token service the registry names is read on a private address only when
+it is listed too:
 
 ```toml
 [images]

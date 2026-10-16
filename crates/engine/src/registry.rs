@@ -62,7 +62,7 @@ impl OciImage {
     pub fn parse(image: &str) -> Option<Self> {
         let (named, reference) = match image.split_once('@') {
             Some((named, digest)) => {
-                if !pinned_image(image) {
+                if !pinned_image(image) || !valid_digest(digest) {
                     return None;
                 }
                 (named, Reference::Digest(digest.to_ascii_lowercase()))
@@ -163,6 +163,13 @@ impl std::fmt::Display for OciImage {
     }
 }
 
+/// Whether `digest` is `sha256:` and 64 hex digits.
+fn valid_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Whether `image` names a tag before its digest, as images pinned from a
 /// public tag do.
 pub fn pinned_from_tag(image: &str) -> bool {
@@ -180,6 +187,9 @@ pub enum Lookup {
     Missing,
     /// The registry does not show the image without credentials.
     Private,
+    /// The registry is on a private address it is not listed for, so it is
+    /// not read.
+    Unlisted,
 }
 
 /// Reads images from registries.
@@ -364,23 +374,26 @@ impl HttpRegistry {
         })
     }
 
-    /// Refuses `url` when its host is an address literal that is not public,
-    /// unless the registry `host` is allowed private addresses. Names are
-    /// checked as they resolve.
-    fn reachable(&self, url: &reqwest::Url, host: &str) -> Result<(), CloudError> {
-        let literal = match url.host() {
-            Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
-            Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
-            _ => None,
-        };
-        match literal {
-            Some(ip) if !is_public(ip) && !self.private.contains(host) => {
-                Err(CloudError::Rejected(format!(
-                    "registry `{host}` is on a private address; list it in \
-                     `images.private_registries` to read it"
-                )))
+    /// Whether `url` may be read: its host is listed, or is a public address
+    /// literal, or a name with a public address. A name that does not
+    /// resolve is left to the request to report; the resolver still refuses
+    /// private addresses it resolves to then.
+    async fn reachable(&self, url: &reqwest::Url, listed: bool) -> bool {
+        if listed {
+            return true;
+        }
+        match url.host() {
+            Some(url::Host::Ipv4(ip)) => is_public(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => is_public(IpAddr::V6(ip)),
+            Some(url::Host::Domain(name)) => {
+                match tokio::net::lookup_host((name, url.port_or_known_default().unwrap_or(443)))
+                    .await
+                {
+                    Ok(mut addrs) => addrs.any(|a| is_public(a.ip())),
+                    Err(_) => true,
+                }
             }
-            _ => Ok(()),
+            None => false,
         }
     }
 
@@ -415,7 +428,9 @@ impl HttpRegistry {
         );
         let parsed = reqwest::Url::parse(&url)
             .map_err(|_| CloudError::Rejected(format!("`{image}` names no valid registry")))?;
-        self.reachable(&parsed, host)?;
+        if !self.reachable(&parsed, self.private.contains(host)).await {
+            return Ok(Lookup::Unlisted);
+        }
         let unavailable = |e: reqwest::Error| unreachable_registry(host, &e);
         let request = |method: reqwest::Method, token: Option<&str>| {
             let mut r = self
@@ -474,7 +489,13 @@ impl HttpRegistry {
             .and_then(|v| v.to_str().ok())
             .map(str::to_ascii_lowercase);
         let digest = match reported {
-            Some(d) => d,
+            Some(d) if valid_digest(&d) => d,
+            Some(d) => {
+                return Err(CloudError::Rejected(format!(
+                    "registry `{host}` answered `{image}` with digest `{d}`, which is not a \
+                     sha256 digest"
+                )));
+            }
             // Not every registry reports the digest; it is the manifest's
             // SHA-256.
             None => {
@@ -539,13 +560,25 @@ impl HttpRegistry {
         let Ok(mut realm) = reqwest::Url::parse(realm) else {
             return Ok(None);
         };
+        // A registry's listing extends to its token service only when that is
+        // listed too, so a public registry cannot point the server at a
+        // listed host.
+        let registry = image.api_host();
         let realm_host = listed_host(&self.private, &realm);
-        // A token is fetched over HTTPS, unless the registry itself is reached
-        // over plain HTTP.
-        if realm.scheme() != "https" && !self.insecure.contains(&realm_host) {
+        let listed = self.private.contains(registry) && self.private.contains(&realm_host);
+        // A token is fetched over HTTPS, unless both are reached over plain
+        // HTTP.
+        let insecure = self.insecure.contains(registry) && self.insecure.contains(&realm_host);
+        if realm.scheme() != "https" && !insecure {
             return Ok(None);
         }
-        self.reachable(&realm, &realm_host)?;
+        if !self.reachable(&realm, listed).await {
+            return Err(CloudError::Rejected(format!(
+                "the token service of registry `{}` is on a private address that is not listed \
+                 for it",
+                image.host
+            )));
+        }
         {
             let mut query = realm.query_pairs_mut();
             if let Some((_, service)) = params.iter().find(|(k, _)| k == "service") {
@@ -553,8 +586,12 @@ impl HttpRegistry {
             }
             query.append_pair("scope", &format!("repository:{}:pull", image.repository));
         }
-        let response = self
-            .client(&realm_host)
+        let client = if listed {
+            &self.private_client
+        } else {
+            &self.client
+        };
+        let response = client
             .get(realm)
             .send()
             .await
