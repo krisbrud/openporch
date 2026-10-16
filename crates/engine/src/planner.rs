@@ -334,18 +334,21 @@ pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracin
     )
 }
 
-/// Logs how an operation ended. Executor failures are already redacted.
+/// Logs what the executor returned for an operation. This is the driver's
+/// result, not the recorded one: a checkpoint that fails afterwards logs
+/// "could not checkpoint an operation" and leaves the outcome unknown.
+/// Executor failures are already redacted.
 pub(crate) fn log_outcome<T>(result: &Result<T, ExecFailure>) {
     match result {
-        Ok(_) => tracing::info!(outcome = "succeeded", "operation finished"),
+        Ok(_) => tracing::info!(outcome = "succeeded", "driver finished"),
         Err(ExecFailure::Permanent(e)) => {
-            tracing::warn!(outcome = "failed", error = %e, "operation finished");
+            tracing::warn!(outcome = "failed", error = %e, "driver finished");
         }
         Err(ExecFailure::Retryable { error, .. }) => {
-            tracing::warn!(outcome = "retryable", error = %error, "operation finished");
+            tracing::warn!(outcome = "retryable", error = %error, "driver finished");
         }
         Err(ExecFailure::Uncertain(e)) => {
-            tracing::warn!(outcome = "unknown", error = %e, "operation finished");
+            tracing::warn!(outcome = "unknown", error = %e, "driver finished");
         }
     }
 }

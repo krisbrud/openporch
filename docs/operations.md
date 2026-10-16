@@ -53,7 +53,12 @@ can be found together:
 | `request_id` | The caller's `x-request-id` header, or one the server generates; it is returned in the same header and stored on audit entries |
 | `app`, `env`, `deployment` | The deployment the line belongs to |
 | `operation`, `guresid`, `resource`, `driver`, `attempt`, `action` | One driver operation (`provision`, `delete` or `observe`) |
-| `outcome` | `succeeded`, `failed`, `retryable` or `unknown` on `operation finished` and `deployment finished` lines |
+| `outcome` | `succeeded`, `failed`, `retryable` or `unknown` on `driver finished` and `deployment finished` lines |
+
+`driver finished` reports what the driver returned. If the result cannot be
+recorded afterwards, a `could not checkpoint an operation` line follows and the
+resource's outcome becomes unknown until it is recovered. `deployment finished`
+is logged only once the deployment's outcome is recorded.
 
 A deployment keeps the `request_id` of the request that started it, so a
 failure reported later can be traced to that request, and the audit entry for

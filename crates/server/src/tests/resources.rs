@@ -1421,7 +1421,7 @@ async fn a_failed_operation_is_correlated_with_its_request() {
     let failed: Vec<_> = events
         .iter()
         .map(fields)
-        .filter(|f| f["message"] == "operation finished" && f["outcome"] == "failed")
+        .filter(|f| f["message"] == "driver finished" && f["outcome"] == "failed")
         .collect();
     assert_eq!(failed.len(), 1, "{text}");
     let op = &failed[0];
