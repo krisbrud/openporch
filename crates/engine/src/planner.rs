@@ -439,6 +439,16 @@ pub trait Executor: Send + Sync + 'static {
         async { Ok(()) }
     }
 
+    /// Checks, without changing anything, that the version of the driver's
+    /// code `job.pin` names can still run, such as a module commit that can
+    /// still be fetched. The job carries the definition's driver inputs but no
+    /// resource inputs. An executor that cannot check accepts it, and a
+    /// missing version fails when the resource's turn comes.
+    fn check_pin(&self, job: ProvisionJob) -> impl Future<Output = Result<(), ExecFailure>> + Send {
+        let _ = job;
+        async { Ok(()) }
+    }
+
     /// Pins `pin.artifact` to the identity it has now, such as an S3 object
     /// version. An artifact without a fixed identity, such as an object in an
     /// unversioned bucket, is refused.
@@ -694,7 +704,13 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 account,
                 artifacts,
             };
-            if let Err(reason) = self.check_with_retries(check, deadline).await {
+            let what = format!("the artifacts of `{}`", node.descriptor);
+            if let Err(reason) = self
+                .check_with_retries(&what, deadline, || {
+                    self.executor.check_artifacts(check.clone())
+                })
+                .await
+            {
                 missing.insert(node.descriptor.clone(), reason);
             }
         }
@@ -904,28 +920,112 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         }
     }
 
+    /// Checks that the version of the drivers' code each resource of a
+    /// replay ran can still run; why each resource whose version cannot
+    /// cannot deploy. A resource whose driver inputs come from other
+    /// resources' outputs, which are not known before they provision, is left
+    /// to its driver.
+    async fn check_pins(
+        &self,
+        deployment: &Deployment,
+        deadline: Instant,
+    ) -> BTreeMap<Descriptor, String> {
+        let mut missing = BTreeMap::new();
+        for node in deployment.graph.nodes.values() {
+            let Some(pin) = deployment.pins.get(&node.descriptor.to_string()) else {
+                continue;
+            };
+            let Some((version, def)) = deployment.definitions.get(&node.definition) else {
+                continue;
+            };
+            let mut scope = scope_for(deployment, node, &BTreeMap::new());
+            // A resource the replay finds removed gets a new identity when it
+            // provisions; a definition that names it is left to its driver.
+            let guresid = match self
+                .store
+                .active_resource(
+                    deployment.org.as_str(),
+                    deployment.app.as_str(),
+                    deployment.env.as_str(),
+                    &node.descriptor.to_string(),
+                )
+                .await
+            {
+                Ok(Some(active)) => Guresid::new(active.guresid).ok(),
+                _ => None,
+            };
+            if let Some(guresid) = &guresid {
+                scope
+                    .context
+                    .insert(ContextKey::ResGuresid, json!(guresid.as_str()));
+            }
+            let recording = Recording {
+                scope: &scope,
+                seen: std::sync::Mutex::new(BTreeSet::new()),
+            };
+            let Ok((values, secrets, secret_refs)) = driver_inputs(def, &recording) else {
+                continue;
+            };
+            let job = ProvisionJob {
+                operation_id: format!("{}-check", deployment.id),
+                attempt: 0,
+                descriptor: node.descriptor.clone(),
+                // The check changes nothing, so a removed resource needs no
+                // identity.
+                guresid: guresid.unwrap_or_else(|| Guresid::from_bytes([0; 16])),
+                context: JobContext::of(deployment),
+                definition_id: def.id.clone(),
+                definition_version: *version,
+                driver_type: def.driver_type.clone(),
+                // Fetching code needs no cloud credentials.
+                driver_account: None,
+                inputs: JobInputs {
+                    values,
+                    secrets,
+                    secret_refs,
+                    resource: Resolved::Value(Value::Null),
+                    sources: recording.into_sources(),
+                },
+                input_fingerprint: String::new(),
+                cookie: None,
+                target: None,
+                pin: Some(pin.clone()),
+                existing: false,
+                deadline,
+                log: JobLog::discard(),
+            };
+            let what = format!("the pinned version of `{}`", node.descriptor);
+            if let Err(reason) = self
+                .check_with_retries(&what, deadline, || self.executor.check_pin(job.clone()))
+                .await
+            {
+                missing.insert(node.descriptor.clone(), reason);
+            }
+        }
+        missing
+    }
+
     /// Runs `check`, retrying failures that may pass with backoff, within the
     /// deployment's attempts and deadline.
-    async fn check_with_retries(
+    async fn check_with_retries<F>(
         &self,
-        check: ArtifactCheck,
+        what: &str,
         deadline: Instant,
-    ) -> Result<(), String> {
+        check: impl Fn() -> F,
+    ) -> Result<(), String>
+    where
+        F: Future<Output = Result<(), ExecFailure>>,
+    {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let checked =
-                tokio::time::timeout_at(deadline, self.executor.check_artifacts(check.clone()))
-                    .await;
+            let checked = tokio::time::timeout_at(deadline, check()).await;
             let (error, retry_after) = match checked {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => return Err(e),
                 Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
                 Err(_) => {
-                    return Err(format!(
-                        "the deployment ran out of time checking the artifacts of `{}`",
-                        check.descriptor
-                    ));
+                    return Err(format!("the deployment ran out of time checking {what}"));
                 }
             };
             let delay = retry_after.unwrap_or_else(|| backoff(&self.limits, attempt));
@@ -953,19 +1053,24 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
         let mut tasks: BTreeMap<tokio::task::Id, (Descriptor, tracing::Span)> = BTreeMap::new();
-        // Nothing runs unless every artifact the deployment names exists.
-        let missing = self.check_artifacts(&deployment, deadline).await;
+        // Nothing runs unless every artifact the deployment names exists and,
+        // in a replay, every version of the drivers' code it ran can run again.
+        let mut missing = self.check_artifacts(&deployment, deadline).await;
+        let artifacts_missing = !missing.is_empty();
+        for (d, reason) in self.check_pins(&deployment, deadline).await {
+            missing.entry(d).or_insert(reason);
+        }
+        let why = if artifacts_missing {
+            "not started: an artifact the deployment needs is missing"
+        } else {
+            "not started: a version of the code the deployment replays is missing"
+        };
         for (d, reason) in &missing {
             outcomes.insert(d.clone(), Outcome::Failed(reason.clone()));
         }
         for node in deployment.graph.nodes.values() {
             if !missing.is_empty() && !missing.contains_key(&node.descriptor) {
-                outcomes.insert(
-                    node.descriptor.clone(),
-                    Outcome::Pending(
-                        "not started: an artifact the deployment needs is missing".into(),
-                    ),
-                );
+                outcomes.insert(node.descriptor.clone(), Outcome::Pending(why.into()));
             }
         }
         while missing.is_empty() {
@@ -1426,6 +1531,36 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
     scope
 }
 
+/// The definition's driver inputs resolved in `recording`'s scope: values,
+/// secrets and secret references.
+fn driver_inputs(
+    def: &ResourceDefinition,
+    recording: &Recording,
+) -> Result<(Value, Resolved, Resolved), String> {
+    let at = |what: &str| format!("definition `{}`: {what}", def.id);
+    let values = resolve_value(
+        &Value::Object(def.driver_inputs.values.clone()),
+        Dialect::Definition,
+        recording.scope,
+        Sink::Plain,
+        "driver_inputs.values",
+    )
+    .map_err(|e| at(&e.to_string()))?
+    .as_plain()
+    .cloned()
+    .ok_or_else(|| at("driver_inputs.values contains a secret"))?;
+    let secrets = resolve_value(
+        &Value::Object(def.driver_inputs.secrets.clone()),
+        Dialect::Definition,
+        recording,
+        Sink::Secret,
+        "driver_inputs.secrets",
+    )
+    .map_err(|e| at(&e.to_string()))?;
+    let secret_refs = references(&Value::Object(def.driver_inputs.secret_refs.clone()));
+    Ok((values, secrets, secret_refs))
+}
+
 /// A scope that records where each secret reference it hands out came from.
 struct Recording<'a> {
     scope: &'a MapScope,
@@ -1721,33 +1856,13 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
         started: &openporch_store::OperationStarted,
         log: &JobLog,
     ) -> Result<ProvisionJob, String> {
-        let at = |what: &str| format!("definition `{}`: {what}", def.id);
         let scope = &self.scope;
         // Secret inputs record where each reference came from.
         let recording = Recording {
             scope,
             seen: std::sync::Mutex::new(BTreeSet::new()),
         };
-        let values = resolve_value(
-            &Value::Object(def.driver_inputs.values.clone()),
-            Dialect::Definition,
-            scope,
-            Sink::Plain,
-            "driver_inputs.values",
-        )
-        .map_err(|e| at(&e.to_string()))?
-        .as_plain()
-        .cloned()
-        .ok_or_else(|| at("driver_inputs.values contains a secret"))?;
-        let secrets = resolve_value(
-            &Value::Object(def.driver_inputs.secrets.clone()),
-            Dialect::Definition,
-            &recording,
-            Sink::Secret,
-            "driver_inputs.secrets",
-        )
-        .map_err(|e| at(&e.to_string()))?;
-        let secret_refs = references(&Value::Object(def.driver_inputs.secret_refs.clone()));
+        let (values, secrets, secret_refs) = driver_inputs(def, &recording)?;
         let driver_account = driver_account(def, scope)?;
         // Params from a set use the set's placeholders; co-provisioning params
         // use the definition's.

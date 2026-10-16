@@ -753,6 +753,34 @@ where
         Ok(())
     }
 
+    async fn check_pin(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+        let mut log = job.log.redacting();
+        let checked = async {
+            // Reading the source's credentials needs the definition to still
+            // match, as provisioning does.
+            let Call {
+                driver,
+                req,
+                timeout,
+                ..
+            } = self
+                .request(&job, &job.inputs.sources, true, &mut log)
+                .await?;
+            // A check changes nothing, so running out of time is not uncertain.
+            with_timeout(timeout, driver.check_pin(&req))
+                .await
+                .map_err(|e| match e {
+                    DriverError::Timeout(_) => ExecFailure::Retryable {
+                        error: format!("checking the pinned version failed: {e}"),
+                        retry_after: None,
+                    },
+                    e => driver_failure(e),
+                })
+        }
+        .await;
+        checked.map_err(|f| log.failure(f))
+    }
+
     async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
         let object = S3Object::parse(&pin.artifact).ok_or_else(|| {
             ExecFailure::Permanent(format!(

@@ -143,6 +143,10 @@ struct Fake {
     /// Every image pinned; each pins to digest `sha256:aa…`.
     image_pins: Mutex<Vec<ImagePin>>,
     gone: Mutex<BTreeSet<String>>,
+    /// The pins checked before a replay, and the commits that can no longer
+    /// be fetched.
+    pin_checks: Mutex<Vec<ProvisionJob>>,
+    lost_commits: Mutex<BTreeSet<String>>,
     /// How many artifact checks fail in a way that may pass before one
     /// answers.
     artifact_flakes: Mutex<usize>,
@@ -306,6 +310,20 @@ fn none_outputs(
 }
 
 impl Executor for Fake {
+    async fn check_pin(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
+        let commit = job.pin.as_ref().unwrap()["commit"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        self.pin_checks.lock().unwrap().push(job);
+        if self.lost_commits.lock().unwrap().contains(&commit) {
+            return Err(ExecFailure::Permanent(format!(
+                "the pinned commit `{commit}` can no longer be fetched"
+            )));
+        }
+        Ok(())
+    }
+
     async fn check_artifacts(&self, check: ArtifactCheck) -> Result<(), ExecFailure> {
         self.artifact_checks.lock().unwrap().push(check.clone());
         {

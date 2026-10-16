@@ -1362,6 +1362,12 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
     );
     assert!(init.contains("-lockfile=readonly"), "{init}");
     assert_eq!(repinned, pin);
+    // Checking the pin before a replay fetches it and runs nothing.
+    std::fs::write(&record, "").unwrap();
+    let mut req = request(values.clone(), json!({}));
+    req.pin = Some(pin.clone());
+    d.check_pin(&req).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "");
     // An observation reports the version the last apply ran.
     let Observation::Ready { outputs, .. } =
         d.get(&request(values.clone(), json!({}))).await.unwrap()
@@ -1399,6 +1405,10 @@ async fn a_pinned_run_applies_the_commit_and_lock_file_it_names() {
         let mut req = request(values.clone(), json!({}));
         req.pin = Some(bad);
         let (code, message) = invalid(d.put(&req).await.unwrap_err());
+        assert_eq!(code, "TOFU-003", "{message}");
+        assert!(message.contains(want), "{message}");
+        // The check before a replay refuses it the same way.
+        let (code, message) = invalid(d.check_pin(&req).await.unwrap_err());
         assert_eq!(code, "TOFU-003", "{message}");
         assert!(message.contains(want), "{message}");
     }

@@ -70,6 +70,8 @@ struct FakeDriver {
     deletes: Mutex<Vec<DriverRequest>>,
     /// `get` cannot tell, and says so with the secrets it received.
     unsure: Mutex<bool>,
+    /// The pins checked; a pin naming commit `lost` is refused.
+    pin_checks: Mutex<Vec<DriverRequest>>,
 }
 
 impl FakeDriver {
@@ -99,6 +101,7 @@ impl FakeDriver {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
             unsure: Mutex::new(false),
+            pin_checks: Mutex::new(Vec::new()),
         })
     }
 
@@ -149,6 +152,22 @@ impl Driver for FakeDriver {
     fn plan_delete<'a>(&'a self, _req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
         let plan = self.plan_delete.lock().unwrap().clone();
         Box::pin(async move { Ok(plan) })
+    }
+
+    fn check_pin<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        self.pin_checks.lock().unwrap().push(req.clone());
+        Box::pin(async move {
+            if req.pin == Some(json!({"commit": "lost"})) {
+                return Err(DriverError::Invalid {
+                    code: Some("FAKE-2".into()),
+                    message: format!(
+                        "commit `lost` can no longer be fetched with {}",
+                        secret_values(req).join(", ")
+                    ),
+                });
+            }
+            Ok(())
+        })
     }
 
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
@@ -1188,6 +1207,52 @@ async fn a_pin_reaches_the_driver_and_the_version_it_ran_comes_back() {
         Some(json!({"commit": "recorded"}))
     );
     assert_eq!(result.pin, Some(json!({"commit": "recorded"})));
+}
+
+#[tokio::test]
+async fn a_pin_is_checked_with_the_definitions_secrets_and_changes_nothing() {
+    let f = Fixture::new().await;
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "openporch", "ref": "defs/pg/master"}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let puts = f.driver.puts().len();
+    let executor = f.executor(Arc::new(NoPermits));
+    let check = |commit: &str| {
+        let mut job = provision_job(&db, db.guresid.parse().unwrap());
+        job.pin = Some(json!({"commit": commit}));
+        executor.check_pin(job)
+    };
+
+    check("recorded").await.unwrap();
+    let checked = f.driver.pin_checks.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(checked.pin, Some(json!({"commit": "recorded"})));
+    assert_eq!(secret_values(&checked), [MASTER]);
+    // A version that is gone is refused, redacted, and nothing ran.
+    let Err(ExecFailure::Permanent(error)) = check("lost").await else {
+        panic!("not refused");
+    };
+    assert!(error.contains("can no longer be fetched"), "{error}");
+    assert!(!error.contains(MASTER), "{error}");
+    assert_eq!(f.driver.puts().len(), puts);
+
+    // A definition that no longer matches does not get its secrets read.
+    sqlx::query("UPDATE criteria SET app_id = 'billing' WHERE definition_id = 'pg'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let checks = f.driver.pin_checks.lock().unwrap().len();
+    let Err(ExecFailure::Permanent(error)) = check("recorded").await else {
+        panic!("not refused");
+    };
+    assert!(error.contains("no longer matches"), "{error}");
+    assert_eq!(f.driver.pin_checks.lock().unwrap().len(), checks);
 }
 
 #[tokio::test]

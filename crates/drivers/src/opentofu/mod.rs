@@ -327,6 +327,52 @@ fn is_commit(commit: &str) -> bool {
     matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The version a replay must run, when the request names one: refused when
+/// it came from another source or names no commit.
+fn pinned(inputs: &Inputs, req: &DriverRequest) -> Result<Option<Pinned>, Failure> {
+    let Some(pin) = &req.pin else {
+        return Ok(None);
+    };
+    let pinned: Pinned = serde_json::from_value(pin.clone())
+        .map_err(|_| input("the pinned module version is unreadable"))?;
+    let current = inputs
+        .source
+        .as_ref()
+        .map(|(s, path)| (s.url.as_str(), path.as_deref()));
+    let recorded = pinned
+        .source
+        .as_ref()
+        .map(|s| (s.url.as_str(), s.path.as_deref()));
+    if current != recorded {
+        return Err(input(
+            "the definition's `source` is not the one the pinned version came from",
+        ));
+    }
+    if pinned
+        .source
+        .as_ref()
+        .is_some_and(|s| !is_commit(&s.commit))
+    {
+        return Err(input("the pinned module version names no commit"));
+    }
+    Ok(Some(pinned))
+}
+
+/// Why a pinned commit failed to fetch: a replay cannot run another commit in
+/// its place.
+fn unfetchable(source: &git::Source, e: Failure) -> Failure {
+    match e {
+        Failure::Command { stderr, .. } => input(format!(
+            "the pinned commit `{}` of `{}` can no longer be fetched; deploy the current \
+             configuration instead: {}",
+            source.rev,
+            source.url,
+            stderr.lines().last().unwrap_or_default()
+        )),
+        e => e,
+    }
+}
+
 fn input(message: impl Into<String>) -> Failure {
     Failure::Input(message.into())
 }
@@ -777,33 +823,9 @@ impl OpenTofu {
     ) -> Result<(), Failure> {
         let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
         // A replay runs the version its deployment ran, from the same source.
-        let pinned = match (at, &req.pin) {
-            (SourceAt::Current, Some(pin)) => {
-                let pinned: Pinned = serde_json::from_value(pin.clone())
-                    .map_err(|_| input("the pinned module version is unreadable"))?;
-                let current = inputs
-                    .source
-                    .as_ref()
-                    .map(|(s, path)| (s.url.as_str(), path.as_deref()));
-                let recorded = pinned
-                    .source
-                    .as_ref()
-                    .map(|s| (s.url.as_str(), s.path.as_deref()));
-                if current != recorded {
-                    return Err(input(
-                        "the definition's `source` is not the one the pinned version came from",
-                    ));
-                }
-                if pinned
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| !is_commit(&s.commit))
-                {
-                    return Err(input("the pinned module version names no commit"));
-                }
-                Some(pinned)
-            }
-            _ => None,
+        let pinned = match at {
+            SourceAt::Current => pinned(&inputs, req)?,
+            SourceAt::Retained(_) => None,
         };
         let home = run.dir.join("home");
         files::private_dir(&home).map_err(Failure::io)?;
@@ -864,7 +886,7 @@ impl OpenTofu {
         match &source {
             Some((s, path)) => {
                 let checkout = run.dir.join("source");
-                let commit = git::fetch(
+                let fetched = git::fetch(
                     &self.config,
                     &mut run.log,
                     &run.stop,
@@ -873,18 +895,11 @@ impl OpenTofu {
                     &checkout,
                     &home,
                 )
-                .await
-                .map_err(|e| match (&pinned, e) {
-                    // A replay cannot run another commit in its place.
-                    (Some(_), Failure::Command { stderr, .. }) => input(format!(
-                        "the pinned commit `{}` of `{}` can no longer be fetched; deploy the \
-                         current configuration instead: {}",
-                        s.rev,
-                        s.url,
-                        stderr.lines().last().unwrap_or_default()
-                    )),
-                    (_, e) => e,
-                })?;
+                .await;
+                let commit = match pinned {
+                    Some(_) => fetched.map_err(|e| unfetchable(s, e))?,
+                    None => fetched?,
+                };
                 run.module = match path {
                     Some(p) => files::inside(&checkout, p).map_err(Failure::Input)?,
                     None => checkout.canonicalize().map_err(Failure::io)?,
@@ -1770,6 +1785,52 @@ impl Driver for OpenTofu {
                 })
                 .await?;
             Ok(to_plan(planned))
+        })
+    }
+
+    fn check_pin<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            if req.pin.is_none() {
+                return Ok(());
+            }
+            let mut run = match self.start(req).await {
+                Ok(run) => run,
+                Err(f) => return self.finish(req, &RunLog::default(), Err(f), false),
+            };
+            let result = async {
+                let inputs = parse(&self.config, &req.values, req.secrets.expose())?;
+                let pinned = pinned(&inputs, req)?;
+                let (Some((current, _)), Some(recorded)) = (
+                    &inputs.source,
+                    pinned.as_ref().and_then(|p| p.source.as_ref()),
+                ) else {
+                    // A script alone has nothing to fetch.
+                    return Ok(());
+                };
+                let source = git::Source {
+                    url: current.url.clone(),
+                    rev: recorded.commit.clone(),
+                    username: current.username.clone(),
+                    password: current.password.clone(),
+                    ssh_key: current.ssh_key.clone(),
+                };
+                let home = run.dir.join("home");
+                files::private_dir(&home).map_err(Failure::io)?;
+                git::fetch(
+                    &self.config,
+                    &mut run.log,
+                    &run.stop,
+                    &source,
+                    &source.rev,
+                    &run.dir.join("source"),
+                    &home,
+                )
+                .await
+                .map(drop)
+                .map_err(|e| unfetchable(&source, e))
+            }
+            .await;
+            self.finish(req, &run.log, result, false)
         })
     }
 
