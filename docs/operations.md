@@ -94,7 +94,7 @@ scrape_configs:
 | `openporch_driver_call_seconds_sum`, `_count{action,outcome}` | Finished driver calls and their duration; `outcome="retryable"` counts the calls that were retried |
 | `openporch_resources{status}` | Active resources by status |
 | `openporch_resources_needing_recovery` | Resources with an unknown outcome; see [`porch resources recover`](cli.md#porch-resources-recover) |
-| `openporch_database_bytes`, `openporch_database_free_bytes` | The database's size and the free space inside it |
+| `openporch_database_bytes`, `openporch_database_wal_bytes`, `openporch_database_free_bytes` | The database's files on disk (write-ahead log included), the write-ahead log alone, and the free space inside the database |
 | `openporch_audit_entries`, `openporch_deployment_log_lines` | Stored audit entries and deployment log lines |
 | `openporch_ready`, `openporch_build_info{version}` | Readiness, as `/readyz` reports it, and the version |
 

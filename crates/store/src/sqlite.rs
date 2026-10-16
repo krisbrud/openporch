@@ -31,8 +31,10 @@ pub struct SqliteStore {
 pub struct StoreStats {
     /// Active resources by status.
     pub resources: std::collections::BTreeMap<String, i64>,
-    /// The database's size, free pages included.
+    /// The database's files on disk, its write-ahead log included.
     pub database_bytes: i64,
+    /// The write-ahead log, which a checkpoint folds into the database.
+    pub wal_bytes: i64,
     /// The database's free pages, which new data reuses.
     pub free_bytes: i64,
     /// Audit log entries.
@@ -174,9 +176,18 @@ impl SqliteStore {
             .bind(&self.org)
             .fetch_one(&self.pool)
             .await?;
+        // The files, not the pages: the write-ahead log grows on its own
+        // while checkpoints are held up.
+        let size = |name: &str| {
+            std::fs::metadata(self.ownership.dir().join(name))
+                .map_or(0, |m| i64::try_from(m.len()).unwrap_or(i64::MAX))
+        };
+        let wal_bytes = size("openporch.db-wal");
+        let database_bytes = size("openporch.db").max(pages * page_size) + wal_bytes;
         Ok(StoreStats {
             resources: resources.into_iter().collect(),
-            database_bytes: pages * page_size,
+            database_bytes,
+            wal_bytes,
             free_bytes: free * page_size,
             audit_entries,
             log_lines,

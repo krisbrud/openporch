@@ -1551,7 +1551,8 @@ async fn metrics_count_work_outcomes_and_storage() {
     assert_eq!(sample(&text, "openporch_deployments_queued"), 0.0);
     assert_eq!(sample(&text, "openporch_deployments_running"), 0.0);
     assert_eq!(sample(&text, "openporch_ready"), 1.0);
-    assert!(sample(&text, "openporch_database_bytes") > 0.0);
+    let wal = sample(&text, "openporch_database_wal_bytes");
+    assert!(sample(&text, "openporch_database_bytes") > wal, "{text}");
     assert!(sample(&text, "openporch_audit_entries") >= 2.0);
     assert!(sample(&text, "openporch_deployment_log_lines") >= 1.0);
 

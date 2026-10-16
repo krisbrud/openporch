@@ -160,8 +160,13 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Response> {
     // Storage.
     out.gauge(
         "openporch_database_bytes",
-        "The database's size, free pages included.",
+        "The database's files on disk, write-ahead log and free pages included.",
         stats.database_bytes,
+    );
+    out.gauge(
+        "openporch_database_wal_bytes",
+        "The database's write-ahead log, which checkpoints fold into the database.",
+        stats.wal_bytes,
     );
     out.gauge(
         "openporch_database_free_bytes",
