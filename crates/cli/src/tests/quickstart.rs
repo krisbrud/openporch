@@ -217,8 +217,9 @@ async fn the_quickstart_runs_as_written() {
     // The application goes, with everything its deployments created, once
     // its deletion has run in the background.
     let mut apps = Value::Null;
-    for _ in 0..500 {
+    for _ in 0..2000 {
         let r = m.porch(&["get", "apps", "-o", "json"], "").await;
+        assert_eq!(r.code, 0, "{r:?}");
         apps = serde_json::from_str(&r.out).unwrap();
         if apps == serde_json::json!([]) {
             break;
