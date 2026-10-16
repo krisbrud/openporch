@@ -283,6 +283,17 @@ pub trait IdentityStore: Send + Sync {
     ) -> impl Future<Output = Result<Vec<AuditEntry>>> + Send;
 }
 
+/// How often a token's `last_used_at` is rewritten while it is in use.
+const TOKEN_USE_INTERVAL_MS: i64 = 60_000;
+
+/// SQLITE_BUSY (5) or SQLITE_LOCKED (6), including their extended codes.
+fn is_busy(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .and_then(|c| c.parse::<i64>().ok())
+        .is_some_and(|c| matches!(c & 0xff, 5 | 6))
+}
+
 fn not_found(what: String) -> StoreError {
     StoreError::NotFound(what)
 }
@@ -649,12 +660,24 @@ impl IdentityStore for SqliteStore {
         let Some(principal) = principal else {
             return Ok(None);
         };
-        sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE org_id = ? AND token_hash = ?")
-            .bind(now)
-            .bind(org)
-            .bind(token_hash)
-            .execute(&mut *conn)
-            .await?;
+        // Recording use is best effort: at most once a minute per token, and
+        // a busy database skips it instead of failing the request it
+        // authenticates.
+        let touched = sqlx::query(
+            "UPDATE api_tokens SET last_used_at = ? WHERE org_id = ? AND token_hash = ? \
+             AND (last_used_at IS NULL OR last_used_at <= ?)",
+        )
+        .bind(now)
+        .bind(org)
+        .bind(token_hash)
+        .bind(now - TOKEN_USE_INTERVAL_MS)
+        .execute(&mut *conn)
+        .await;
+        if let Err(e) = touched
+            && !is_busy(&e)
+        {
+            return Err(e.into());
+        }
         fetch_principal(&mut conn, org, &principal).await
     }
 
