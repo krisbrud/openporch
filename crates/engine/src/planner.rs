@@ -334,6 +334,25 @@ pub(crate) fn operation_span(job: &ProvisionJob, action: &'static str) -> tracin
     )
 }
 
+/// The span a resource's work in a deployment is logged in, so events outside
+/// the driver call, such as a failed checkpoint, name the resource and, once
+/// [`record_operation`] runs, its current operation and GUResID.
+pub(crate) fn resource_span(descriptor: &Descriptor) -> tracing::Span {
+    tracing::error_span!(
+        "resource",
+        resource = %descriptor,
+        operation = tracing::field::Empty,
+        guresid = tracing::field::Empty,
+    )
+}
+
+/// Records the operation just started on the current [`resource_span`].
+pub(crate) fn record_operation(started: &openporch_store::OperationStarted) {
+    let span = tracing::Span::current();
+    span.record("operation", started.operation_id.as_str());
+    span.record("guresid", started.guresid.as_str());
+}
+
 /// Logs what the executor returned for an operation. This is the driver's
 /// result, not the recorded one: a checkpoint that fails afterwards logs
 /// "could not checkpoint an operation" and leaves the outcome unknown.
@@ -958,9 +977,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     log: log.resource(&node.descriptor),
                 };
                 let d = node.descriptor.clone();
+                let span = resource_span(&d);
                 let task = running.spawn({
                     let d = d.clone();
-                    async move { (d, ctx.run().await) }.in_current_span()
+                    async move { (d, ctx.run().await) }.instrument(span)
                 });
                 tasks.insert(task.id(), d);
             }
@@ -1510,6 +1530,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     }
                     other => Outcome::Failed(format!("the operation was not recorded: {other}")),
                 })?;
+            record_operation(&started);
             self.scope
                 .context
                 .insert(ContextKey::ResGuresid, json!(started.guresid.as_str()));

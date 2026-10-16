@@ -224,9 +224,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     deadline,
                     log: log.resource(descriptor),
                 };
+                let span = super::resource_span(descriptor);
                 let id = running
                     .spawn(
-                        async move { (run.descriptor.clone(), run.run().await) }.in_current_span(),
+                        async move { (run.descriptor.clone(), run.run().await) }.instrument(span),
                     )
                     .id();
                 tasks.insert(id, descriptor.clone());
@@ -431,6 +432,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                     )),
                     other => failed(format!("the deletion was not recorded: {other}")),
                 })?;
+            super::record_operation(&started);
             let guresid: Guresid = started.guresid.clone();
             let log = self
                 .log

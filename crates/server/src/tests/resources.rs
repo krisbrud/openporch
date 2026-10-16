@@ -1436,6 +1436,21 @@ async fn a_failed_operation_is_correlated_with_its_request() {
         op["error"].as_str().unwrap().contains("[REDACTED]"),
         "{op:?}"
     );
+    // The resource's span names the operation too, for events outside the
+    // driver call such as a failed checkpoint.
+    let resource_spans: Vec<_> = events
+        .iter()
+        .filter(|e| e["fields"]["message"] == "driver finished")
+        .flat_map(|e| e["spans"].as_array().cloned().unwrap_or_default())
+        .filter(|s| s["name"] == "resource" && s["resource"] == DB)
+        .collect();
+    assert!(!resource_spans.is_empty(), "{text}");
+    assert!(
+        resource_spans
+            .iter()
+            .all(|s| s["guresid"] == op["guresid"] && s["operation"] == op["operation"]),
+        "{resource_spans:?}"
+    );
     let finished: Vec<_> = events
         .iter()
         .map(fields)
