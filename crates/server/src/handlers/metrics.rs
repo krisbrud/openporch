@@ -78,7 +78,7 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Response> {
     );
     out.gauge(
         "openporch_deployments_capacity",
-        "How many deployments may run or wait at once.",
+        "How many deployments may run at once; more can wait.",
         state.runners.capacity(),
     );
     out.family(

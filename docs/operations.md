@@ -87,7 +87,7 @@ scrape_configs:
 
 | Metric | What it measures |
 | --- | --- |
-| `openporch_deployments_queued`, `openporch_deployments_running`, `openporch_deployments_capacity` | Accepted deployments waiting for room, running now, and the limit on both together |
+| `openporch_deployments_queued`, `openporch_deployments_running`, `openporch_deployments_capacity` | Accepted deployments waiting for room, running now, and how many may run at once |
 | `openporch_deployments_finished_total{outcome}` | Finished deployments, `succeeded` or `failed` |
 | `openporch_deployment_run_seconds_sum`, `_count` | How long deployments ran |
 | `openporch_driver_calls_running`, `openporch_driver_concurrency` | Driver calls running now, and the limit |
