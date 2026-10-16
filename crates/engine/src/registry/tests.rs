@@ -159,6 +159,7 @@ async fn fake_registry() -> String {
     async fn manifest(
         State(host): State<Arc<String>>,
         Path((repository, reference)): Path<(String, String)>,
+        method: axum::http::Method,
         headers: HeaderMap,
     ) -> Response {
         if headers
@@ -187,6 +188,10 @@ async fn fake_registry() -> String {
                 ([("docker-content-digest", digest)], "{}").into_response()
             }
             ("web", "quiet") => "quiet manifest".into_response(),
+            ("slow", _) if method == axum::http::Method::HEAD => "slow manifest".into_response(),
+            ("slow", _) => {
+                (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "9")]).into_response()
+            }
             ("busy", _) => {
                 (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "7")]).into_response()
             }
@@ -248,6 +253,14 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
         CloudError::Throttled {
             message: format!("registry `{host}` answered 429 for `{host}/busy:1`"),
             retry_after: Some(Duration::from_secs(7)),
+        }
+    );
+    // So does one on reading a manifest whose digest is not reported.
+    assert_eq!(
+        lookup(format!("{host}/slow:1")).await.unwrap_err(),
+        CloudError::Throttled {
+            message: format!("registry `{host}` answered 429 reading `{host}/slow:1`"),
+            retry_after: Some(Duration::from_secs(9)),
         }
     );
     // A token service answer is read only up to a limit.
@@ -336,6 +349,7 @@ fn only_public_addresses_are_public() {
         "::ffff:169.254.169.254",
         "fec0::1",
         "2001:db8::1",
+        "3fff::1",
         "2001::1",
         "2002:0a00:0001::1",
         "64:ff9b::a00:1",

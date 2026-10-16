@@ -253,7 +253,7 @@ fn is_public(ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => is_public(IpAddr::V4(v4)),
-            // Global unicast only (2000::/3), less the documentation range,
+            // Global unicast only (2000::/3), less the documentation ranges,
             // the special-purpose 2001::/23, and 6to4 addresses that wrap a
             // non-public IPv4 address.
             None => {
@@ -261,6 +261,7 @@ fn is_public(ip: IpAddr) -> bool {
                 (first & 0xe000) == 0x2000
                     && !(first == 0x2001 && second < 0x0200)
                     && !(first == 0x2001 && second == 0x0db8)
+                    && (first & 0xfff0) != 0x3ff0
                     && (first != 0x2002
                         || is_public(IpAddr::V4(std::net::Ipv4Addr::new(
                             (second >> 8) as u8,
@@ -479,6 +480,12 @@ impl HttpRegistry {
                     .send()
                     .await
                     .map_err(unavailable)?;
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(throttled(
+                        format!("registry `{host}` answered 429 reading `{image}`"),
+                        &response,
+                    ));
+                }
                 if !response.status().is_success() {
                     return Err(CloudError::Unavailable(format!(
                         "registry `{host}` answered {} reading `{image}`",
