@@ -269,11 +269,16 @@ pub(crate) async fn planned(
     Ok(deployment)
 }
 
-/// Runs deployment `run`, counting how long it took.
+/// Runs deployment `run`, counting how long it took, even if it panics.
 async fn timed(run: impl Future<Output = ()>) {
-    let started = std::time::Instant::now();
+    struct Ran(std::time::Instant);
+    impl Drop for Ran {
+        fn drop(&mut self) {
+            METRICS.deployment_ran(self.0.elapsed());
+        }
+    }
+    let _ran = Ran(std::time::Instant::now());
     run.await;
-    METRICS.deployment_ran(started.elapsed());
 }
 
 /// Finishes `job`'s deployment, which ends its log with the outcome; a
