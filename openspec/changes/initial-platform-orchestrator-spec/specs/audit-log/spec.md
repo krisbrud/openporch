@@ -24,11 +24,15 @@ Accepted mutations SHALL persist audit intent atomically with domain changes. Re
 
 ### Requirement: Retention
 
-Audit entries SHALL not be API-deletable. Retention defaults to 30 days and SHALL support 365 days or export. Expose retention and export failures. Expiry SHALL be explicit maintenance independent of resource recovery records. Storage exhaustion SHALL reject new mutations rather than silently discard audit events. Tamper-proof storage against a host administrator is not claimed.
+Audit entries SHALL not be API-deletable, except through the explicit administrator expiry of entries past retention described below. Retention defaults to 30 days and SHALL support 365 days or export. Expose retention and export failures. Expiry SHALL be explicit maintenance independent of resource recovery records. Storage exhaustion SHALL reject new mutations rather than silently discard audit events. Tamper-proof storage against a host administrator is not claimed.
 
 #### Scenario: Delete attempt
 - **WHEN** any principal sends `DELETE` to an audit log path
 - **THEN** the server returns `405`
+
+#### Scenario: Expire past retention
+- **WHEN** an administrator expires entries older than the retention period after a dry run
+- **THEN** only those entries are removed, the expiry is recorded in the audit log in the same transaction, and entries inside the retention period cannot be expired
 
 ### Requirement: Execution outcome correlation
 

@@ -1388,6 +1388,132 @@ async fn audit_failure_rejects_the_mutation() {
 }
 
 #[tokio::test]
+async fn audit_entries_expire_only_when_an_administrator_expires_them() {
+    let s = server().await;
+    s.member("dev", "member").await;
+    let viewer = s.member("auditor", "orgViewer").await;
+    // Everything so far is 40 days old, past the default 30-day retention.
+    let pool = s.state.store.pool();
+    sqlx::query("UPDATE audit_log SET at = at - 40 * 86400000")
+        .execute(pool)
+        .await
+        .unwrap();
+    let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(old >= 2);
+    let developer = s.member("dev2", "member").await;
+
+    // Nothing expires by itself; how much would is reported.
+    let (_, metrics) = s.get_text("/orgs/acme/metrics", Some(&s.admin)).await;
+    assert!(
+        metrics.contains(&format!("openporch_audit_expirable_entries {old}\n")),
+        "{metrics}"
+    );
+    let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
+    assert_eq!(report["audit"]["retention_days"], 30, "{report}");
+    assert_eq!(report["audit"]["expirable"], old, "{report}");
+    let expire = "/orgs/acme/audit-logs/expire";
+    let (status, b) = s.post(expire, &s.admin, json!({"dry_run": true})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["expired"], old, "{b}");
+    assert_eq!(b["dry_run"], true, "{b}");
+    let cutoff = b["before"].clone();
+    assert_eq!(b["retained"]["resources"], 0, "{b}");
+    assert!(
+        b["note"]
+            .as_str()
+            .unwrap()
+            .contains("may keep costing money"),
+        "{b}"
+    );
+    let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
+    assert_eq!(report["audit"]["expirable"], old, "{report}");
+
+    // Only administrators expire entries.
+    for token in [&viewer, &developer] {
+        let (status, _) = s.post(expire, token, json!({"before": cutoff})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // A failed expiry removes nothing and is reported.
+    sqlx::query(
+        "CREATE TRIGGER audit_locked BEFORE DELETE ON audit_log \
+         BEGIN SELECT RAISE(ABORT, 'disk error'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
+    assert_error(status, &b, StatusCode::INTERNAL_SERVER_ERROR, "SRV-001");
+    let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
+    assert_eq!(report["audit"]["expirable"], old, "{report}");
+    assert_eq!(
+        report["audit"]["last_expiry"]["outcome"], "failed",
+        "{report}"
+    );
+    assert!(report["audit"]["expiry_failures"].as_u64().unwrap() >= 1);
+    let (_, metrics) = s.get_text("/orgs/acme/metrics", Some(&s.admin)).await;
+    assert!(
+        metrics.contains(r#"openporch_audit_last_expiry_timestamp_seconds{outcome="failed"}"#),
+        "{metrics}"
+    );
+    sqlx::query("DROP TRIGGER audit_locked")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // Expiry cannot reach into the retention period.
+    let (status, b) = s
+        .post(
+            expire,
+            &s.admin,
+            json!({"before": openporch_store::now_ms()}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    // Expiry takes the `before` of a dry run, which reports what is kept.
+    let (status, b) = s.post(expire, &s.admin, json!({})).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    // Expiry removes the old entries and records itself.
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["expired"], old, "{b}");
+    let before = b["before"].as_i64().unwrap();
+    let (_, page) = s.get("/orgs/acme/audit-logs?limit=1000", &s.admin).await;
+    let entries = page["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().all(|e| e["at"].as_i64().unwrap() >= before),
+        "{page}"
+    );
+    let expiry = entries
+        .iter()
+        .find(|e| e["action"] == "audit_log.expire" && e["outcome"] == "succeeded")
+        .unwrap_or_else(|| panic!("{page}"));
+    assert_eq!(expiry["user_id"], "bootstrap", "{page}");
+    assert_eq!(
+        expiry["target"],
+        format!("{old} entries before {before}"),
+        "{page}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"] == "audit_log.expire" && e["outcome"] == "failed")
+    );
+    let (_, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
+    assert_eq!(report["audit"]["expirable"], 0, "{report}");
+    assert_eq!(
+        report["audit"]["last_expiry"]["outcome"], "succeeded",
+        "{report}"
+    );
+    // Entries still cannot be deleted through the API.
+    let (status, _) = s.delete("/orgs/acme/audit-logs", &s.admin).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn hidden_and_missing_applications_are_404_and_mutations_are_audited() {
     let s = server().await;
     s.app("billing").await;

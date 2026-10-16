@@ -83,6 +83,8 @@ pub enum Command {
     Secretstores(members::SecretStores),
     /// Queries the audit log, newest first.
     AuditLogs(members::AuditLogs),
+    /// Removes the audit entries older than the server's retention period.
+    ExpireAuditLogs(members::ExpireAuditLogs),
     /// Deploys or previews workload documents.
     #[command(subcommand)]
     Workload(deploys::WorkloadCmd),
@@ -264,6 +266,7 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
         Command::EnvTypes(cmd) => members::env_types(&session, cmd, io).await,
         Command::Secretstores(cmd) => members::secret_stores(&session, cmd, io).await,
         Command::AuditLogs(args) => members::audit_logs(&session, args, io).await,
+        Command::ExpireAuditLogs(args) => members::expire_audit_logs(&session, args, io).await,
         Command::Workload(cmd) => deploys::workload(&session, cmd, io).await,
         Command::Score(cmd) => deploys::score(&session, cmd, io).await,
         Command::Deploy(cmd) => deploys::deploy(&session, cmd, io).await,

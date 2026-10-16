@@ -1,5 +1,5 @@
 //! `porch users`, `porch apps users`, `porch env-types users`, `porch secretstores`
-//! and `porch audit-logs`. The server applies the same permission rules as for the
+//! `porch audit-logs` and `porch expire-audit-logs`. The server applies the same permission rules as for the
 //! API; the CLI only shapes requests and output.
 
 use clap::{Args, Subcommand};
@@ -212,6 +212,27 @@ pub struct AuditLogs {
     /// Entries older than this sequence number, to page back.
     #[arg(long, value_name = "SEQ")]
     pub before: Option<i64>,
+    /// Every matching entry, following the pages, for export.
+    #[arg(long)]
+    pub all: bool,
+    #[command(flatten)]
+    pub output: OutputArg,
+}
+
+/// `porch expire-audit-logs`.
+#[derive(Debug, Args)]
+pub struct ExpireAuditLogs {
+    /// Report how many entries would expire without removing any.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Expire only entries written before this time, in Unix milliseconds,
+    /// such as the `before` of a dry run whose entries were exported.
+    #[arg(long, value_name = "MS")]
+    pub before: Option<i64>,
+    /// Without `--before`, expire what the dry run reports without asking
+    /// for a second run, as from cron.
+    #[arg(long)]
+    pub yes: bool,
     #[command(flatten)]
     pub output: OutputArg,
 }
@@ -588,41 +609,159 @@ pub(crate) async fn audit_logs(
     args: AuditLogs,
     io: &mut Io<'_>,
 ) -> Result<(), String> {
-    let path = with_query(
-        &format!("{}/audit-logs", org(session)?),
-        &[
-            ("user_id", args.user),
-            ("path_prefix", args.path_prefix),
-            ("method", args.method.map(|m| m.to_ascii_uppercase())),
-            ("from", args.from.map(|v| v.to_string())),
-            ("to", args.to.map(|v| v.to_string())),
-            ("limit", args.limit.map(|v| v.to_string())),
-            ("before", args.before.map(|v| v.to_string())),
-        ],
-    );
-    let page: Value = session
-        .client()?
-        .request(Method::GET, &path, None)
-        .await
-        .map_err(api)?;
-    output::print(
-        io.out,
-        args.output.output,
-        &page,
-        &[
-            ("SEQ", "seq"),
-            ("AT", "at"),
-            ("USER", "user_id"),
-            ("METHOD", "method"),
-            ("PATH", "path"),
-            ("ACTION", "action"),
-            ("OUTCOME", "outcome"),
-        ],
-    )?;
-    if args.output.output == Format::Table
-        && let Some(next) = page["next"].as_i64()
-    {
-        writeln!(io.err, "More entries: add `--before {next}`").map_err(|e| e.to_string())?;
+    if args.all && args.output.output != Format::Json {
+        return Err("`--all` exports JSON: add `-o json`".into());
     }
-    Ok(())
+    let client = session.client()?;
+    let mut before = args.before;
+    let mut first = true;
+    loop {
+        let path = with_query(
+            &format!("{}/audit-logs", org(session)?),
+            &[
+                ("user_id", args.user.clone()),
+                ("path_prefix", args.path_prefix.clone()),
+                (
+                    "method",
+                    args.method.as_ref().map(|m| m.to_ascii_uppercase()),
+                ),
+                ("from", args.from.map(|v| v.to_string())),
+                ("to", args.to.map(|v| v.to_string())),
+                ("limit", args.limit.map(|v| v.to_string())),
+                ("before", before.map(|v| v.to_string())),
+            ],
+        );
+        let page: Value = client
+            .request(Method::GET, &path, None)
+            .await
+            .map_err(api)?;
+        let next = page["next"].as_i64();
+        if !args.all {
+            output::print(
+                io.out,
+                args.output.output,
+                &page,
+                &[
+                    ("SEQ", "seq"),
+                    ("AT", "at"),
+                    ("USER", "user_id"),
+                    ("METHOD", "method"),
+                    ("PATH", "path"),
+                    ("ACTION", "action"),
+                    ("OUTCOME", "outcome"),
+                ],
+            )?;
+            if args.output.output == Format::Table
+                && let Some(next) = next
+            {
+                writeln!(
+                    io.err,
+                    "More entries: add `--before {next}`, or `--all -o json` for every one"
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
+        // Each page is written as it arrives, so an export of any size
+        // needs only one page in memory. An export cut short by an error
+        // is not valid JSON, and the command fails.
+        let write = |out: &mut dyn std::io::Write, text: &str| {
+            out.write_all(text.as_bytes()).map_err(|e| e.to_string())
+        };
+        if first {
+            write(io.out, "{\"entries\": [")?;
+        }
+        for entry in page["entries"].as_array().into_iter().flatten() {
+            let text = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+            write(io.out, if first { "\n" } else { ",\n" })?;
+            write(io.out, &text)?;
+            first = false;
+        }
+        match next {
+            Some(seq) => before = Some(seq),
+            None => return write(io.out, "\n]}\n"),
+        }
+    }
+}
+
+pub(crate) async fn expire_audit_logs(
+    session: &Session,
+    args: ExpireAuditLogs,
+    io: &mut Io<'_>,
+) -> Result<(), String> {
+    let client = session.client()?;
+    let path = format!("{}/audit-logs/expire", org(session)?);
+    let expire = |dry_run: bool, before: Option<i64>| {
+        let body = json!({ "dry_run": dry_run, "before": before });
+        let (client, path) = (&client, &path);
+        async move {
+            client
+                .request(Method::POST, path, Some(&body))
+                .await
+                .map_err(api)
+        }
+    };
+    let format = args.output.output;
+    if args.dry_run || args.before.is_some() {
+        let result = expire(args.dry_run, args.before).await?;
+        return print_expiry(io.out, format, &result, args.dry_run);
+    }
+    // What is kept is reported before anything is removed.
+    // In table form it goes before the result; as JSON or YAML it goes to
+    // stderr, so stdout holds one document.
+    let report = expire(true, None).await?;
+    if format == Format::Table {
+        print_expiry(io.out, format, &report, true)?;
+    } else {
+        print_expiry(io.err, format, &report, true)?;
+    }
+    let before = report["before"]
+        .as_i64()
+        .ok_or("the server's dry run did not report `before`")?;
+    if !args.yes {
+        return Err(format!(
+            "nothing was removed; run `porch expire-audit-logs --before {before}` \
+             (or add `--yes`) to expire these entries"
+        ));
+    }
+    let result = expire(false, Some(before)).await?;
+    print_expiry(io.out, format, &result, false)
+}
+
+fn print_expiry(
+    out: &mut dyn std::io::Write,
+    format: Format,
+    result: &Value,
+    dry_run: bool,
+) -> Result<(), String> {
+    if format == Format::Table {
+        let expired = result["expired"].as_i64().unwrap_or(0);
+        let remaining = result["remaining"].as_i64().unwrap_or(0);
+        let days = result["retention_days"].as_i64().unwrap_or(0);
+        let verb = if dry_run { "would expire" } else { "expired" };
+        let retained = &result["retained"];
+        let drivers: Vec<String> = retained["by_driver"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(driver, n)| format!("{n} {driver}"))
+            .collect();
+        writeln!(
+            out,
+            "{expired} entries older than {days} days {verb}; {remaining} kept\n\
+             Kept: {} resources ({}), {} needing recovery, {} awaiting cleanup\n{}",
+            retained["resources"].as_i64().unwrap_or(0),
+            if drivers.is_empty() {
+                "none".to_owned()
+            } else {
+                drivers.join(", ")
+            },
+            retained["needing_recovery"].as_i64().unwrap_or(0),
+            retained["cleanup_pending"].as_i64().unwrap_or(0),
+            result["note"].as_str().unwrap_or_default(),
+        )
+        .map_err(|e| e.to_string())
+    } else {
+        output::print(out, format, result, &[])
+    }
 }

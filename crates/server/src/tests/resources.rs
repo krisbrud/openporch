@@ -1663,6 +1663,22 @@ async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
         "{report}"
     );
 
+    // Expiring audit entries reports the resources it keeps.
+    let (status, b) = s
+        .post(
+            "/orgs/acme/audit-logs/expire",
+            &s.admin,
+            json!({"dry_run": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let retained = &b["retained"];
+    assert!(retained["resources"].as_i64().unwrap() >= 2, "{b}");
+    assert!(
+        retained["by_driver"]["openporch/echo"].as_i64().unwrap() >= 1,
+        "{b}"
+    );
+
     // Naming a deployment takes all three of app, env and deployment.
     let (status, b) = s.get("/orgs/acme/diagnostics?app=shop", &s.admin).await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");

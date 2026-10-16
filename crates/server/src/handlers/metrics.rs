@@ -183,6 +183,44 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Response> {
         "Deployment log lines stored.",
         stats.log_lines,
     );
+    let retention = state
+        .store
+        .audit_retention(super::audit::retention_start(&state))
+        .await?;
+    out.gauge(
+        "openporch_audit_expirable_entries",
+        "Audit log entries older than the retention period, which expiry would remove.",
+        retention.expirable,
+    );
+    if let Some(oldest) = retention.oldest_at {
+        out.gauge(
+            "openporch_audit_oldest_entry_timestamp_seconds",
+            "When the oldest audit log entry was written.",
+            seconds(oldest),
+        );
+    }
+    if let Some(last) = &retention.last_expiry {
+        out.family(
+            "openporch_audit_last_expiry_timestamp_seconds",
+            "gauge",
+            "When audit entries were last expired, and whether that succeeded.",
+        );
+        out.sample(
+            "openporch_audit_last_expiry_timestamp_seconds",
+            &[("outcome", &last.outcome)],
+            seconds(last.at),
+        );
+    }
+    out.family(
+        "openporch_audit_expiry_failures_total",
+        "counter",
+        "Audit expiries that failed since the server started.",
+    );
+    out.sample(
+        "openporch_audit_expiry_failures_total",
+        &[],
+        super::audit::expiry_failures(),
+    );
 
     Ok((
         [(
@@ -192,4 +230,10 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Response> {
         out.0,
     )
         .into_response())
+}
+
+/// Milliseconds since the epoch, as seconds.
+#[allow(clippy::cast_precision_loss)]
+fn seconds(ms: i64) -> f64 {
+    ms as f64 / 1000.0
 }

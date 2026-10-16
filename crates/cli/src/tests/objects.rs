@@ -405,6 +405,7 @@ async fn members_roles_secret_stores_and_audit_logs() {
         &["env-types", "users", "development", "grant", "dev"][..],
         &["apps", "users", "shop", "grant", "dev", "owner"][..],
         &["audit-logs"][..],
+        &["expire-audit-logs"][..],
     ] {
         let r = dev.porch(args, "").await;
         assert_eq!(r.code, 1, "{args:?}: {r:?}");
@@ -474,6 +475,61 @@ async fn members_roles_secret_stores_and_audit_logs() {
     assert_eq!(r.out.lines().count(), 3, "{r:?}");
     assert!(r.err.contains("--before"), "{r:?}");
     assert_no_secret(&r, &server.admin);
+    // `--all` follows the pages, for export.
+    let r = m.porch(&["audit-logs", "--all"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("-o json"), "{r:?}");
+    let r = m
+        .porch(&["audit-logs", "--all", "--limit", "2", "-o", "json"], "")
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let all: Value = serde_json::from_str(&r.out).unwrap();
+    assert!(all["entries"].as_array().unwrap().len() > 2, "{r:?}");
+    assert!(all.get("next").is_none(), "{r:?}");
+    // Nothing here is older than the retention period.
+    let r = m.porch(&["expire-audit-logs", "--dry-run"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out
+            .starts_with("0 entries older than 30 days would expire"),
+        "{r:?}"
+    );
+    assert!(r.out.contains("may keep costing money"), "{r:?}");
+    // Expiring reports what is kept first, and removes nothing without
+    // `--before` or `--yes`.
+    let r = m.porch(&["expire-audit-logs"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.out.contains("may keep costing money"), "{r:?}");
+    assert!(r.err.contains("--before"), "{r:?}");
+    let r = m.porch(&["expire-audit-logs", "--yes"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("would expire") && r.out.contains("0 entries older than 30 days expired"),
+        "{r:?}"
+    );
+    // As JSON, stdout holds only the result; the report goes to stderr.
+    let r = m
+        .porch(&["expire-audit-logs", "--yes", "-o", "json"], "")
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let result: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(result["dry_run"], false, "{r:?}");
+    assert!(r.err.contains("\"dry_run\": true"), "{r:?}");
+    let r = m
+        .porch(&["expire-audit-logs", "--dry-run", "-o", "json"], "")
+        .await;
+    let report: Value = serde_json::from_str(&r.out).unwrap();
+    let before = report["before"].as_i64().unwrap().to_string();
+    let r = m
+        .porch(
+            &["expire-audit-logs", "--before", &before, "-o", "json"],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let expired: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(expired["expired"], 0, "{r:?}");
+    assert_eq!(expired["dry_run"], false, "{r:?}");
 
     // An ID of `..` cannot redirect a request to another route.
     let r = m.porch(&["apps", "users", "..", "revoke", "dev"], "").await;
