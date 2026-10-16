@@ -539,15 +539,12 @@ impl HttpRegistry {
         let Ok(mut realm) = reqwest::Url::parse(realm) else {
             return Ok(None);
         };
+        let realm_host = listed_host(&self.private, &realm);
         // A token is fetched over HTTPS, unless the registry itself is reached
         // over plain HTTP.
-        let insecure = realm
-            .host_str()
-            .is_some_and(|h| self.insecure.contains(&realm_host(h, realm.port())));
-        if realm.scheme() != "https" && !insecure {
+        if realm.scheme() != "https" && !self.insecure.contains(&realm_host) {
             return Ok(None);
         }
-        let realm_host = realm_host(realm.host_str().unwrap_or_default(), realm.port());
         self.reachable(&realm, &realm_host)?;
         {
             let mut query = realm.query_pairs_mut();
@@ -626,6 +623,24 @@ fn throttled(message: String, response: &reqwest::Response) -> CloudError {
     CloudError::Throttled {
         message,
         retry_after,
+    }
+}
+
+/// The `host[:port]` of `url` as the hosts in `listed` name it: the URL drops
+/// a default port, which a listing may name.
+fn listed_host(listed: &BTreeSet<String>, url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    let named = realm_host(host, url.port());
+    match url.port_or_known_default() {
+        Some(port) if !listed.contains(&named) => {
+            let explicit = realm_host(host, Some(port));
+            if listed.contains(&explicit) {
+                explicit
+            } else {
+                named
+            }
+        }
+        _ => named,
     }
 }
 

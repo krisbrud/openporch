@@ -322,6 +322,24 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
 }
 
 #[test]
+fn listed_hosts_match_default_ports() {
+    let listed: BTreeSet<String> = ["r.internal:443".to_owned(), "plain:80".to_owned()].into();
+    for (url, host) in [
+        ("https://r.internal:443/token", "r.internal:443"),
+        ("https://r.internal/token", "r.internal:443"),
+        ("http://plain:80/token", "plain:80"),
+        ("https://other/token", "other"),
+        ("https://other:8443/token", "other:8443"),
+    ] {
+        assert_eq!(
+            listed_host(&listed, &reqwest::Url::parse(url).unwrap()),
+            host,
+            "{url}"
+        );
+    }
+}
+
+#[test]
 fn only_public_addresses_are_public() {
     for public in [
         "8.8.8.8",
