@@ -428,7 +428,18 @@ fn run_deployments(
     let tofu = state.config.opentofu();
     let backend = tofu.state.location();
     let registry = Arc::new(DriverRegistry::with_builtins().with_opentofu(tofu));
-    state.drivers.set(registry.clone(), Some(backend));
+    run_with_drivers(state, keyring, image_registry, registry, Some(backend));
+}
+
+/// Runs accepted deployments with the drivers in `registry`, in this process.
+pub(crate) fn run_with_drivers(
+    state: &AppState,
+    keyring: Arc<Keyring>,
+    image_registry: Option<Arc<HttpRegistry>>,
+    registry: Arc<DriverRegistry>,
+    backend: Option<String>,
+) {
+    state.drivers.set(registry.clone(), backend);
     let store = state.store.clone();
     let checks: Arc<dyn PermitCheck> = Arc::new(StorePermits(store.clone()));
     let secrets = Arc::new(BuiltinSecretStore::new(
