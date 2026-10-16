@@ -69,9 +69,9 @@ impl SqliteStore {
     }
 
     /// Removes the audit entries written before `before` and records the
-    /// expiry with `audit`, in one transaction; returns how many were removed.
-    /// `audit` must be an administrator's.
-    pub async fn expire_audit(&self, before: i64, mut audit: AuditIntent) -> Result<u64> {
+    /// expiry with `audit`, in one transaction; returns how many were removed
+    /// and how many are kept. `audit` must be an administrator's.
+    pub async fn expire_audit(&self, before: i64, mut audit: AuditIntent) -> Result<(u64, i64)> {
         self.check_org(&audit.org)?;
         let mut tx = self.begin().await?;
         crate::identity::check_admin_authority(&mut tx, self.org(), audit.actor.as_deref()).await?;
@@ -83,7 +83,11 @@ impl SqliteStore {
             .rows_affected();
         audit.target = Some(format!("{removed} entries before {before}"));
         audit::insert(&mut tx, &audit, None, None).await?;
+        let kept = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE org_id = ?")
+            .bind(self.org())
+            .fetch_one(&mut *tx)
+            .await?;
         tx.commit().await?;
-        Ok(removed)
+        Ok((removed, kept))
     }
 }

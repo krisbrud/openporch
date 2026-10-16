@@ -133,15 +133,16 @@ pub async fn expire(
     let mut audit = ctx.audit(org, EXPIRY_ACTION, String::new());
     audit.outcome = AuditOutcome::Succeeded;
     match state.store.expire_audit(before, audit).await {
-        Ok(removed) => {
-            let status = state.store.audit_retention(before).await?;
+        // Once the expiry has committed, nothing after it may turn it into
+        // an error.
+        Ok((removed, kept)) => {
             tracing::info!(removed, before, "audit entries expired");
             Ok(Json(Expired {
                 dry_run: false,
                 retention_days,
                 before,
                 expired: i64::try_from(removed).unwrap_or(i64::MAX),
-                remaining: status.entries,
+                remaining: kept,
             }))
         }
         Err(e) => {
