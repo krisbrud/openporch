@@ -28,6 +28,8 @@ pub(super) struct Fake {
     uncertain: Mutex<BTreeSet<String>>,
     /// What observing a resource finds.
     observation: Mutex<Option<Observed>>,
+    /// How many lines provisioning writes to the log first.
+    chatter: Mutex<usize>,
 }
 
 impl Executor for Fake {
@@ -37,6 +39,13 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push((job.descriptor.to_string(), job.guresid.to_string()));
+        let chatter = *self.chatter.lock().unwrap();
+        if chatter > 0 {
+            let mut log = job.log.redacting();
+            for i in 0..chatter {
+                log.info(&format!("{ty} line {i}"));
+            }
+        }
         let leak = self.leak.lock().unwrap().clone();
         if let Some(secret) = leak.filter(|_| ty == "postgres") {
             let mut log = job.log.redacting();
@@ -1570,6 +1579,8 @@ async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
     let fake = Arc::new(Fake::default());
     s.provisioning(fake.clone()).await;
     fake.uncertain.lock().unwrap().insert("postgres".into());
+    // A long log is cut to its last lines.
+    *fake.chatter.lock().unwrap() = 250;
     let timed_out = s.deploy_web("nginx:1", true).await;
     assert_eq!(timed_out["status"], "failed", "{timed_out}");
     let id = timed_out["id"].as_str().unwrap();
@@ -1607,10 +1618,20 @@ async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
     let audit = d["audit"].as_array().unwrap();
     assert!(audit.iter().any(|a| a["outcome"] == "accepted"), "{report}");
     assert!(audit.iter().any(|a| a["outcome"] == "failed"), "{report}");
-    assert!(!d["log"].as_array().unwrap().is_empty(), "{report}");
+    let log = d["log"].as_array().unwrap();
+    assert_eq!(log.len(), 200, "{report}");
+    assert!(
+        log.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("deployment failed"),
+        "{report}"
+    );
+    assert_eq!(d["log_truncated"], true, "{report}");
 
     // A deployment whose driver leaks a secret keeps it out of the report.
     fake.uncertain.lock().unwrap().clear();
+    *fake.chatter.lock().unwrap() = 0;
     let (status, _) = s
         .post(
             &format!("{RESOURCES}/postgres/modules.web.externals.db/resolve"),

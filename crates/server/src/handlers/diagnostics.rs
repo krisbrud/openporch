@@ -17,10 +17,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The most log lines a report includes, from the end of the log.
-const LOG_LINES: usize = 200;
-
-/// How many log lines are read to find the last ones.
-const LOG_READ: i64 = 100_000;
+const LOG_LINES: i64 = 200;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,12 +135,10 @@ async fn deployment(state: &AppState, app: &str, env: &str, id: &str) -> ApiResu
     };
     let operations = state.store.deployment_operations(app, env, id).await?;
     let audit = state.store.deployment_audit(id).await?;
-    let mut log = state
+    let (log, total) = state
         .store
-        .deployment_logs(org, app, env, id, None, LOG_READ)
+        .deployment_log_tail(app, env, id, LOG_LINES)
         .await?;
-    let total = log.len();
-    let log = log.split_off(total.saturating_sub(LOG_LINES));
     Ok(json!({
         "id": d.id,
         "app": d.app,
@@ -157,7 +152,7 @@ async fn deployment(state: &AppState, app: &str, env: &str, id: &str) -> ApiResu
         "operations": operations,
         "audit": audit,
         "log": log,
-        "log_truncated": total > log.len(),
+        "log_truncated": total > LOG_LINES,
     }))
 }
 

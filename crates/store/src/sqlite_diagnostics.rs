@@ -4,8 +4,8 @@
 
 use serde::Serialize;
 
-use crate::Result;
 use crate::sqlite::SqliteStore;
+use crate::{LogLine, Result};
 
 /// A driver operation, as diagnostics show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -112,5 +112,40 @@ impl SqliteStore {
         .bind(id)
         .fetch_all(self.pool())
         .await?)
+    }
+
+    /// The last `limit` lines of deployment `id`'s log, oldest first, and how
+    /// many lines it has in all.
+    pub async fn deployment_log_tail(
+        &self,
+        app: &str,
+        env: &str,
+        id: &str,
+        limit: i64,
+    ) -> Result<(Vec<LogLine>, i64)> {
+        let mut lines: Vec<LogLine> = sqlx::query_as(
+            "SELECT seq, operation_id, descriptor, guresid, at, level, message FROM logs \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ? \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(self.org())
+        .bind(app)
+        .bind(env)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        lines.reverse();
+        let total = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM logs \
+             WHERE org_id = ? AND app_id = ? AND env_id = ? AND deployment_id = ?",
+        )
+        .bind(self.org())
+        .bind(app)
+        .bind(env)
+        .bind(id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok((lines, total))
     }
 }
