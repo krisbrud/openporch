@@ -414,6 +414,7 @@ impl Runners {
         let runner = self.current();
         let slots = self.slots.clone();
         tokio::spawn(async move {
+            let waited = slot.is_none();
             let _slot = match slot {
                 Some(slot) => Some(slot),
                 // The semaphore is never closed; were it, the job runs anyway.
@@ -423,9 +424,24 @@ impl Runners {
                     .ok()
                     .map(|p| Slot { _permit: p }),
             };
-            let run = tokio::spawn(runner.run(state.clone(), job.clone()));
-            // A runner that panics must not leave the environment blocked.
-            if run.await.is_err() {
+            // A job that waited for room does not start once the server is
+            // stopping: it has changed nothing, so it fails and can be repeated.
+            if waited && state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                finish(
+                    &state,
+                    &job,
+                    Some(
+                        "the server stopped before this started; nothing was changed, so \
+                         repeat the request"
+                            .into(),
+                    ),
+                )
+                .await;
+            } else if tokio::spawn(runner.run(state.clone(), job.clone()))
+                .await
+                .is_err()
+            {
+                // A runner that panics must not leave the environment blocked.
                 finish(
                     &state,
                     &job,

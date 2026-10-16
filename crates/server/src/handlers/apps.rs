@@ -5,8 +5,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_store::{
-    AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, PermitStore, Store,
-    StoreError,
+    Acceptance, AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, PermitStore,
+    Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -214,7 +214,12 @@ pub async fn delete(
     let mut deletions = Vec::with_capacity(accepted.deletions.len());
     let mut failure = None;
     for acceptance in &accepted.deletions {
-        match envs::start_deletion(&state, acceptance, snapshot.clone(), slots.pop()).await {
+        // Only a deletion that starts now uses a slot.
+        let slot = match acceptance {
+            Acceptance::Created(_) => slots.pop(),
+            _ => None,
+        };
+        match envs::start_deletion(&state, acceptance, snapshot.clone(), slot).await {
             Ok(d) => deletions.push(d),
             Err(e) => failure = failure.or(Some(e)),
         }
