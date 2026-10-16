@@ -21,6 +21,7 @@ mod sqlite_catalog;
 mod sqlite_diagnostics;
 mod sqlite_identity;
 mod sqlite_permits;
+mod sqlite_restore;
 mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
@@ -48,6 +49,7 @@ pub use sqlite_permits::{
     ApprovalRequest, NewPermit, NewPlan, PERMIT_TTL_MS, PermitBinding, PermitRecord, PermitStore,
     PermitUse, PlanRecord,
 };
+pub use sqlite_restore::{DatabaseCopy, RESTORED, copy_database};
 pub use sqlite_values::{
     PutValue, ValueContent, ValueRecord, ValueSetVersion, ValueStore, value_secret_prefix,
 };

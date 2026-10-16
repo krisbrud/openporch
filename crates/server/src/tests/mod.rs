@@ -35,6 +35,7 @@ mod keys;
 mod limits;
 mod plans;
 mod resources;
+mod restore;
 mod secret_use;
 mod sets;
 mod tls;

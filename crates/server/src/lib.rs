@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod backup;
 mod browser_login;
 pub mod config;
 pub mod deploy;

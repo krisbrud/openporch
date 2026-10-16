@@ -21,6 +21,24 @@ enum Command {
         #[arg(long, env = "OPENPORCH_CONFIG")]
         config: Option<PathBuf>,
     },
+    /// Backs a stopped server up into a new or empty directory. The master key
+    /// is not included: back it up on its own.
+    Backup {
+        /// The configuration file, as for `serve`.
+        #[arg(long, env = "OPENPORCH_CONFIG")]
+        config: Option<PathBuf>,
+        /// The directory to write the backup to.
+        dest: PathBuf,
+    },
+    /// Restores a backup into an empty data directory. The next start
+    /// observes every resource before it accepts changes.
+    Restore {
+        /// The configuration file, as for `serve`.
+        #[arg(long, env = "OPENPORCH_CONFIG")]
+        config: Option<PathBuf>,
+        /// The backup directory.
+        backup: PathBuf,
+    },
     /// Prints a new master key, for key rotation: put it first in the master key
     /// file and keep the old keys below it.
     Keygen,
@@ -44,6 +62,67 @@ async fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Command::Backup { config, dest } => {
+            let done = match load(config.as_deref()) {
+                Ok(config) => openporch_server::backup::backup(&config, &dest)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            match done {
+                Ok(manifest) => {
+                    println!(
+                        "backed up {} resources of `{}` (schema {}) to {}",
+                        manifest.active_resources,
+                        manifest.org,
+                        manifest.schema_version,
+                        dest.display()
+                    );
+                    if !manifest.key_ids.is_empty() {
+                        println!(
+                            "restoring it needs the master keys {}, which are not in the backup",
+                            manifest.key_ids.join(", ")
+                        );
+                    }
+                    if manifest.state_backend != "local" {
+                        println!(
+                            "OpenTofu state in {} is not in the backup",
+                            manifest.state_backend
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("openporch backup: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Restore { config, backup } => {
+            let done = match load(config.as_deref()) {
+                Ok(config) => openporch_server::backup::restore(&config, &backup)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            match done {
+                Ok(manifest) => {
+                    println!(
+                        "restored {} resources of `{}`; the next start observes each before it \
+                         accepts changes",
+                        manifest.active_resources, manifest.org
+                    );
+                    if !manifest.key_ids.is_empty() {
+                        println!("it needs the master keys {}", manifest.key_ids.join(", "));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("openporch restore: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Serve { config } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -60,6 +139,10 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn load(config: Option<&std::path::Path>) -> Result<Config, String> {
+    Config::load(config, |k| std::env::var(k).ok()).map_err(|e| e.to_string())
 }
 
 /// How long open connections may take to close once shutdown has drained.
