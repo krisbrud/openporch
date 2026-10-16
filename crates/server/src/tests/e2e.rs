@@ -9,8 +9,8 @@ use axum::http::StatusCode;
 use openporch_core::catalog::builtin_types;
 use openporch_core::workload::Workload;
 use openporch_engine::cloud::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrImage, Latest, S3Object, S3Version,
-    Sts,
+    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrDigest, EcrImage, Latest, S3Object,
+    S3Version, Sts,
 };
 use openporch_store::Store;
 use openporch_store::secrets::BoxFuture;
@@ -24,6 +24,8 @@ use super::{Server, server, server_from, server_in};
 #[derive(Default)]
 struct ArtifactSts {
     version: Mutex<String>,
+    /// Image digests deleted from ECR.
+    gone_images: Mutex<Vec<String>>,
 }
 
 impl ArtifactSts {
@@ -87,6 +89,15 @@ impl Sts for ArtifactSts {
             && matches!(image.tag.as_str(), "1" | "2"))
         .then(|| format!("sha256:{}", image.tag.repeat(64)));
         Box::pin(async move { Ok(digest) })
+    }
+    fn image_exists<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        image: &'a EcrDigest,
+    ) -> BoxFuture<'a, Result<bool, CloudError>> {
+        assert_eq!(credentials.access_key_id, "AKIAEXAMPLE");
+        let gone = self.gone_images.lock().unwrap().contains(&image.digest);
+        Box::pin(async move { Ok(!gone) })
     }
 }
 
@@ -659,7 +670,8 @@ const ECR: &str = "111122223333.dkr.ecr.eu-west-1.amazonaws.com";
 /// the digest, the set keeps the tag, and a missing tag deploys nothing.
 #[tokio::test]
 async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
-    let s = server_with_s3(Arc::new(ArtifactSts::default())).await;
+    let sts = Arc::new(ArtifactSts::default());
+    let s = server_with_s3(sts.clone()).await;
     s.app("shop").await;
     for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
         let (st, b) = s
@@ -734,6 +746,35 @@ async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
     assert_eq!(
         set["modules"]["web"]["spec"]["containers"]["web"]["image"],
         format!("{ECR}/web:1")
+    );
+    // The pinned digest is deleted from the repository: a replay of the
+    // snapshot fails before anything runs, naming it.
+    sts.gone_images
+        .lock()
+        .unwrap()
+        .push(format!("sha256:{}", "1".repeat(64)));
+    let (_, env) = s.get(&format!("{APP}/envs/development"), &s.admin).await;
+    let (st, replay) = s
+        .post(
+            &format!("{APP}/envs/development/deploys"),
+            &s.admin,
+            json!({"deploy_id": id, "replay": "snapshot",
+                   "expected_generation": env["generation"]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{replay}");
+    let replay = s
+        .finished_at(&format!(
+            "{APP}/envs/development/deploys/{}",
+            replay["id"].as_str().unwrap()
+        ))
+        .await;
+    assert_eq!(replay["status"], "failed", "{replay}");
+    let error = replay["error"].to_string();
+    assert!(
+        error.contains(&format!("image `{ECR}/web@sha256:{}`", "1".repeat(64)))
+            && error.contains("no longer exists"),
+        "{replay}"
     );
 }
 

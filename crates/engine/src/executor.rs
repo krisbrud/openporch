@@ -26,8 +26,8 @@ use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 use crate::cloud::{
-    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, EcrImage, Latest, S3Object,
-    S3Version, pinned_image,
+    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, EcrDigest, EcrImage, Latest,
+    S3Object, S3Version, pinned_image,
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
@@ -721,14 +721,20 @@ where
     }
 
     async fn check_artifacts(&self, check: ArtifactCheck) -> Result<(), ExecFailure> {
-        // Only an artifact pinned to a version names something that can be
-        // gone; acceptance pins S3 objects to versions.
+        // Only an artifact pinned to a version, or an image pinned to a
+        // digest, names something that can be gone; acceptance pins S3
+        // objects to versions and ECR tags to digests.
         let versions: Vec<S3Version> = check
             .artifacts
             .iter()
             .filter_map(|a| S3Version::parse(a))
             .collect();
-        if versions.is_empty() {
+        let images: Vec<EcrDigest> = check
+            .artifacts
+            .iter()
+            .filter_map(|a| EcrDigest::parse(a))
+            .collect();
+        if versions.is_empty() && images.is_empty() {
             return Ok(());
         }
         let mut log = JobLog::discard().redacting();
@@ -744,6 +750,18 @@ where
                 Ok(false) => {
                     return Err(ExecFailure::Permanent(format!(
                         "artifact `{version}` of `{}` no longer exists; nothing changed",
+                        check.descriptor
+                    )));
+                }
+                Err(e) => return Err(log.failure(cloud_failure(e))),
+            }
+        }
+        for image in &images {
+            match self.cloud.image_exists(&credentials, image).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ExecFailure::Permanent(format!(
+                        "image `{image}` of `{}` no longer exists; nothing changed",
                         check.descriptor
                     )));
                 }

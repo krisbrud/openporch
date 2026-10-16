@@ -1682,13 +1682,15 @@ before the deployment runs.
 Before a deployment changes anything, it checks that every function artifact
 its workloads name as an S3 object version, `s3://<bucket>/<key>?versionId=<id>`
 (key percent-encoded), still exists, reading it with the workload definition's
-cloud account, which needs `s3:GetObjectVersion` on it. If one is gone, as when
-a replay names a version that was deleted, the workload fails naming the
-artifact, every other resource is left `pending`, and the deployment fails with
+cloud account, which needs `s3:GetObjectVersion` on it. It also checks that
+every image its workloads name by digest in Amazon ECR is still in its
+repository (`ecr:DescribeImages`). If one is gone, as when a replay names a
+version or digest that was deleted, the workload fails naming the artifact or
+image, every other resource is left `pending`, and the deployment fails with
 nothing changed. Checks that fail in a way that may pass are retried like
-provisioning. An artifact of a workload whose definition has no cloud account, or one
-that comes from another resource's outputs, is not checked; its driver reports
-a missing artifact when it runs.
+provisioning. An artifact or image of a workload whose definition has no cloud
+account, or one that comes from another resource's outputs, is not checked, nor
+is an image in another registry; its driver reports a missing one when it runs.
 
 A deployment also has each driver check, before anything runs, that it can
 still delete the resources the deployment will delete, such as those of a
