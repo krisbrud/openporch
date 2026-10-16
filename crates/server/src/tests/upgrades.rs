@@ -45,7 +45,11 @@ fn install(from: &Path) -> tempfile::TempDir {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap();
         if name != "observed.json" {
-            std::fs::copy(&path, dir.path().join(name)).unwrap();
+            let to = dir.path().join(name);
+            std::fs::copy(&path, &to).unwrap();
+            // Git keeps no owner-only modes, which the key and tokens need.
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
     dir
