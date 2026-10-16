@@ -84,11 +84,31 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         descriptor: &str,
         audit: AuditIntent,
     ) -> Result<Recovered, RecoverError> {
+        // Everything the recovery logs, its resolution included, names the
+        // resource and operation.
+        let span = match Descriptor::parse(descriptor) {
+            Ok(d) => super::resource_span(&d),
+            Err(_) => tracing::Span::none(),
+        };
+        self.recover_in_span(org, app, env, descriptor, audit)
+            .instrument(span)
+            .await
+    }
+
+    async fn recover_in_span(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        descriptor: &str,
+        audit: AuditIntent,
+    ) -> Result<Recovered, RecoverError> {
         let op = self
             .store
             .unknown_operation(org, app, env, descriptor)
             .await?
             .ok_or_else(|| RecoverError::NothingToRecover(descriptor.to_owned()))?;
+        super::record_operation_ids(&op.operation_id, &op.resource.guresid);
         let deleting = op.kind == OperationKind::Delete;
         let (resolution, recovered) = match self.job(org, app, env, &op).await {
             Err(reason) => required(reason),
@@ -190,9 +210,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 }
             }
         };
-        self.store
+        if let Err(e) = self
+            .store
             .resolve_operation(&op.operation_id, resolution, audit)
-            .await?;
+            .await
+        {
+            tracing::error!(error = %e, "could not record a recovery");
+            return Err(e.into());
+        }
         Ok(recovered)
     }
 

@@ -227,10 +227,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 let span = super::resource_span(descriptor);
                 let id = running
                     .spawn(
-                        async move { (run.descriptor.clone(), run.run().await) }.instrument(span),
+                        async move { (run.descriptor.clone(), run.run().await) }
+                            .instrument(span.clone()),
                     )
                     .id();
-                tasks.insert(id, descriptor.clone());
+                tasks.insert(id, (descriptor.clone(), span));
             }
             let Some(joined) = running.join_next_with_id().await else {
                 break;
@@ -241,13 +242,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // The deletion may have started: only an observation can
                     // tell, and a restart marks its open operation unknown.
                     // A panic message could hold a secret, so it is not logged.
-                    tracing::error!(
-                        panicked = e.is_panic(),
-                        "a deletion task stopped unexpectedly"
-                    );
-                    let Some(descriptor) = tasks.get(&e.id()).cloned() else {
+                    let Some((descriptor, span)) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
+                    // Logged in the resource's span, which names the operation.
+                    span.in_scope(|| {
+                        tracing::error!(
+                            panicked = e.is_panic(),
+                            "a deletion task stopped unexpectedly"
+                        );
+                    });
                     (
                         descriptor,
                         Outcome::Unknown("the deletion stopped unexpectedly".into()),

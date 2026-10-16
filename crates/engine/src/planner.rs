@@ -348,9 +348,15 @@ pub(crate) fn resource_span(descriptor: &Descriptor) -> tracing::Span {
 
 /// Records the operation just started on the current [`resource_span`].
 pub(crate) fn record_operation(started: &openporch_store::OperationStarted) {
+    record_operation_ids(&started.operation_id, started.guresid.as_str());
+}
+
+/// Records operation `operation` on GUResID `guresid` on the current
+/// [`resource_span`].
+pub(crate) fn record_operation_ids(operation: &str, guresid: &str) {
     let span = tracing::Span::current();
-    span.record("operation", started.operation_id.as_str());
-    span.record("guresid", started.guresid.as_str());
+    span.record("operation", operation);
+    span.record("guresid", guresid);
 }
 
 /// Logs what the executor returned for an operation. This is the driver's
@@ -933,7 +939,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         let mut done: BTreeMap<Descriptor, Done> = BTreeMap::new();
         let mut started: BTreeSet<Descriptor> = BTreeSet::new();
         let mut running = JoinSet::new();
-        let mut tasks: BTreeMap<tokio::task::Id, Descriptor> = BTreeMap::new();
+        let mut tasks: BTreeMap<tokio::task::Id, (Descriptor, tracing::Span)> = BTreeMap::new();
         // Nothing runs unless every artifact the deployment names exists.
         let missing = self.check_artifacts(&deployment, deadline).await;
         for (d, reason) in &missing {
@@ -980,9 +986,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 let span = resource_span(&d);
                 let task = running.spawn({
                     let d = d.clone();
-                    async move { (d, ctx.run().await) }.instrument(span)
+                    async move { (d, ctx.run().await) }.instrument(span.clone())
                 });
-                tasks.insert(task.id(), d);
+                tasks.insert(task.id(), (d, span));
             }
             let Some(joined) = running.join_next_with_id().await else {
                 break;
@@ -994,13 +1000,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     // Its operation, if one started, stays open for restart
                     // recovery, and the resource may have changed.
                     // A panic message could hold a secret, so it is not logged.
-                    tracing::error!(
-                        panicked = e.is_panic(),
-                        "a provisioning task stopped unexpectedly"
-                    );
-                    let Some(d) = tasks.get(&e.id()).cloned() else {
+                    let Some((d, span)) = tasks.get(&e.id()).cloned() else {
                         continue;
                     };
+                    // Logged in the resource's span, which names the operation.
+                    span.in_scope(|| {
+                        tracing::error!(
+                            panicked = e.is_panic(),
+                            "a provisioning task stopped unexpectedly"
+                        );
+                    });
                     (
                         d,
                         Err(Outcome::Unknown(
