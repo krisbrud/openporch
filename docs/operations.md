@@ -177,7 +177,9 @@ before a run, and its driver reports it when it is gone.
 
 Registries on loopback, private or link-local addresses are not read, so an
 image name cannot make the server probe its own network, and redirects are not
-followed. List a registry on such an address to read it:
+followed. List a registry on such an address to read it, as `host[:port]`
+exactly as images name it; the listing covers that port only, and a token
+service on another host or port needs its own entry:
 
 ```toml
 [images]

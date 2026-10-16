@@ -107,9 +107,7 @@ impl OciImage {
                     })
                     && part.as_bytes()[0].is_ascii_alphanumeric()
             })
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b));
+            && valid_host(&host);
         if !valid {
             return None;
         }
@@ -180,7 +178,11 @@ pub trait Registry: Send + Sync {
 /// make the server probe its own network.
 #[derive(Debug, Clone)]
 pub struct HttpRegistry {
+    /// Reaches public addresses only.
     client: Client,
+    /// Also reaches the private addresses of the hosts in `private`; used only
+    /// for exactly those `host[:port]`s.
+    private_client: Client,
     insecure: BTreeSet<String>,
     private: BTreeSet<String>,
 }
@@ -243,6 +245,35 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether `host` is `name[:port]` or `[ipv6][:port]`.
+fn valid_host(host: &str) -> bool {
+    let port_ok = |port: Option<&str>| {
+        port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            after => match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
+        };
+        return address.parse::<std::net::Ipv6Addr>().is_ok() && port_ok(port);
+    }
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+        && port_ok(port)
+}
+
 /// The host of `host[:port]`, without its port or IPv6 brackets.
 fn host_name(host: &str) -> String {
     let host = host.to_ascii_lowercase();
@@ -279,21 +310,21 @@ impl HttpRegistry {
             .map(|h| h.to_ascii_lowercase())
             .chain(insecure.iter().cloned())
             .collect();
-        let resolver = PublicOnly {
-            allowed: private.iter().map(|h| host_name(h)).collect(),
-        };
         // `ring` is the crypto provider; installing it twice is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
         // Redirects are not followed: one could lead anywhere.
-        let client = Client::builder()
-            .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .dns_resolver(Arc::new(resolver))
-            .build()
-            .map_err(|e| CloudError::Invalid(format!("no registry client: {e}")))?;
+        let client = |allowed: BTreeSet<String>| {
+            Client::builder()
+                .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(REQUEST_TIMEOUT)
+                .dns_resolver(Arc::new(PublicOnly { allowed }))
+                .build()
+                .map_err(|e| CloudError::Invalid(format!("no registry client: {e}")))
+        };
         Ok(Self {
-            client,
+            client: client(BTreeSet::new())?,
+            private_client: client(private.iter().map(|h| host_name(h)).collect())?,
             insecure,
             private,
         })
@@ -319,6 +350,16 @@ impl HttpRegistry {
         }
     }
 
+    /// The client for `host[:port]`: one that reaches private addresses only
+    /// for a host listed with exactly that port.
+    fn client(&self, host: &str) -> &Client {
+        if self.private.contains(host) {
+            &self.private_client
+        } else {
+            &self.client
+        }
+    }
+
     fn scheme(&self, host: &str) -> &'static str {
         if self.insecure.contains(host) {
             "http"
@@ -341,11 +382,10 @@ impl HttpRegistry {
         let parsed = reqwest::Url::parse(&url)
             .map_err(|_| CloudError::Rejected(format!("`{image}` names no valid registry")))?;
         self.reachable(&parsed, host)?;
-        let unavailable =
-            |e: reqwest::Error| CloudError::Unavailable(format!("registry `{host}`: {e}"));
+        let unavailable = |e: reqwest::Error| unreachable_registry(host, &e);
         let request = |method: reqwest::Method, token: Option<&str>| {
             let mut r = self
-                .client
+                .client(host)
                 .request(method, &url)
                 .header(header::ACCEPT, MANIFEST_TYPES);
             if let Some(token) = token {
@@ -477,11 +517,11 @@ impl HttpRegistry {
             query.append_pair("scope", &format!("repository:{}:pull", image.repository));
         }
         let response = self
-            .client
+            .client(&realm_host)
             .get(realm)
             .send()
             .await
-            .map_err(|e| CloudError::Unavailable(format!("registry `{}`: {e}", image.host)))?;
+            .map_err(|e| unreachable_registry(&image.host, &e))?;
         match response.status() {
             s if s.is_success() => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Ok(None),
@@ -501,8 +541,7 @@ impl HttpRegistry {
                 )));
             }
         }
-        let unavailable =
-            |e: reqwest::Error| CloudError::Unavailable(format!("registry `{}`: {e}", image.host));
+        let unavailable = |e: reqwest::Error| unreachable_registry(&image.host, &e);
         let mut response = response;
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
@@ -523,6 +562,17 @@ impl HttpRegistry {
         })?;
         Ok(token.token.or(token.access_token))
     }
+}
+
+/// A request that failed, with the causes reqwest leaves out of its message.
+fn unreachable_registry(host: &str, e: &reqwest::Error) -> CloudError {
+    let mut message = format!("registry `{host}`: {e}");
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    CloudError::Unavailable(message)
 }
 
 /// A `429`, with the wait its `Retry-After` names in seconds.

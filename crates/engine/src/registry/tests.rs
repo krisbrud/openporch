@@ -43,6 +43,12 @@ fn image_references_are_parsed_like_docker_does() {
             Reference::Tag("latest".into()),
         ),
         (
+            "[::1]:5000/web:1",
+            "[::1]:5000",
+            "web",
+            Reference::Tag("1".into()),
+        ),
+        (
             "index.docker.io/nginx:1",
             "docker.io",
             "library/nginx",
@@ -84,6 +90,11 @@ fn image_references_are_parsed_like_docker_does() {
         "${resources.registry.outputs.host}/web:1",
         "web@sha256:abc",
         "web@md5:0123",
+        "[::1/web:1",
+        "[nope]:5000/web:1",
+        "[::1]x/web:1",
+        "[::1]:/web:1",
+        "host:port/web:1",
     ] {
         assert_eq!(OciImage::parse(invalid), None, "{invalid}");
     }
@@ -265,7 +276,31 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
         .lookup(&OciImage::parse(&format!("localhost:{port}/web:1")).unwrap())
         .await
         .unwrap_err();
-    assert!(matches!(e, CloudError::Unavailable(_)), "{e:?}");
+    assert!(
+        matches!(&e, CloudError::Unavailable(m) if m.contains("no public address")),
+        "{e:?}"
+    );
+    // Listed with one port, a name reaches its private address on that port
+    // only.
+    let named = format!("localhost:{port}");
+    // (The token service is named by address, so it is listed too.)
+    let listed = HttpRegistry::new([named.clone(), host.clone()], []).unwrap();
+    assert_eq!(
+        listed
+            .lookup(&OciImage::parse(&format!("{named}/web:1")).unwrap())
+            .await
+            .unwrap(),
+        Lookup::Found(web_digest())
+    );
+    let other = HttpRegistry::new(["localhost:1".to_owned()], []).unwrap();
+    let e = other
+        .lookup(&OciImage::parse(&format!("{named}/web:1")).unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, CloudError::Unavailable(m) if m.contains("no public address")),
+        "{e:?}"
+    );
 }
 
 #[test]
