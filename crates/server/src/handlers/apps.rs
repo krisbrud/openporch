@@ -5,8 +5,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_store::{
-    AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, PermitStore, Store,
-    StoreError,
+    Acceptance, AppDeletionRequest, AppRecord, AppRole, EnvTypeRecord, IdentityStore, PermitStore,
+    Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -178,8 +178,17 @@ pub async fn delete(
         ))
         .into());
     }
+    let envs = state.store.envs(org, &app).await?;
+    // Room for the deletions is taken before anything is stored: one for each
+    // environment not already being deleted, which repeating the request does
+    // not start again. An application with more of them than the server runs
+    // at once takes every slot, and its other deletions wait for one.
+    let starting = envs.iter().filter(|e| e.state != "deleting").count();
+    let mut slots = state
+        .runners
+        .slots(starting.min(state.runners.capacity()))?;
     let mut permits = std::collections::BTreeMap::new();
-    for env in state.store.envs(org, &app).await? {
+    for env in envs {
         let entries = plans::preflight(&state, &env, String::new(), &snapshot, true).await?;
         let presented: Vec<String> = issued
             .iter()
@@ -205,7 +214,12 @@ pub async fn delete(
     let mut deletions = Vec::with_capacity(accepted.deletions.len());
     let mut failure = None;
     for acceptance in &accepted.deletions {
-        match envs::start_deletion(&state, acceptance, snapshot.clone()).await {
+        // Only a deletion that starts now uses a slot.
+        let slot = match acceptance {
+            Acceptance::Created(_) => slots.pop(),
+            _ => None,
+        };
+        match envs::start_deletion(&state, acceptance, snapshot.clone(), slot).await {
             Ok(d) => deletions.push(d),
             Err(e) => failure = failure.or(Some(e)),
         }

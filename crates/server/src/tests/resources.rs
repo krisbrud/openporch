@@ -1105,7 +1105,7 @@ async fn a_resource_secret_output_is_used_only_in_its_environment() {
 
 impl Server {
     /// Permits for deleting every environment of the application at `app`.
-    async fn app_deletion_permits(&self, app: &str) -> Vec<String> {
+    pub(super) async fn app_deletion_permits(&self, app: &str) -> Vec<String> {
         let (status, envs) = self.get(&format!("{app}/envs"), &self.admin).await;
         assert_eq!(status, StatusCode::OK, "{envs}");
         let mut permits = Vec::new();

@@ -46,6 +46,77 @@ pub struct Config {
     /// The `openporch/opentofu` driver.
     #[serde(default)]
     pub opentofu: OpenTofuSettings,
+    /// Bounds on work and storage.
+    #[serde(default)]
+    pub limits: WorkLimits,
+}
+
+/// The longest deployment time a server accepts: a week.
+const MAX_DEPLOYMENT_MINUTES: u64 = 7 * 24 * 60;
+/// The most driver operations or deployments a server runs at once.
+const MAX_SLOTS: usize = 100_000;
+
+/// Bounds on work and storage.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkLimits {
+    /// Driver operations at once across every deployment, OpenTofu runs
+    /// included.
+    #[serde(default = "default_driver_concurrency")]
+    pub driver_concurrency: usize,
+    /// Deployments and deletions running or waiting for a driver slot at
+    /// once; more are refused with `429`.
+    #[serde(default = "default_running_deployments")]
+    pub running_deployments: usize,
+    /// How long one deployment may run, in minutes.
+    #[serde(default = "default_deployment_minutes")]
+    pub deployment_minutes: u64,
+    /// The most log text kept per deployment, in bytes.
+    #[serde(default = "default_deployment_log_bytes")]
+    pub deployment_log_bytes: usize,
+    /// The most resources in one deployment's graph.
+    #[serde(default = "default_graph_nodes")]
+    pub graph_nodes: usize,
+    /// The most dependencies in one deployment's graph.
+    #[serde(default = "default_graph_edges")]
+    pub graph_edges: usize,
+}
+
+impl Default for WorkLimits {
+    fn default() -> Self {
+        Self {
+            driver_concurrency: default_driver_concurrency(),
+            running_deployments: default_running_deployments(),
+            deployment_minutes: default_deployment_minutes(),
+            deployment_log_bytes: default_deployment_log_bytes(),
+            graph_nodes: default_graph_nodes(),
+            graph_edges: default_graph_edges(),
+        }
+    }
+}
+
+fn default_driver_concurrency() -> usize {
+    4
+}
+
+fn default_running_deployments() -> usize {
+    64
+}
+
+fn default_deployment_minutes() -> u64 {
+    30
+}
+
+fn default_deployment_log_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_graph_nodes() -> usize {
+    500
+}
+
+fn default_graph_edges() -> usize {
+    5000
 }
 
 /// The `openporch/opentofu` driver's settings.
@@ -293,6 +364,7 @@ impl Config {
             github: None,
             rate_limits: RateLimits::default(),
             opentofu: OpenTofuSettings::default(),
+            limits: WorkLimits::default(),
         }
     }
 
@@ -336,6 +408,33 @@ impl Config {
                 self.org,
                 openporch_core::ids::OBJECT_ID_RULE
             )));
+        }
+        let l = &self.limits;
+        for (name, value) in [
+            ("driver_concurrency", l.driver_concurrency),
+            ("running_deployments", l.running_deployments),
+            ("deployment_log_bytes", l.deployment_log_bytes),
+            ("graph_nodes", l.graph_nodes),
+            ("graph_edges", l.graph_edges),
+        ] {
+            if value == 0 {
+                return Err(ConfigError(format!("`limits.{name}` must be at least 1")));
+            }
+        }
+        if l.deployment_minutes == 0 || l.deployment_minutes > MAX_DEPLOYMENT_MINUTES {
+            return Err(ConfigError(format!(
+                "`limits.deployment_minutes` must be between 1 and {MAX_DEPLOYMENT_MINUTES}"
+            )));
+        }
+        for (name, value) in [
+            ("driver_concurrency", l.driver_concurrency),
+            ("running_deployments", l.running_deployments),
+        ] {
+            if value > MAX_SLOTS {
+                return Err(ConfigError(format!(
+                    "`limits.{name}` must be at most {MAX_SLOTS}"
+                )));
+            }
         }
         if !self.listen.ip().is_loopback() && !self.tls_terminated_by_proxy {
             return Err(ConfigError(format!(
@@ -572,6 +671,30 @@ mod tests {
         .unwrap();
         let e = Config::load(Some(&path), |_| None).unwrap_err();
         assert!(e.to_string().contains("must use https"), "{e}");
+    }
+
+    #[test]
+    fn work_limits() {
+        let env = |_: &str| None;
+        let load = |text: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("c.toml");
+            std::fs::write(&path, format!("org = \"acme\"\ndata_dir = \"/d\"\n{text}")).unwrap();
+            Config::load(Some(&path), env)
+        };
+        let c = load("").unwrap();
+        assert_eq!(c.limits, WorkLimits::default());
+        assert_eq!(c.limits.driver_concurrency, 4);
+        let c = load("[limits]\ndriver_concurrency = 8\ngraph_nodes = 100\n").unwrap();
+        assert_eq!(c.limits.driver_concurrency, 8);
+        assert_eq!(c.limits.graph_nodes, 100);
+        let e = load("[limits]\nrunning_deployments = 0\n").unwrap_err();
+        assert!(e.to_string().contains("limits.running_deployments"), "{e}");
+        assert!(load("[limits]\nqueue = 1\n").is_err());
+        let e = load("[limits]\ndeployment_minutes = 100000000000000000\n").unwrap_err();
+        assert!(e.to_string().contains("limits.deployment_minutes"), "{e}");
+        let e = load("[limits]\ndriver_concurrency = 1000000\n").unwrap_err();
+        assert!(e.to_string().contains("limits.driver_concurrency"), "{e}");
     }
 
     #[test]

@@ -330,6 +330,7 @@ pub async fn delete(
     }
 
     let env_record = env_or_404(&state, &app, &env).await?;
+    let slot = state.runners.slots(1)?.pop();
     let snapshot = deletion_snapshot(&req.permits);
     let entries = plans::preflight(&state, &env_record, String::new(), &snapshot, true).await?;
     let acceptance = state
@@ -352,7 +353,7 @@ pub async fn delete(
             audit: ctx.audit(org, "env.delete", format!("{app}/{env}")),
         })
         .await?;
-    let deletion = start_deletion(&state, &acceptance, snapshot).await?;
+    let deletion = start_deletion(&state, &acceptance, snapshot, slot).await?;
     Ok((StatusCode::ACCEPTED, Json(deletion)))
 }
 
@@ -373,6 +374,7 @@ pub(super) async fn start_deletion(
     state: &AppState,
     acceptance: &Acceptance,
     snapshot: Value,
+    slot: Option<crate::deploy::Slot>,
 ) -> ApiResult<EnvDeletion> {
     let org = state.org();
     let mut deployment = acceptance.deployment().clone();
@@ -408,6 +410,7 @@ pub(super) async fn start_deletion(
                 id: d.id.clone(),
                 snapshot,
             },
+            slot,
         );
     }
     let retained = retained_of(resources?);

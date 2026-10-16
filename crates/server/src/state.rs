@@ -319,6 +319,7 @@ pub async fn start_with(
         finish_bootstrap_file(&config)?;
     }
 
+    let runners = crate::deploy::Runners::new(config.limits.running_deployments);
     let login_limit = RateLimiter::new(config.rate_limits.login_per_minute);
     let token_limit = RateLimiter::new(config.rate_limits.tokens_per_minute);
     let state = AppState(Arc::new(Inner {
@@ -332,7 +333,7 @@ pub async fn start_with(
         browser_logins: Default::default(),
         login_limit,
         token_limit,
-        runners: crate::deploy::Runners::default(),
+        runners,
         drivers: crate::deploy::Drivers::default(),
         draining: Default::default(),
         changes: Default::default(),
@@ -423,8 +424,15 @@ fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
         state.cloud.clone(),
         checks.clone(),
     );
-    let planner = Planner::new(Arc::new(store), Arc::new(executor), Limits::default())
-        .with_permit_check(checks);
+    let configured = &state.config.limits;
+    let limits = Limits {
+        concurrency: configured.driver_concurrency,
+        deadline: std::time::Duration::from_secs(configured.deployment_minutes * 60),
+        log_bytes: configured.deployment_log_bytes,
+        ..Limits::default()
+    };
+    let planner =
+        Planner::new(Arc::new(store), Arc::new(executor), limits).with_permit_check(checks);
     state
         .runners
         .set(Arc::new(PlannerRunner::new(Arc::new(planner))));

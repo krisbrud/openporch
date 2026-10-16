@@ -1087,3 +1087,69 @@ async fn stopping_and_restarting_the_server_deletes_nothing() {
     assert_eq!(st, StatusCode::OK, "{apps}");
     assert!(apps.to_string().contains("\"shop\""), "{apps}");
 }
+
+/// An application with more environments than the server runs deployments at
+/// once is still deleted: the deletions it cannot start at once wait for room.
+#[tokio::test]
+async fn an_application_larger_than_the_server_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.limits.running_deployments = 2;
+    let s = super::server_with(dir, config).await;
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let def = json!({"id": id, "type": ty, "driver_type": "openporch/none",
+                         "driver_inputs": {}, "criteria": [{}]});
+        let (st, b) = s.post("/orgs/acme/resources/defs", &s.admin, def).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            &format!("{APP}/deltas"),
+            &s.admin,
+            json!({"modules": {"add": {"web": {"spec": {"containers": {
+                "web": {"image": "nginx:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let envs = ["development", "staging", "qa"];
+    for env in &envs[1..] {
+        let (st, b) = s
+            .post(
+                &format!("{APP}/envs"),
+                &s.admin,
+                json!({"id": env, "type": "development"}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    for env in envs {
+        s.deploy_to(env, json!({"delta_id": delta["id"]})).await;
+        assert!(!s.active(env).await.is_empty());
+    }
+
+    let body = json!({"permits": s.app_deletion_permits(APP).await});
+    let delete = || {
+        s.call(
+            axum::http::Method::DELETE,
+            APP,
+            Some(&s.admin),
+            Some(body.clone()),
+        )
+    };
+    let (st, b) = delete().await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{b}");
+    assert_eq!(b["deletions"].as_array().unwrap().len(), 3, "{b}");
+    // Repeating it while the deletions run is not refused for want of room.
+    // (Once an environment is gone, its permits are too, so a late repeat may
+    // be refused for those instead.)
+    let (st, again) = delete().await;
+    assert_ne!(st, StatusCode::TOO_MANY_REQUESTS, "{again}");
+    for _ in 0..3000 {
+        if s.get(APP, &s.admin).await.0 == StatusCode::NOT_FOUND {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the application was not deleted");
+}

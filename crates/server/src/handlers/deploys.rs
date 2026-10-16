@@ -192,6 +192,8 @@ pub async fn trigger(
     {
         return Err(StoreError::Busy(running.id).into());
     }
+    // Room to run it is taken before anything is stored.
+    let slot = state.runners.slots(1)?.pop();
     let resolved = resolve(&state, &env_record, &req).await?;
     let set_id = state.store.put_set(org, &app, &resolved.set).await?;
     // The same preflight as a preview: migrations are refused, and every
@@ -233,6 +235,7 @@ pub async fn trigger(
                 id: d.id.clone(),
                 snapshot: resolved.snapshot,
             },
+            slot,
         );
     }
     Ok((StatusCode::ACCEPTED, Json(acceptance.deployment().clone())))
@@ -418,6 +421,17 @@ async fn snapshot(
         classes: &classes,
     })
     .map_err(|e| ApiError::invalid(format!("the set cannot be deployed: {e}")))?;
+    let limits = &state.config.limits;
+    let edges = graph.edges().len();
+    if graph.nodes.len() > limits.graph_nodes || edges > limits.graph_edges {
+        return Err(ApiError::invalid(format!(
+            "the set cannot be deployed: its resource graph has {} resources and {edges} \
+             dependencies, more than this server's limits of {} and {}",
+            graph.nodes.len(),
+            limits.graph_nodes,
+            limits.graph_edges
+        )));
+    }
     let used: BTreeMap<String, Value> = records
         .iter()
         .filter(|r| {

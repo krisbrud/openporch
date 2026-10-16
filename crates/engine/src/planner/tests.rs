@@ -120,6 +120,8 @@ enum Behavior {
     Panic,
     /// Waits until every resource sharing the barrier is provisioning at once.
     Meet(Arc<Barrier>),
+    /// Succeeds after a while, like a slow cloud API.
+    Slow(Duration),
     /// Fails with the secret values it read in its error, as a careless driver
     /// would.
     Leak,
@@ -390,6 +392,10 @@ impl Executor for Fake {
                 barrier.wait().await;
                 Ok(())
             }
+            Behavior::Slow(delay) => {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
             Behavior::Retryable(retry_after) => Err(ExecFailure::Retryable {
                 error: "503 from the DNS API".into(),
                 retry_after,
@@ -444,6 +450,10 @@ impl Executor for Fake {
             }
             Behavior::Meet(barrier) => {
                 barrier.wait().await;
+                Ok(())
+            }
+            Behavior::Slow(delay) => {
+                tokio::time::sleep(delay).await;
                 Ok(())
             }
             Behavior::Retryable(retry_after) => Err(ExecFailure::Retryable {
@@ -817,6 +827,61 @@ async fn concurrency_is_bounded() {
     let outcomes = planner(&f, &fake, limits).run(deployment).await;
     assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
     assert_eq!(fake.most.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrency_is_bounded_across_environments() {
+    let mut f = Fixture::new().await;
+    let slow = Behavior::Slow(Duration::from_millis(50));
+    let fake = Fake::with(&[
+        ("base-env", slow.clone()),
+        ("dns", slow.clone()),
+        ("postgres", slow.clone()),
+        ("route", slow.clone()),
+        ("workload", slow),
+    ]);
+    // Five environments, more runnable resources together than the limit.
+    let mut deployments = vec![f.accept().await];
+    for env in ["staging", "qa", "perf", "demo"] {
+        f.store
+            .create_env(
+                ORG,
+                "shop",
+                NewEnv {
+                    id: env.into(),
+                    name: env.into(),
+                    env_type: "development".into(),
+                    draft: None,
+                },
+                audit("POST", "/orgs/acme/apps/shop/envs"),
+            )
+            .await
+            .unwrap();
+        f.env = env;
+        deployments.push(f.accept().await);
+    }
+    let limits = Limits {
+        concurrency: 4,
+        ..fast()
+    };
+    let planner = planner(&f, &fake, limits);
+    let [a, b, c, d, e] = <[Deployment; 5]>::try_from(deployments).unwrap();
+    let all = tokio::join!(
+        planner.run(a),
+        planner.run(b),
+        planner.run(c),
+        planner.run(d),
+        planner.run(e)
+    );
+    for outcomes in [all.0, all.1, all.2, all.3, all.4] {
+        assert!(
+            outcomes.values().all(|o| *o == Outcome::Provisioned),
+            "{outcomes:?}"
+        );
+    }
+    // The limit is shared: never more than four driver operations at once,
+    // and the environments did overlap up to it.
+    assert_eq!(fake.most.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
