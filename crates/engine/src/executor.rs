@@ -1221,6 +1221,13 @@ fn cloud_failure(e: CloudError) -> ExecFailure {
             error: m,
             retry_after: None,
         },
+        CloudError::Throttled {
+            message,
+            retry_after,
+        } => ExecFailure::Retryable {
+            error: message,
+            retry_after,
+        },
         CloudError::Invalid(m) | CloudError::Rejected(m) | CloudError::Expiring(m) => {
             ExecFailure::Permanent(m)
         }

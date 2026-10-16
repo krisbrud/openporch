@@ -288,7 +288,7 @@ pub async fn check_account(
             CloudError::Rejected(m) => {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, code::CLOUD_REJECTED, m)
             }
-            CloudError::Unavailable(m) => {
+            CloudError::Unavailable(m) | CloudError::Throttled { message: m, .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, code::CLOUD_UNAVAILABLE, m)
             }
         })?;

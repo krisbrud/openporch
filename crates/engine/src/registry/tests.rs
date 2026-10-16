@@ -122,7 +122,8 @@ fn web_digest() -> String {
 
 /// A registry that wants an anonymous token for every repository: `web` has
 /// tag `1` (reported by digest) and tag `quiet` (whose digest is not
-/// reported), and `private` gives no anonymous token.
+/// reported), `private` gives no anonymous token, `busy` is rate limited
+/// and the token for `huge` is too large to read.
 async fn fake_registry() -> String {
     async fn token(Query(q): Query<Vec<(String, String)>>) -> Response {
         let scope = q
@@ -131,6 +132,10 @@ async fn fake_registry() -> String {
             .map(|(_, v)| v.as_str());
         match scope {
             Some("repository:private:pull") => StatusCode::UNAUTHORIZED.into_response(),
+            Some("repository:huge:pull") => {
+                let token = "x".repeat(2 * MAX_TOKEN_BYTES);
+                axum::Json(serde_json::json!({ "token": token })).into_response()
+            }
             Some(_) => axum::Json(serde_json::json!({"token": "anonymous"})).into_response(),
             None => StatusCode::BAD_REQUEST.into_response(),
         }
@@ -166,6 +171,9 @@ async fn fake_registry() -> String {
                 ([("docker-content-digest", digest)], "{}").into_response()
             }
             ("web", "quiet") => "quiet manifest".into_response(),
+            ("busy", _) => {
+                (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "7")]).into_response()
+            }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -217,6 +225,20 @@ async fn a_public_image_is_looked_up_with_an_anonymous_token() {
     assert_eq!(
         lookup(format!("{host}/private:1")).await.unwrap(),
         Lookup::Private
+    );
+    // A rate limit says how long to wait.
+    assert_eq!(
+        lookup(format!("{host}/busy:1")).await.unwrap_err(),
+        CloudError::Throttled {
+            message: format!("registry `{host}` answered 429 for `{host}/busy:1`"),
+            retry_after: Some(Duration::from_secs(7)),
+        }
+    );
+    // A token service answer is read only up to a limit.
+    let e = lookup(format!("{host}/huge:1")).await.unwrap_err();
+    assert!(
+        matches!(&e, CloudError::Rejected(m) if m.contains("more than")),
+        "{e:?}"
     );
 
     // Named private, the registry is reached on its loopback address, but

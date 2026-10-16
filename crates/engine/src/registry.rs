@@ -27,6 +27,10 @@ const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.v2+json";
 /// The largest manifest read to compute a digest a registry does not report.
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+/// The largest token service answer read.
+const MAX_TOKEN_BYTES: usize = 64 * 1024;
+/// The longest `Retry-After` honored.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// How long one registry request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -373,7 +377,13 @@ impl HttpRegistry {
             s if s.is_success() => {}
             StatusCode::NOT_FOUND => return Ok(Lookup::Missing),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Ok(Lookup::Private),
-            s if s == StatusCode::TOO_MANY_REQUESTS || s.is_server_error() => {
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(throttled(
+                    format!("registry `{host}` answered 429 for `{image}`"),
+                    &response,
+                ));
+            }
+            s if s.is_server_error() => {
                 return Err(CloudError::Unavailable(format!(
                     "registry `{host}` answered {s} for `{image}`"
                 )));
@@ -475,6 +485,15 @@ impl HttpRegistry {
         match response.status() {
             s if s.is_success() => {}
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Ok(None),
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(throttled(
+                    format!(
+                        "the token service of registry `{}` answered 429",
+                        image.host
+                    ),
+                    &response,
+                ));
+            }
             s => {
                 return Err(CloudError::Unavailable(format!(
                     "the token service of registry `{}` answered {s}",
@@ -482,13 +501,41 @@ impl HttpRegistry {
                 )));
             }
         }
-        let token: Token = response.json().await.map_err(|e| {
+        let unavailable =
+            |e: reqwest::Error| CloudError::Unavailable(format!("registry `{}`: {e}", image.host));
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
+            if body.len() + chunk.len() > MAX_TOKEN_BYTES {
+                return Err(CloudError::Rejected(format!(
+                    "the token service of registry `{}` answered with more than \
+                     {MAX_TOKEN_BYTES} bytes",
+                    image.host
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let token: Token = serde_json::from_slice(&body).map_err(|e| {
             CloudError::Unavailable(format!(
                 "the token service of registry `{}` answered unreadably: {e}",
                 image.host
             ))
         })?;
         Ok(token.token.or(token.access_token))
+    }
+}
+
+/// A `429`, with the wait its `Retry-After` names in seconds.
+fn throttled(message: String, response: &reqwest::Response) -> CloudError {
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
+    CloudError::Throttled {
+        message,
+        retry_after,
     }
 }
 
