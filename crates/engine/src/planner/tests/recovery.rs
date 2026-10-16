@@ -233,6 +233,16 @@ async fn a_crash_before_the_result_is_recorded_is_recovered_by_observation() {
         .unwrap();
 
     let db = f.guresid(DB).await;
+    // An observation that panics establishes nothing.
+    fake.observe_panics
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        f.recover(&planner, DB).await,
+        Err(RecoverError::Observation(e)) if e.contains("stopped unexpectedly")
+    ),);
+    assert_eq!(f.active(DB).await.unwrap().status, "unknown");
+    fake.observe_panics
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         f.recover(&planner, DB).await.unwrap(),
         Recovered::Provisioned

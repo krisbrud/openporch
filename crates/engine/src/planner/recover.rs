@@ -133,11 +133,24 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     tokio::time::Instant::now(),
                     crate::metrics::METRICS.driver_started(),
                 );
-                let observed = self
-                    .executor
-                    .observe(job, deleting)
-                    .instrument(span.clone())
-                    .await;
+                let executor = self.executor.clone();
+                // A panicking observation leaves the outcome as unknown as before.
+                let observed = tokio::spawn(
+                    async move { executor.observe(job, deleting).await }.instrument(span.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    // A panic message could hold a secret, so it is not logged.
+                    span.in_scope(|| {
+                        tracing::error!(
+                            panicked = e.is_panic(),
+                            "the executor stopped unexpectedly"
+                        );
+                    });
+                    Err(ExecFailure::Uncertain(
+                        "the executor stopped unexpectedly while observing the resource".into(),
+                    ))
+                });
                 drop(running);
                 span.in_scope(|| super::log_outcome("observe", started, &observed));
                 match observed {
