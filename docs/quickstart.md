@@ -1,10 +1,12 @@
 # Developer quickstart
 
-This walks through running an openporch server on your machine and deploying a
-workload to it with `porch`, without a cloud account: the definitions here use
-the built-in `openporch/none` driver, which provisions nothing. Every command
+This walks through running an openporch server on your machine, deploying a
+workload to it with `porch` and removing it again, without a cloud account: the
+definitions here use the built-in `openporch/none` driver, which provisions
+nothing, and `openporch/echo`, which describes something that already exists. Every command
 in the `sh` blocks below runs as written in this repository's tests
-(`crates/cli/src/tests/quickstart.rs`), against a dev server.
+(`crates/cli/src/tests/quickstart.rs`), against a dev server, including the
+command a preview prints.
 
 ## Start a server
 
@@ -88,14 +90,46 @@ porch create resource-definition -f workloads.yaml
 porch get resource-definitions
 ```
 
+A workload can depend on resources such as a database. This definition
+provides every `postgres` resource with `openporch/echo`, which returns its
+inputs as outputs: a database that already runs somewhere, described rather
+than created. `secret_refs` with `value` writes the credentials to openporch's
+built-in secret store, encrypted; they are never returned by the API:
+
+```sh
+cat > postgres.yaml <<'EOF'
+apiVersion: openporch.dev/v1
+kind: Definition
+metadata:
+  id: shared-postgres
+entity:
+  type: postgres
+  driver_type: openporch/echo
+  driver_inputs:
+    values:
+      host: db.internal
+      port: 5432
+      name: shop
+    secret_refs:
+      username:
+        value: shop
+      password:
+        value: change-me
+  criteria:
+    - {}
+EOF
+porch create resource-definition -f postgres.yaml
+```
+
 With AWS, a definition would use `openporch/opentofu` with a module and a
 `driver_account`; see [cloud accounts](cloud-accounts.md) and
 [the OpenTofu driver](drivers/opentofu.md).
 
 ## Deploy a workload
 
-A workload document describes what to run. The image is left as `.` and
-supplied at deploy time, as CI would:
+A workload document describes what to run and the resources it needs. The
+image is left as `.` and supplied at deploy time, as CI would, and `DB_HOST`
+comes from the database's outputs:
 
 ```sh
 cat > workload.yaml <<'EOF'
@@ -108,6 +142,10 @@ containers:
     image: .
     variables:
       PAGE_SIZE: "10"
+      DB_HOST: ${resources.db.host}
+resources:
+  db:
+    type: postgres
 EOF
 porch workload deploy -f workload.yaml --image web=nginx:1.27 --comment "first deploy" --wait
 ```
@@ -169,3 +207,39 @@ porch api get /orgs/acme/resources/types
 
 Every command is listed in the [command reference](cli.md), and every API
 route in [the API reference](api.md).
+
+## Remove it
+
+Deleting the application deletes its environments and everything their
+deployments created. Every resource it deletes needs a permit, since with
+other drivers that can destroy data, such as a cloud database. Preview the
+deletion: it lists what goes and prints the command that carries out exactly
+that preview, with one `--ack` per resource:
+
+```sh
+porch delete app shop --preview
+```
+
+Then run the command it printed, which looks like this:
+
+```sh
+# The command the preview printed, such as:
+# porch delete app shop --plan development=pln-… --ack 'development:base-env.default#base-env=delete' …
+```
+
+The deletion runs in the background, like a deployment. `porch get apps` shows
+the application as `deleting` until every resource is gone, and then no longer
+lists it. With these drivers nothing outside openporch changes, so it goes
+within moments:
+
+```sh
+porch get apps
+```
+
+Stop the server with Ctrl-C. Deleting `~/porch-demo` removes its data, keys
+and tokens.
+
+## Next
+
+[Getting started](getting-started.md) sets up a server that deploys serverless
+workloads to AWS Lambda, with DynamoDB, SQS and EventBridge, all pay-per-use.

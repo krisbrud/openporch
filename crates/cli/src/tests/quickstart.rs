@@ -7,7 +7,9 @@
 //! lines up to `EOF`, and `porch` commands, optionally reading standard input
 //! with `< FILE`. Files are written to the machine's home directory, and
 //! `.openporch/` names the dev server's data directory. `OPENPORCH_URL` is the
-//! dev server's address. Every command must succeed.
+//! dev server's address. Every command must succeed. A comment that starts
+//! with `# The command the preview printed` runs the `porch` command the
+//! previous command printed, as a reader would copy it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -125,10 +127,26 @@ async fn the_quickstart_runs_as_written() {
     };
     let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut ran = 0;
+    // What the previous command printed, and whether the deployments were
+    // checked before the application is deleted.
+    let mut printed = String::new();
+    let mut checked = false;
     for block in blocks(&text, "sh") {
         let mut lines = block.into_iter();
         while let Some((n, line)) = lines.next() {
             let line = line.trim();
+            let copied;
+            let line = if line.starts_with("# The command the preview printed") {
+                copied = printed
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|l| l.starts_with("porch "))
+                    .unwrap_or_else(|| panic!("line {n}: no command was printed: {printed}"))
+                    .to_owned();
+                copied.as_str()
+            } else {
+                line
+            };
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -184,15 +202,35 @@ async fn the_quickstart_runs_as_written() {
                 })
                 .collect();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if args.starts_with(&["delete", "app"]) && !checked {
+                check_deployments(&server).await;
+                checked = true;
+            }
             let r = m.porch(&args, &stdin).await;
             assert_eq!(r.code, 0, "line {n}: `{line}` failed: {r:?}");
+            printed = format!("{}{}", r.out, r.err);
             ran += 1;
         }
     }
     assert!(ran >= 15, "only {ran} commands ran");
+    assert!(checked, "the quickstart deletes the application");
+    // The application goes, with everything its deployments created, once
+    // its deletion has run in the background.
+    let mut apps = Value::Null;
+    for _ in 0..500 {
+        let r = m.porch(&["get", "apps", "-o", "json"], "").await;
+        apps = serde_json::from_str(&r.out).unwrap();
+        if apps == serde_json::json!([]) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(apps, serde_json::json!([]));
+}
 
-    // Two deployments and a rollback, all of which succeeded.
-    let list: Vec<Value> = deploys(&server).await;
+/// Two deployments and a rollback, all of which succeeded.
+async fn check_deployments(server: &DevServer) {
+    let list: Vec<Value> = deploys(server).await;
     assert_eq!(list.len(), 3, "{list:?}");
     assert!(list.iter().all(|d| d["status"] == "succeeded"), "{list:?}");
     assert_ne!(
