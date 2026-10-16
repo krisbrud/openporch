@@ -449,6 +449,18 @@ pub trait Executor: Send + Sync + 'static {
         async { Ok(()) }
     }
 
+    /// Checks, without changing anything, that the version of the driver's
+    /// code a resource was last applied with, which deleting it runs, can
+    /// still run. An executor that cannot check accepts it, and a missing
+    /// version fails when the deletion runs.
+    fn check_retained(
+        &self,
+        job: DeprovisionJob,
+    ) -> impl Future<Output = Result<(), ExecFailure>> + Send {
+        let _ = job;
+        async { Ok(()) }
+    }
+
     /// Pins `pin.artifact` to the identity it has now, such as an S3 object
     /// version. An artifact without a fixed identity, such as an object in an
     /// unversioned bucket, is refused.
@@ -1029,6 +1041,81 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         missing
     }
 
+    /// Checks that the version of the drivers' code each resource the
+    /// deployment must delete was last applied with can still run; why each
+    /// whose version cannot stops the deployment.
+    async fn check_deletions(
+        &self,
+        deployment: &Deployment,
+        deadline: Instant,
+    ) -> BTreeMap<Descriptor, String> {
+        let d = deployment;
+        let mut missing = BTreeMap::new();
+        let active = match self
+            .store
+            .active_resources(d.org.as_str(), d.app.as_str(), d.env.as_str())
+            .await
+        {
+            Ok(active) => active,
+            // The deletions report it when their turn comes.
+            Err(_) => return missing,
+        };
+        // Only removals the deployment must complete: a resource merely
+        // scheduled for deletion may be kept, and fails only when deleted.
+        let (candidates, mandatory) = deletion_candidates(&d.graph, d.teardown, &active);
+        for (descriptor, r) in candidates {
+            // A confirmed deletion only has its record left to remove.
+            if r.cleanup_pending || !mandatory.contains(&r.descriptor) {
+                continue;
+            }
+            let (recorded, guresid) =
+                match (deprovision::Recorded::of(&r), r.guresid.parse::<Guresid>()) {
+                    (Ok(recorded), Ok(guresid)) => (recorded, guresid),
+                    // The deletion reports it when its turn comes.
+                    _ => continue,
+                };
+            let job = DeprovisionJob {
+                job: ProvisionJob {
+                    operation_id: format!("{}-check", d.id),
+                    attempt: 0,
+                    descriptor: descriptor.clone(),
+                    guresid,
+                    context: JobContext::of(d),
+                    definition_id: recorded.definition_id,
+                    definition_version: r.definition_version.unwrap_or_default(),
+                    driver_type: recorded.driver_type,
+                    driver_account: recorded.driver_account,
+                    inputs: recorded.inputs,
+                    input_fingerprint: "delete".into(),
+                    cookie: r.cookie.clone(),
+                    target: r.target.clone(),
+                    pin: None,
+                    existing: true,
+                    deadline,
+                    log: JobLog::discard(),
+                },
+                snapshot: r.snapshot.clone(),
+                recovery: r.recovery.clone(),
+            };
+            let what = format!("the retained version of `{descriptor}`");
+            if let Err(reason) = self
+                .check_with_retries(&what, deadline, || {
+                    self.executor.check_retained(job.clone())
+                })
+                .await
+            {
+                missing.insert(
+                    descriptor,
+                    format!(
+                        "the deployment deletes this resource, but the version it was applied \
+                         with, which the deletion runs, is not available: {reason}"
+                    ),
+                );
+            }
+        }
+        missing
+    }
+
     /// Runs `check`, retrying failures that may pass with backoff, within the
     /// deployment's attempts and deadline.
     async fn check_with_retries<F>(
@@ -1084,10 +1171,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
         if !artifacts_missing {
             missing = self.check_pins(&deployment, deadline).await;
         }
+        let pins_missing = !artifacts_missing && !missing.is_empty();
+        if missing.is_empty() {
+            missing = self.check_deletions(&deployment, deadline).await;
+        }
         let why = if artifacts_missing {
             "not started: an artifact the deployment needs is missing"
-        } else {
+        } else if pins_missing {
             "not started: a version of the code the deployment replays is missing"
+        } else {
+            "not started: a resource the deployment deletes cannot be deleted"
         };
         for (d, reason) in &missing {
             outcomes.insert(d.clone(), Outcome::Failed(reason.clone()));

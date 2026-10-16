@@ -1690,6 +1690,14 @@ provisioning. An artifact of a workload whose definition has no cloud account, o
 that comes from another resource's outputs, is not checked; its driver reports
 a missing artifact when it runs.
 
+A deployment also has each driver check, before anything runs, that it can
+still delete the resources the deployment will delete, such as those of a
+removed workload: the OpenTofu driver fetches the commit and lock file it
+retained for the resource. If that fails, the resource fails naming the cause,
+every other resource is left `pending`, and the deployment fails with nothing
+changed. Resources that are only scheduled for deletion, which the deployment
+keeps while something it keeps still uses them, are not checked.
+
 ```http
 POST /orgs/acme/apps
 Authorization: Bearer $ADMIN_TOKEN

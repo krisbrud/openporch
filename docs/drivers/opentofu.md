@@ -378,6 +378,15 @@ destroy succeeds, and a remote workspace only once its state is empty. If the
 destroy fails, state and the retained record stay, and the delete can be retried.
 Deleting again after a successful delete does nothing.
 
+Before a deployment changes anything, the driver also checks the retained
+version of every resource the deployment will delete, such as a removed
+workload: it fetches the retained commit and runs `tofu init -backend=false`
+with the retained lock file, as for a replay's pins. If the commit can no longer
+be fetched or a provider can no longer be installed, that resource fails with
+the error, every other resource is left `pending` and nothing is applied, so the
+deployment does not provision the rest and then fail at the deletion. A
+resource that was never applied has nothing to check.
+
 ## Timeouts and locks
 
 Within one server process, calls for one resource run one at a time. When a call times out, its commands

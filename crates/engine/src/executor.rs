@@ -781,6 +781,38 @@ where
         checked.map_err(|f| log.failure(f))
     }
 
+    async fn check_retained(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let job = &job.job;
+        let mut log = job.log.redacting();
+        let checked = async {
+            // As for the deletion: the definition as it was, whether or not
+            // it still matches.
+            let sources = if job.inputs.sources.is_empty() {
+                inferred_sources(job)
+            } else {
+                job.inputs.sources.clone()
+            };
+            let Call {
+                driver,
+                req,
+                timeout,
+                ..
+            } = self.request(job, &sources, false, &mut log).await?;
+            // A check changes nothing, so running out of time is not uncertain.
+            with_timeout(timeout, driver.check_retained(&req))
+                .await
+                .map_err(|e| match e {
+                    DriverError::Timeout(_) => ExecFailure::Retryable {
+                        error: format!("checking the retained version failed: {e}"),
+                        retry_after: None,
+                    },
+                    e => driver_failure(e),
+                })
+        }
+        .await;
+        checked.map_err(|f| log.failure(f))
+    }
+
     async fn pin_artifact(&self, pin: ArtifactPin) -> Result<String, ExecFailure> {
         let object = S3Object::parse(&pin.artifact).ok_or_else(|| {
             ExecFailure::Permanent(format!(

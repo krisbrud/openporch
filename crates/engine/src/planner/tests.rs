@@ -146,6 +146,10 @@ struct Fake {
     /// The pins checked before a replay, and the commits that can no longer
     /// be fetched.
     pin_checks: Mutex<Vec<ProvisionJob>>,
+    /// The retained versions checked before deletions, and the resources
+    /// whose retained version is gone.
+    retained_checks: Mutex<Vec<DeprovisionJob>>,
+    lost_retained: Mutex<BTreeSet<String>>,
     lost_commits: Mutex<BTreeSet<String>>,
     /// How many artifact checks fail in a way that may pass before one
     /// answers.
@@ -310,6 +314,17 @@ fn none_outputs(
 }
 
 impl Executor for Fake {
+    async fn check_retained(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let descriptor = job.job.descriptor.to_string();
+        self.retained_checks.lock().unwrap().push(job);
+        if self.lost_retained.lock().unwrap().contains(&descriptor) {
+            return Err(ExecFailure::Permanent(
+                "the retained commit can no longer be fetched".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn check_pin(&self, job: ProvisionJob) -> Result<(), ExecFailure> {
         let commit = job.pin.as_ref().unwrap()["commit"]
             .as_str()
@@ -1304,6 +1319,50 @@ async fn a_removed_workload_is_deleted_before_what_it_used() {
     );
     assert!(at(ROUTE) < at(DNS), "{order:?}");
     assert!(f.active(BASE).await.is_some());
+}
+
+#[tokio::test]
+async fn a_removal_whose_retained_version_is_gone_changes_nothing() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let checks = Arc::new(AllowAll::default());
+    deleting(&f, &fake, &checks).run(f.accept().await).await;
+    let workload = f.active(WORKLOAD).await.unwrap();
+    // DB is only scheduled, so it may be kept and is not checked ahead.
+    f.schedule(DB).await;
+    let fake = Fake::with(&[]);
+    fake.lost_retained.lock().unwrap().insert(WORKLOAD.into());
+    let deployment = f.accept_set(None, definitions()).await.unwrap();
+    let outcomes = deleting(&f, &fake, &checks).run(deployment.clone()).await;
+
+    let checked = fake.retained_checks.lock().unwrap().clone();
+    assert_eq!(
+        checked
+            .iter()
+            .map(|j| j.job.descriptor.to_string())
+            .collect::<Vec<_>>(),
+        [WORKLOAD]
+    );
+    // Checked with what the workload was provisioned with.
+    assert_eq!(checked[0].job.guresid.as_str(), workload.guresid);
+    assert_eq!(checked[0].snapshot, workload.snapshot);
+    let Outcome::Failed(reason) = &outcomes[&d(WORKLOAD)] else {
+        panic!("{outcomes:?}");
+    };
+    assert!(reason.contains("can no longer be fetched"), "{reason}");
+    assert!(
+        reason.contains("the deployment deletes this resource"),
+        "{reason}"
+    );
+    // Nothing ran, nothing was deleted, and the deployment failed.
+    assert!(fake.jobs.lock().unwrap().is_empty());
+    assert!(fake.deletions().is_empty());
+    assert!(
+        matches!(outcomes[&d(BASE)], Outcome::Pending(_)),
+        "{outcomes:?}"
+    );
+    assert!(f.active(WORKLOAD).await.is_some());
+    assert_eq!(f.status(&deployment).await.0, DeploymentStatus::Failed);
 }
 
 #[tokio::test]

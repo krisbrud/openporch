@@ -1941,6 +1941,29 @@ impl Driver for OpenTofu {
         })
     }
 
+    fn check_retained<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            // Deleting what was never applied needs no code.
+            if !matches!(self.state(req).await?, State::Present(_)) {
+                return Ok(());
+            }
+            let retained = self.retained(req)?;
+            // The source, script and lock file a deletion runs with, installed
+            // without a backend: nothing is planned or applied.
+            self.with_run(req, SourceAt::Retained(&retained), async |run| {
+                self.tofu(
+                    run,
+                    "installing the modules and providers this resource was applied with failed",
+                    &["init", "-input=false", "-backend=false"],
+                    exec::Stdout::Logged,
+                )
+                .await
+                .map(drop)
+            })
+            .await
+        })
+    }
+
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         Box::pin(async move {
             match self.state(req).await? {
