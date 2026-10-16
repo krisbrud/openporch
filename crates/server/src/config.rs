@@ -512,11 +512,7 @@ impl Config {
             ("private_registries", &self.images.private_registries),
         ] {
             for host in hosts {
-                let valid = !host.is_empty()
-                    && host
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b));
-                if !valid {
+                if !openporch_engine::registry::valid_registry_host(host) {
                     return Err(ConfigError(format!(
                         "`images.{name}` entry `{host}` is not `host[:port]`"
                     )));
@@ -701,6 +697,25 @@ mod tests {
         assert_eq!(c.images.insecure_registries, ["localhost:5000"]);
         let e = load("[images]\ninsecure_registries = [\"http://r\"]\n").unwrap_err();
         assert!(e.to_string().contains("images.insecure_registries"), "{e}");
+        let c = load("[images]\nprivate_registries = [\"r.internal:5000\", \"[fd00::1]:443\"]\n");
+        assert_eq!(
+            c.unwrap().images.private_registries,
+            ["r.internal:5000", "[fd00::1]:443"]
+        );
+        for bad in [
+            "r:port",
+            "r:70000",
+            "r:0",
+            "[fd00::1",
+            "[nope]:5000",
+            ":5000",
+        ] {
+            let e = load(&format!("[images]\nprivate_registries = [\"{bad}\"]\n")).unwrap_err();
+            assert!(
+                e.to_string().contains("images.private_registries"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]

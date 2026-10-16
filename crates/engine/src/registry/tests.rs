@@ -77,6 +77,10 @@ fn image_references_are_parsed_like_docker_does() {
     let tagged = OciImage::parse("nginx:1").unwrap();
     let digest = format!("sha256:{}", "0".repeat(64));
     assert_eq!(tagged.at(&digest), format!("nginx@{digest}"));
+    assert_eq!(tagged.tagged_at(&digest), format!("nginx:1@{digest}"));
+    assert!(pinned_from_tag(&tagged.tagged_at(&digest)));
+    assert!(!pinned_from_tag(&tagged.at(&digest)));
+    assert!(!pinned_from_tag(&format!("localhost:5000/web@{digest}")));
     assert_eq!(tagged.to_string(), "nginx:1");
 
     for invalid in [
@@ -95,6 +99,7 @@ fn image_references_are_parsed_like_docker_does() {
         "[::1]x/web:1",
         "[::1]:/web:1",
         "host:port/web:1",
+        "host:70000/web:1",
     ] {
         assert_eq!(OciImage::parse(invalid), None, "{invalid}");
     }
@@ -335,6 +340,9 @@ fn only_public_addresses_are_public() {
         "2002:0a00:0001::1",
         "64:ff9b::a00:1",
         "ff02::1",
+        "192.0.0.8",
+        "192.88.99.1",
+        "224.0.0.251",
     ] {
         assert!(!is_public(private.parse().unwrap()), "{private}");
     }

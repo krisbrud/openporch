@@ -173,7 +173,10 @@ definition's cloud account. Images in other registries, such as Docker Hub or
 outbound access to them. A tag that does not exist is refused with `400`. An
 image the registry shows only with credentials is refused too; name it by
 digest (`<image>@sha256:<digest>`) instead. Its digest is then not checked
-before a run, and its driver reports it when it is gone.
+before a run, and its driver reports it when it is gone. An image pinned from a
+public tag keeps the tag (`<image>:<tag>@sha256:<digest>`), and a run fails
+before it changes anything if the registry no longer shows it without
+credentials.
 
 Registries on loopback, private or link-local addresses are not read, so an
 image name cannot make the server probe its own network, and redirects are not

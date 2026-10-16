@@ -34,7 +34,7 @@ use crate::planner::{
     JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
     RedactingLog, SecretSource,
 };
-use crate::registry::{Lookup, OciImage, Reference, Registry};
+use crate::registry::{Lookup, OciImage, Reference, Registry, pinned_from_tag};
 
 /// The version of the sealed cookie format, bound into its associated data.
 const COOKIE_AAD: &str = "openporch-cookie:v1";
@@ -914,8 +914,8 @@ where
             _ => return Ok(image),
         };
         match registry.lookup(&parsed).await {
-            Ok(Lookup::Found(digest)) if pinned_image(&parsed.at(&digest)) => {
-                Ok(parsed.at(&digest))
+            Ok(Lookup::Found(digest)) if pinned_image(&parsed.tagged_at(&digest)) => {
+                Ok(parsed.tagged_at(&digest))
             }
             Ok(Lookup::Found(digest)) => Err(ExecFailure::Permanent(format!(
                 "image `{image}` of `{descriptor}` has digest `{digest}`, which is not a sha256 \
@@ -941,16 +941,28 @@ where
         let Some(registry) = &self.registry else {
             return Ok(());
         };
-        for image in images.iter().filter_map(|i| OciImage::parse(i)) {
+        for named in &images {
+            let Some(image) = OciImage::parse(named) else {
+                continue;
+            };
             if !matches!(image.reference, Reference::Digest(_)) {
                 continue;
             }
             match registry.lookup(&image).await {
-                // One that needs credentials cannot be checked here.
-                Ok(Lookup::Found(_) | Lookup::Private) => {}
+                Ok(Lookup::Found(_)) => {}
+                // One pinned here from a public tag must stay readable.
+                Ok(Lookup::Private) if pinned_from_tag(named) => {
+                    return Err(ExecFailure::Permanent(format!(
+                        "image `{named}` of `{descriptor}` was pinned from a public tag, but its \
+                         registry no longer shows it without credentials; nothing changed"
+                    )));
+                }
+                // One named by digest that needs credentials cannot be
+                // checked here.
+                Ok(Lookup::Private) => {}
                 Ok(Lookup::Missing) => {
                     return Err(ExecFailure::Permanent(format!(
-                        "image `{image}` of `{descriptor}` no longer exists; nothing changed"
+                        "image `{named}` of `{descriptor}` no longer exists; nothing changed"
                     )));
                 }
                 Err(e) => return Err(cloud_failure(e)),

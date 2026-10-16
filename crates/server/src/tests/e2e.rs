@@ -781,18 +781,21 @@ async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
 
 /// A registry without authentication: `web:1` is at a digest of ones until
 /// it is deleted, and `private` answers only with credentials.
-async fn fake_registry() -> (String, Arc<Mutex<bool>>) {
+/// A registry whose `web` repository is served while `state` is `public`,
+/// needs credentials when it is `private` and is gone when it is `deleted`.
+async fn fake_registry() -> (String, Arc<Mutex<&'static str>>) {
     use axum::extract::{Path, State};
     use axum::response::IntoResponse;
-    let deleted = Arc::new(Mutex::new(false));
+    let state = Arc::new(Mutex::new("public"));
     async fn manifest(
-        State(deleted): State<Arc<Mutex<bool>>>,
+        State(state): State<Arc<Mutex<&'static str>>>,
         Path((repository, reference)): Path<(String, String)>,
     ) -> axum::response::Response {
         let digest = format!("sha256:{}", "1".repeat(64));
-        let exists = !*deleted.lock().unwrap();
+        let state = *state.lock().unwrap();
         match repository.as_str() {
-            "web" if exists && (reference == "1" || reference == digest) => {
+            "web" if state == "private" => StatusCode::UNAUTHORIZED.into_response(),
+            "web" if state == "public" && (reference == "1" || reference == digest) => {
                 ([("docker-content-digest", digest)], "{}").into_response()
             }
             "private" => StatusCode::UNAUTHORIZED.into_response(),
@@ -806,14 +809,14 @@ async fn fake_registry() -> (String, Arc<Mutex<bool>>) {
             "/v2/{repository}/manifests/{reference}",
             axum::routing::get(manifest),
         )
-        .with_state(deleted.clone());
+        .with_state(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (host, deleted)
+    (host, state)
 }
 
 #[tokio::test]
 async fn images_in_other_registries_are_pinned_and_checked() {
-    let (registry, deleted) = fake_registry().await;
+    let (registry, registry_state) = fake_registry().await;
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::Config::new("acme", dir.path());
     config.images.insecure_registries = vec![registry.clone()];
@@ -867,7 +870,34 @@ async fn images_in_other_registries_are_pinned_and_checked() {
         "{b}"
     );
 
-    // A public tag is pinned to its digest in the snapshot.
+    let hex = "1".repeat(64);
+    let image_of = async |id: &str| {
+        let snapshot = s
+            .state
+            .store
+            .deployment_snapshot("acme", "shop", "development", id)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot["graph"]["nodes"]["workload.default#modules.web"]["params"]["spec"]["containers"]
+            ["web"]["image"]
+            .clone()
+    };
+
+    // A private image named by digest drops any tag and is not checked.
+    let (st, d) = deploy(format!("{registry}/private:1@sha256:{hex}")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let d = s
+        .finished_at(&format!("{APP}/envs/development/deploys/{id}"))
+        .await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(
+        image_of(&id).await,
+        format!("{registry}/private@sha256:{hex}")
+    );
+
+    // A public tag is pinned to its digest in the snapshot, keeping the tag.
     let (st, d) = deploy(format!("{registry}/web:1")).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{d}");
     let id = d["id"].as_str().unwrap().to_owned();
@@ -875,44 +905,39 @@ async fn images_in_other_registries_are_pinned_and_checked() {
         .finished_at(&format!("{APP}/envs/development/deploys/{id}"))
         .await;
     assert_eq!(d["status"], "succeeded", "{d}");
-    let pinned = format!("{registry}/web@sha256:{}", "1".repeat(64));
-    let snapshot = s
-        .state
-        .store
-        .deployment_snapshot("acme", "shop", "development", &id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        snapshot["graph"]["nodes"]["workload.default#modules.web"]["params"]["spec"]["containers"]
-            ["web"]["image"],
-        pinned
-    );
+    let pinned = format!("{registry}/web:1@sha256:{hex}");
+    assert_eq!(image_of(&id).await, pinned);
 
-    // The digest is deleted: a replay fails before anything runs, naming it.
-    *deleted.lock().unwrap() = true;
-    let (_, env) = s.get(&format!("{APP}/envs/development"), &s.admin).await;
-    let (st, replay) = s
-        .post(
-            &format!("{APP}/envs/development/deploys"),
-            &s.admin,
-            json!({"deploy_id": id, "replay": "snapshot",
-                   "expected_generation": env["generation"]}),
-        )
-        .await;
-    assert_eq!(st, StatusCode::ACCEPTED, "{replay}");
-    let replay = s
-        .finished_at(&format!(
-            "{APP}/envs/development/deploys/{}",
-            replay["id"].as_str().unwrap()
-        ))
-        .await;
-    assert_eq!(replay["status"], "failed", "{replay}");
-    let error = replay["error"].to_string();
-    assert!(
-        error.contains(&format!("image `{pinned}`")) && error.contains("no longer exists"),
-        "{replay}"
-    );
+    // The repository turns private, then the digest is deleted: each time a
+    // replay fails before anything runs, naming the image.
+    for (state, why) in [
+        ("private", "no longer shows it without credentials"),
+        ("deleted", "no longer exists"),
+    ] {
+        *registry_state.lock().unwrap() = state;
+        let (_, env) = s.get(&format!("{APP}/envs/development"), &s.admin).await;
+        let (st, replay) = s
+            .post(
+                &format!("{APP}/envs/development/deploys"),
+                &s.admin,
+                json!({"deploy_id": id, "replay": "snapshot",
+                       "expected_generation": env["generation"]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{replay}");
+        let replay = s
+            .finished_at(&format!(
+                "{APP}/envs/development/deploys/{}",
+                replay["id"].as_str().unwrap()
+            ))
+            .await;
+        assert_eq!(replay["status"], "failed", "{replay}");
+        let error = replay["error"].to_string();
+        assert!(
+            error.contains(&format!("image `{pinned}`")) && error.contains(why),
+            "{state}: {replay}"
+        );
+    }
 }
 
 const ORDER_WORKER: &str = include_str!("../../../../examples/lambda-order-worker/workload.yaml");

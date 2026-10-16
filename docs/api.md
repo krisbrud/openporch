@@ -1676,9 +1676,11 @@ account known before the deployment runs, is refused with `400`; naming the
 image by digest avoids the lookup, and a digest that is not `sha256:` with 64
 hex digits is refused. Images already named by digest are kept. Images in
 other registries named by tag, such as `nginx:1` or `ghcr.io/acme/web:abc123`,
-are pinned to `<image>@sha256:<digest>` too, read without credentials; a tag
-that does not exist, or an image the registry shows only with credentials, is
-refused with `400` (see [container registries](operations.md#container-registries)).
+are pinned to `<image>:<tag>@sha256:<digest>` too, read without credentials; a
+tag that does not exist, or an image the registry shows only with credentials,
+is refused with `400` (see [container registries](operations.md#container-registries)).
+An image in another registry named by both tag and digest is stored without
+its tag, since only images pinned from a public tag keep one.
 Images built from other resources' outputs are not pinned; an ECR image built
 from them is refused, since it cannot be pinned before the deployment runs.
 
@@ -1689,7 +1691,8 @@ cloud account, which needs `s3:GetObjectVersion` on it. It also checks that
 every image its workloads name by digest in Amazon ECR is still in its
 repository (`ecr:DescribeImages`), and that every image they name by digest in
 another registry still exists, where the registry shows it without
-credentials. If one is gone, as when a replay names a
+credentials. An image pinned from a public tag must still be shown without
+credentials; one named by digest that needs them is not checked. If one is gone, as when a replay names a
 version or digest that was deleted, the workload fails naming the artifact or
 image, every other resource is left `pending`, and the deployment fails with
 nothing changed. Checks that fail in a way that may pass are retried like

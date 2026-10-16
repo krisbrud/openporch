@@ -107,7 +107,7 @@ impl OciImage {
                     })
                     && part.as_bytes()[0].is_ascii_alphanumeric()
             })
-            && valid_host(&host);
+            && valid_registry_host(&host);
         if !valid {
             return None;
         }
@@ -135,6 +135,15 @@ impl OciImage {
         format!("{}@{digest}", self.name)
     }
 
+    /// The image pinned to `digest`, keeping the name and tag it was given,
+    /// which marks it as pinned from a public tag.
+    pub fn tagged_at(&self, digest: &str) -> String {
+        match &self.reference {
+            Reference::Tag(tag) => format!("{}:{tag}@{digest}", self.name),
+            Reference::Digest(_) => self.at(digest),
+        }
+    }
+
     /// The host the registry's API answers on.
     fn api_host(&self) -> &str {
         if self.host == DOCKER_HUB {
@@ -152,6 +161,14 @@ impl std::fmt::Display for OciImage {
             Reference::Digest(digest) => write!(f, "{}@{digest}", self.name),
         }
     }
+}
+
+/// Whether `image` names a tag before its digest, as images pinned from a
+/// public tag do.
+pub fn pinned_from_tag(image: &str) -> bool {
+    image
+        .split_once('@')
+        .is_some_and(|(named, _)| named.rsplit('/').next().is_some_and(|l| l.contains(':')))
 }
 
 /// What looking an image up found.
@@ -219,7 +236,7 @@ impl reqwest::dns::Resolve for PublicOnly {
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -229,6 +246,9 @@ fn is_public(ip: IpAddr) -> bool {
                 || a == 0
                 || (a == 100 && (64..128).contains(&b))
                 || (a == 198 && (b == 18 || b == 19))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 88 && c == 99)
+                || v4.is_multicast()
                 || a >= 240)
         }
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -253,10 +273,13 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether `host` is `name[:port]` or `[ipv6][:port]`.
-fn valid_host(host: &str) -> bool {
+/// Whether `host` is `name[:port]` or `[ipv6][:port]`, with a port from 1
+/// to 65535.
+pub fn valid_registry_host(host: &str) -> bool {
     let port_ok = |port: Option<&str>| {
-        port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        port.is_none_or(|p| {
+            p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|p| p > 0)
+        })
     };
     if let Some(rest) = host.strip_prefix('[') {
         let Some((address, after)) = rest.split_once(']') else {

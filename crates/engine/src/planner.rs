@@ -37,6 +37,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cloud::{EcrDigest, EcrImage, S3Object, S3Version, in_ecr, pinned_image};
+use crate::registry::{OciImage, pinned_from_tag};
 
 mod deprovision;
 mod log;
@@ -897,6 +898,15 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     continue;
                 };
                 if pinned_image(&image) {
+                    // A tag kept before the digest marks an image pinned
+                    // here from a public tag, whose digest must stay readable;
+                    // one named by digest outside ECR drops its tag.
+                    let image = match OciImage::parse(&image) {
+                        Some(parsed) if !in_ecr(&image) && pinned_from_tag(&image) => {
+                            parsed.to_string()
+                        }
+                        _ => image,
+                    };
                     if image != named {
                         pinned
                             .entry(node.descriptor.clone())
