@@ -429,7 +429,8 @@ fn recover_uncertain(
             return;
         };
         let mut pending = restored;
-        for delay in RESTORE_RETRIES {
+        let mut waits = RESTORE_RETRIES.iter();
+        loop {
             let mut left = Vec::new();
             for op in pending {
                 if !recover_one(&state, &op, "restore").await {
@@ -437,10 +438,10 @@ fn recover_uncertain(
                 }
             }
             pending = left;
-            if pending.is_empty() {
-                break;
+            match waits.next() {
+                Some(wait) if !pending.is_empty() => tokio::time::sleep(*wait).await,
+                _ => break,
             }
-            tokio::time::sleep(*delay).await;
         }
         if let Err(e) = std::fs::remove_file(&marker)
             && e.kind() != std::io::ErrorKind::NotFound

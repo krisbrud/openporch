@@ -86,10 +86,48 @@ pub async fn backup(config: &Config, dest: &Path) -> Result<Manifest, BackupErro
         )));
     }
     let ownership = Ownership::acquire(&config.data_dir)?;
+    let created = !dest.exists();
     prepare_empty(dest)?;
+    // What a failed backup wrote is removed, so the directory can be reused.
+    let taken = take(config, &ownership, dest).await;
+    if taken.is_err() && created {
+        let _ = std::fs::remove_dir_all(dest);
+    } else if taken.is_err()
+        && let Ok(entries) = std::fs::read_dir(dest)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let _ = if path.is_dir() && !path.is_symlink() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+    taken
+}
+
+async fn take(
+    config: &Config,
+    ownership: &Ownership,
+    dest: &Path,
+) -> Result<Manifest, BackupError> {
+    // Paths are compared as the file system resolves them, so a file the
+    // configuration spells differently is still left out.
+    let data_dir = canonical(&config.data_dir)?;
+    let tofu_root = tofu_root(config);
+    let dest_dir = canonical(dest)?;
+    if dest_dir.starts_with(&data_dir)
+        || std::fs::canonicalize(&tofu_root).is_ok_and(|root| dest_dir.starts_with(root))
+    {
+        return Err(BackupError(format!(
+            "{} is inside the installation; back it up somewhere else",
+            dest.display()
+        )));
+    }
     let data = dest.join(DATA);
     create_private_dir(&data)?;
-    let copy = openporch_store::copy_database(&ownership, &data.join("openporch.db")).await?;
+    let copy = openporch_store::copy_database(ownership, &data.join("openporch.db")).await?;
     let org = copy.org.clone().unwrap_or_else(|| config.org.clone());
     if org != config.org {
         return Err(BackupError(format!(
@@ -97,9 +135,8 @@ pub async fn backup(config: &Config, dest: &Path) -> Result<Manifest, BackupErro
             config.org
         )));
     }
-    let tofu_root = tofu_root(config);
-    let skip = skipped(config, &tofu_root);
-    copy_tree(&config.data_dir, &data, &|p| skip.iter().any(|s| s == p))?;
+    let skip = skipped(config, &data_dir, &tofu_root);
+    copy_tree(&data_dir, &data, &|p| skip.iter().any(|s| s == p))?;
     let state = tofu_root.join("state");
     if state.is_dir() {
         copy_tree(&state, &dest.join(OPENTOFU_STATE), &|_| false)?;
@@ -163,11 +200,8 @@ pub async fn restore(config: &Config, from: &Path) -> Result<Manifest, BackupErr
         prepare_empty(&state)?;
     }
     let _ownership = Ownership::acquire(&config.data_dir)?;
-    let lock = config.data_dir.join("openporch.lock");
-    copy_tree(&data, &config.data_dir, &|p| p == lock)?;
-    if tofu_state.is_dir() {
-        copy_tree(&tofu_state, &state, &|_| false)?;
-    }
+    // The marker comes first: a restore that fails halfway still starts
+    // read-only and observes whatever it restored.
     write_json(
         &config.data_dir.join(RESTORE_MARKER),
         &serde_json::json!({
@@ -176,6 +210,10 @@ pub async fn restore(config: &Config, from: &Path) -> Result<Manifest, BackupErr
             "backup_version": manifest.version,
         }),
     )?;
+    copy_tree(&data, &config.data_dir, &|_| false)?;
+    if tofu_state.is_dir() {
+        copy_tree(&tofu_state, &state, &|_| false)?;
+    }
     Ok(manifest)
 }
 
@@ -207,11 +245,10 @@ fn state_backend(config: &Config) -> String {
 /// the master key and the bootstrap token, which are credentials; and the
 /// OpenTofu root, whose state is copied on its own and whose runs and plugin
 /// cache are rebuilt.
-fn skipped(config: &Config, tofu_root: &Path) -> Vec<PathBuf> {
-    let dir = &config.data_dir;
+fn skipped(config: &Config, dir: &Path, tofu_root: &Path) -> Vec<PathBuf> {
     let mut pending = config.bootstrap_token_path().into_os_string();
     pending.push(".pending");
-    vec![
+    let paths = [
         dir.join("openporch.db"),
         dir.join("openporch.db-wal"),
         dir.join("openporch.db-shm"),
@@ -222,7 +259,16 @@ fn skipped(config: &Config, tofu_root: &Path) -> Vec<PathBuf> {
         config.bootstrap_token_path(),
         pending.into(),
         tofu_root.to_owned(),
-    ]
+    ];
+    // A path that does not exist is never met while copying.
+    paths
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect()
+}
+
+fn canonical(path: &Path) -> Result<PathBuf, BackupError> {
+    std::fs::canonicalize(path).map_err(io(format!("resolving {}", path.display())))
 }
 
 /// Creates `dir` with owner-only permissions unless it exists; refuses one
@@ -233,6 +279,9 @@ fn prepare_empty(dir: &Path) -> Result<(), BackupError> {
             if entries.next().is_some() {
                 return Err(BackupError(format!("{} is not empty", dir.display())));
             }
+            #[cfg(unix)]
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .map_err(io(format!("restricting {}", dir.display())))?;
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_dir(dir),

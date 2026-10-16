@@ -252,7 +252,8 @@ openporch backup --config /etc/openporch/openporch.toml /backups/2026-10-16
 ```
 
 It refuses while the server runs, since the database and the state files must
-match. The backup directory, readable by its owner only, holds:
+match, and refuses a destination inside the data directory or the OpenTofu
+root. A backup that fails removes what it wrote. The backup directory, readable by its owner only, holds:
 
 - `backup.json`, the manifest: when and by which version it was taken, the
   schema version, the organization, the number of active resources, where
@@ -287,7 +288,7 @@ openporch restore --config /etc/openporch/openporch.toml /backups/2026-10-16
 
 Put the master key back where the configuration expects it, then start the
 server. A restored server starts read-only: until the driver of every
-resource the backup records has observed it, `/healthz` reports
+resource the backup records as provisioned has observed it, `/healthz` reports
 `restore_reconciling` and every change is refused with `503` `SRV-002`, while
 reads keep working. Each resource is then:
 
@@ -307,6 +308,10 @@ changes, and that resource stays blocked until `POST .../recover` observes it.
 The audit log records each observation as `resource.recover` with reason
 `restore`. Without the master keys the server is not ready at all; the
 restored resources are observed on the first start that has them.
+Resources the backup records as being deleted are not observed: the next
+deployment deletes them, which a resource already gone does not fail. A
+restore that fails halfway leaves the data directory marked, so a start still
+observes what it restored; empty the directory before restoring again.
 
 A backup only knows what existed when it was taken. Resources created after
 it are not in the restored records, and a deployment that needs them again

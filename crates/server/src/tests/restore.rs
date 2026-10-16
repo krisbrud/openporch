@@ -214,6 +214,26 @@ async fn backup_and_restore_drill() {
         std::fs::create_dir_all(tofu.join(file).parent().unwrap()).unwrap();
         std::fs::write(tofu.join(file), body).unwrap();
     }
+    // Not inside the installation, and the master key is left out however
+    // the configuration spells its path.
+    let inside = old.path().join("backups");
+    let err = backup::backup(&config(old.path()), &inside)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("inside the installation"), "{err}");
+    assert!(!inside.exists());
+    #[cfg(unix)]
+    {
+        let link = backups.path().join("link");
+        std::os::unix::fs::symlink(old.path(), &link).unwrap();
+        let mut spelled = config(&link);
+        spelled.master_key_file = Some(old.path().join("master.key"));
+        let other = backups.path().join("spelled");
+        backup::backup(&spelled, &other).await.unwrap();
+        assert!(other.join("data/openporch.db").exists());
+        assert!(!other.join("data/master.key").exists());
+        assert!(!other.join("data/opentofu").exists());
+    }
     let manifest = backup::backup(&config(old.path()), &dest).await.unwrap();
     assert_eq!(manifest.state_backend, "local");
     assert!(dest.join("opentofu-state/0123/terraform.tfstate").exists());

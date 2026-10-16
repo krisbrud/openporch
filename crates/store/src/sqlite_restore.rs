@@ -103,13 +103,16 @@ impl SqliteStore {
     /// provisioning recorded its inputs, and returns them to be observed.
     /// Operations an earlier start marked and nobody resolved are returned
     /// again. A resource with an operation already open is left to that
-    /// operation's recovery; one never provisioned has nothing to observe.
+    /// operation's recovery; one never provisioned has nothing to observe;
+    /// one being deleted is deleted by the next deployment, which a resource
+    /// already gone does not fail.
     pub async fn mark_restored(&self) -> Result<Vec<UncertainOperation>> {
         let mut tx = self.begin().await?;
         let now = crate::now_ms();
         let resources: Vec<(String, String, String, String, String)> = sqlx::query_as(
             "SELECT guresid, app_id, env_id, descriptor, status FROM active_resources \
-             WHERE org_id = ? ORDER BY app_id, env_id, descriptor",
+             WHERE org_id = ? AND cleanup_pending = 0 AND status != 'deletion_failed' \
+             ORDER BY app_id, env_id, descriptor",
         )
         .bind(self.org())
         .fetch_all(&mut *tx)
