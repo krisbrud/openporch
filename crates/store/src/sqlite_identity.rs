@@ -126,7 +126,8 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Resolves an unexpired, unrevoked token hash to its principal and records the use.
+    /// Resolves an unexpired, unrevoked token hash to its principal and records the
+    /// use, at most once a minute and not while the database is busy.
     fn authenticate_token(
         &self,
         org: &str,

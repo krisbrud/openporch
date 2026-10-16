@@ -294,7 +294,7 @@ Authorization: Bearer $LEAD_TOKEN
 ## Tokens
 
 A token is returned only by the request that creates it. Listing and reading show
-its metadata and when it was last used, to within a minute. Revoking it takes
+its metadata and when it was last used, roughly to the minute. Revoking it takes
 effect on the next request:
 
 ```http

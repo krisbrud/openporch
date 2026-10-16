@@ -1076,3 +1076,28 @@ async fn a_checkpoint_replaces_the_resources_pin_in_its_deployment() {
     expected["pins"][DB] = json!({"commit": "b", "modules": {}, "lock": null});
     assert_eq!(after, expected);
 }
+
+#[tokio::test]
+async fn token_use_is_recorded_at_most_once_a_minute() {
+    use crate::sqlite_identity::IdentityStore;
+    let f = Fixture::new().await;
+    sqlx::query(
+        "INSERT INTO api_tokens (org_id, principal_id, id, token_hash, created_at, created_by) \
+         VALUES ('acme', 'ci', 'deploy', 'hash', 0, 'alice')",
+    )
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let used = async |now: i64| {
+        let p = f.store.authenticate_token(ORG, "hash", now).await.unwrap();
+        assert_eq!(p.unwrap().id, "ci");
+        sqlx::query_scalar::<_, Option<i64>>("SELECT last_used_at FROM api_tokens")
+            .fetch_one(f.store.pool())
+            .await
+            .unwrap()
+    };
+    let t = 1_000_000;
+    assert_eq!(used(t).await, Some(t));
+    assert_eq!(used(t + 59_999).await, Some(t));
+    assert_eq!(used(t + 60_000).await, Some(t + 60_000));
+}

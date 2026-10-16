@@ -479,10 +479,6 @@ async fn tokens_are_shown_once_and_revocable() {
     let (_, info) = s.get("/orgs/acme/users/ci/tokens/deploy", &s.admin).await;
     assert!(info.get("token").is_none(), "{info}");
     assert!(info["last_used_at"].is_i64(), "{info}");
-    // Use within a minute is not written again.
-    assert_eq!(s.get("/orgs/acme/current-user", &token).await.1["id"], "ci");
-    let (_, again) = s.get("/orgs/acme/users/ci/tokens/deploy", &s.admin).await;
-    assert_eq!(again["last_used_at"], info["last_used_at"]);
     let (_, list) = s.get("/orgs/acme/users/ci/tokens", &s.admin).await;
     assert!(list.to_string().find(&token).is_none());
 
