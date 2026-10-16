@@ -123,36 +123,46 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 // stays busy it is refused and can be repeated.
                 let permit =
                     tokio::time::timeout(PERMIT_WAIT, self.permits.clone().acquire_owned()).await;
-                let Ok(Ok(_permit)) = permit else {
+                let Ok(Ok(permit)) = permit else {
                     return Err(RecoverError::Observation(
                         "every driver slot is busy; try the recovery again later".into(),
                     ));
                 };
                 let span = super::operation_span(&job, "observe");
-                let (started, running) = (
-                    tokio::time::Instant::now(),
-                    crate::metrics::METRICS.driver_started(),
-                );
                 let executor = self.executor.clone();
-                // A panicking observation leaves the outcome as unknown as before.
-                let observed = tokio::spawn(
-                    async move { executor.observe(job, deleting).await }.instrument(span.clone()),
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    // A panic message could hold a secret, so it is not logged.
-                    span.in_scope(|| {
+                // The observation runs in its own task, which holds the
+                // driver slot and is counted until the driver returns, even
+                // when the request that started it goes away. A panic leaves
+                // the outcome as unknown as before.
+                let observing = async move {
+                    let _permit = permit;
+                    let started = tokio::time::Instant::now();
+                    let running = crate::metrics::METRICS.driver_started();
+                    let observed = tokio::spawn(
+                        async move { executor.observe(job, deleting).await }.in_current_span(),
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        // A panic message could hold a secret, so it is not logged.
                         tracing::error!(
                             panicked = e.is_panic(),
                             "the executor stopped unexpectedly"
                         );
+                        Err(ExecFailure::Uncertain(
+                            "the executor stopped unexpectedly while observing the resource".into(),
+                        ))
                     });
-                    Err(ExecFailure::Uncertain(
-                        "the executor stopped unexpectedly while observing the resource".into(),
-                    ))
-                });
-                drop(running);
-                span.in_scope(|| super::log_outcome("observe", started, &observed));
+                    drop(running);
+                    super::log_outcome("observe", started, &observed);
+                    observed
+                };
+                let observed = tokio::spawn(observing.instrument(span))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ExecFailure::Uncertain(
+                            "the executor stopped unexpectedly while observing the resource".into(),
+                        ))
+                    });
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
                     Ok(Observed::Absent { .. }) if deleting => (
