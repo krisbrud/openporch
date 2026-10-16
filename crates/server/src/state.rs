@@ -9,6 +9,7 @@ use std::time::Duration;
 use openporch_drivers::DriverRegistry;
 use openporch_engine::executor::LocalExecutor;
 use openporch_engine::planner::{Limits, PermitCheck, Planner};
+use openporch_engine::registry::HttpRegistry;
 use openporch_store::secrets::{BuiltinSecretStore, Keyring, MasterKey, Sealed, SecretError};
 use openporch_store::{
     AuditIntent, IdentityStore, Ownership, SqliteStore, Store, StoreError, UncertainOperation,
@@ -343,8 +344,20 @@ pub async fn start_with(
         changes_done: tokio::sync::Notify::new(),
     }));
     prune_sessions(&state);
+    // Images are not left unpinned because the registry client failed.
+    let images = &state.config.images;
+    let image_registry = if images.pin_other_registries {
+        let registry = HttpRegistry::new(
+            images.insecure_registries.iter().cloned(),
+            images.private_registries.iter().cloned(),
+        )
+        .map_err(|e| StartupError::Io(format!("the container registry client: {e}")))?;
+        Some(Arc::new(registry))
+    } else {
+        None
+    };
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {
-        run_deployments(&state, keyring);
+        run_deployments(&state, keyring, image_registry);
         recover_uncertain(&state, report.uncertain);
     }
     Ok(state)
@@ -407,7 +420,11 @@ fn recover_uncertain(state: &AppState, uncertain: Vec<UncertainOperation>) {
 /// Runs accepted deployments with the built-in drivers and the OpenTofu
 /// driver, in this process. Without the master keys nothing is accepted, so
 /// nothing runs.
-fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
+fn run_deployments(
+    state: &AppState,
+    keyring: Arc<Keyring>,
+    image_registry: Option<Arc<HttpRegistry>>,
+) {
     let tofu = state.config.opentofu();
     let backend = tofu.state.location();
     let registry = Arc::new(DriverRegistry::with_builtins().with_opentofu(tofu));
@@ -419,7 +436,7 @@ fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
         keyring.clone(),
         state.org(),
     ));
-    let executor = LocalExecutor::new(
+    let mut executor = LocalExecutor::new(
         Arc::new(store.clone()),
         registry,
         secrets,
@@ -427,6 +444,9 @@ fn run_deployments(state: &AppState, keyring: Arc<Keyring>) {
         state.cloud.clone(),
         checks.clone(),
     );
+    if let Some(image_registry) = image_registry {
+        executor = executor.with_registry(image_registry);
+    }
     let configured = &state.config.limits;
     let limits = Limits {
         concurrency: configured.driver_concurrency,

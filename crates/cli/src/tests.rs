@@ -34,6 +34,7 @@ impl DevServer {
     async fn start(github: Option<&str>) -> Self {
         let data = tempfile::tempdir().unwrap();
         let mut config = openporch_server::Config::new("acme", data.path());
+        config.images.pin_other_registries = false;
         config.github = github.map(|base| openporch_server::config::GithubConfig {
             client_id: "Iv1.cli-test".into(),
             api_url: base.to_owned(),

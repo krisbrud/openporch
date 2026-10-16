@@ -52,6 +52,42 @@ pub struct Config {
     /// Audit log retention.
     #[serde(default)]
     pub audit: AuditSettings,
+    /// Container registries other than ECR.
+    #[serde(default)]
+    pub images: ImageSettings,
+}
+
+/// How images in registries other than ECR are pinned and checked.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageSettings {
+    /// Pin images named by tag to their digests at acceptance, and check
+    /// pinned digests before a deployment runs, reading the registries
+    /// without credentials.
+    #[serde(default = "default_true")]
+    pub pin_other_registries: bool,
+    /// Registries (`host[:port]`) reached over plain HTTP rather than HTTPS,
+    /// such as a local test registry. They may be on private addresses.
+    #[serde(default)]
+    pub insecure_registries: Vec<String>,
+    /// Registries (`host[:port]`) read over HTTPS on loopback, private or
+    /// link-local addresses, which no other registry is read on.
+    #[serde(default)]
+    pub private_registries: Vec<String>,
+}
+
+impl Default for ImageSettings {
+    fn default() -> Self {
+        Self {
+            pin_other_registries: true,
+            insecure_registries: Vec::new(),
+            private_registries: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The longest audit retention a server accepts: a hundred years.
@@ -394,6 +430,7 @@ impl Config {
             opentofu: OpenTofuSettings::default(),
             limits: WorkLimits::default(),
             audit: AuditSettings::default(),
+            images: ImageSettings::default(),
         }
     }
 
@@ -469,6 +506,18 @@ impl Config {
             return Err(ConfigError(format!(
                 "`audit.retention_days` must be between 1 and {MAX_RETENTION_DAYS}"
             )));
+        }
+        for (name, hosts) in [
+            ("insecure_registries", &self.images.insecure_registries),
+            ("private_registries", &self.images.private_registries),
+        ] {
+            for host in hosts {
+                if !openporch_engine::registry::valid_registry_host(host) {
+                    return Err(ConfigError(format!(
+                        "`images.{name}` entry `{host}` is not `host[:port]`"
+                    )));
+                }
+            }
         }
         if !self.listen.ip().is_loopback() && !self.tls_terminated_by_proxy {
             return Err(ConfigError(format!(
@@ -627,6 +676,46 @@ mod tests {
         let e = load("[audit]\nretention_days = 0\n").unwrap_err();
         assert!(e.to_string().contains("audit.retention_days"), "{e}");
         assert!(load("[audit]\nkeep = true\n").is_err());
+    }
+
+    #[test]
+    fn image_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openporch.toml");
+        let load = |text: &str| {
+            std::fs::write(&path, format!("org = \"acme\"\ndata_dir = \"/x\"\n{text}")).unwrap();
+            Config::load(Some(&path), |_| None)
+        };
+        let c = load("").unwrap();
+        assert!(c.images.pin_other_registries);
+        assert!(c.images.insecure_registries.is_empty());
+        let c = load(
+            "[images]\npin_other_registries = false\ninsecure_registries = [\"localhost:5000\"]\n",
+        )
+        .unwrap();
+        assert!(!c.images.pin_other_registries);
+        assert_eq!(c.images.insecure_registries, ["localhost:5000"]);
+        let e = load("[images]\ninsecure_registries = [\"http://r\"]\n").unwrap_err();
+        assert!(e.to_string().contains("images.insecure_registries"), "{e}");
+        let c = load("[images]\nprivate_registries = [\"r.internal:5000\", \"[fd00::1]:443\"]\n");
+        assert_eq!(
+            c.unwrap().images.private_registries,
+            ["r.internal:5000", "[fd00::1]:443"]
+        );
+        for bad in [
+            "r:port",
+            "r:70000",
+            "r:0",
+            "[fd00::1",
+            "[nope]:5000",
+            ":5000",
+        ] {
+            let e = load(&format!("[images]\nprivate_registries = [\"{bad}\"]\n")).unwrap_err();
+            assert!(
+                e.to_string().contains("images.private_registries"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]

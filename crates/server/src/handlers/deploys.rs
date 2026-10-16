@@ -14,8 +14,9 @@ use openporch_core::canonical::to_canonical_string;
 use openporch_core::catalog::{ClassRegistry, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
-use openporch_engine::cloud::{EcrImage, S3Version, pinned_image};
+use openporch_engine::cloud::{EcrImage, S3Version, in_ecr, pinned_image};
 use openporch_engine::planner::PinError;
+use openporch_engine::registry::{OciImage, Reference, pinned_from_tag};
 use openporch_store::{
     Acceptance, CatalogStore, DeploymentKind, DeploymentRecord, DeploymentRequest,
     DeploymentStatus, EnvRecord, LogLine, Store, StoreError, ValueStore,
@@ -517,16 +518,22 @@ async fn pin_artifacts(state: &AppState, env: &EnvRecord, snapshot: &mut Value) 
     Ok(())
 }
 
-/// Pins the ECR images the snapshot's workloads name by tag to their
-/// digests, in the snapshot's graph, as [`pin_artifacts`] does for artifacts.
-/// Images in other registries are not pinned.
+/// Pins the images the snapshot's workloads name by tag to their digests, in
+/// the snapshot's graph, as [`pin_artifacts`] does for artifacts. Images in
+/// registries other than ECR are pinned only when `images.pin_other_registries`
+/// is set.
 async fn pin_images(state: &AppState, env: &EnvRecord, snapshot: &mut Value) -> ApiResult<()> {
-    // Tags in ECR, malformed digests and images that may resolve to either.
+    let elsewhere = state.config.images.pin_other_registries;
+    // Tags, malformed digests and images that may resolve to either.
     let image = |v: &Value| {
         v.as_str().is_some_and(|i| {
             EcrImage::parse(i).is_some()
                 || i.contains("${")
                 || (i.contains('@') && !pinned_image(i))
+                || (elsewhere
+                    && OciImage::parse(i).is_some_and(|o| matches!(o.reference, Reference::Tag(_))))
+                // A tag before a digest outside ECR is dropped.
+                || (elsewhere && pinned_image(i) && !in_ecr(i) && pinned_from_tag(i))
         })
     };
     let unpinned = snapshot["graph"]["nodes"]

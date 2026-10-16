@@ -105,7 +105,8 @@ impl Sts for ArtifactSts {
 /// account `aws-dev`.
 async fn server_with_s3(sts: Arc<ArtifactSts>) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let config = crate::Config::new("acme", dir.path());
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     let state = crate::start_with(config, None, sts).await.unwrap();
     let s = server_from(dir, state);
     s.static_account("aws-dev").await;
@@ -734,7 +735,7 @@ async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
         containers["web"]["image"],
         format!("{ECR}/web@sha256:{}", "1".repeat(64))
     );
-    // Another registry's image is not pinned.
+    // With `pin_other_registries` off, another registry's image is not pinned.
     assert_eq!(containers["sidecar"]["image"], "nginx:1");
     // The set keeps the tag it was given.
     let (_, set) = s
@@ -776,6 +777,167 @@ async fn ecr_image_tags_are_pinned_to_digests_at_acceptance() {
             && error.contains("no longer exists"),
         "{replay}"
     );
+}
+
+/// A registry without authentication: `web:1` is at a digest of ones until
+/// it is deleted, and `private` answers only with credentials.
+/// A registry whose `web` repository is served while `state` is `public`,
+/// needs credentials when it is `private` and is gone when it is `deleted`.
+async fn fake_registry() -> (String, Arc<Mutex<&'static str>>) {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    let state = Arc::new(Mutex::new("public"));
+    async fn manifest(
+        State(state): State<Arc<Mutex<&'static str>>>,
+        Path((repository, reference)): Path<(String, String)>,
+    ) -> axum::response::Response {
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let state = *state.lock().unwrap();
+        match repository.as_str() {
+            "web" if state == "private" => StatusCode::UNAUTHORIZED.into_response(),
+            "web" if state == "public" && (reference == "1" || reference == digest) => {
+                ([("docker-content-digest", digest)], "{}").into_response()
+            }
+            "private" => StatusCode::UNAUTHORIZED.into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    let app = axum::Router::new()
+        .route(
+            "/v2/{repository}/manifests/{reference}",
+            axum::routing::get(manifest),
+        )
+        .with_state(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (host, state)
+}
+
+#[tokio::test]
+async fn images_in_other_registries_are_pinned_and_checked() {
+    let (registry, registry_state) = fake_registry().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.insecure_registries = vec![registry.clone()];
+    let s = server_from(dir, crate::start(config, None).await.unwrap());
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": "openporch/none", "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let deploy = |image: String| {
+        let s = &s;
+        async move {
+            let doc = "apiVersion: openporch.dev/v1\nkind: Workload\nmetadata: {name: web}\n\
+                       containers: {web: {image: \".\"}}\n";
+            let (st, delta) = s
+                .post(
+                    &format!("{APP}/deltas"),
+                    &s.admin,
+                    json!({"env": "development", "workload": doc,
+                           "overrides": {"images": {"web": image}}}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{delta}");
+            s.post(
+                &format!("{APP}/envs/development/deploys"),
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": delta["base_generation"]}),
+            )
+            .await
+        }
+    };
+
+    // A tag that does not exist, or one the registry hides without
+    // credentials, is refused before anything is accepted.
+    let (st, b) = deploy(format!("{registry}/web:2")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("does not exist"),
+        "{b}"
+    );
+    let (st, b) = deploy(format!("{registry}/private:1")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("name it by digest"),
+        "{b}"
+    );
+
+    let hex = "1".repeat(64);
+    let image_of = async |id: &str| {
+        let snapshot = s
+            .state
+            .store
+            .deployment_snapshot("acme", "shop", "development", id)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot["graph"]["nodes"]["workload.default#modules.web"]["params"]["spec"]["containers"]
+            ["web"]["image"]
+            .clone()
+    };
+
+    // A private image named by digest drops any tag and is not checked.
+    let (st, d) = deploy(format!("{registry}/private:1@sha256:{hex}")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let d = s
+        .finished_at(&format!("{APP}/envs/development/deploys/{id}"))
+        .await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    assert_eq!(
+        image_of(&id).await,
+        format!("{registry}/private@sha256:{hex}")
+    );
+
+    // A public tag is pinned to its digest in the snapshot, keeping the tag.
+    let (st, d) = deploy(format!("{registry}/web:1")).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let d = s
+        .finished_at(&format!("{APP}/envs/development/deploys/{id}"))
+        .await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let pinned = format!("{registry}/web:1@sha256:{hex}");
+    assert_eq!(image_of(&id).await, pinned);
+
+    // The repository turns private, then the digest is deleted: each time a
+    // replay fails before anything runs, naming the image.
+    for (state, why) in [
+        ("private", "no longer shows it without credentials"),
+        ("deleted", "no longer exists"),
+    ] {
+        *registry_state.lock().unwrap() = state;
+        let (_, env) = s.get(&format!("{APP}/envs/development"), &s.admin).await;
+        let (st, replay) = s
+            .post(
+                &format!("{APP}/envs/development/deploys"),
+                &s.admin,
+                json!({"deploy_id": id, "replay": "snapshot",
+                       "expected_generation": env["generation"]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{replay}");
+        let replay = s
+            .finished_at(&format!(
+                "{APP}/envs/development/deploys/{}",
+                replay["id"].as_str().unwrap()
+            ))
+            .await;
+        assert_eq!(replay["status"], "failed", "{replay}");
+        let error = replay["error"].to_string();
+        assert!(
+            error.contains(&format!("image `{pinned}`")) && error.contains(why),
+            "{state}: {replay}"
+        );
+    }
 }
 
 const ORDER_WORKER: &str = include_str!("../../../../examples/lambda-order-worker/workload.yaml");
@@ -1135,6 +1297,7 @@ async fn stopping_and_restarting_the_server_deletes_nothing() {
 async fn an_application_larger_than_the_server_is_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
     config.limits.running_deployments = 2;
     let s = super::server_with(dir, config).await;
     s.app("shop").await;

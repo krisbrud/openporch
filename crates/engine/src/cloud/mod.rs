@@ -129,6 +129,13 @@ pub enum CloudError {
     /// No credentials can stay valid for the whole operation.
     #[error("{0}")]
     Expiring(String),
+    /// The service is limiting requests; retry after `retry_after` when it
+    /// says how long to wait.
+    #[error("{message}")]
+    Throttled {
+        message: String,
+        retry_after: Option<Duration>,
+    },
 }
 
 /// An STS `AssumeRole` request.
@@ -433,7 +440,10 @@ impl fmt::Display for EcrDigest {
 /// which names the same content wherever it is pulled from.
 pub fn pinned_image(image: &str) -> bool {
     image.rsplit_once("@sha256:").is_some_and(|(name, hex)| {
-        !name.is_empty() && hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        !name.is_empty()
+            && !name.contains('@')
+            && hex.len() == 64
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })
 }
 
@@ -742,6 +752,13 @@ fn redacted(e: CloudError, credentials: &AwsCredentials) -> CloudError {
         CloudError::Rejected(m) => CloudError::Rejected(credentials.redact(&m)),
         CloudError::Unavailable(m) => CloudError::Unavailable(credentials.redact(&m)),
         CloudError::Expiring(m) => CloudError::Expiring(credentials.redact(&m)),
+        CloudError::Throttled {
+            message,
+            retry_after,
+        } => CloudError::Throttled {
+            message: credentials.redact(&message),
+            retry_after,
+        },
     }
 }
 

@@ -34,6 +34,7 @@ use crate::planner::{
     JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
     RedactingLog, SecretSource,
 };
+use crate::registry::{Lookup, OciImage, Reference, Registry, pinned_from_tag};
 
 /// The version of the sealed cookie format, bound into its associated data.
 const COOKIE_AAD: &str = "openporch-cookie:v1";
@@ -56,6 +57,9 @@ pub struct LocalExecutor<S> {
     keyring: Arc<Keyring>,
     cloud: Arc<CredentialResolver>,
     checks: Arc<dyn PermitCheck>,
+    /// Reads images in registries other than ECR; none when they are not
+    /// pinned or checked.
+    registry: Option<Arc<dyn Registry>>,
 }
 
 impl<S> std::fmt::Debug for LocalExecutor<S> {
@@ -90,7 +94,14 @@ where
             keyring,
             cloud,
             checks,
+            registry: None,
         }
+    }
+
+    /// Pins and checks images in registries other than ECR with `registry`.
+    pub fn with_registry(mut self, registry: Arc<dyn Registry>) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Everything a driver call needs, with the secrets the job uses read and
@@ -889,6 +900,103 @@ where
         }
     }
 
+    async fn pin_registry_image(
+        &self,
+        descriptor: Descriptor,
+        image: String,
+    ) -> Result<String, ExecFailure> {
+        let Some(registry) = &self.registry else {
+            return Ok(image);
+        };
+        // What is not a reference to a tag is left to the driver, as before.
+        let parsed = match OciImage::parse(&image) {
+            Some(parsed) if matches!(parsed.reference, Reference::Tag(_)) => parsed,
+            _ => return Ok(image),
+        };
+        match registry.lookup(&parsed).await {
+            Ok(Lookup::Found(digest)) if pinned_image(&parsed.tagged_at(&digest)) => {
+                Ok(parsed.tagged_at(&digest))
+            }
+            Ok(Lookup::Found(digest)) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{descriptor}` has digest `{digest}`, which is not a sha256 \
+                 digest"
+            ))),
+            Ok(Lookup::Missing) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{descriptor}` does not exist in registry `{}`",
+                parsed.host
+            ))),
+            Ok(Lookup::Private) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{descriptor}` cannot be read without credentials, so its \
+                 tag cannot be pinned; name it by digest as `<image>@sha256:<digest>`"
+            ))),
+            Ok(Lookup::Unlisted) => Err(ExecFailure::Permanent(format!(
+                "image `{image}` of `{descriptor}` is in registry `{}` on a private address, so \
+                 its tag cannot be pinned; list the registry in `images.private_registries`, or \
+                 name the image by digest as `<image>@sha256:<digest>`",
+                parsed.host
+            ))),
+            Ok(Lookup::Unresolved) => Err(ExecFailure::Retryable {
+                error: format!(
+                    "registry `{}` of image `{image}` does not resolve",
+                    parsed.host
+                ),
+                retry_after: None,
+            }),
+            Err(e) => Err(cloud_failure(e)),
+        }
+    }
+
+    async fn check_registry_images(
+        &self,
+        descriptor: Descriptor,
+        images: Vec<String>,
+    ) -> Result<(), ExecFailure> {
+        let Some(registry) = &self.registry else {
+            return Ok(());
+        };
+        for named in &images {
+            let Some(image) = OciImage::parse(named) else {
+                continue;
+            };
+            if !matches!(image.reference, Reference::Digest(_)) {
+                continue;
+            }
+            match registry.lookup(&image).await {
+                Ok(Lookup::Found(_)) => {}
+                // One pinned here from a public tag must stay readable.
+                Ok(Lookup::Private | Lookup::Unlisted) if pinned_from_tag(named) => {
+                    return Err(ExecFailure::Permanent(format!(
+                        "image `{named}` of `{descriptor}` was pinned from a public tag, but its \
+                         registry no longer shows it without credentials; nothing changed"
+                    )));
+                }
+                // One named by digest that needs credentials, or is in a
+                // registry on a private address not listed, is not checked
+                // here.
+                Ok(Lookup::Private | Lookup::Unlisted) => {}
+                Ok(Lookup::Unresolved) if pinned_from_tag(named) => {
+                    return Err(ExecFailure::Retryable {
+                        error: format!(
+                            "registry `{}` of image `{named}` of `{descriptor}` does not resolve",
+                            image.host
+                        ),
+                        retry_after: None,
+                    });
+                }
+                // One named by digest in a registry the server cannot resolve
+                // is left to its driver.
+                Ok(Lookup::Unresolved) => {}
+                Ok(Lookup::Missing) => {
+                    return Err(ExecFailure::Permanent(format!(
+                        "image `{named}` of `{descriptor}` no longer exists; nothing changed"
+                    )));
+                }
+                Err(e) => return Err(cloud_failure(e)),
+            }
+        }
+        Ok(())
+    }
+
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
         let mut log = job.job.log.redacting();
         // The planner logs the failure it records.
@@ -1150,6 +1258,13 @@ fn cloud_failure(e: CloudError) -> ExecFailure {
         CloudError::Unavailable(m) => ExecFailure::Retryable {
             error: m,
             retry_after: None,
+        },
+        CloudError::Throttled {
+            message,
+            retry_after,
+        } => ExecFailure::Retryable {
+            error: message,
+            retry_after,
         },
         CloudError::Invalid(m) | CloudError::Rejected(m) | CloudError::Expiring(m) => {
             ExecFailure::Permanent(m)
