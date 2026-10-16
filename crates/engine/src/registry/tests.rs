@@ -310,6 +310,8 @@ fn only_public_addresses_are_public() {
         "140.82.112.33",
         "2606:4700::1111",
         "::ffff:8.8.8.8",
+        "2a00:1450:4001::1",
+        "2002:0808:0808::1",
     ] {
         assert!(is_public(public.parse().unwrap()), "{public}");
     }
@@ -327,6 +329,12 @@ fn only_public_addresses_are_public() {
         "fd00::1",
         "fe80::1",
         "::ffff:169.254.169.254",
+        "fec0::1",
+        "2001:db8::1",
+        "2001::1",
+        "2002:0a00:0001::1",
+        "64:ff9b::a00:1",
+        "ff02::1",
     ] {
         assert!(!is_public(private.parse().unwrap()), "{private}");
     }

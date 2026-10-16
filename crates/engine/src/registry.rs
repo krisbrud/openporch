@@ -215,7 +215,7 @@ impl reqwest::dns::Resolve for PublicOnly {
 }
 
 /// Whether `ip` is a public address, rather than loopback, private,
-/// link-local, shared, unspecified or otherwise not routed.
+/// link-local, shared, unspecified or otherwise not globally routed.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -233,13 +233,21 @@ fn is_public(ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => is_public(IpAddr::V4(v4)),
+            // Global unicast only (2000::/3), less the documentation range,
+            // the special-purpose 2001::/23, and 6to4 addresses that wrap a
+            // non-public IPv4 address.
             None => {
-                let first = v6.segments()[0];
-                !(v6.is_loopback()
-                    || v6.is_unspecified()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-                    || v6.is_multicast())
+                let [first, second, third, ..] = v6.segments();
+                (first & 0xe000) == 0x2000
+                    && !(first == 0x2001 && second < 0x0200)
+                    && !(first == 0x2001 && second == 0x0db8)
+                    && (first != 0x2002
+                        || is_public(IpAddr::V4(std::net::Ipv4Addr::new(
+                            (second >> 8) as u8,
+                            second as u8,
+                            (third >> 8) as u8,
+                            third as u8,
+                        ))))
             }
         },
     }
