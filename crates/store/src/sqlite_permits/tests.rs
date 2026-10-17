@@ -441,3 +441,117 @@ async fn approval_requests_keep_the_latest_plan_per_resource() {
     let stored = f.store.approval_requests(ORG, "shop", "development").await;
     assert_eq!(stored.unwrap(), vec![request("fp-2")]);
 }
+
+/// The entries with `action`, oldest first.
+async fn entries(f: &Fixture, action: &str) -> Vec<crate::AuditEntry> {
+    let mut entries: Vec<_> = f
+        .store
+        .audit_entries(ORG, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.action == action)
+        .collect();
+    entries.reverse();
+    entries
+}
+
+#[tokio::test]
+async fn binding_and_using_a_permit_are_audited() {
+    let f = Fixture::new().await;
+    let permit = f.permit("delete", Some("fp-1")).await;
+    let issued = entries(&f, "test").await.pop().unwrap();
+    assert_eq!(
+        issued.target.as_deref(),
+        Some(&*format!("shop/development/{}", permit.plan))
+    );
+    let d = f.deploy(&[&permit.id], "digest-1").await.unwrap();
+
+    let target = format!("shop/development/{DB}");
+    let [bound] = &entries(&f, "permit.bind").await[..] else {
+        panic!("one binding");
+    };
+    assert_eq!(bound.actor_id.as_deref(), Some("ci"));
+    assert_eq!(bound.operation_id.as_deref(), Some(&*d));
+    assert_eq!(bound.outcome, "accepted");
+    assert_eq!(bound.target.as_deref(), Some(&*target));
+    assert_eq!(bound.reason.as_deref(), Some("delete"));
+    assert_eq!(bound.correlates.as_deref(), Some(&*issued.id));
+
+    f.use_in(&d, Some("fp-1")).await.unwrap();
+    // A retry uses the permit again without another entry.
+    f.use_in(&d, Some("fp-1")).await.unwrap();
+    let [used] = &entries(&f, "permit.use").await[..] else {
+        panic!("one use");
+    };
+    // The use is the deployment's: its requester, operation and path.
+    assert_eq!(used.actor_id.as_deref(), Some("ci"));
+    assert_eq!(used.operation_id.as_deref(), Some(&*d));
+    assert_eq!(used.path, bound.path);
+    assert_eq!(used.outcome, "succeeded");
+    assert_eq!(used.target.as_deref(), Some(&*target));
+    assert_eq!(used.reason.as_deref(), Some("delete"));
+    assert_eq!(used.correlates.as_deref(), Some(&*issued.id));
+
+    // An action no permit covers is recorded as denied, with the deployment.
+    f.use_in(&d, Some("fp-2")).await.unwrap_err();
+    let refused = entries(&f, "permit.use").await.pop().unwrap();
+    assert_eq!(refused.outcome, "denied");
+    assert_eq!(refused.reason.as_deref(), Some("approval_required"));
+    assert_eq!(refused.operation_id.as_deref(), Some(&*d));
+    assert_eq!(refused.actor_id.as_deref(), Some("ci"));
+    let accepted = entries(&f, "test")
+        .await
+        .into_iter()
+        .find(|e| e.operation_id.as_deref() == Some(&*d))
+        .unwrap();
+    assert_eq!(refused.correlates.as_deref(), Some(&*accepted.id));
+
+    // The deployment's outcome still correlates with its acceptance, not a
+    // binding.
+    f.finish(&d, None).await;
+    let finished = entries(&f, "deployment.finish").await.pop().unwrap();
+    assert_eq!(finished.correlates.as_deref(), Some(&*accepted.id));
+}
+
+#[tokio::test]
+async fn a_detach_audits_the_permit_it_uses() {
+    let f = Fixture::new().await;
+    sqlx::query(
+        "INSERT INTO active_resources (org_id, app_id, env_id, descriptor, guresid, status, \
+         last_deploy_id, created_at, updated_at) \
+         VALUES ('acme', 'shop', 'development', ?, 'g1', 'provisioned', 'd0', 0, 0)",
+    )
+    .bind(DB)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    let permit = f.permit("detach", None).await;
+    let issued = entries(&f, "test").await.pop().unwrap();
+    f.store
+        .detach_resource(
+            ORG,
+            "shop",
+            "development",
+            Detach {
+                descriptor: DB,
+                guresid: "g1",
+                reason: "moved to another tool",
+                permits: Some(std::slice::from_ref(&permit.id)),
+            },
+            audit("root"),
+        )
+        .await
+        .unwrap();
+    let [used] = &entries(&f, "permit.use").await[..] else {
+        panic!("one use");
+    };
+    assert_eq!(used.actor_id.as_deref(), Some("root"));
+    assert_eq!(used.outcome, "succeeded");
+    assert_eq!(used.reason.as_deref(), Some("detach"));
+    assert_eq!(
+        used.target.as_deref(),
+        Some(&*format!("shop/development/{DB}"))
+    );
+    assert_eq!(used.correlates.as_deref(), Some(&*issued.id));
+}
