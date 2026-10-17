@@ -11,6 +11,8 @@
 use std::collections::BTreeMap;
 
 use openporch_core::canonical::to_canonical_string;
+use openporch_core::graph::Node;
+use openporch_core::model::CloudAccount;
 use openporch_core::placeholder::SharedValue;
 use openporch_store::ActiveResource;
 use serde::Serialize;
@@ -67,6 +69,11 @@ pub struct DriverPlan {
     pub fingerprint: String,
     /// The planned actions on named objects.
     pub actions: Vec<(String, String)>,
+    /// The configuration digest of the resource it was planned for, when
+    /// known: once the configuration differs the plan lapses, and the driver
+    /// plans the change again when the deployment runs.
+    #[serde(skip)]
+    pub config_digest: Option<String>,
 }
 
 /// One resource in a preview.
@@ -91,18 +98,16 @@ pub struct Entry {
     pub permit_required: bool,
     /// The driver's plan from an earlier attempt, when one needed a permit.
     pub driver_plan: Option<DriverPlan>,
-    /// A digest of the resource's configuration as previewed; a permit for
-    /// the change binds only while the deployment's digest is the same.
+    /// A digest of the resource's configuration and of what the environment
+    /// recorded about it, its dependencies and its cloud account as
+    /// previewed; a permit for the change binds only while the deployment's
+    /// digest is the same.
     pub digest: String,
 }
 
-/// A digest of `value`'s canonical JSON.
 /// The shared values `node` may reference, secrets as their references: every
 /// value whose `values.KEY` appears in it.
-fn referenced_values(
-    deployment: &Deployment,
-    node: &openporch_core::graph::Node,
-) -> BTreeMap<String, serde_json::Value> {
+fn referenced_values(deployment: &Deployment, node: &Node) -> BTreeMap<String, serde_json::Value> {
     let text = serde_json::to_string(node).unwrap_or_default();
     deployment
         .values
@@ -118,6 +123,7 @@ fn referenced_values(
         .collect()
 }
 
+/// A digest of `value`'s canonical JSON.
 fn digest(value: &serde_json::Value) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(to_canonical_string(value).as_bytes())
@@ -126,15 +132,54 @@ fn digest(value: &serde_json::Value) -> String {
         .collect()
 }
 
+/// A digest of what `node` is provisioned from: the node, the definition
+/// version it matched and the shared values it may reference.
+fn config_digest(deployment: &Deployment, node: &Node) -> String {
+    digest(&serde_json::json!({
+        "node": node,
+        "definition": deployment.definitions.get(&node.definition),
+        "values": referenced_values(deployment, node),
+        // A replay runs the version of the driver's code it recorded.
+        "pin": deployment.pins.get(&node.descriptor.to_string()),
+    }))
+}
+
+/// The configuration digest of each resource `deployment` provisions, by
+/// descriptor: what a driver plan made while it ran was planned for.
+pub fn config_digests(deployment: &Deployment) -> BTreeMap<String, String> {
+    deployment
+        .graph
+        .nodes
+        .values()
+        .map(|n| (n.descriptor.to_string(), config_digest(deployment, n)))
+        .collect()
+}
+
+/// What the environment recorded about `r` when it last changed, which a
+/// change acts on even when its configuration stays the same.
+fn recorded(r: &ActiveResource) -> serde_json::Value {
+    serde_json::json!({
+        "last_deploy_id": r.last_deploy_id,
+        "inputs": r.inputs,
+        "outputs": r.outputs,
+        "secret_outputs": r.secret_outputs,
+        "driver_account": r.driver_account,
+        "target": r.target,
+        "backend": r.backend,
+    })
+}
+
 /// Previews `deployment` against the environment's `active` resources.
 /// `facts` describes each driver by ID; `plans` holds driver plans from
-/// earlier attempts that needed a permit, by GUResID. Fails with every
-/// migration the deployment would need.
+/// earlier attempts that needed a permit, by GUResID; `accounts` holds the
+/// cloud accounts definitions may name, by ID. Fails with every migration the
+/// deployment would need.
 pub fn preview(
     deployment: &Deployment,
     active: &[ActiveResource],
     facts: impl Fn(&str) -> Option<DriverFacts>,
     plans: &BTreeMap<String, DriverPlan>,
+    accounts: &BTreeMap<String, CloudAccount>,
 ) -> Result<Vec<Entry>, Vec<String>> {
     let by_descriptor: BTreeMap<&str, &ActiveResource> =
         active.iter().map(|r| (r.descriptor.as_str(), r)).collect();
@@ -145,14 +190,31 @@ pub fn preview(
         let current = by_descriptor.get(descriptor.as_str()).copied();
         let def = deployment.definitions.get(&node.definition).map(|(_, d)| d);
         let driver = facts(&node.driver_type);
-        // What the resource is provisioned from: its node, the definition
-        // version it matched and the shared values it may reference.
-        let config = digest(&serde_json::json!({
-            "node": node,
-            "definition": deployment.definitions.get(&node.definition),
-            "values": referenced_values(deployment, node),
-            // A replay runs the version of the driver's code it recorded.
-            "pin": deployment.pins.get(&descriptor),
+        let config = config_digest(deployment, node);
+        // An account given as a placeholder resolves only when the deployment
+        // runs, which checks it then.
+        let account = def.and_then(|d| d.driver_account.as_deref());
+        let literal = def.is_some() && !account.is_some_and(|a| a.contains("${"));
+        // What the change acts on besides its configuration: the resource's
+        // record, the outputs of what it depends on and the cloud account it
+        // runs in, none of which moves the environment's generation when it
+        // changes.
+        let dependencies: BTreeMap<String, serde_json::Value> = node
+            .depends_on
+            .iter()
+            .map(|d| {
+                let d = d.to_string();
+                let outputs = by_descriptor.get(d.as_str()).map(|r| {
+                    serde_json::json!({"outputs": r.outputs, "secret_outputs": r.secret_outputs})
+                });
+                (d, outputs.unwrap_or_default())
+            })
+            .collect();
+        let entry_digest = digest(&serde_json::json!({
+            "config": config,
+            "recorded": current.map(recorded),
+            "dependencies": dependencies,
+            "account": account.filter(|_| literal).and_then(|a| accounts.get(a)),
         }));
         let entry = |action, known, reason: &str, permit_required, plan| Entry {
             descriptor: descriptor.clone(),
@@ -164,13 +226,16 @@ pub fn preview(
             reason: reason.to_owned(),
             permit_required,
             driver_plan: plan,
-            digest: config.clone(),
+            digest: entry_digest.clone(),
         };
         let existing = current
             .filter(|r| r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some());
         // A driver plan an earlier attempt could not run without a permit:
-        // the change needs a permit for that action, whatever else is true.
-        if let Some(plan) = current.and_then(|r| plans.get(&r.guresid)) {
+        // the change needs a permit for that action, whatever else is true,
+        // until the configuration it was planned for changes.
+        if let Some(plan) = current.and_then(|r| plans.get(&r.guresid))
+            && plan.config_digest.as_ref().is_none_or(|d| *d == config)
+        {
             let refused = match plan.action.as_str() {
                 "delete" => Some((
                     Change::Delete,
@@ -224,10 +289,6 @@ pub fn preview(
             ));
             continue;
         }
-        // An account given as a placeholder resolves only when the deployment
-        // runs, which checks it then.
-        let account = def.and_then(|d| d.driver_account.as_deref());
-        let literal = def.is_some() && !account.is_some_and(|a| a.contains("${"));
         if literal && r.last_deploy_id.is_some() && r.driver_account.as_deref() != account {
             let name = |a: Option<&str>| match a {
                 Some(a) => format!("cloud account `{a}`"),
@@ -299,6 +360,7 @@ pub fn preview(
                 "last_deploy_id": r.last_deploy_id,
                 "definition": r.definition_id,
                 "version": r.definition_version,
+                "recorded": recorded(&r),
             })),
         });
     }

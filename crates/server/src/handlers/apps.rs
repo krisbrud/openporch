@@ -128,6 +128,10 @@ pub struct DeleteAppRequest {
     permits: Vec<String>,
     #[serde(default)]
     comment: String,
+    /// The generation of each environment the client previewed the deletion
+    /// at; any of them moved on, or an environment added since, is `409`.
+    #[serde(default)]
+    expected_generations: Option<std::collections::BTreeMap<String, i64>>,
 }
 
 /// An accepted application deletion.
@@ -188,7 +192,25 @@ pub async fn delete(
         .runners
         .slots(starting.min(state.runners.capacity()))?;
     let mut permits = std::collections::BTreeMap::new();
+    let mut generations = std::collections::BTreeMap::new();
     for env in envs {
+        if let Some(expected) = &req.expected_generations
+            && env.state != "deleting"
+        {
+            let Some(&expected) = expected.get(&env.id) else {
+                return Err(ApiError::conflict(format!(
+                    "environment `{app}/{}` was not previewed; preview the deletion again",
+                    env.id
+                )));
+            };
+            if expected != env.generation {
+                return Err(StoreError::StaleGeneration {
+                    expected,
+                    actual: env.generation,
+                }
+                .into());
+            }
+        }
         let entries = plans::preflight(&state, &env, String::new(), &snapshot, true).await?;
         let presented: Vec<String> = issued
             .iter()
@@ -196,11 +218,14 @@ pub async fn delete(
             .map(|(id, _)| id.clone())
             .collect();
         permits.insert(env.id.clone(), plans::binding(&entries, &presented));
+        // The deletion is accepted only at the generation previewed here.
+        generations.insert(env.id.clone(), env.generation);
     }
     let accepted = state
         .store
         .accept_app_deletion(AppDeletionRequest {
             permits,
+            generations,
             org: org.to_owned(),
             app: app.clone(),
             actor: ctx.principal.id.clone(),

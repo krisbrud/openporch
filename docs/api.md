@@ -554,9 +554,13 @@ only the applications the caller can see.
 
 Deleting an application needs `owner` on it and `deployer` on every
 environment type it uses. The optional body is `{"permits": [...], "comment":
-"..."}`, with the destructive-action permits for deleting the resources of
-every environment, each from a `delete_env` [preview](#previews-and-permits) of
-its environment; a missing one is `409` `DPL-001`. Each environment, `development` included, is then deleted
+"...", "expected_generations": {...}}`, with the destructive-action permits for
+deleting the resources of every environment, each from a `delete_env`
+[preview](#previews-and-permits) of its environment; a missing one is `409`
+`DPL-001`. `expected_generations` maps each environment to the generation its
+preview was made at; one that moved on since, or an
+environment it leaves out, is `409` `API-004`. Each environment's deletion is accepted only at the
+generation its preflight saw. Each environment, `development` included, is then deleted
 as by its own deletion (see [Environments](#environments)), and the response
 is `202 Accepted` with each environment's deletion and what it leaves in
 place. The application's `state` becomes `deleting`: it takes no new
@@ -1985,7 +1989,8 @@ or `detach`, with a `reason`:
 
 - `update` means its driver plans the change when the deployment runs. A
   replacement it finds then fails the deployment with `approval_required`, and
-  the next preview shows that plan as a `replace` with its `driver_plan`.
+  the next preview shows that plan as a `replace` with its `driver_plan`,
+  until the resource's configuration changes and its driver plans again.
 - `unknown` is a change to an existing resource whose driver cannot preview.
 - `delete` covers removed workloads, what they owned, and resources scheduled
   for deletion.
@@ -2049,8 +2054,11 @@ the deploy permission, and an administrator for `detach` or for any permit in an
 environment whose type is [protected](#environment-types); there an `unknown`
 permit is refused to everyone (`403`). A permit expires an
 hour after it is issued unless a deployment binds it first. It binds only at
-the preview's generation and while the resource's configuration is the one
-previewed. Once bound, it authorizes that change in that deployment and its
+the preview's generation and while what the change acts on is as previewed:
+the resource's configuration, what the environment recorded about it, the
+outputs of the resources it depends on and the cloud account it runs in.
+Binding and using a permit are recorded in the audit log as `permit.bind` and
+`permit.use`, each correlating with the `permit.create` entry that issued it. Once bound, it authorizes that change in that deployment and its
 retries, as long as its issuer keeps the authority. A permit issued for a
 deployment that failed is not reused: preview again.
 
