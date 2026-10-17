@@ -25,6 +25,7 @@ struct Server {
 }
 
 mod accounts;
+mod benchmark;
 mod catalog;
 mod deploys;
 mod e2e;
@@ -34,9 +35,11 @@ mod keys;
 mod limits;
 mod plans;
 mod resources;
+mod restore;
 mod secret_use;
 mod sets;
 mod tls;
+mod upgrades;
 mod values;
 
 async fn server_in(dir: TempDir) -> Server {
@@ -1790,6 +1793,7 @@ async fn creation_and_revocation_are_rechecked_with_the_change() {
                 "acme",
                 "staging",
                 "",
+                false,
                 as_carol("POST", "/orgs/acme/env-types"),
             )
             .await

@@ -110,13 +110,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             .ok_or_else(|| RecoverError::NothingToRecover(descriptor.to_owned()))?;
         super::record_operation_ids(&op.operation_id, &op.resource.guresid);
         let deleting = op.kind == OperationKind::Delete;
+        // A restore's operation asks whether the resource still is what the
+        // backup recorded, not whether an update took effect.
+        let restored = op.recovery.get("restored") == Some(&Value::Bool(true));
         let (resolution, recovered) = match self.job(org, app, env, &op).await {
             Err(reason) => required(reason),
             Ok(job) => {
                 let account = job.driver_account.as_ref().map(ToString::to_string);
                 // A resource that existed before the operation says nothing,
                 // by existing, about whether an update took effect.
-                let updating = !deleting && job.existing;
+                let updating = !deleting && job.existing && !restored;
                 // Observing runs the driver too, so it waits for a slot
                 // like any other driver operation.
                 // A recovery request does not wait long: when every slot
@@ -169,6 +172,12 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                         Resolution::Observed(CheckpointResult::Deleted),
                         Recovered::Deleted,
                     ),
+                    Ok(Observed::Absent { .. }) if restored => required(
+                        "the backup records the resource, but nothing exists for its identity: \
+                         it was deleted after the backup was taken, or its state was not \
+                         restored; check the cloud before resolving it"
+                            .into(),
+                    ),
                     Ok(Observed::Absent { repeatable: true }) => repeatable_reason(
                         "nothing exists for the resource's identity, so the next deployment \
                          provisions it with the same identity",
@@ -178,6 +187,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                          guarantee that a creation still on its way is not duplicated"
                             .into(),
                     ),
+                    // It still exists: what the backup records stands.
+                    Ok(Observed::Ready { .. }) if restored => {
+                        (Resolution::Confirmed, Recovered::Provisioned)
+                    }
                     Ok(Observed::Ready { repeatable, .. }) if deleting => {
                         if repeatable {
                             repeatable_reason(

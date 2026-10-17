@@ -431,7 +431,7 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 201 Created
 
-{"id": "production", "description": "Live traffic", "created_at": "…"}
+{"id": "production", "description": "Live traffic", "protected": false, "created_at": "…"}
 ```
 
 ```http
@@ -472,6 +472,29 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"id": "production", "description": "Live customer traffic"}
+```
+
+`protected`, given when the type is created or changed with `PATCH`, protects
+the environments of the type. In them, a destructive-action
+[permit](#previews-and-permits) for a `delete`, `replace` or `detach` needs an
+administrator, even for a developer holding the `deployer` role, and a change of
+unknown impact gets no permit at all: deploy it where its driver can plan it
+first. Protecting a type rechecks the permits already issued there whenever a
+deployment binds or uses one, retries included: a permit whose issuer is not an
+administrator, and every `unknown` permit, stops holding (`DPL-003`), which can
+fail a deployment already running.
+
+```http
+PATCH /orgs/acme/env-types/production
+Authorization: Bearer $ADMIN_TOKEN
+
+{"protected": true}
+```
+
+```http-response
+200 OK
+
+{"id": "production", "description": "Live customer traffic", "protected": true}
 ```
 
 ```http
@@ -1947,7 +1970,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | --- | --- | --- |
 | POST | `/orgs/{org}/apps/{app}/envs/{env}/plans` | app deploy |
 | GET | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}` | app read |
-| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits` | app deploy; `detach` needs administer |
+| POST | `/orgs/{org}/apps/{app}/envs/{env}/plans/{plan}/permits` | app deploy; `detach`, and any permit in a protected environment, needs administer (`unknown` is refused there) |
 
 A preview runs a deployment's preflight without provisioning anything: it
 resolves the set, builds the resource graph and classifies each resource's
@@ -2022,7 +2045,9 @@ Authorization: Bearer $ADMIN_TOKEN
 `POST .../plans/{plan}/permits` issues permits for changes the preview marked,
 each `{"descriptor", "action"}` with the preview's action. A `replace` permit
 covers the preview's driver plan, which `fingerprint` may name. The issuer needs
-the deploy permission, and an administrator for `detach`. A permit expires an
+the deploy permission, and an administrator for `detach` or for any permit in an
+environment whose type is [protected](#environment-types); there an `unknown`
+permit is refused to everyone (`403`). A permit expires an
 hour after it is issued unless a deployment binds it first. It binds only at
 the preview's generation and while the resource's configuration is the one
 previewed. Once bound, it authorizes that change in that deployment and its

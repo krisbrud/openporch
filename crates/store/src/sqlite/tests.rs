@@ -274,6 +274,15 @@ async fn logical_contents(dir: &std::path::Path) -> Vec<String> {
     out
 }
 
+#[test]
+fn schema_version_is_the_newest_migration() {
+    assert_eq!(
+        MIGRATOR.iter().map(|m| m.version).max(),
+        Some(SCHEMA_VERSION),
+        "a migration was added: raise SCHEMA_VERSION and add its schema fixture"
+    );
+}
+
 #[tokio::test]
 async fn newer_schema_is_refused_without_changes() {
     let f = Fixture::new().await;
@@ -560,7 +569,13 @@ async fn failed_audit_write_rejects_the_mutation() {
 
     let e = f
         .store
-        .create_env_type(ORG, "staging", "", system("POST", "/orgs/acme/env-types"))
+        .create_env_type(
+            ORG,
+            "staging",
+            "",
+            false,
+            system("POST", "/orgs/acme/env-types"),
+        )
         .await
         .unwrap_err();
     assert!(e.to_string().contains("audit storage unavailable"), "{e}");

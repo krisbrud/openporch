@@ -420,3 +420,121 @@ async fn a_state_backend_move_is_refused_before_acceptance() {
     let (status, b) = s.post(&format!("{ENV_DEV}/deploys"), &s.admin, body).await;
     assert_error(status, &b, StatusCode::CONFLICT, "DPL-002");
 }
+
+#[tokio::test]
+async fn destructive_permits_in_a_protected_environment_need_an_administrator() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", true).await;
+    let dev = s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "developer").await;
+    s.grant_deployer("development", "dev").await;
+    let protect = |by: String, protected: bool| {
+        let s = &s;
+        async move {
+            s.call(
+                axum::http::Method::PATCH,
+                "/orgs/acme/env-types/development",
+                Some(&by),
+                Some(json!({"protected": protected})),
+            )
+            .await
+        }
+    };
+    // Only an administrator marks a type protected.
+    let (status, b) = protect(dev.clone(), true).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, t) = protect(s.admin.clone(), true).await;
+    assert_eq!(status, StatusCode::OK, "{t}");
+    assert_eq!(t["protected"], true);
+
+    // A developer who may deploy there previews deleting the database, but
+    // gets no permit for it; an administrator does.
+    let body = json!({"kind": "delete_env", "expected_generation": s.dev_generation().await});
+    let (status, plan) = s.post(PLANS, &dev, body).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let permits = format!("{PLANS}/{}/permits", plan["id"].as_str().unwrap());
+    let ask = json!({"permits": [{"descriptor": DB, "action": "delete"}]});
+    let (status, b) = s.post(&permits, &dev, ask.clone()).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    assert!(b["message"].as_str().unwrap().contains("protected"), "{b}");
+    let (status, issued) = s.post(&permits, &s.admin, ask.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+
+    // A permit a developer got before the type was protected no longer holds.
+    let (status, _) = protect(s.admin.clone(), false).await;
+    assert_eq!(status, StatusCode::OK);
+    let delta = removing_web(&s).await;
+    let body = json!({"delta_id": delta, "expected_generation": s.dev_generation().await});
+    let (status, plan) = s.post(PLANS, &dev, body).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let asks: Vec<Value> = plan["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["permit_required"] == true)
+        .map(|r| json!({"descriptor": r["descriptor"], "action": r["action"]}))
+        .collect();
+    assert!(!asks.is_empty(), "{plan}");
+    let (status, issued) = s
+        .post(
+            &format!("{PLANS}/{}/permits", plan["id"].as_str().unwrap()),
+            &dev,
+            json!({"permits": asks}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let ids: Vec<Value> = issued["permits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].clone())
+        .collect();
+    let (status, _) = protect(s.admin.clone(), true).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, b) = s
+        .post(
+            &format!("{ENV_DEV}/deploys"),
+            &dev,
+            json!({"delta_id": delta, "expected_generation": s.dev_generation().await,
+                   "permits": ids}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-003");
+    assert!(b["message"].as_str().unwrap().contains("protected"), "{b}");
+}
+
+#[tokio::test]
+async fn a_protected_environment_refuses_changes_of_unknown_impact() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", true).await;
+    let mut registry = openporch_drivers::DriverRegistry::default();
+    registry
+        .register(Arc::new(openporch_drivers::NoneDriver::new()) as Arc<_>)
+        .ok();
+    s.state.drivers.set(Arc::new(registry), None);
+    let (status, t) = s
+        .call(
+            axum::http::Method::PATCH,
+            "/orgs/acme/env-types/development",
+            Some(&s.admin),
+            Some(json!({"protected": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{t}");
+
+    // Not even an administrator gets a permit for a change no driver planned.
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    assert_eq!(entry(&plan, DB)["action"], "unknown", "{plan}");
+    let (status, b) = s
+        .post(
+            &format!("{PLANS}/{}/permits", plan["id"].as_str().unwrap()),
+            &s.admin,
+            json!({"permits": [{"descriptor": DB, "action": "unknown"}]}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    assert!(b["message"].as_str().unwrap().contains("protected"), "{b}");
+}

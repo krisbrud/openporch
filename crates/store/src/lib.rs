@@ -21,6 +21,7 @@ mod sqlite_catalog;
 mod sqlite_diagnostics;
 mod sqlite_identity;
 mod sqlite_permits;
+mod sqlite_restore;
 mod sqlite_values;
 
 pub use audit::{AuditEntry, AuditIntent, AuditOutcome};
@@ -38,7 +39,7 @@ pub use identity::{
 };
 pub use ownership::Ownership;
 pub use secret_use::{SecretOwner, SecretUseStore};
-pub use sqlite::{SqliteStore, StoreStats};
+pub use sqlite::{SCHEMA_VERSION, SqliteStore, StoreStats, check_schema};
 pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_audit_retention::{AuditRetention, EXPIRY_ACTION, Expiry, Retained};
 pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
@@ -48,6 +49,7 @@ pub use sqlite_permits::{
     ApprovalRequest, NewPermit, NewPlan, PERMIT_TTL_MS, PermitBinding, PermitRecord, PermitStore,
     PermitUse, PlanRecord,
 };
+pub use sqlite_restore::{DatabaseCopy, RESTORED, copy_database};
 pub use sqlite_values::{
     PutValue, ValueContent, ValueRecord, ValueSetVersion, ValueStore, value_secret_prefix,
 };
@@ -87,12 +89,14 @@ pub trait Store: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<AuditEntry>>> + Send;
 
-    /// Creates an environment type.
+    /// Creates an environment type, `protected` or not. The actor must be an
+    /// administrator.
     fn create_env_type(
         &self,
         org: &str,
         id: &str,
         description: &str,
+        protected: bool,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -120,12 +124,14 @@ pub trait Store: Send + Sync {
     /// Lists an application's environments.
     fn envs(&self, org: &str, app: &str) -> impl Future<Output = Result<Vec<EnvRecord>>> + Send;
 
-    /// Changes an environment type's description.
+    /// Changes an environment type's description, whether it is protected,
+    /// or both. The actor must be an administrator.
     fn update_env_type(
         &self,
         org: &str,
         id: &str,
-        description: &str,
+        description: Option<&str>,
+        protected: Option<bool>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 

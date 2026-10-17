@@ -54,18 +54,11 @@ impl SqliteStore {
     /// The store keeps `ownership` for as long as it or any clone of it lives, so the
     /// installation lock cannot be released while the database is still in use.
     pub async fn open(ownership: Ownership, org: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(ownership.dir().join("openporch.db"))
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
-            .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect_with(options)
+            .connect_with(connect_options(&ownership.dir().join("openporch.db")))
             .await?;
-        check_schema_version(&pool).await?;
+        check_schema_version(&pool, SCHEMA_VERSION).await?;
         MIGRATOR.run(&pool).await?;
         let store = Self {
             pool,
@@ -218,8 +211,36 @@ impl SqliteStore {
     }
 }
 
+/// The schema version this build reads and writes: its newest migration. It
+/// migrates older databases forward and refuses newer ones.
+pub const SCHEMA_VERSION: i64 = 9;
+
+pub(crate) fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5))
+}
+
+/// Connects to the existing database at `path` as [`SqliteStore::open`] does
+/// and checks whether a build whose schema version is `supported` could open
+/// it, which is how a test plays an older build.
+#[doc(hidden)]
+pub async fn check_schema(path: &std::path::Path, supported: i64) -> Result<()> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options(path).create_if_missing(false))
+        .await?;
+    let checked = check_schema_version(&pool, supported).await;
+    pool.close().await;
+    checked
+}
+
 /// Refuses databases written by a newer binary before any migration runs.
-async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
+async fn check_schema_version(pool: &SqlitePool, supported: i64) -> Result<()> {
     let has_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
@@ -231,7 +252,6 @@ async fn check_schema_version(pool: &SqlitePool) -> Result<()> {
     let found: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(pool)
         .await?;
-    let supported = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
     match found {
         Some(found) if found > supported => Err(StoreError::SchemaTooNew { found, supported }),
         _ => Ok(()),
@@ -474,18 +494,20 @@ impl Store for SqliteStore {
         org: &str,
         id: &str,
         description: &str,
+        protected: bool,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         crate::identity::check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         let res = sqlx::query(
-            "INSERT INTO env_types (org_id, id, description, created_at, created_by) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO env_types (org_id, id, description, protected, created_at, created_by) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(org)
         .bind(id)
         .bind(description)
+        .bind(protected)
         .bind(now_ms())
         .bind(&audit.actor)
         .execute(&mut *tx)
@@ -663,18 +685,23 @@ impl Store for SqliteStore {
         &self,
         org: &str,
         id: &str,
-        description: &str,
+        description: Option<&str>,
+        protected: Option<bool>,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        let res = sqlx::query("UPDATE env_types SET description = ? WHERE org_id = ? AND id = ?")
-            .bind(description)
-            .bind(org)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let res = sqlx::query(
+            "UPDATE env_types SET description = COALESCE(?, description), \
+             protected = COALESCE(?, protected) WHERE org_id = ? AND id = ?",
+        )
+        .bind(description)
+        .bind(protected)
+        .bind(org)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         if res.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("environment type `{id}`")));
         }
@@ -1584,15 +1611,34 @@ impl Store for SqliteStore {
         audit: AuditIntent,
     ) -> Result<()> {
         let mut tx = self.begin().await?;
-        let op: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
-            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind FROM operations \
-             WHERE id = ?",
+        #[allow(clippy::type_complexity)]
+        let op: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT org_id, app_id, env_id, deployment_id, guresid, state, kind, \
+             CASE WHEN json_extract(recovery, '$.restored') = 1 \
+             THEN COALESCE(json_extract(recovery, '$.restored_status'), 'provisioned') END \
+             FROM operations WHERE id = ?",
         )
         .bind(operation_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (org, app, env, deployment_id, guresid, state, kind) =
+        let (org, app, env, deployment_id, guresid, state, kind, restored) =
             op.ok_or_else(|| StoreError::NotFound(format!("operation `{operation_id}`")))?;
+        // A restore's operation belongs to no deployment: the deployment it
+        // names is history, which its outcome leaves as it was.
+        let deployment_id = if restored.is_some() {
+            String::new()
+        } else {
+            deployment_id
+        };
         self.check_org(&org)?;
         if state != "unknown" {
             return Err(StoreError::Conflict(format!(
@@ -1615,6 +1661,32 @@ impl Store for SqliteStore {
         let repeat = match resolution {
             Resolution::Observed(result) => {
                 self.checkpoint_in_tx(&mut tx, operation_id, result).await?;
+                None
+            }
+            Resolution::Confirmed => {
+                let Some(status) = restored else {
+                    return Err(StoreError::Conflict(format!(
+                        "operation `{operation_id}` was not restored from a backup"
+                    )));
+                };
+                sqlx::query(
+                    "UPDATE operations SET state = 'succeeded', error = NULL, finished_at = ? \
+                     WHERE id = ?",
+                )
+                .bind(now)
+                .bind(operation_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE active_resources SET status = ?, observed_at = ?, updated_at = ? \
+                     WHERE guresid = ?",
+                )
+                .bind(status)
+                .bind(now)
+                .bind(now)
+                .bind(&guresid)
+                .execute(&mut *tx)
+                .await?;
                 None
             }
             Resolution::Repeatable { reason } => Some(format!("recovered: {reason}")),

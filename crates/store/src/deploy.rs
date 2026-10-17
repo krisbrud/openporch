@@ -575,6 +575,10 @@ pub enum Resolution {
         /// Why.
         reason: String,
     },
+    /// Observing a resource restored from a backup established that it
+    /// still exists. What the backup records is kept, and the resource
+    /// returns to the status it had.
+    Confirmed,
     /// An administrator established that repeating the operation with the
     /// same identity is safe. The audit intent's actor must be one.
     Operator {
