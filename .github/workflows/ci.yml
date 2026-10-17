@@ -41,6 +41,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  release-plan:
+    name: release plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dist
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      # The release workflow runs only on tags, so check here that it matches
+      # dist-workspace.toml and that the release plan still builds.
+      - name: Plan a release
+        run: dist plan
+
   floci:
     name: account check against Floci
     runs-on: ubuntu-latest

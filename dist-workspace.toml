@@ -17,3 +17,9 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Whether to enable GitHub Attestations
+github-attestations = true
+# Which actions to run on pull requests; CI checks the release plan instead
+pr-run-mode = "skip"
+# Steps to run before each build: the pinned toolchain and a locked dependency check
+github-build-setup = "../build-setup.yml"
