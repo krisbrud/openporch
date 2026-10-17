@@ -212,6 +212,52 @@ async fn stale_permits_fail() {
 }
 
 #[tokio::test]
+async fn binding_and_using_permits_are_audited() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", true).await;
+    let delta = removing_web(&s).await;
+    let permits = s.permits_for(ENV_DEV, json!({"delta_id": delta})).await;
+    assert!(!permits.is_empty(), "{permits:?}");
+    let (status, d) = s
+        .post(
+            &format!("{ENV_DEV}/deploys"),
+            &s.admin,
+            json!({"delta_id": delta,
+                   "expected_generation": s.dev_generation().await, "permits": permits}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap();
+    let d = s.finished_at(&format!("{ENV_DEV}/deploys/{id}")).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+
+    let (status, page) = s.get("/orgs/acme/audit-logs?limit=200", &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let entries = page["entries"].as_array().unwrap();
+    let issued = entries
+        .iter()
+        .find(|e| e["action"] == "permit.create")
+        .unwrap();
+    for (action, outcome) in [("permit.bind", "accepted"), ("permit.use", "succeeded")] {
+        let found: Vec<&Value> = entries.iter().filter(|e| e["action"] == action).collect();
+        assert_eq!(found.len(), permits.len(), "{action}: {page}");
+        for e in found {
+            assert_eq!(e["outcome"], outcome, "{e}");
+            assert_eq!(e["operation_id"], id, "{e}");
+            assert_eq!(e["correlates"], issued["id"], "{e}");
+            assert!(
+                e["target"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("shop/development/"),
+                "{e}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_refused_driver_plan_shows_in_the_next_preview() {
     let s = server().await;
     s.provisioning(Arc::default()).await;

@@ -213,7 +213,7 @@ impl SqliteStore {
 
 /// The schema version this build reads and writes: its newest migration. It
 /// migrates older databases forward and refuses newer ones.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub(crate) fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
@@ -1935,8 +1935,8 @@ impl Store for SqliteStore {
             )));
         }
         // The permit is used with the detach, so a refused detach keeps it.
-        if let Some(presented) = permits {
-            crate::sqlite_permits::consume_permit(
+        let used = if let Some(presented) = permits {
+            let used = crate::sqlite_permits::consume_permit(
                 &mut tx,
                 &crate::PermitUse {
                     org,
@@ -1951,7 +1951,10 @@ impl Store for SqliteStore {
                 },
             )
             .await?;
-        }
+            Some(used)
+        } else {
+            None
+        };
         let now = now_ms();
         sqlx::query(
             "INSERT INTO tombstones (org_id, app_id, env_id, descriptor, guresid, reason, \
@@ -1986,6 +1989,17 @@ impl Store for SqliteStore {
         .execute(&mut *tx)
         .await?;
         audit::insert(&mut tx, &audit, None, None).await?;
+        if let Some(used) = used {
+            // Part of the detach's request, correlated with the permit's issue.
+            let intent = AuditIntent {
+                action: "permit.use".to_owned(),
+                target: Some(format!("{app}/{env}/{descriptor}")),
+                outcome: AuditOutcome::Succeeded,
+                reason: Some("detach".to_owned()),
+                ..audit.clone()
+            };
+            audit::insert(&mut tx, &intent, None, used.issued_entry.as_deref()).await?;
+        }
         let tombstone = sqlx::query_as::<_, TombstoneRow>(&format!(
             "{TOMBSTONE_COLUMNS} WHERE guresid = ? ORDER BY seq DESC LIMIT 1"
         ))
@@ -2752,7 +2766,9 @@ async fn accept_in_tx(conn: &mut SqliteConnection, req: &DeploymentRequest) -> R
 
     let id = crate::random_hex(16);
     let new_generation = generation + 1;
-    crate::sqlite_permits::bind_permits(conn, org, app, env, generation, &id, &req.permits).await?;
+    let bound =
+        crate::sqlite_permits::bind_permits(conn, org, app, env, generation, &id, &req.permits)
+            .await?;
     let seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM deployments \
              WHERE org_id = ? AND app_id = ? AND env_id = ?",
@@ -2804,6 +2820,7 @@ async fn accept_in_tx(conn: &mut SqliteConnection, req: &DeploymentRequest) -> R
     intent.outcome = AuditOutcome::Accepted;
     intent.target.get_or_insert_with(|| format!("{app}/{env}"));
     audit::insert(&mut *conn, &intent, Some(&id), None).await?;
+    crate::sqlite_permits::audit_bound(&mut *conn, &intent, app, env, &id, &bound).await?;
     let d = fetch_deployment(&mut *conn, org, app, env, &id)
         .await?
         .ok_or_else(|| StoreError::Corrupt(format!("deployment `{id}`")))?;
@@ -3007,33 +3024,9 @@ async fn finish_in_tx(
             }
         }
     }
-    /// The accepted entry's ID, actor, request ID, method and path.
-    type Accepted = (String, Option<String>, Option<String>, String, String);
-    let accepted: Option<Accepted> = sqlx::query_as(
-        "SELECT id, actor_id, request_id, method, path FROM audit_log WHERE org_id = ? \
-         AND operation_id = ? \
-         AND outcome = 'accepted' ORDER BY seq LIMIT 1",
-    )
-    .bind(org)
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (correlates, actor, request_id, method, path) = match accepted {
-        Some((a, actor, r, m, p)) => (Some(a), actor, r, m, p),
-        None => (
-            None,
-            None,
-            None,
-            "POST".to_owned(),
-            format!("/orgs/{org}/apps/{app}/envs/{env}/deploys"),
-        ),
-    };
+    let (correlates, accepted) =
+        crate::sqlite_permits::acceptance_intent(&mut *conn, org, app, env, id).await?;
     let intent = AuditIntent {
-        org: org.to_owned(),
-        actor,
-        request_id,
-        method,
-        path,
         action: "deployment.finish".to_owned(),
         target: Some(format!("{app}/{env}")),
         outcome: if error.is_some() {
@@ -3043,6 +3036,7 @@ async fn finish_in_tx(
         },
         status_code: None,
         reason: error.map(|_| "deployment_failed".to_owned()),
+        ..accepted
     };
     audit::insert(&mut *conn, &intent, Some(id), correlates.as_deref()).await?;
     if app_removed {
