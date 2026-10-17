@@ -1198,7 +1198,13 @@ impl Store for SqliteStore {
             .execute(&mut *tx)
             .await?;
         let mut deletions = Vec::with_capacity(envs.len());
-        for (env, _, state, generation) in &envs {
+        let added = |env: &str| {
+            StoreError::Conflict(format!(
+                "environment `{app}/{env}` was added while the application's deletion was \
+                 prepared; try again"
+            ))
+        };
+        for (env, _, state, _) in &envs {
             // A deletion that runs is part of this one.
             if state == "deleting" {
                 let running: Option<String> = sqlx::query_scalar(
@@ -1228,7 +1234,9 @@ impl Store for SqliteStore {
                     app: app.clone(),
                     env: env.clone(),
                     actor: req.actor.clone(),
-                    expected_generation: *generation,
+                    // What the preview saw: a deployment since then is a
+                    // stale generation.
+                    expected_generation: *req.generations.get(env).ok_or_else(|| added(env))?,
                     idempotency_key: None,
                     fingerprint: String::new(),
                     kind: DeploymentKind::DeleteEnv,
@@ -1242,12 +1250,7 @@ impl Store for SqliteStore {
                         ..req.audit.clone()
                     },
 
-                    permits: req.permits.get(env).cloned().ok_or_else(|| {
-                        StoreError::Conflict(format!(
-                            "environment `{app}/{env}` was added while the application's \
-                             deletion was prepared; try again"
-                        ))
-                    })?,
+                    permits: req.permits.get(env).cloned().ok_or_else(|| added(env))?,
                 },
             )
             .await?;

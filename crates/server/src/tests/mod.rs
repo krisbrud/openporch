@@ -1740,6 +1740,7 @@ async fn application_deletion_is_rechecked_with_the_change() {
         .store
         .accept_app_deletion(openporch_store::AppDeletionRequest {
             permits: Default::default(),
+            generations: Default::default(),
             org: "acme".into(),
             app: "shop".into(),
             actor: "alice".into(),

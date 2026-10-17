@@ -252,7 +252,8 @@ pub(crate) fn print(
 pub(crate) struct Prepared {
     path: String,
     id: String,
-    base_generation: i64,
+    /// The environment generation the preview was made at.
+    pub base_generation: i64,
     asks: Vec<Value>,
     /// The `--ack` values still missing.
     pub missing: Vec<String>,
