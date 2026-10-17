@@ -157,7 +157,7 @@ Resources that the state no longer covers can be found by name:
 
 | Date | Commit | Account, region | Result |
 | --- | --- | --- | --- |
-| | | | Not yet run against a real account |
+| 2026-10-17 | `1134dfc` | A sandbox account, eu-north-1 | Passed in about 16 minutes. Every step ran, the environment's deletion took 7 permits, and nothing the run created was left in the account. |
 
 Add a row for each manual run, with the summary from
 `target/e2e-aws-results.md`.
