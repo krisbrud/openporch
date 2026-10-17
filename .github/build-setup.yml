@@ -1,0 +1,5 @@
+# Steps dist runs before each release build (`github-build-setup` in dist-workspace.toml).
+- name: Install toolchain from rust-toolchain.toml
+  run: rustup toolchain install
+- name: Refuse a Cargo.lock that does not match Cargo.toml
+  run: cargo fetch --locked

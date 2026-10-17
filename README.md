@@ -23,6 +23,23 @@ openporch is under active development. The milestone 1 specification lives in [`
 | `crates/cli` | The `porch` command-line interface |
 | `provider` | The OpenTofu provider, a Go module |
 
+## Install
+
+Each [GitHub release](https://github.com/krisbrud/openporch/releases) has prebuilt binaries: the server, `openporch`, for Linux and macOS, and the command line, `porch`, for Linux (glibc and musl), macOS and Windows.
+
+```sh
+# The server, on macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/krisbrud/openporch/releases/latest/download/openporch-server-installer.sh | sh
+
+# The command line, on macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/krisbrud/openporch/releases/latest/download/openporch-cli-installer.sh | sh
+
+# The command line, on Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/krisbrud/openporch/releases/latest/download/openporch-cli-installer.ps1 | iex"
+```
+
+[Releases](docs/releasing.md) describes what a release contains, how to verify its checksums and build attestations, how to build the same binaries from source, and how to cut one.
+
 ## Getting started
 
 [Getting started](docs/getting-started.md) takes you from a clean machine to a

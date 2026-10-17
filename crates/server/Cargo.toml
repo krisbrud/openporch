@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# `publish = false` keeps the crate off crates.io; `dist = true` still ships `openporch`
+# in GitHub releases. The drivers manage OpenTofu processes with Unix signals, so the
+# server is built for Linux and macOS only.
+[package.metadata.dist]
+dist = true
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+installers = ["shell"]
+
 [[bin]]
 name = "openporch"
 path = "src/main.rs"
