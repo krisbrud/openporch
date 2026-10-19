@@ -23,6 +23,20 @@ openporch is under active development. The milestone 1 specification lives in [`
 | `crates/cli` | The `porch` command-line interface |
 | `provider` | The OpenTofu provider, a Go module |
 
+## Install the CLI
+
+Prebuilt `porch` binaries for Linux (glibc and musl), macOS and Windows are attached to each [GitHub release](https://github.com/krisbrud/openporch/releases).
+
+```sh
+# macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/krisbrud/openporch/releases/latest/download/openporch-cli-installer.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/krisbrud/openporch/releases/latest/download/openporch-cli-installer.ps1 | iex"
+```
+
+Releases are built by [`dist`](https://github.com/axodotdev/cargo-dist). To cut one, bump `version` in the workspace `Cargo.toml`, merge, then push a matching tag such as `v0.1.0`. After changing `dist-workspace.toml`, run `dist generate` to refresh `.github/workflows/release.yml`.
+
 ## Getting started
 
 [Getting started](docs/getting-started.md) takes you from a clean machine to a
