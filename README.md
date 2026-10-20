@@ -30,7 +30,10 @@ Lambda function in your own AWS account, without Kubernetes. The
 [developer quickstart](docs/quickstart.md) runs a server locally and deploys
 a workload with the `porch` command line, without a cloud account. The [command reference](docs/cli.md)
 lists every `porch` command, and the [API reference](docs/api.md) every route.
-[Operating openporch](docs/operations.md) covers health checks, shutdown, upgrades and uninstalling.
+[Operating openporch](docs/operations.md) covers health checks, shutdown, upgrades, backups and uninstalling.
+[Compatibility](docs/compatibility.md) lists the supported contract versions and
+the tested matrix, and [building and releasing](docs/releasing.md) the locked
+build and how to verify a release.
 
 ## Development
 
@@ -46,6 +49,9 @@ just provider  # test the OpenTofu provider and load it into OpenTofu (needs Go 
 just example-platform  # apply examples/aws-platform against a dev server and AWS or Floci, then destroy it
 just e2e-aws  # opt-in: deploy the Lambda examples to a real AWS account and delete them (docs/e2e.md)
 ```
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

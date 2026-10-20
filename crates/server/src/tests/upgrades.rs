@@ -353,6 +353,12 @@ async fn every_schema_fixture_upgrades_to_this_build() {
         );
         let dir = install(&fixture);
         let mut s = server_in(dir).await;
+        // The fixtures' tokens expired a day after they were written; time
+        // passing is not what this test checks.
+        sqlx::query("UPDATE api_tokens SET expires_at = NULL")
+            .execute(s.state.store.pool())
+            .await
+            .unwrap();
         s.admin = std::fs::read_to_string(s.dir.path().join("bootstrap-token"))
             .unwrap()
             .trim()
