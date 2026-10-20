@@ -433,6 +433,51 @@ async fn requests_are_checked_before_acceptance() {
 }
 
 #[tokio::test]
+async fn snapshots_without_recorded_types_are_not_replayed() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let delta = s.delta("web:1").await;
+    let (_, first) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+            None,
+        )
+        .await;
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    gate.add_permits(1);
+    s.finished(&first_id).await;
+    // A snapshot written before types were recorded would replay without
+    // checking any driver's outputs, so it is refused.
+    sqlx::query(
+        "UPDATE deployments SET snapshot = json_set(json_remove(snapshot, '$.types'), \
+         '$.version', 4) WHERE id = ?",
+    )
+    .bind(&first_id)
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"deploy_id": first_id, "expected_generation": 1}),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(b.to_string().contains("no replayable snapshot"), "{b}");
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"deploy_id": first_id, "replay": "current", "expected_generation": 1}),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{b}");
+    gate.add_permits(1);
+}
+
+#[tokio::test]
 async fn redeploys_replay_the_recorded_snapshot_unless_asked_for_current() {
     let s = server().await;
     let gate = s.deployable().await;
