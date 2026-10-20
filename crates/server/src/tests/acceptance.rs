@@ -298,6 +298,10 @@ async fn every_route_declares_the_documented_permission() {
         let [_, method, path, phrase, _] = cells[..] else {
             continue;
         };
+        // Only rows of the route tables: other tables name fields, not methods.
+        if !method.bytes().all(|b| b.is_ascii_uppercase()) {
+            continue;
+        }
         let Ok(method) = method.parse::<Method>() else {
             continue;
         };
