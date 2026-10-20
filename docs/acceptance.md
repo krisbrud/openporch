@@ -47,7 +47,7 @@ end.
 |---|---|---|
 | Request for the configured organization | covered | `crates/server/src/tests/mod.rs::single_organization` |
 | Request for an unknown organization | covered | `crates/server/src/tests/mod.rs::single_organization`, `crates/server/src/tests/mod.rs::other_organizations_are_hidden_before_routing` |
-| Unauthenticated request | covered | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route`, `crates/server/src/tests/mod.rs::router_walk_every_route_declares_a_permission_and_requires_credentials` |
+| Unauthenticated request | gap (partial) | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route`, `crates/server/src/tests/mod.rs::router_walk_every_route_declares_a_permission_and_requires_credentials` (partial: the 401 is asserted, but no test shows a credential-less mutation leaves state unchanged) |
 | Forbidden request | covered | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route`, `crates/server/src/tests/acceptance.rs::every_route_refuses_members_without_its_permission` |
 | Validation failure | covered | `crates/server/src/tests/mod.rs::uniform_errors_and_identifiers` |
 | Duplicate ID | covered | `crates/server/src/tests/mod.rs::uniform_errors_and_identifiers` |
@@ -58,9 +58,9 @@ end.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Create an application | covered | `crates/server/src/tests/envs.rs::application_starts_with_an_undeployed_development_environment`, `crates/server/src/tests/mod.rs::creator_becomes_owner` |
-| Delete an application with provisioned resources | covered | `crates/engine/src/planner/tests/teardown.rs::deleting_an_application_deletes_every_environment_then_the_application`, `crates/engine/src/planner/tests/teardown.rs::adopted_and_external_resources_are_released_not_deleted`, `crates/server/src/tests/resources.rs::delete_a_deployed_application` |
+| Delete an application with provisioned resources | gap (partial) | `crates/engine/src/planner/tests/teardown.rs::deleting_an_application_deletes_every_environment_then_the_application`, `crates/engine/src/planner/tests/teardown.rs::adopted_and_external_resources_are_released_not_deleted`, `crates/server/src/tests/resources.rs::delete_a_deployed_application` (partial: no test asserts external or retained adopted objects are listed in the deletion result) |
 | Delete a type in use | covered | `crates/server/src/tests/envs.rs::environment_types_in_use_are_kept` |
-| Empty environment | covered | `crates/server/src/tests/envs.rs::environments_need_developer_and_deployer` (created env is `never_deployed`, no delta) |
+| Empty environment | gap (partial) | `crates/server/src/tests/envs.rs::environments_need_developer_and_deployer` (created env is `never_deployed`, no delta) (partial: no test lists a new environment's active resources and deployments to show both are empty) |
 | Clone from a deployment | covered | `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` |
 | Successful deletion | covered | `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`, `crates/server/src/tests/resources.rs::delete_a_deployed_environment` (no namespace: Kubernetes is group 9) |
 | Deprovision failure | covered | `crates/engine/src/planner/tests/teardown.rs::a_failed_deletion_keeps_the_environment_for_a_retry` |
@@ -73,7 +73,7 @@ end.
 | Deployment recorded | covered | `crates/server/src/tests/deploys.rs::deployments_are_recorded_with_their_correlated_outcome` |
 | Filter deletions | covered | `crates/server/src/tests/mod.rs::audit_query_filters_and_pages` |
 | Delete attempt | covered | `crates/server/src/tests/mod.rs::audit_access_and_deletion` |
-| Expire past retention | covered | `crates/server/src/tests/mod.rs::audit_entries_expire_only_when_an_administrator_expires_them` |
+| Expire past retention | gap (partial) | `crates/server/src/tests/mod.rs::audit_entries_expire_only_when_an_administrator_expires_them` (partial: no test shows the expiry's audit record shares the deletion's transaction) |
 | Accepted deployment later fails | covered | `crates/server/src/tests/deploys.rs::deployments_are_recorded_with_their_correlated_outcome`, `crates/server/src/tests/resources.rs::a_failed_operation_is_correlated_with_its_request` |
 | Audit storage unavailable | covered | `crates/server/src/tests/mod.rs::audit_failure_rejects_the_mutation`, `crates/store/src/sqlite/tests.rs::failed_audit_write_rejects_the_mutation` |
 
@@ -82,14 +82,14 @@ end.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Actor recorded | gap | No test asserts a definition's `created_by` is the creating service user. Searched `created_by` across `crates/*/src/tests`: only sets, value versions and grants assert it (as `bootstrap`); `DefinitionRecord` serializes `created_by` but no catalog test reads it |
-| Token shown once | covered | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` |
+| Token shown once | gap (partial) | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` (partial: later reads are not checked for the token's ID, description, expiry and creation time) |
 | Revoked token | covered | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` |
-| Who may create tokens | covered | `crates/server/src/tests/mod.rs::who_may_create_tokens`, `crates/server/src/tests/mod.rs::manager_delegation_ceiling` |
-| Missing token | covered | `crates/server/src/tests/mod.rs::missing_bearer_header` |
+| Who may create tokens | gap (partial) | `crates/server/src/tests/mod.rs::who_may_create_tokens`, `crates/server/src/tests/mod.rs::manager_delegation_ceiling` (partial: the cited tests do not cover an administrator creating a service user token or the delegation ceiling; see also `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable`, `crates/server/src/tests/mod.rs::service_user_beyond_the_issuers_authority`) |
+| Missing token | gap (partial) | `crates/server/src/tests/mod.rs::missing_bearer_header` (partial: only the 401 on a GET is asserted; no test shows the request is not processed) |
 | Login and expiry | gap (partial) | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`; CLI hint: `crates/cli/src/tests.rs::login_with_a_token_stores_it_owner_only` (asserts "porch login" only when no credential is stored; the 401-to-relogin hint for an expired session is not asserted) |
 | GitHub device login | covered | `crates/server/src/tests/github.rs::device_login_maps_the_immutable_github_id`, `crates/cli/src/tests.rs::device_login_stores_a_session_for_the_github_user` |
 | Unknown identity | covered | `crates/server/src/tests/mod.rs::unknown_identities_need_an_invitation` |
-| Provider is locked after first login | covered | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1) |
+| Provider is locked after first login | gap (partial) | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1) (partial: no test shows an administrator changing the identity binding, or that only an administrator can) |
 | First start | covered | `crates/server/src/tests/mod.rs::first_start_bootstraps_an_administrator`, `crates/server/tests/bootstrap_logs.rs::bootstrap_token_is_not_logged` |
 | Reused GitHub name | covered | `crates/server/src/tests/github.rs::renamed_and_reused_github_logins`, `crates/server/src/tests/mod.rs::reused_github_login_gains_nothing` |
 | Unverified invitation email | covered | `crates/server/src/tests/mod.rs::unverified_invitation_email_is_denied`, `crates/server/src/tests/github.rs::email_invitations_need_a_verified_github_email` |
@@ -104,7 +104,7 @@ end.
 | Zip function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::zip_function`; real function: manual `just e2e-aws` |
 | Image function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_from_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_function_without_image` |
 | Container workload on Lambda | gap (partial) | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files`; real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter |
-| Non-ECR image | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_in_another_region` |
+| Non-ECR image | gap (partial) | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_in_another_region` (partial: `expect_failures` does not assert the message that images must come from ECR in the same region) |
 | Database password | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::secret_variables_are_references`; `just e2e-aws` checks `SIGNING_KEY_SECRET_REF` in the real function |
 | Function URL | manual | `just e2e-aws` step "Call the API's URL"; config only: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::iam_url`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::inferred_url_is_not_public` |
 | Queue trigger | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::queue_trigger`; real mapping and message processing: `just e2e-aws` |
@@ -138,7 +138,7 @@ end.
 | Create a static account | covered | `crates/server/src/tests/accounts.rs::create_a_static_account` |
 | Create a role account | covered | `crates/server/src/tests/accounts.rs::create_a_role_account`, `crates/engine/src/cloud/tests.rs::role_accounts_assume_the_role_with_the_external_id` |
 | Wrong external ID | covered | `crates/server/src/tests/accounts.rs::account_check_returns_the_caller_identity` (mocked STS); `crates/engine/src/cloud/tests.rs::real_account_check` (ignored; CI against Floci, once against real AWS) |
-| OpenTofu driver with a role account | covered | `crates/engine/src/cloud/tests.rs::drivers_receive_only_the_account_credentials`, `crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only` |
+| OpenTofu driver with a role account | gap (partial) | `crates/engine/src/cloud/tests.rs::drivers_receive_only_the_account_credentials`, `crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only` (partial: no test runs an OpenTofu definition with `driver_account` through the executor and checks the driver log for credentials) |
 | Delete in use | covered | `crates/server/src/tests/accounts.rs::delete_an_account_in_use` |
 | Expiring role session | covered | `crates/engine/src/cloud/tests.rs::role_sessions_are_reused_and_refreshed_before_expiry`, `crates/engine/src/cloud/tests.rs::work_longer_than_a_session_fails_before_any_call` |
 
@@ -148,12 +148,12 @@ end.
 |---|---|---|
 | Small installation | covered | `crates/cli/src/tests/quickstart.rs::the_quickstart_runs_as_written` |
 | Second process | covered | `crates/server/src/tests/keys.rs::a_second_server_on_the_same_installation_exits_before_any_work`, `crates/store/src/sqlite/tests.rs::second_owner_is_refused` |
-| Database works but key is missing | covered | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations` |
+| Database works but key is missing | gap (partial) | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations` (partial: the refusal is shown for creating an application, not for running a deployment) |
 | Restore after total server loss | covered | `crates/server/src/tests/restore.rs::backup_and_restore_drill` |
 | Unsupported downgrade | covered | `crates/server/src/tests/upgrades.rs::an_older_build_refuses_every_newer_fixture_unchanged`, `crates/store/src/sqlite/tests.rs::newer_schema_is_refused_without_changes` |
-| Uninstall with active resources | covered | `crates/server/src/tests/e2e.rs::stopping_and_restarting_the_server_deletes_nothing`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` (instructions in `docs/operations.md`) |
+| Uninstall with active resources | gap (partial) | `crates/server/src/tests/e2e.rs::stopping_and_restarting_the_server_deletes_nothing`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` (instructions in `docs/operations.md`) (partial: no test performs the uninstall described in docs/operations.md) |
 | Concurrent environments | covered | `crates/engine/src/planner/tests.rs::concurrency_is_bounded_across_environments`, `crates/server/src/tests/deploys.rs::running_deployments_are_bounded_and_status_stays_available` |
-| Storage exhausted | covered | `crates/engine/src/planner/tests.rs::the_log_stops_at_its_quota_but_keeps_the_outcome`, `crates/engine/src/planner/tests.rs::lost_log_lines_fail_the_deployment`, `crates/server/src/tests/mod.rs::audit_failure_rejects_the_mutation` |
+| Storage exhausted | gap (partial) | `crates/engine/src/planner/tests.rs::the_log_stops_at_its_quota_but_keeps_the_outcome`, `crates/engine/src/planner/tests.rs::lost_log_lines_fail_the_deployment`, `crates/server/src/tests/mod.rs::audit_failure_rejects_the_mutation` (partial: rejection is shown only when the audit write fails, not when operation records cannot be stored) |
 | Benchmark under driver load | manual | `just bench` runs the ignored `crates/server/src/tests/benchmark.rs::reference_capacity_benchmark` (asserts p95 thresholds); not in CI; results in `docs/benchmark.md` |
 | Diagnose a timeout | covered | `crates/server/src/tests/resources.rs::diagnostics_correlate_a_timed_out_deployment_without_secrets` |
 | Release from clean checkout | manual | `.github/workflows/release.yml` on a `v*` tag (PRs touching the release build run its locked-input, test, fixture and checksum steps without attestation); task 14.5 is still open, so no tagged run is recorded |
@@ -166,8 +166,8 @@ end.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Unsupported target | deferred | Kubernetes workloads, group 9 |
-| Database replacement | covered | `crates/engine/src/executor/tests.rs::a_replacement_needs_a_permit_for_its_plan`, `crates/server/src/tests/plans.rs::a_refused_driver_plan_shows_in_the_next_preview` |
-| Inputs become resolvable later | covered | `crates/engine/src/executor/tests.rs::a_replacement_needs_a_permit_for_its_plan`, `crates/server/src/tests/plans.rs::a_refused_driver_plan_shows_in_the_next_preview` |
+| Database replacement | gap (partial) | `crates/engine/src/executor/tests.rs::a_replacement_needs_a_permit_for_its_plan`, `crates/server/src/tests/plans.rs::a_refused_driver_plan_shows_in_the_next_preview` (partial: `approval_required` is checked, but not the preview the record should carry) |
+| Inputs become resolvable later | gap (partial) | `crates/engine/src/executor/tests.rs::a_replacement_needs_a_permit_for_its_plan`, `crates/server/src/tests/plans.rs::a_refused_driver_plan_shows_in_the_next_preview` (partial: no test has earlier dependencies finish before the late driver plan and asserts they stay tracked and the deployment fails) |
 | Protected environment | covered | `crates/server/src/tests/plans.rs::destructive_permits_in_a_protected_environment_need_an_administrator` |
 | Pre-existing namespace | deferred | Kubernetes namespaces, group 9 |
 | Developer requests host access | deferred | Kubernetes target fragments, group 9 (task 9.2) |
@@ -192,21 +192,21 @@ end.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Deploy a delta | covered | `crates/server/src/tests/deploys.rs::deploy_a_delta` |
-| Stale or concurrent request | covered | `crates/server/src/tests/deploys.rs::stale_or_concurrent_requests_conflict`, `crates/store/src/sqlite/tests.rs::stale_generation_and_running_deployments_conflict_without_changes` |
+| Stale or concurrent request | gap (partial) | `crates/server/src/tests/deploys.rs::stale_or_concurrent_requests_conflict`, `crates/store/src/sqlite/tests.rs::stale_generation_and_running_deployments_conflict_without_changes` (partial: no test has an environment deletion still running when the request arrives) |
 | Lost HTTP response | covered | `crates/server/src/tests/deploys.rs::a_lost_response_is_retried_with_the_same_key`, `crates/store/src/sqlite/tests.rs::idempotent_retry_returns_the_original_deployment` |
 | Missing deployer role | covered | `crates/server/src/tests/deploys.rs::deploying_needs_the_deployer_role` |
-| Partial success | covered | `crates/server/src/tests/resources.rs::usage_after_a_partial_failure` (database result and last success kept), `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` (`partial` convergence after a failure), `crates/engine/src/planner/tests.rs::one_branch_fails` |
+| Partial success | gap (partial) | `crates/server/src/tests/resources.rs::usage_after_a_partial_failure` (database result and last success kept), `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` (`partial` convergence after a failure), `crates/engine/src/planner/tests.rs::one_branch_fails` (partial: no test has the database succeed while the workload fails; partial convergence is asserted only on a constructed record) |
 | One branch fails | covered | `crates/engine/src/planner/tests.rs::one_branch_fails` |
 | Permanent driver error | covered | `crates/engine/src/planner/tests.rs::permanent_errors_are_not_retried`, `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-400-validation.json`) |
 | Crash after creation | covered | `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation`, `crates/engine/src/planner/tests/recovery.rs::nothing_found_is_provisioned_again_with_the_same_identity` |
 | Driver keeps running after timeout | covered | `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered`, `crates/engine/src/planner/tests/recovery.rs::an_operation_still_running_is_left_unknown` |
 | Configuration changes during execution | gap (partial) | `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (snapshot vs current; no test edits configuration while a run is in flight) |
 | Unchanged deployment | covered | `crates/server/src/tests/resources.rs::stable_across_deployments`, `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` (second plan has no effects) |
-| Recover after a failed deployment | covered | `crates/cli/src/tests/deploys.rs::logs_replays_and_stored_deltas`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` |
+| Recover after a failed deployment | gap (partial) | `crates/cli/src/tests/deploys.rs::logs_replays_and_stored_deltas`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (partial: no failed deployment precedes the replay, and current permissions or permit policy on the replay are not checked) |
 | Artifact no longer exists | covered | `crates/engine/src/planner/tests/workloads.rs::a_missing_artifact_stops_the_deployment_before_anything_runs`, `crates/server/src/tests/e2e.rs::a_deployment_pins_its_versions_and_replay_refuses_missing_inputs` |
 | Redacted failure | covered | `crates/engine/src/executor/tests.rs::opentofu_failure_is_redacted_in_the_deployment_log` (ignored, runs in CI), `crates/server/src/tests/resources.rs::read_a_deployments_redacted_log` |
 | Retry after generation advanced | covered | `crates/server/src/tests/deploys.rs::a_lost_response_is_retried_with_the_same_key`, `crates/cli/src/tests/deploys.rs::lost_acceptance_response_returns_the_original_deployment` |
-| Reading after partial failure | covered | `crates/server/src/tests/resources.rs::inspect_the_graph_after_a_failed_deployment`, `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` |
+| Reading after partial failure | gap (partial) | `crates/server/src/tests/resources.rs::inspect_the_graph_after_a_failed_deployment`, `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` (partial: partial convergence is asserted only on a constructed failed record) |
 
 ## drivers
 
@@ -262,13 +262,13 @@ end.
 | Table key from params | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_modules_read_the_resource_inputs`, `examples/modules/dynamodb-table/tests/table.tftest.hcl::key_sort_key_and_index` |
 | Secret workload variable | covered | `crates/drivers/src/opentofu/tests.rs::secret_resource_inputs_are_moved_out_one_by_one`, `crates/drivers/src/opentofu/tests.rs::a_secret_inside_another_moves_with_it`, `crates/drivers/src/opentofu/tests.rs::the_plain_variable_file_has_no_secret_input` |
 | Reserved variable name | covered | `crates/server/src/tests/catalog.rs::opentofu_definition_inputs_are_checked_when_written` |
-| Git module with variables | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit` (git module with variables; the RDS module itself is milestone 2) |
+| Git module with variables | gap (partial) | `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit` (git module with variables; the RDS module itself is milestone 2) (partial: the module returns `length`, not host, port, name, username and password) |
 | Default AWS environment | covered | `crates/drivers/src/opentofu/tests.rs::fake_run_exports_the_default_aws_environment`; real: `just e2e-aws` |
 | Orchestrator-managed state | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice` (CI against Floci S3; once against real S3) |
 | Sensitive output | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` |
 | Environment deleted | covered | Driver destroy and state removal: `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end`, `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice`; environment teardown: `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`; real bucket: `just e2e-aws` |
 | Apply fails | gap (partial) | `crates/drivers/src/opentofu/tests.rs::opentofu_failures_are_reported_redacted`, `crates/engine/src/executor/tests.rs::opentofu_failure_is_redacted_in_the_deployment_log` (generic failure, not an AWS IAM error) |
-| Partial apply writes state | covered | `crates/drivers/src/opentofu/tests.rs::a_failed_apply_is_uncertain_and_keeps_what_it_ran`, `crates/drivers/src/opentofu/tests.rs::opentofu_a_timed_out_apply_leaves_usable_state` |
+| Partial apply writes state | gap (partial) | `crates/drivers/src/opentofu/tests.rs::a_failed_apply_is_uncertain_and_keeps_what_it_ran`, `crates/drivers/src/opentofu/tests.rs::opentofu_a_timed_out_apply_leaves_usable_state` (partial: no test has an apply create one object, fail on a second, then retry) |
 | Missing state | covered | `crates/drivers/src/opentofu/tests.rs::lost_state_needs_recovery`, `crates/drivers/src/opentofu/tests.rs::state_lost_after_an_apply_started_is_never_replaced` |
 | Module revision removed upstream | covered | `crates/engine/src/planner/tests.rs::a_removal_whose_retained_version_is_gone_changes_nothing`, `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit`, `crates/drivers/src/opentofu/tests.rs::deleting_a_script_resource_never_fetches_a_newer_source` |
 | State and resource accounts differ | covered | `crates/drivers/src/opentofu/tests.rs::s3_state_uses_a_workspace_per_resource_and_its_own_credentials` |
@@ -326,7 +326,7 @@ end.
 | Org viewer reads secrets | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references` |
 | Developer without deployer | covered | `crates/server/src/tests/deploys.rs::deploying_needs_the_deployer_role`, `crates/server/src/rbac.rs::deployer_gate_names_the_missing_role` |
 | Create an application | covered | `crates/server/src/tests/mod.rs::creator_becomes_owner` |
-| Hidden application | covered | `crates/server/src/tests/mod.rs::hidden_and_missing_applications_are_404_and_mutations_are_audited` |
+| Hidden application | gap (partial) | `crates/server/src/tests/mod.rs::hidden_and_missing_applications_are_404_and_mutations_are_audited` (partial: the cited test exercises a DELETE, not a read; see also `crates/server/src/tests/mod.rs::union_of_roles_and_hidden_applications`) |
 | Known application, forbidden action | covered | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route` |
 | Grant through the provider | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |
 | Cross-application deployment reference | covered | `crates/server/src/tests/deploys.rs::cross_application_references_are_hidden` |
@@ -339,7 +339,7 @@ end.
 | List types | covered | `crates/server/src/tests/catalog.rs::built_in_types_are_listed_with_schemas`, `crates/core/src/catalog.rs::builtin_type_list` |
 | Workload type | covered | `crates/core/src/catalog.rs::workload_type` |
 | Postgres outputs | covered | `crates/core/src/catalog.rs::postgres_schema` |
-| Create a custom type | covered | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed`; workload request of a custom type: `crates/core/src/graph/tests.rs::unknown_types_and_bad_placeholders_fail` |
+| Create a custom type | gap (partial) | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed`; workload request of a custom type: `crates/core/src/graph/tests.rs::unknown_types_and_bad_placeholders_fail` (partial: no test has a workload request the created type and build it into a graph) |
 | Modify a built-in type | covered | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed` |
 | Request an undefined class | covered | `crates/core/src/graph/tests.rs::undefined_class_fails_naming_it` |
 | Missing required output | gap | Only the pure check is tested (`crates/core/src/catalog.rs::output_validation`). `ResourceType::validate_outputs` / `validate_secret_output` are never called outside `crates/core/src/catalog.rs`, so provisioning does not enforce output schemas; searched `validate_outputs`, `output_kind`, `missing output` in `crates/engine`, `crates/server` |
@@ -392,10 +392,10 @@ end.
 | Reference copied between applications | covered | `crates/server/src/tests/secret_use.rs::reference_copied_between_applications` |
 | Production reference in development | covered | `crates/server/src/tests/secret_use.rs::production_reference_in_development` |
 | Failure leaves a variables file | gap (partial) | Run directories are private and removed after a run or a reaped timeout (`crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only`, `crates/drivers/src/opentofu/tests.rs::a_timed_out_run_is_interrupted_and_reaped_before_the_next`). No test leaves `secrets.tfvars.json` behind after a server crash and checks owner-only mode, removal on recovery and omission from diagnostics; searched `secrets.tfvars`, `runs/`, `mode()` in `crates/drivers/src/opentofu/tests.rs` |
-| Master key unavailable | covered | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` |
+| Master key unavailable | gap (partial) | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` (partial: the key file is deleted rather than a database restored without it, and a deployment is not shown refused) |
 | Store depends on itself | covered | `crates/server/src/tests/accounts.rs::store_depends_on_itself` |
 | Environment secret copied to app values | covered | `crates/server/src/tests/secret_use.rs::environment_secret_copied_to_app_values` |
-| Restore after key rotation | covered | `crates/server/src/tests/keys.rs::rotate_the_master_key`, `crates/store/src/secrets/tests.rs::rotation_keeps_old_versions_readable` |
+| Restore after key rotation | gap (partial) | `crates/server/src/tests/keys.rs::rotate_the_master_key`, `crates/store/src/secrets/tests.rs::rotation_keeps_old_versions_readable` (partial: no backup holding old and new key IDs is restored; key handling is shown only on a restart) |
 
 ## shared-values
 
@@ -403,7 +403,7 @@ end.
 |---|---|---|
 | Environment override | covered | `crates/server/src/tests/values.rs::environment_override`, `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays` |
 | Override without base | covered | `crates/server/src/tests/values.rs::override_without_base` |
-| Secret in a composite string | covered | `crates/engine/src/executor/tests.rs::a_secret_in_a_composite_string_is_rendered_only_for_the_driver` |
+| Secret in a composite string | gap (partial) | `crates/engine/src/executor/tests.rs::a_secret_in_a_composite_string_is_rendered_only_for_the_driver` (partial: nothing asserts conversion and the planner keep the unresolved `${values.API_TOKEN}` expression) |
 | Deployment pins its version | covered | `crates/server/src/tests/e2e.rs::a_deployment_pins_its_versions_and_replay_refuses_missing_inputs` |
 | Delete environment | covered | `crates/server/src/tests/values.rs::delete_environment` |
 
@@ -416,7 +416,7 @@ end.
 | Unknown field | covered | `crates/core/src/workload/tests.rs::unknown_field_is_named` |
 | Web container | covered | `crates/core/src/workload/tests.rs::web_container_implies_http_trigger` |
 | Zip function | covered | `crates/core/src/workload/tests.rs::deploy_time_artifact_is_required_and_supplied_by_name` |
-| Image function | covered | `crates/core/src/workload/tests.rs::image_function`, `crates/core/src/workload/tests.rs::deploy_time_image_is_required` |
+| Image function | gap (partial) | `crates/core/src/workload/tests.rs::image_function`, `crates/core/src/workload/tests.rs::deploy_time_image_is_required` (partial: no test shows deploying a function image package requires `--image <name>=<ref>`) |
 | Queue trigger on a dependency | covered | `crates/core/src/workload/tests.rs::queue_trigger_on_a_dependency`, `crates/core/src/graph/tests.rs::queue_trigger_dependency_is_in_the_graph`, `crates/engine/src/planner/tests/workloads.rs::a_lambda_class_workload_gets_its_resolved_document` |
 | Trigger names a missing resource | covered | `crates/core/src/workload/tests.rs::trigger_names_missing_resource` |
 | Unsupported trigger for the target | deferred | `openporch/kubernetes`, group 9 |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 217 covered, 9 manual, 31 deferred, 17 gaps.
+274 scenarios: 190 covered, 9 manual, 31 deferred, 44 gaps.
