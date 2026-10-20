@@ -395,7 +395,15 @@ async fn asynchronous_provisioning_over_http() {
 async fn a_failed_mutation_keeps_the_cookie_it_returned() {
     let old = Cookie::new(1, "op-1").unwrap();
     let new = Cookie::new(1, "op-2").unwrap();
-    for (status, call) in [(409, "put"), (503, "put"), (409, "delete"), (500, "delete")] {
+    for (status, call) in [
+        (409, "put"),
+        (503, "put"),
+        (409, "delete"),
+        (500, "delete"),
+        // A 404 without `Openporch-Protocol` is uncertain, and its cookie is
+        // still kept.
+        (404, "delete"),
+    ] {
         let mock = Shared::default();
         mock.lock().unwrap().queue.push_back(Canned {
             status,

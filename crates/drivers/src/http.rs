@@ -508,7 +508,10 @@ impl Driver for HttpDriver {
                 StatusCode::OK | StatusCode::NO_CONTENT => Ok(DeleteOutcome::Deleted),
                 // The driver's own 404 means it is already gone.
                 StatusCode::NOT_FOUND if reply.spoken => Ok(DeleteOutcome::Deleted),
-                StatusCode::NOT_FOUND => Err(DriverError::Uncertain(NOT_A_DRIVER_404.into())),
+                // Whatever answered, a cookie it returned is kept.
+                StatusCode::NOT_FOUND => {
+                    Err(DriverError::Uncertain(NOT_A_DRIVER_404.into()).with_cookie(reply.cookie))
+                }
                 StatusCode::ACCEPTED => Ok(DeleteOutcome::InProgress {
                     poll_after: reply.poll_after(),
                     cookie: reply.cookie,
