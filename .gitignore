@@ -2,3 +2,4 @@
 /.openporch/
 /provider/terraform-provider-openporch
 __pycache__/
+/dist

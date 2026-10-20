@@ -1,0 +1,137 @@
+name: Release
+
+# A tag `vX.Y.Z` builds the release from that commit with the locked inputs,
+# tests it, and drafts a GitHub release with the archives, their SHA256SUMS
+# and a build provenance attestation; a maintainer publishes the draft
+# (docs/releasing.md). Pull requests that change the release build, and
+# manual runs, do everything except attesting and drafting.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/release-archive.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  verify:
+    name: locked inputs, tests and fixtures
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: The tag names the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "openporch-server") | .version')
+          test "v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $version" >&2
+            exit 1
+          }
+      - name: Cargo.lock is complete and current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: provider/go.mod
+          cache: false
+      - name: go.sum is complete and current
+        working-directory: provider
+        run: |
+          go mod verify
+          go build -mod=readonly ./...
+          go mod tidy -diff
+      - name: Tests, schema fixtures and documented examples
+        run: cargo test --locked --workspace
+      - name: Dependency licenses and advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: provider/go.mod
+          cache: false
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: scripts/release-archive.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    name: checksums and provenance
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Draft the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "openporch $GITHUB_REF_NAME" \
+            --notes "Built from $GITHUB_SHA. Verify with docs/releasing.md before publishing."
