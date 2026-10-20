@@ -340,7 +340,11 @@ impl Client {
         check_path(path)?;
         let url = Url::parse(&format!("{}{path}", url_key(&self.base)))
             .map_err(|e| Error::InvalidUrl(format!("{path}: {e}")))?;
-        let mut req = self.http.request(method, url);
+        // A server of another contract refuses the request before acting on it.
+        let mut req = self
+            .http
+            .request(method, url)
+            .header(CONTRACT_HEADER, CONTRACT_VERSION);
         for (name, value) in headers {
             req = req.header(*name, *value);
         }

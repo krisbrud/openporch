@@ -213,7 +213,11 @@ async fn servers_of_another_contract_are_refused_clearly() {
         )
         .route(
             "/orgs/acme/current-user",
-            get(|| async { ([(CONTRACT_HEADER, "1")], axum::Json(serde_json::json!({}))) }),
+            get(|headers: HeaderMap| async move {
+                // Requests name the contract the client was written for.
+                assert_eq!(headers[CONTRACT_HEADER], CONTRACT_VERSION);
+                ([(CONTRACT_HEADER, "1")], axum::Json(serde_json::json!({})))
+            }),
         )
         .route(
             "/version",

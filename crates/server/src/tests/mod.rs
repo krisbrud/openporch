@@ -417,6 +417,37 @@ async fn health_and_version() {
 }
 
 #[tokio::test]
+async fn requests_for_another_contract_change_nothing() {
+    let s = server().await;
+    let headers = [(crate::api::CONTRACT_HEADER, "2")];
+    let (status, body) = s
+        .call_with(
+            Method::POST,
+            "/orgs/acme/apps",
+            Some(&s.admin),
+            Some(json!({"id": "shop"})),
+            &headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "API-008", "{body}");
+    let (_, apps) = s.get("/orgs/acme/apps", &s.admin).await;
+    assert_eq!(apps, json!([]));
+    // The contract it serves is accepted.
+    let headers = [(crate::api::CONTRACT_HEADER, "1")];
+    let (status, body) = s
+        .call_with(
+            Method::POST,
+            "/orgs/acme/apps",
+            Some(&s.admin),
+            Some(json!({"id": "shop"})),
+            &headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
 async fn missing_master_key_blocks_readiness_and_mutations() {
     let s = server().await;
     let admin = s.admin.clone();

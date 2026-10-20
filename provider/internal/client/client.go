@@ -173,6 +173,8 @@ func (c *Client) DoWithHeaders(ctx context.Context, method, path string, headers
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// A server of another contract refuses the request before acting on it.
+	req.Header.Set(contractHeader, ContractVersion)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
