@@ -570,6 +570,21 @@ where
             ..ProvisionResult::default()
         };
         let secrets = outputs.secrets.expose();
+        // Outputs that do not match the type would reach the resources that use
+        // them, so the resource fails, naming the output. Messages name outputs
+        // and types, never values.
+        if let Some(ty) = &job.output_schema {
+            let names = secrets.keys().cloned().collect();
+            ty.validate_outputs(&result.outputs, &names)
+                .and_then(|()| {
+                    secrets
+                        .iter()
+                        .try_for_each(|(name, value)| ty.validate_secret_output(name, value))
+                })
+                .map_err(|e| {
+                    ExecFailure::Permanent(format!("the driver's outputs are invalid: {e}"))
+                })?;
+        }
         let mut texts = Vec::new();
         for value in secrets.values() {
             secret_texts(value, &mut texts);

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use openporch_core::canonical::to_canonical_string;
-use openporch_core::catalog::{ResourceUse, builtin_types};
+use openporch_core::catalog::{ResourceType, ResourceUse, builtin_types};
 use openporch_core::graph::{Node, ResourceGraph};
 use openporch_core::ids::{
     AccountId, AppId, DefinitionId, Descriptor, EnvId, EnvTypeId, Guresid, OrgId, ResourceTypeId,
@@ -79,6 +79,10 @@ pub struct Deployment {
     /// The version of the drivers' code each resource ran, by descriptor, as
     /// recorded when it provisioned: a replay runs the same versions.
     pub pins: BTreeMap<String, Value>,
+    /// The resource types the graph uses, as the snapshot recorded them.
+    /// Snapshots from before types were recorded have none, and their outputs
+    /// are not checked.
+    pub types: BTreeMap<ResourceTypeId, ResourceType>,
     /// Whether this deletes the environment: the graph is empty, and every
     /// owned resource is deleted rather than only removed workloads and those
     /// scheduled for deletion.
@@ -145,8 +149,24 @@ impl Deployment {
                 .as_object()
                 .map(|pins| pins.clone().into_iter().collect())
                 .unwrap_or_default(),
+            types: snapshot["types"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(id, ty)| {
+                    let ty: ResourceType = serde_json::from_value(ty.clone())
+                        .map_err(|e| format!("the snapshot's type `{id}` is unreadable: {e}"))?;
+                    Ok((ty.id.clone(), ty))
+                })
+                .collect::<Result<_, String>>()?,
             teardown: false,
         })
+    }
+
+    /// The type of the resources of type `ty`, whose output schema their
+    /// driver's outputs must satisfy.
+    pub fn output_schema(&self, ty: &ResourceTypeId) -> Option<ResourceType> {
+        self.types.get(ty).cloned()
     }
 }
 
@@ -191,6 +211,9 @@ pub struct ProvisionJob {
     /// resource whose impact the driver cannot preview needs a permit; a
     /// first creation destroys nothing and does not.
     pub existing: bool,
+    /// The resource's type, whose output schema the driver's outputs must
+    /// satisfy; none when nothing is provisioned, such as a check or a deletion.
+    pub output_schema: Option<ResourceType>,
     /// When the deployment's time runs out.
     pub deadline: Instant,
     /// Where the executor writes the resource's log. Before writing, it
@@ -1095,6 +1118,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 target: None,
                 pin: Some(pin.clone()),
                 existing: false,
+                output_schema: None,
                 deadline,
                 log: JobLog::discard(),
             };
@@ -1213,6 +1237,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     target: r.target.clone(),
                     pin: None,
                     existing: true,
+                    output_schema: None,
                     deadline,
                     log: JobLog::discard(),
                 },
@@ -2181,6 +2206,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                 .get(&node.descriptor.to_string())
                 .cloned(),
             existing: false,
+            output_schema: self.deployment.output_schema(&node.descriptor.ty),
             deadline: self.deadline,
             log: log.clone(),
         })
@@ -2454,4 +2480,9 @@ fn fingerprint(
     });
     let digest = Sha256::digest(to_canonical_string(&doc).as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The built-in type `ty`, if it is one.
+pub(crate) fn builtin_type(ty: &ResourceTypeId) -> Option<ResourceType> {
+    builtin_types().into_iter().find(|t| &t.id == ty)
 }

@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use openporch_core::canonical::to_canonical_string;
-use openporch_core::catalog::{ClassRegistry, builtin_types};
+use openporch_core::catalog::{ClassRegistry, ResourceType, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_engine::cloud::{EcrImage, S3Version, in_ecr, pinned_image};
@@ -449,6 +449,13 @@ async fn snapshot(
             )
         })
         .collect();
+    // The types the graph uses, whose output schemas the driver's outputs must
+    // satisfy, as they are now: a replay checks against the same schemas.
+    let used_types: BTreeMap<String, &ResourceType> = types
+        .iter()
+        .filter(|t| graph.nodes.values().any(|n| n.descriptor.ty == t.id))
+        .map(|t| (t.id.to_string(), t))
+        .collect();
     let drivers: BTreeMap<String, Option<String>> = graph
         .nodes
         .values()
@@ -465,6 +472,7 @@ async fn snapshot(
         "permits": req.permits,
         "graph": graph,
         "definitions": used,
+        "types": used_types,
         "drivers": drivers,
         "values": values(state, env).await?,
     });

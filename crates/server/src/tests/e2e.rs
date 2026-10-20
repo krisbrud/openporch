@@ -141,7 +141,8 @@ const QUEUE: &str = "sqs.default#modules.worker.externals.queue";
 fn postgres(port: u16) -> Value {
     json!({"values": {
         "host": "db.internal",
-        "templates": {"outputs": format!("host: \"{{{{ driver.values.host }}}}\"\nport: {port}\n")},
+        "templates": {"outputs": format!("host: \"{{{{ driver.values.host }}}}\"\nname: shop\nport: {port}\n"),
+                      "secrets": "username: shop\npassword: change-me\n"},
     }})
 }
 
@@ -208,7 +209,9 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
             "queues",
             "sqs",
             "openporch/echo",
-            json!({"values": {"url": "https://sqs.example/orders"}}),
+            json!({"values": {"url": "https://sqs.example/orders",
+                              "arn": "arn:aws:sqs:eu-north-1:111122223333:orders",
+                              "region": "eu-north-1"}}),
         ),
     ] {
         let mut def = json!({"id": id, "type": ty, "driver_type": driver,
@@ -313,7 +316,7 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     // the application's values and the queue's outputs.
     assert_eq!(
         dev[DB]["outputs"],
-        json!({"host": "db.internal", "port": 5432})
+        json!({"host": "db.internal", "name": "shop", "port": 5432})
     );
     assert_eq!(
         variables(&dev),
@@ -323,7 +326,8 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     let triggers = &dev[WORKLOAD]["outputs"]["spec"]["triggers"];
     assert_eq!(
         triggers["orders"]["queue"]["outputs"],
-        json!({"url": "https://sqs.example/orders"})
+        json!({"url": "https://sqs.example/orders",
+               "arn": "arn:aws:sqs:eu-north-1:111122223333:orders", "region": "eu-north-1"})
     );
     assert!(
         dev[WORKLOAD]["dependencies"]
@@ -389,7 +393,7 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     let old = s.active("development").await;
     assert_eq!(
         old[DB]["outputs"],
-        json!({"host": "db.internal", "port": 5432})
+        json!({"host": "db.internal", "name": "shop", "port": 5432})
     );
     assert_eq!(variables(&old)["API_HOST"], "api.shared");
     assert_eq!(artifact(&old), "s3://artifacts/worker.zip?versionId=v1");
@@ -405,7 +409,7 @@ async fn a_function_with_a_database_and_a_queue_deploys_and_replays() {
     let current = s.active("development").await;
     assert_eq!(
         current[DB]["outputs"],
-        json!({"host": "db.internal", "port": 6432})
+        json!({"host": "db.internal", "name": "shop", "port": 6432})
     );
     assert_eq!(variables(&current)["API_HOST"], "api.v2");
     assert_eq!(artifact(&current), "s3://artifacts/worker.zip?versionId=v2");
@@ -498,8 +502,9 @@ async fn a_deployment_pins_its_versions_and_replay_refuses_missing_inputs() {
             "pg",
             "postgres",
             "openporch/echo",
-            json!({"values": {"host": "db.internal"},
-                   "secret_refs": {"password": {"store": "openporch", "ref": "shop/pg-password"}}}),
+            json!({"values": {"host": "db.internal", "name": "shop", "port": 5432},
+                   "secret_refs": {"username": {"value": "shop"},
+                                   "password": {"store": "openporch", "ref": "shop/pg-password"}}}),
         ),
     ] {
         let (st, b) = s

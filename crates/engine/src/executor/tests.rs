@@ -1008,6 +1008,7 @@ fn provision_job(db: &openporch_store::ActiveResource, guresid: Guresid) -> Prov
         target: None,
         pin: None,
         existing: true,
+        output_schema: None,
         deadline: Instant::now() + Duration::from_secs(60),
         log: JobLog::discard(),
     }
@@ -1124,6 +1125,7 @@ fn provision_job_empty() -> ProvisionJob {
         target: None,
         pin: None,
         existing: false,
+        output_schema: None,
         deadline: Instant::now(),
         log: JobLog::discard(),
     }

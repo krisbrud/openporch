@@ -302,10 +302,11 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             .ok_or_else(|| format!("environment `{app}/{env}` no longer exists"))?
             .env_type;
         let invalid_id = |what: &str| format!("the stored {what} ID is invalid");
+        let descriptor = Descriptor::parse(&r.descriptor).map_err(|_| invalid_id("resource"))?;
         Ok(ProvisionJob {
             operation_id: op.operation_id.clone(),
             attempt: op.attempt,
-            descriptor: Descriptor::parse(&r.descriptor).map_err(|_| invalid_id("resource"))?,
+            descriptor: descriptor.clone(),
             guresid: r
                 .guresid
                 .parse::<Guresid>()
@@ -335,6 +336,10 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             target: r.target.clone(),
             pin: None,
             existing: r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some(),
+            // A creation found finished is checked like one that finished in
+            // the deployment. Custom types are not recorded with the resource,
+            // so only built-in types are checked.
+            output_schema: crate::planner::builtin_type(&descriptor.ty),
             deadline: Instant::now() + OBSERVE_TIMEOUT,
             log: JobLog::discard(),
         })

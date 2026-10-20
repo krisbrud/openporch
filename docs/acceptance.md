@@ -342,7 +342,7 @@ end.
 | Create a custom type | gap (partial) | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed`; workload request of a custom type: `crates/core/src/graph/tests.rs::unknown_types_and_bad_placeholders_fail` (partial: no test has a workload request the created type and build it into a graph) |
 | Modify a built-in type | covered | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed` |
 | Request an undefined class | covered | `crates/core/src/graph/tests.rs::undefined_class_fails_naming_it` |
-| Missing required output | gap | Only the pure check is tested (`crates/core/src/catalog.rs::output_validation`). `ResourceType::validate_outputs` / `validate_secret_output` are never called outside `crates/core/src/catalog.rs`, so provisioning does not enforce output schemas; searched `validate_outputs`, `output_kind`, `missing output` in `crates/engine`, `crates/server` |
+| Missing required output | covered | `crates/server/src/tests/deploys.rs::a_missing_required_output_fails_the_resource`, `crates/core/src/catalog.rs::output_validation` |
 | Catalog schema fixture | covered | `crates/core/src/catalog.rs::published_catalog_fixtures_are_current`, `crates/core/src/catalog.rs::catalog_output_conformance` |
 
 ## resource-definitions
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 190 covered, 9 manual, 31 deferred, 44 gaps.
+274 scenarios: 191 covered, 9 manual, 31 deferred, 43 gaps.

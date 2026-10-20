@@ -1157,6 +1157,10 @@ Built-in types, such as `postgres`, `s3`, `sqs` and `workload`, are listed with
 their input and output schemas. Custom types are named `<org>/<name>`. `use` is
 `direct` (workloads request it), `indirect` (only other resources reference it) or
 `implicit` (one per environment). Output schemas have `values` and `secrets`.
+A resource whose driver returns outputs that miss a required output, have the
+wrong JSON type, or put a secret output in `values` fails, and the error names
+the output. A deployment checks against the types as they were when it was
+accepted; a snapshot replay uses the schemas it recorded.
 `PUT` replaces the whole type, so schemas left out reset to their defaults.
 
 ```http

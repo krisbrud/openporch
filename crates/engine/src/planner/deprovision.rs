@@ -436,6 +436,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                 target: r.target.clone(),
                 pin: None,
                 existing: true,
+                output_schema: None,
                 deadline: self.deadline,
                 log: log.clone(),
             };
