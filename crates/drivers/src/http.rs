@@ -314,6 +314,13 @@ impl HttpDriver {
                 code: None,
                 message: format!("the driver refused the credentials ({status})"),
             },
+            // A conflicting operation may be this one, retried after its
+            // response was lost: the resource is observed before anything is
+            // changed again, never mutated blindly.
+            409 if reply.mutation => DriverError::Uncertain(format!(
+                "the driver reports a conflicting operation (409), so the resource is \
+                 observed before it is changed again: {message}"
+            )),
             409 => DriverError::Conflict(message),
             429 => DriverError::Transient {
                 message,
