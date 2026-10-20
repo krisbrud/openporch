@@ -71,6 +71,8 @@ struct FakeDriver {
     deletes: Mutex<Vec<DriverRequest>>,
     /// `get` cannot tell, and says so with the secrets it received.
     unsure: Mutex<bool>,
+    /// The cookie `get` returns.
+    observed_cookie: Mutex<Option<Cookie>>,
     /// The pins checked; a pin naming commit `lost` is refused.
     pin_checks: Mutex<Vec<DriverRequest>>,
     /// `put` and `delete` answer as a conflicting operation, with the next
@@ -106,6 +108,7 @@ impl FakeDriver {
             puts: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
             unsure: Mutex::new(false),
+            observed_cookie: Mutex::default(),
             pin_checks: Mutex::new(Vec::new()),
             conflict: Mutex::new(false),
             gets: Mutex::new(Vec::new()),
@@ -230,11 +233,12 @@ impl Driver for FakeDriver {
     fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
         self.gets.lock().unwrap().push(req.clone());
         let unsure = *self.unsure.lock().unwrap();
+        let cookie = self.observed_cookie.lock().unwrap().clone();
         Box::pin(async move {
             if unsure {
                 return Ok(Observation::Unknown {
                     reason: format!("cannot tell with {}", secret_values(req).join(", ")),
-                    cookie: None,
+                    cookie,
                 });
             }
             // Everything the `postgres` type requires, so that a creation
@@ -245,10 +249,7 @@ impl Driver for FakeDriver {
             let mut secrets = outputs.secrets.expose().clone();
             secrets.insert("username".into(), json!("shop"));
             outputs.secrets = SecretMap::new(secrets);
-            Ok(Observation::Ready {
-                outputs,
-                cookie: None,
-            })
+            Ok(Observation::Ready { outputs, cookie })
         })
     }
 
@@ -1038,6 +1039,8 @@ async fn an_uncertain_update_keeps_the_new_cookie_for_recovery() {
     // finding it says nothing about the update, which the next deployment
     // repeats.
     *f.driver.conflict.lock().unwrap() = false;
+    // The observation returns newer state still, which is kept.
+    *f.driver.observed_cookie.lock().unwrap() = Some(Cookie::new(1, "n=3").unwrap());
     let recovered = f.recover(DB).await;
     assert!(
         matches!(recovered, crate::planner::Recovered::Repeatable(_)),
@@ -1046,12 +1049,15 @@ async fn an_uncertain_update_keeps_the_new_cookie_for_recovery() {
     let gets = f.driver.gets.lock().unwrap().clone();
     assert_eq!(gets.len(), 1);
     assert_eq!(gets[0].cookie, Some(Cookie::new(1, "n=2").unwrap()));
+    let db = f.active(DB).await;
+    assert_eq!(f.opened_cookie(&db), Some(Cookie::new(1, "n=3").unwrap()));
     // The next deployment's update carries it too.
+    *f.driver.observed_cookie.lock().unwrap() = None;
     let (_, outcomes) = f.deploy(&defs, allow()).await;
     all_provisioned(&outcomes);
     assert_eq!(
         f.driver.puts().last().unwrap().cookie,
-        Some(Cookie::new(1, "n=2").unwrap())
+        Some(Cookie::new(1, "n=3").unwrap())
     );
 }
 
@@ -1199,7 +1205,7 @@ async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource()
 
     // The resource existed before, so its state proves nothing about an
     // update and nothing is stored for it.
-    match executor.observe(job.clone(), false).await.unwrap() {
+    match executor.observe(job.clone(), false).await.unwrap().observed {
         Observed::Ready { result, repeatable } => {
             assert!(repeatable);
             assert!(result.secret_outputs.is_empty(), "{result:?}");
@@ -1209,7 +1215,7 @@ async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource()
     }
     // What a driver says while observing is redacted like any failure.
     *f.driver.unsure.lock().unwrap() = true;
-    match executor.observe(job, false).await.unwrap() {
+    match executor.observe(job, false).await.unwrap().observed {
         Observed::Unknown(reason) => {
             assert!(reason.contains("[REDACTED]"), "{reason}");
             assert!(!reason.contains(MASTER), "{reason}");

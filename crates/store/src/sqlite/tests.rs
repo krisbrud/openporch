@@ -975,6 +975,27 @@ async fn an_unknown_outcome_keeps_the_newest_cookie() {
     let r = f.resource(DB).await.unwrap();
     assert_eq!(r.status, "unknown");
     assert_eq!(r.cookie, Some(sealed("c2")));
+
+    // Observing it during recovery may return a newer one still.
+    f.store
+        .keep_recovery_cookie(&op.operation_id, &sealed("c3"))
+        .await
+        .unwrap();
+    let r = f.resource(DB).await.unwrap();
+    assert_eq!(r.status, "unknown");
+    assert_eq!(r.cookie, Some(sealed("c3")));
+
+    // Once the outcome is known, nothing changes.
+    let first = op.operation_id.clone();
+    f.store
+        .checkpoint_operation(&op.operation_id, observed("c3"))
+        .await
+        .unwrap();
+    f.store
+        .keep_recovery_cookie(&first, &sealed("c4"))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c3")));
 }
 
 #[tokio::test]

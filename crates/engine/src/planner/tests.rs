@@ -170,6 +170,8 @@ struct Fake {
     /// How observations answer, by resource type, instead of from the
     /// objects.
     observations: Mutex<BTreeMap<String, Observed>>,
+    /// The newer cookie those observations return.
+    observed_cookie: Mutex<Option<Sealed>>,
     /// The descriptors observed, in order.
     observed: Mutex<Vec<String>>,
     /// The output schema each observation was asked to check, in order.
@@ -505,7 +507,11 @@ impl Executor for Fake {
         }
     }
 
-    async fn observe(&self, job: ProvisionJob, _deleting: bool) -> Result<Observed, ExecFailure> {
+    async fn observe(
+        &self,
+        job: ProvisionJob,
+        _deleting: bool,
+    ) -> Result<Observation, ExecFailure> {
         let ty = job.descriptor.ty.to_string();
         self.observed
             .lock()
@@ -522,7 +528,10 @@ impl Executor for Fake {
             "the driver crashed while observing"
         );
         if let Some(observed) = self.observations.lock().unwrap().get(&ty) {
-            return Ok(observed.clone());
+            return Ok(Observation {
+                observed: observed.clone(),
+                cookie: self.observed_cookie.lock().unwrap().clone(),
+            });
         }
         let exists = self
             .objects
@@ -536,7 +545,8 @@ impl Executor for Fake {
             }
         } else {
             Observed::Absent { repeatable: true }
-        })
+        }
+        .into())
     }
 }
 

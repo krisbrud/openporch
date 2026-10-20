@@ -326,11 +326,21 @@ async fn an_operation_still_running_is_left_unknown() {
         .lock()
         .unwrap()
         .insert("postgres".into(), Observed::InProgress);
+    // The driver's newer state is kept although the outcome is not known yet.
+    let newer = Sealed {
+        key_id: "k1".into(),
+        nonce: vec![1; 12],
+        ciphertext: b"still-running".to_vec(),
+    };
+    *fake.observed_cookie.lock().unwrap() = Some(newer.clone());
     assert_eq!(
         f.recover(&planner, DB).await.unwrap(),
         Recovered::InProgress
     );
-    assert_eq!(f.active(DB).await.unwrap().status, "unknown");
+    let active = f.active(DB).await.unwrap();
+    assert_eq!(active.status, "unknown");
+    assert_eq!(active.cookie, Some(newer));
+    *fake.observed_cookie.lock().unwrap() = None;
     assert!(matches!(
         f.try_accept().await,
         Err(StoreError::RecoveryRequired(_))

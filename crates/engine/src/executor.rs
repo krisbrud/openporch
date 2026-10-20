@@ -31,8 +31,8 @@ use crate::cloud::{
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
-    JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
-    RedactingLog, SecretSource,
+    JobContext, JobLog, Observation as Observing, Observed, PermitCheck, PermitRequest,
+    ProvisionJob, ProvisionResult, RedactingLog, SecretSource,
 };
 use crate::registry::{Lookup, OciImage, Reference, Registry, pinned_from_tag};
 
@@ -645,14 +645,15 @@ where
         job: &ProvisionJob,
         deleting: bool,
         log: &mut RedactingLog,
-    ) -> Result<Observed, ExecFailure> {
+    ) -> Result<Observing, ExecFailure> {
         if let Some(driver) = self.drivers.get(&job.driver_type)
             && !driver.info().capabilities.observe
         {
             return Ok(Observed::Unknown(format!(
                 "driver `{}` cannot observe resources",
                 job.driver_type
-            )));
+            ))
+            .into());
         }
         let sources = if job.inputs.sources.is_empty() {
             inferred_sources(job)
@@ -676,31 +677,47 @@ where
                     retry_after: None,
                 })?;
         let repeatable = driver.info().capabilities.recover;
-        Ok(match observation {
-            Observation::Absent { .. } => Observed::Absent { repeatable },
-            Observation::InProgress { .. } => Observed::InProgress,
-            Observation::Failed { error } => Observed::Failed {
-                error: error.to_string(),
-                repeatable,
-            },
-            Observation::Unknown { reason, .. } => Observed::Unknown(reason),
+        // Whatever the driver reports, a cookie it returned is kept.
+        let (observed, cookie) = match observation {
+            Observation::Absent { cookie } => (Observed::Absent { repeatable }, cookie),
+            Observation::InProgress { cookie, .. } => (Observed::InProgress, cookie),
+            Observation::Failed { error } => {
+                let (error, cookie) = error.split();
+                (
+                    Observed::Failed {
+                        error: error.to_string(),
+                        repeatable,
+                    },
+                    cookie,
+                )
+            }
+            Observation::Unknown { reason, cookie } => (Observed::Unknown(reason), cookie),
             // Only a creation's result is kept: for a resource that existed
             // before, nothing is stored.
-            Observation::Ready { .. } if deleting || job.existing => Observed::Ready {
-                result: Box::default(),
-                repeatable,
-            },
+            Observation::Ready { cookie, .. } if deleting || job.existing => (
+                Observed::Ready {
+                    result: Box::default(),
+                    repeatable,
+                },
+                cookie,
+            ),
             Observation::Ready { outputs, cookie } => {
                 // A driver that returns no cookie leaves the last one in place.
+                // The result carries it sealed, as after provisioning.
                 let cookie = cookie.or(req.cookie.clone());
-                Observed::Ready {
+                let observed = Observed::Ready {
                     result: Box::new(
                         self.provisioned(job, outputs, cookie.as_ref(), target, log)
                             .await?,
                     ),
                     repeatable,
-                }
+                };
+                return Ok(observed.into());
             }
+        };
+        Ok(Observing {
+            observed,
+            cookie: self.newer_cookie(job, &req, cookie.as_ref()),
         })
     }
 
@@ -1052,21 +1069,22 @@ where
             .map_err(|f| log.failure(f))
     }
 
-    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Result<Observed, ExecFailure> {
+    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Result<Observing, ExecFailure> {
         let mut log = job.log.redacting();
-        let observed = self
+        let Observing { observed, cookie } = self
             .run_observe(&job, deleting, &mut log)
             .await
             .map_err(|f| log.failure(f))?;
         // What the driver said goes into records, so it is redacted too.
-        Ok(match observed {
+        let observed = match observed {
             Observed::Failed { error, repeatable } => Observed::Failed {
                 error: log.redact(&error),
                 repeatable,
             },
             Observed::Unknown(reason) => Observed::Unknown(log.redact(&reason)),
             other => other,
-        })
+        };
+        Ok(Observing { observed, cookie })
     }
 }
 

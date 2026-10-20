@@ -1604,6 +1604,32 @@ impl Store for SqliteStore {
         }))
     }
 
+    async fn keep_recovery_cookie(&self, operation_id: &str, cookie: &Sealed) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let op: Option<(String, String)> = sqlx::query_as(
+            "SELECT org_id, guresid FROM operations WHERE id = ? AND state = 'unknown'",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((org, guresid)) = op else {
+            return Ok(());
+        };
+        self.check_org(&org)?;
+        sqlx::query(
+            "UPDATE active_resources SET cookie_key_id = ?, cookie_nonce = ?, cookie = ? \
+             WHERE guresid = ?",
+        )
+        .bind(&cookie.key_id)
+        .bind(&cookie.nonce)
+        .bind(&cookie.ciphertext)
+        .bind(&guresid)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn resolve_operation(
         &self,
         operation_id: &str,
