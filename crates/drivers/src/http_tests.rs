@@ -360,6 +360,36 @@ async fn duplicate_put_recovers_the_same_object() {
     );
 }
 
+#[tokio::test]
+async fn an_unreadable_mutation_response_keeps_its_cookie() {
+    let new = Cookie::new(1, "op-2").unwrap();
+    for call in ["put", "delete"] {
+        let mock = Shared::default();
+        mock.lock().unwrap().queue.push_back(Canned {
+            status: 200,
+            headers: BTreeMap::from([("set-openporch-driver-cookie".into(), "1.b3AtMg".into())]),
+            // Larger than a response may be.
+            body: Some(json!({"padding": "x".repeat(5 << 20)})),
+        });
+        let target = serve(mock.clone()).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let req = request(Some(Cookie::new(1, "op-1").unwrap()));
+        let settled = match call {
+            "put" => {
+                let s = converge(&driver, &req, DEFAULT_TIMEOUT).await;
+                Settled {
+                    result: s.result.map(|_| ()),
+                    cookie: s.cookie,
+                }
+            }
+            _ => remove(&driver, &req, DEFAULT_TIMEOUT).await,
+        };
+        let err = settled.result.unwrap_err();
+        assert!(matches!(err, DriverError::Uncertain(_)), "{call}: {err:?}");
+        assert_eq!(settled.cookie, Some(new.clone()), "{call}");
+    }
+}
+
 // Real time: paused time would jump to the deadline while waiting on sockets.
 #[tokio::test]
 async fn a_failed_poll_keeps_the_cookie_it_returned() {

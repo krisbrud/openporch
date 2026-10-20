@@ -206,19 +206,6 @@ impl HttpDriver {
         };
         let status = res.status();
         let headers = res.headers().clone();
-        let mut body = Vec::new();
-        loop {
-            match res.chunk().await {
-                Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > MAX_BODY_BYTES {
-                        return Err(lost("the driver's response is larger than 4 MiB"));
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(_) => return Err(lost("reading the driver's response failed")),
-            }
-        }
         if let Some(version) = headers.get(PROTOCOL_HEADER)
             && version.as_bytes() != PROTOCOL_VERSION.as_bytes()
         {
@@ -241,6 +228,25 @@ impl HttpDriver {
                 DriverError::Uncertain("the driver returned a malformed cookie".into())
             })?),
         };
+        // The headers arrived, so a cookie in them is kept even when the body
+        // does not.
+        let mut body = Vec::new();
+        loop {
+            match res.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > MAX_BODY_BYTES {
+                        return Err(
+                            lost("the driver's response is larger than 4 MiB").with_cookie(cookie)
+                        );
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(lost("reading the driver's response failed").with_cookie(cookie));
+                }
+            }
+        }
         Ok(Reply {
             status,
             spoken: headers.contains_key(PROTOCOL_HEADER),
