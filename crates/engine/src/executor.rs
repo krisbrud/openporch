@@ -547,8 +547,17 @@ where
         let settled = converge(driver.as_ref(), &req, timeout).await;
         let accepted = settled.cookie != req.cookie;
         let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
+        // The driver made the change, so a result that cannot be kept, such as
+        // outputs its type does not allow, leaves the resource for recovery to
+        // observe rather than as if nothing changed.
         self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
             .await
+            .map_err(|f| match f {
+                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } => {
+                    ExecFailure::Uncertain(format!("the driver made the change, but {error}"))
+                }
+                f => f,
+            })
     }
 
     /// What a resource that provisioned returns: its outputs, with secret

@@ -773,7 +773,26 @@ async fn a_missing_required_output_fails_the_resource() {
             &s.admin,
         )
         .await;
-    assert_eq!(db["status"], "failed", "{db}");
+    // The driver made the change, so the database is left for recovery to
+    // observe rather than as if nothing exists.
+    assert_eq!(db["status"], "unknown", "{db}");
+    let (st, recovered) = s
+        .post(
+            "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db/recover",
+            &s.admin,
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{recovered}");
+    assert_eq!(recovered["outcome"], "recovery_required", "{recovered}");
+    assert!(
+        recovered["reason"]
+            .as_str()
+            .unwrap()
+            .contains("output `host` of resource type `postgres` is missing"),
+        "{recovered}"
+    );
+    assert!(!recovered.to_string().contains("hunter2"), "{recovered}");
     // The workload that would have read `host` never ran.
     let (_, workload) = s
         .get(
