@@ -677,13 +677,13 @@ where
                 })?;
         let repeatable = driver.info().capabilities.recover;
         Ok(match observation {
-            Observation::Absent => Observed::Absent { repeatable },
+            Observation::Absent { .. } => Observed::Absent { repeatable },
             Observation::InProgress { .. } => Observed::InProgress,
             Observation::Failed { error } => Observed::Failed {
                 error: error.to_string(),
                 repeatable,
             },
-            Observation::Unknown { reason } => Observed::Unknown(reason),
+            Observation::Unknown { reason, .. } => Observed::Unknown(reason),
             // Only a creation's result is kept: for a resource that existed
             // before, nothing is stored.
             Observation::Ready { .. } if deleting || job.existing => Observed::Ready {

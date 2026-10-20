@@ -173,7 +173,8 @@ impl<'d> Run<'d> {
             }
         };
         loop {
-            self.pause(wait).await?;
+            let paused = self.pause(wait).await;
+            self.absorb(paused)?;
             let observed = self.bounded(self.driver.get(&self.req)).await;
             match self.absorb(observed)? {
                 Observation::Ready { outputs, cookie } => {
@@ -185,13 +186,17 @@ impl<'d> Run<'d> {
                     wait = poll_after;
                 }
                 Observation::Failed { error } => return self.absorb(Err(error)),
-                Observation::Absent => {
+                Observation::Absent { cookie } => {
+                    self.keep(cookie)?;
                     return Err(DriverError::Uncertain(
                         "`put` reported an operation in progress, but `get` found no resource"
                             .into(),
                     ));
                 }
-                Observation::Unknown { reason } => return Err(DriverError::Uncertain(reason)),
+                Observation::Unknown { reason, cookie } => {
+                    self.keep(cookie)?;
+                    return Err(DriverError::Uncertain(reason));
+                }
             }
         }
     }
@@ -206,10 +211,12 @@ impl<'d> Run<'d> {
             }
         };
         loop {
-            self.pause(wait).await?;
+            let paused = self.pause(wait).await;
+            self.absorb(paused)?;
             let observed = self.bounded(self.driver.get(&self.req)).await;
             match self.absorb(observed)? {
-                Observation::Absent => return Ok(()),
+                // Gone: like a finished `delete`, nothing of it is kept.
+                Observation::Absent { .. } => return Ok(()),
                 Observation::InProgress { poll_after, cookie } => {
                     self.keep(cookie)?;
                     wait = poll_after;
@@ -220,7 +227,10 @@ impl<'d> Run<'d> {
                     wait = MIN_POLL;
                 }
                 Observation::Failed { error } => return self.absorb(Err(error)),
-                Observation::Unknown { reason } => return Err(DriverError::Uncertain(reason)),
+                Observation::Unknown { reason, cookie } => {
+                    self.keep(cookie)?;
+                    return Err(DriverError::Uncertain(reason));
+                }
             }
         }
     }
@@ -238,21 +248,34 @@ impl<'d> Run<'d> {
     }
 
     /// The error for a timed-out operation, after asking the driver to cancel it
-    /// when it can.
+    /// when it can. A cookie the cancellation returned rides on the error, for
+    /// [`Run::absorb`] to record.
     async fn timed_out(&self) -> DriverError {
         if !self.driver.info().capabilities.cancel {
             return DriverError::Timeout(self.timeout);
         }
-        match tokio::time::timeout(CANCEL_GRACE, self.driver.cancel(&self.req)).await {
-            Ok(Ok(Observation::Absent | Observation::Failed { .. })) => {
-                DriverError::Timeout(self.timeout)
-            }
-            _ => DriverError::Uncertain(format!(
+        let cancelled = tokio::time::timeout(CANCEL_GRACE, self.driver.cancel(&self.req)).await;
+        let (stopped, cookie) = match cancelled {
+            Ok(Ok(Observation::Absent { cookie })) => (true, cookie),
+            Ok(Ok(Observation::Failed { error })) => (true, error.split().1),
+            Ok(Ok(
+                Observation::InProgress { cookie, .. }
+                | Observation::Ready { cookie, .. }
+                | Observation::Unknown { cookie, .. },
+            )) => (false, cookie),
+            Ok(Err(error)) => (false, error.split().1),
+            Err(_) => (false, None),
+        };
+        let error = if stopped {
+            DriverError::Timeout(self.timeout)
+        } else {
+            DriverError::Uncertain(format!(
                 "the driver did not finish within {:?} and did not confirm that the \
                  operation stopped",
                 self.timeout
-            )),
-        }
+            ))
+        };
+        error.with_cookie(cookie)
     }
 
     /// Records the cookie a failed call returned, as a driver may return one

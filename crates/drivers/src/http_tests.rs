@@ -178,13 +178,20 @@ fn summary<T>(r: Result<T, DriverError>, f: impl FnOnce(T) -> Value) -> Value {
 
 fn observation_json(o: Observation) -> Value {
     match o {
-        Observation::Absent => json!({"absent": null}),
+        Observation::Absent { cookie: None } => json!({"absent": null}),
+        Observation::Absent { cookie } => json!({"absent": {"cookie": cookie_json(&cookie)}}),
         Observation::InProgress { poll_after, cookie } => {
             json!({"in_progress": {"poll_after_secs": poll_after.as_secs(), "cookie": cookie_json(&cookie)}})
         }
         Observation::Ready { outputs, cookie } => json!({"ready": outputs_json(&outputs, &cookie)}),
         Observation::Failed { error } => json!({"failed": error_json(&error)}),
-        Observation::Unknown { reason } => json!({"unknown": reason}),
+        Observation::Unknown {
+            reason,
+            cookie: None,
+        } => json!({"unknown": reason}),
+        Observation::Unknown { reason, cookie } => {
+            json!({"unknown": {"reason": reason, "cookie": cookie_json(&cookie)}})
+        }
     }
 }
 
@@ -357,11 +364,19 @@ async fn duplicate_put_recovers_the_same_object() {
 #[tokio::test]
 async fn a_failed_poll_keeps_the_cookie_it_returned() {
     let polled = [
-        (500, Some(json!({"message": "busy"}))),
-        (200, Some(json!({"unexpected": true}))),
-        (422, Some(json!({"message": "rejected"}))),
+        (500, false, Some(json!({"message": "busy"}))),
+        (200, false, Some(json!({"unexpected": true}))),
+        (422, false, Some(json!({"message": "rejected"}))),
+        // The driver's own 404, and one from anything else.
+        (404, true, Some(json!({"message": "gone"}))),
+        (404, false, None),
     ];
-    for (status, body) in polled {
+    for (status, spoken, body) in polled {
+        let mut headers =
+            BTreeMap::from([("set-openporch-driver-cookie".into(), "1.b3AtMg".into())]);
+        if spoken {
+            headers.insert("openporch-protocol".into(), PROTOCOL_VERSION.into());
+        }
         let mock = Shared::default();
         {
             let mut m = mock.lock().unwrap();
@@ -375,10 +390,7 @@ async fn a_failed_poll_keeps_the_cookie_it_returned() {
             });
             m.queue.push_back(Canned {
                 status,
-                headers: BTreeMap::from([(
-                    "set-openporch-driver-cookie".into(),
-                    "1.b3AtMg".into(),
-                )]),
+                headers,
                 body,
             });
         }

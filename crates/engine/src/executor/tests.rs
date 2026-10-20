@@ -234,6 +234,7 @@ impl Driver for FakeDriver {
             if unsure {
                 return Ok(Observation::Unknown {
                     reason: format!("cannot tell with {}", secret_values(req).join(", ")),
+                    cookie: None,
                 });
             }
             // Everything the `postgres` type requires, so that a creation

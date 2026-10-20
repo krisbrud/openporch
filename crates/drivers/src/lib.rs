@@ -298,8 +298,8 @@ pub enum PutOutcome {
 /// What `get` observed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
-    /// Nothing exists for the GUResID.
-    Absent,
+    /// Nothing exists for the GUResID. A driver may still return a cookie.
+    Absent { cookie: Option<Cookie> },
     /// An operation is still running; poll again after `poll_after`.
     InProgress {
         poll_after: Duration,
@@ -312,8 +312,12 @@ pub enum Observation {
     },
     /// The last operation failed.
     Failed { error: DriverError },
-    /// The driver cannot tell; an operator must establish the outcome.
-    Unknown { reason: String },
+    /// The driver cannot tell; an operator must establish the outcome. A cookie
+    /// returned with the answer is kept for that.
+    Unknown {
+        reason: String,
+        cookie: Option<Cookie>,
+    },
 }
 
 /// The result of `delete`.

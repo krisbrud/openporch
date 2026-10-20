@@ -68,7 +68,7 @@ impl Driver for Gated {
                 .unwrap()
                 .contains(&req.guresid.as_str().to_owned());
             if gone {
-                Ok(Observation::Absent)
+                Ok(Observation::Absent { cookie: None })
             } else {
                 self.0.get(req).await
             }

@@ -640,7 +640,10 @@ async fn opentofu_runs_a_local_module_end_to_end() {
             .join("state/0123456789abcdef0123456789abcdef/terraform.tfstate")
             .exists()
     );
-    assert_eq!(d.get(&del).await.unwrap(), Observation::Absent);
+    assert_eq!(
+        d.get(&del).await.unwrap(),
+        Observation::Absent { cookie: None }
+    );
     // Repeating it is a no-op.
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
 }
@@ -671,7 +674,10 @@ output "n" { value = tonumber(nonsensitive(var.token)) }
     assert!(log.contains("$ tofu plan"), "{log}");
     assert!(!log.contains("hunter2-not-a-number"), "{log}");
     // Nothing was applied, so there is no state to keep.
-    assert_eq!(d.get(&req).await.unwrap(), Observation::Absent);
+    assert_eq!(
+        d.get(&req).await.unwrap(),
+        Observation::Absent { cookie: None }
+    );
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -908,7 +914,10 @@ async fn apply_twice_then_delete(d: &OpenTofu) {
     };
     del.permit = Some(fingerprint);
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
-    assert_eq!(d.get(&del).await.unwrap(), Observation::Absent);
+    assert_eq!(
+        d.get(&del).await.unwrap(),
+        Observation::Absent { cookie: None }
+    );
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
 }
 
@@ -960,7 +969,10 @@ async fn opentofu_s3_state_applies_twice() {
         d.plan(&preview).await.unwrap(),
         Plan::Actions { .. }
     ));
-    assert_eq!(d.get(&preview).await.unwrap(), Observation::Absent);
+    assert_eq!(
+        d.get(&preview).await.unwrap(),
+        Observation::Absent { cookie: None }
+    );
     assert_eq!(d.delete(&preview).await.unwrap(), DeleteOutcome::Deleted);
     apply_twice_then_delete(&d).await;
     // Only recovery metadata stays local.
@@ -985,7 +997,10 @@ async fn an_empty_s3_workspace_from_a_preview_is_not_state() {
     });
     d.config.state = StateBackend::S3(Box::new(s3));
     let req = request(json!({"script": "terraform {}"}), json!({}));
-    assert_eq!(d.get(&req).await.unwrap(), Observation::Absent);
+    assert_eq!(
+        d.get(&req).await.unwrap(),
+        Observation::Absent { cookie: None }
+    );
     assert_eq!(d.plan_delete(&req).await.unwrap(), Plan::NoEffects);
     // Deleting removes the empty workspace without needing a retained script.
     assert_eq!(d.delete(&req).await.unwrap(), DeleteOutcome::Deleted);

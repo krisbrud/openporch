@@ -358,9 +358,12 @@ impl HttpDriver {
             }),
             // Only a driver's own 404 means absent: a proxy or a wrong path
             // must not make openporch forget a live resource.
-            StatusCode::NOT_FOUND if reply.spoken => Ok(Observation::Absent),
+            StatusCode::NOT_FOUND if reply.spoken => Ok(Observation::Absent {
+                cookie: reply.cookie,
+            }),
             StatusCode::NOT_FOUND => Ok(Observation::Unknown {
                 reason: NOT_A_DRIVER_404.into(),
+                cookie: reply.cookie,
             }),
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Ok(Observation::Failed {
                 error: self.failure(req, &reply).with_cookie(reply.cookie),
