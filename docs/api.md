@@ -1159,9 +1159,10 @@ their input and output schemas. Custom types are named `<org>/<name>`. `use` is
 `implicit` (one per environment). Output schemas have `values` and `secrets`.
 A resource whose driver returns outputs that miss a required output, have the
 wrong JSON type, or put a secret output in `values` fails, and the error names
-the output. The driver has already made the change, so the resource's outcome
-is `unknown` until recovery observes it; if its outputs still do not match, it
-waits for an administrator (`recovery_required`). A deployment checks against
+the output. When the driver may have changed infrastructure (it did not plan
+"no changes"), the resource's outcome is `unknown` until recovery observes it;
+if its outputs still do not match, it waits for an administrator
+(`recovery_required`). A deployment checks against
 the types as they were when it was accepted; a snapshot replay uses the schemas
 it recorded. Snapshots from servers that did not record types cannot be
 replayed; deploy them with `"replay": "current"`.

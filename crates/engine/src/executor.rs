@@ -510,7 +510,9 @@ where
             timeout,
             target,
         } = self.request(job, &job.inputs.sources, true, log).await?;
-        match self.plan(driver.as_ref(), &req, timeout, false).await? {
+        let plan = self.plan(driver.as_ref(), &req, timeout, false).await?;
+        let changes = !matches!(plan, Plan::NoEffects);
+        match plan {
             Plan::NoEffects => log.info("the driver plans no changes"),
             Plan::Actions {
                 actions,
@@ -547,13 +549,13 @@ where
         let settled = converge(driver.as_ref(), &req, timeout).await;
         let accepted = settled.cookie != req.cookie;
         let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
-        // The driver made the change, so a result that cannot be kept, such as
-        // outputs its type does not allow, leaves the resource for recovery to
+        // A driver that may have made a change leaves a result that cannot be
+        // kept, such as outputs its type does not allow, for recovery to
         // observe rather than as if nothing changed.
         self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
             .await
             .map_err(|f| match f {
-                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } => {
+                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changes => {
                     ExecFailure::Uncertain(format!("the driver made the change, but {error}"))
                 }
                 f => f,
