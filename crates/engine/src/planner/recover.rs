@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use openporch_core::catalog::ResourceType;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_store::{
     AuditIntent, CheckpointResult, OperationKind, Provisioned, Resolution, Store, StoreError,
@@ -303,6 +304,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             .env_type;
         let invalid_id = |what: &str| format!("the stored {what} ID is invalid");
         let descriptor = Descriptor::parse(&r.descriptor).map_err(|_| invalid_id("resource"))?;
+        let output_schema = self
+            .recorded_type(org, app, env, &op.deployment_id, &descriptor)
+            .await?;
         Ok(ProvisionJob {
             operation_id: op.operation_id.clone(),
             attempt: op.attempt,
@@ -337,12 +341,43 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             pin: None,
             existing: r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some(),
             // A creation found finished is checked like one that finished in
-            // the deployment. Custom types are not recorded with the resource,
-            // so only built-in types are checked.
-            output_schema: crate::planner::builtin_type(&descriptor.ty),
+            // the deployment, against the type its snapshot recorded.
+            output_schema,
             deadline: Instant::now() + OBSERVE_TIMEOUT,
             log: JobLog::discard(),
         })
+    }
+}
+
+impl<S: Store + 'static, E: Executor> Planner<S, E> {
+    /// The type the operation's deployment recorded for the resource, whose
+    /// output schema a creation found finished must satisfy. Snapshots from
+    /// before types were recorded fall back to the built-in type, if any.
+    async fn recorded_type(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        descriptor: &Descriptor,
+    ) -> Result<Option<ResourceType>, String> {
+        let snapshot = self
+            .store
+            .deployment_snapshot(org, app, env, deployment_id)
+            .await
+            .map_err(|e| format!("the operation's deployment could not be read: {e}"))?;
+        let recorded = snapshot
+            .as_ref()
+            .and_then(|s| s["types"].get(descriptor.ty.as_str()));
+        match recorded {
+            Some(ty) => serde_json::from_value(ty.clone()).map(Some).map_err(|e| {
+                format!(
+                    "the deployment's recorded type `{}` is unreadable: {e}",
+                    descriptor.ty
+                )
+            }),
+            None => Ok(crate::planner::builtin_type(&descriptor.ty)),
+        }
     }
 }
 
