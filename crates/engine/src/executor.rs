@@ -551,13 +551,15 @@ where
         let outputs = settled
             .result
             .map_err(|e| with_cookie(mutation_failure(e, newer.is_some()), newer.clone()))?;
-        // A driver that may have made a change leaves a result that cannot be
-        // kept, such as outputs its type does not allow, for recovery to
-        // observe rather than as if nothing changed.
+        // A driver that may have made a change, or returned a new cookie and
+        // so accepted one, leaves a result that cannot be kept, such as
+        // outputs its type does not allow, for recovery to observe rather than
+        // as if nothing changed.
+        let changed = changes || newer.is_some();
         self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
             .await
             .map_err(|f| match f {
-                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changes => {
+                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changed => {
                     ExecFailure::uncertain(format!("the driver made the change, but {error}"))
                 }
                 f => f,

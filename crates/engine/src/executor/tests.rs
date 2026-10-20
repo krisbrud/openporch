@@ -1083,6 +1083,37 @@ async fn an_uncertain_creation_keeps_its_cookie_and_is_still_a_creation() {
     assert_eq!(f.opened_cookie(&db), Some(Cookie::new(1, "n=1").unwrap()));
 }
 
+/// A driver that plans no changes but returns a new cookie accepted a
+/// mutation, so outputs its type does not allow leave the outcome uncertain,
+/// with the new cookie for recovery.
+#[tokio::test]
+async fn a_new_cookie_with_invalid_outputs_is_uncertain_even_without_planned_changes() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let mut job = provision_job(&db, db.guresid.parse().unwrap());
+    job.cookie = db.cookie.clone();
+    // The fake returns only `host` and `password`; postgres needs more.
+    job.output_schema = crate::planner::builtin_type(&"postgres".parse().unwrap());
+    let executor = f.executor(allow());
+    let failure = executor.provision(job.clone()).await.unwrap_err();
+    let ExecFailure::Uncertain {
+        error,
+        cookie: Some(sealed),
+    } = failure
+    else {
+        panic!("{failure:?}");
+    };
+    assert!(error.contains("is missing"), "{error}");
+    job.cookie = Some(sealed);
+    assert_eq!(
+        executor.open_cookie(&job).unwrap(),
+        Some(Cookie::new(1, "n=2").unwrap())
+    );
+}
+
 #[tokio::test]
 async fn an_uncertain_deletion_returns_the_new_cookie_sealed() {
     let f = Fixture::new().await;
