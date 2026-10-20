@@ -234,12 +234,14 @@ fn the_acceptance_matrix_lists_every_scenario() {
             declared.iter().any(|d| file.contains(d.as_str()))
         } else if cell.starts_with("::") {
             false
-        } else if ["crates/", "provider/", "examples/", "scripts/"]
-            .iter()
-            .any(|dir| cell.starts_with(dir))
-            && !cell.contains('*')
-            && !cell.contains(' ')
+        } else if !cell.contains(['*', ' ', '{'])
+            && (cell
+                .split_once('/')
+                .is_some_and(|(top, _)| !top.is_empty() && root.join(top).is_dir())
+                || cell.ends_with(".md") && cell.starts_with(|c: char| c.is_ascii_uppercase()))
         {
+            // A path under one of the repository's top-level directories, or a
+            // top-level document such as SECURITY.md.
             root.join(cell).exists()
         } else if cell.starts_with("Test")
             && cell.len() > 4

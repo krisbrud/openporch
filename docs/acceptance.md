@@ -267,7 +267,7 @@ end.
 | Orchestrator-managed state | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice` (CI against Floci S3; once against real S3) |
 | Sensitive output | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` |
 | Environment deleted | covered | Driver destroy and state removal: `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end`, `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice`; environment teardown: `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`; real bucket: `just e2e-aws` |
-| Apply fails | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_failures_are_reported_redacted`, `crates/engine/src/executor/tests.rs::opentofu_failure_is_redacted_in_the_deployment_log` (generic failure, not an AWS IAM error) |
+| Apply fails | gap (partial) | `crates/drivers/src/opentofu/tests.rs::opentofu_failures_are_reported_redacted`, `crates/engine/src/executor/tests.rs::opentofu_failure_is_redacted_in_the_deployment_log` (generic failure, not an AWS IAM error) |
 | Partial apply writes state | covered | `crates/drivers/src/opentofu/tests.rs::a_failed_apply_is_uncertain_and_keeps_what_it_ran`, `crates/drivers/src/opentofu/tests.rs::opentofu_a_timed_out_apply_leaves_usable_state` |
 | Missing state | covered | `crates/drivers/src/opentofu/tests.rs::lost_state_needs_recovery`, `crates/drivers/src/opentofu/tests.rs::state_lost_after_an_apply_started_is_never_replaced` |
 | Module revision removed upstream | covered | `crates/engine/src/planner/tests.rs::a_removal_whose_retained_version_is_gone_changes_nothing`, `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit`, `crates/drivers/src/opentofu/tests.rs::deleting_a_script_resource_never_fetches_a_newer_source` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 218 covered, 9 manual, 31 deferred, 16 gaps.
+274 scenarios: 217 covered, 9 manual, 31 deferred, 17 gaps.
