@@ -17,8 +17,8 @@ use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
     Action, Capabilities, Cookie, Driver, DriverContext, DriverError, DriverInfo, DriverOutputs,
-    DriverRegistry, DriverRequest, HttpDriver, Observation, Operation, Plan, SecretMap, Targets,
-    call_timeout, check_cookie, converge, remove, with_timeout,
+    DriverRegistry, DriverRequest, HttpDriver, HttpDriverError, Observation, Operation, Plan,
+    SecretMap, Targets, call_timeout, check_cookie, converge, default_client, remove, with_timeout,
 };
 use openporch_store::secrets::{Keyring, Sealed, SecretError, SecretStore, SecretValue};
 use openporch_store::{
@@ -62,9 +62,26 @@ pub struct LocalExecutor<S> {
     /// Reads images in registries other than ECR; none when they are not
     /// pinned or checked.
     registry: Option<Arc<dyn Registry>>,
-    /// The client external drivers are called with; each builds its own
-    /// when none is set.
-    http_client: Option<reqwest::Client>,
+    /// The client external drivers with `https` targets are called with,
+    /// built on first use unless one is given, so their connections are kept.
+    http_client: std::sync::OnceLock<reqwest::Client>,
+}
+
+/// A job's driver, before an external one's token is read.
+enum Found {
+    /// An in-process driver.
+    InProcess(Arc<dyn Driver>),
+    /// An external driver's registration, with what it says about the driver.
+    Registered(Box<(DriverRecord, DriverInfo)>),
+}
+
+impl Found {
+    fn info(&self) -> &DriverInfo {
+        match self {
+            Self::InProcess(driver) => driver.info(),
+            Self::Registered(found) => &found.1,
+        }
+    }
 }
 
 impl<S> std::fmt::Debug for LocalExecutor<S> {
@@ -100,7 +117,7 @@ where
             cloud,
             checks,
             registry: None,
-            http_client: None,
+            http_client: std::sync::OnceLock::new(),
         }
     }
 
@@ -113,32 +130,45 @@ where
     /// Calls external drivers with `client`, which decides its own redirect,
     /// HTTPS and timeout settings, instead of the default one.
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http_client = std::sync::OnceLock::from(client);
         self
     }
 
-    /// The driver of `job`: an in-process one, or the external driver
-    /// registered under its ID now. The registration is read for every job,
-    /// so a changed or removed one takes effect at once. Its token is
-    /// authorized and read here, registered with `log`, and never named by
-    /// value in a failure.
-    async fn driver(
-        &self,
-        job: &ProvisionJob,
-        log: &mut RedactingLog,
-    ) -> Result<Arc<dyn Driver>, ExecFailure> {
+    /// The driver of `job`, without reading anything secret: an in-process
+    /// one, or the external driver's registration as it is now. The
+    /// registration is read for every job, so a changed or removed one takes
+    /// effect at once.
+    async fn find_driver(&self, job: &ProvisionJob) -> Result<Found, ExecFailure> {
         let id = job.driver_type.as_str();
         if let Some(driver) = self.drivers.get(id) {
-            return Ok(driver);
+            return Ok(Found::InProcess(driver));
         }
-        let not_registered =
-            || ExecFailure::Permanent(format!("driver `{id}` is not registered on this server"));
         let record = self
             .store
             .driver(job.context.org.as_str(), id)
             .await
             .map_err(|e| store_failure(e, &format!("driver `{id}` could not be read")))?
-            .ok_or_else(not_registered)?;
+            .ok_or_else(|| {
+                ExecFailure::Permanent(format!("driver `{id}` is not registered on this server"))
+            })?;
+        let info = registered_driver_info(&record);
+        Ok(Found::Registered(Box::new((record, info))))
+    }
+
+    /// The driver `found` names, ready to call. An external driver's token is
+    /// authorized and read here, registered with `log`, and never named by
+    /// value in a failure.
+    async fn open_driver(
+        &self,
+        job: &ProvisionJob,
+        found: Found,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn Driver>, ExecFailure> {
+        let (record, info) = match found {
+            Found::InProcess(driver) => return Ok(driver),
+            Found::Registered(found) => *found,
+        };
+        let id = record.id.as_str();
         let token = match &record.token {
             None => None,
             Some(r) => {
@@ -153,13 +183,36 @@ where
                 Some(value.expose().to_owned())
             }
         };
-        let info = registered_driver_info(&record);
-        let driver = match &self.http_client {
-            Some(client) => HttpDriver::with_client(info, &record.target, token, client.clone()),
+        let cannot = |e: HttpDriverError| {
+            ExecFailure::Permanent(format!("driver `{id}` cannot be called: {e}"))
+        };
+        let client = match self.http_client.get() {
+            Some(client) => Some(client.clone()),
+            // Registration requires `https`; any other target gets a client
+            // of its own that may speak plain HTTP.
+            None if record.target.starts_with("https://") => {
+                let client = default_client(true).map_err(cannot)?;
+                Some(self.http_client.get_or_init(|| client).clone())
+            }
+            None => None,
+        };
+        let driver = match client {
+            Some(client) => HttpDriver::with_client(info, &record.target, token, client),
             None => HttpDriver::new(info, &record.target, token),
         }
-        .map_err(|e| ExecFailure::Permanent(format!("driver `{id}` cannot be called: {e}")))?;
+        .map_err(cannot)?;
         Ok(Arc::new(driver))
+    }
+
+    /// The driver of `job`, ready to call: [`Self::find_driver`] and then
+    /// [`Self::open_driver`].
+    async fn driver(
+        &self,
+        job: &ProvisionJob,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn Driver>, ExecFailure> {
+        let found = self.find_driver(job).await?;
+        self.open_driver(job, found, log).await
     }
 
     /// Everything a driver call needs, with the secrets the job uses read and
@@ -712,17 +765,23 @@ where
         deleting: bool,
         log: &mut RedactingLog,
     ) -> Observing {
-        let driver = match self.driver(job, log).await {
-            Ok(driver) => driver,
+        // A driver that cannot observe is reported before its token is read,
+        // so a secret store outage cannot hide that an operator must decide.
+        let found = match self.find_driver(job).await {
+            Ok(found) => found,
             Err(e) => return Err(e).into(),
         };
-        if !driver.info().capabilities.observe {
+        if !found.info().capabilities.observe {
             return Observed::Unknown(format!(
                 "driver `{}` cannot observe resources",
                 job.driver_type
             ))
             .into();
         }
+        let driver = match self.open_driver(job, found, log).await {
+            Ok(driver) => driver,
+            Err(e) => return Err(e).into(),
+        };
         let sources = if job.inputs.sources.is_empty() {
             inferred_sources(job)
         } else {
@@ -1435,11 +1494,11 @@ fn prefixed(f: ExecFailure, what: &str) -> ExecFailure {
     }
 }
 
-/// What a registration says about an external driver. External drivers
-/// provision resources; workloads and triggers are provisioned by built-ins.
+/// What a registration says about an external driver.
 pub fn registered_driver_info(record: &DriverRecord) -> DriverInfo {
     let any_object = || serde_json::json!({"type": "object"});
     let c = record.capabilities;
+    let t = c.targets;
     DriverInfo {
         id: record.id.clone(),
         protocol_version: record.protocol_version.clone(),
@@ -1448,9 +1507,9 @@ pub fn registered_driver_info(record: &DriverRecord) -> DriverInfo {
         output_schema: record.outputs_schema.clone().unwrap_or_else(any_object),
         capabilities: Capabilities {
             targets: Targets {
-                resources: true,
-                workloads: false,
-                triggers: false,
+                resources: t.resources,
+                workloads: t.workloads,
+                triggers: t.triggers,
             },
             observe: c.observe,
             recover: c.recover,

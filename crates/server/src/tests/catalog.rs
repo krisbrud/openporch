@@ -676,7 +676,8 @@ async fn external_drivers_are_registered() {
     assert_eq!(b["cookie_version"], 1, "{b}");
     assert_eq!(
         b["capabilities"],
-        json!({"observe": false, "recover": false, "preview": false, "cancel": false})
+        json!({"targets": {"resources": true, "workloads": false, "triggers": false},
+               "observe": false, "recover": false, "preview": false, "cancel": false})
     );
     let pinned = s
         .created(
@@ -684,7 +685,8 @@ async fn external_drivers_are_registered() {
             json!({"id": "acme/pinned", "target": "https://driver.internal/pinned",
                    "protocol_version": "openporch-http/1", "cookie_version": 3,
                    "outputs_schema": {"type": "object"},
-                   "capabilities": {"observe": true, "recover": true, "cancel": true}}),
+                   "capabilities": {"targets": {"resources": false, "workloads": true},
+                                    "observe": true, "recover": true, "cancel": true}}),
         )
         .await;
     let (status, b) = s
@@ -696,9 +698,61 @@ async fn external_drivers_are_registered() {
     assert_eq!(b["outputs_schema"], json!({"type": "object"}), "{b}");
     assert_eq!(
         b["capabilities"],
-        json!({"observe": true, "recover": true, "preview": false, "cancel": true})
+        json!({"targets": {"resources": false, "workloads": true, "triggers": false},
+               "observe": true, "recover": true, "preview": false, "cancel": true})
     );
+
+    // A definition may use a driver only for what it declares it provisions,
+    // when it is created and when it is changed.
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "web", "type": "workload", "driver_type": "acme/vault-secret"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("driver `acme/vault-secret` cannot provision resources of type `workload`"),
+        "{b}"
+    );
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "pinned-pg", "type": "postgres", "driver_type": "acme/pinned"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("`resources`"),
+        "{b}"
+    );
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "web", "type": "workload", "driver_type": "acme/pinned"}),
+    )
+    .await;
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/defs/web",
+            &s.admin,
+            json!({"driver_type": "acme/vault-secret"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("`workloads`"),
+        "{b}"
+    );
+    let (status, b) = s.delete("/orgs/acme/resources/defs/web", &s.admin).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+
     for (body, message) in [
+        (json!({"capabilities": {"targets": {"pods": true}}}), "pods"),
         (
             json!({"protocol_version": "openporch-http/2"}),
             "`openporch-http/2` is not supported",

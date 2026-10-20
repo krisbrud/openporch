@@ -593,6 +593,12 @@ impl KnownDrivers {
         Some(self.infos.get(id)?.protocol_version.clone())
     }
 
+    /// Whether driver `id` can provision resources of type `ty`; `None` for a
+    /// driver this server cannot run.
+    pub fn covers(&self, id: &str, ty: &str) -> Option<bool> {
+        Some(self.infos.get(id)?.capabilities.targets.covers(ty))
+    }
+
     /// What a preview knows about driver `id`; `None` for a driver this
     /// server cannot run.
     pub fn facts(&self, id: &str) -> Option<DriverFacts> {

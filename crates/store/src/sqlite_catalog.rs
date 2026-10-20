@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
-use openporch_core::catalog::{BUILTIN_DRIVERS, ResourceClass, ResourceType, builtin_type};
+use openporch_core::catalog::{
+    BUILTIN_DRIVERS, DriverTarget, ResourceClass, ResourceType, builtin_type,
+};
 use openporch_core::ids::{ClassId, CriterionId, DefinitionId, ResourceTypeId};
 use openporch_core::model::{Criterion, DriverInputs, Provision, ResourceDefinition, SecretRef};
 use openporch_core::placeholder::{Dialect, Expr, ResourceRef, Template};
@@ -50,6 +52,8 @@ pub struct DriverRecord {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DriverCapabilities {
+    /// What the driver provisions.
+    pub targets: DriverTargets,
     /// `GET` reports the real state of the resource.
     pub observe: bool,
     /// A retried operation identity converges instead of duplicating effects.
@@ -58,6 +62,40 @@ pub struct DriverCapabilities {
     pub preview: bool,
     /// A timed-out operation can be cancelled.
     pub cancel: bool,
+}
+
+/// What an external driver provisions. Registrations that do not say
+/// provision resources other than workloads only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DriverTargets {
+    /// Resources other than workloads.
+    pub resources: bool,
+    /// Workloads.
+    pub workloads: bool,
+    /// Workload triggers. No resource type is a trigger, so this is recorded
+    /// but does not decide which definitions may use the driver.
+    pub triggers: bool,
+}
+
+impl Default for DriverTargets {
+    fn default() -> Self {
+        Self {
+            resources: true,
+            workloads: false,
+            triggers: false,
+        }
+    }
+}
+
+impl DriverTargets {
+    /// Whether the driver can provision resources of type `ty`.
+    pub fn covers(&self, ty: &str) -> bool {
+        match DriverTarget::of_type(ty) {
+            DriverTarget::Resource => self.resources,
+            DriverTarget::Workload => self.workloads,
+        }
+    }
 }
 
 /// A stored resource definition.
@@ -290,23 +328,39 @@ async fn class_exists(
     Ok(row.is_some())
 }
 
-/// Checks that the driver and the cloud account a definition names exist.
+/// Checks that the driver and the cloud account a definition of type `ty`
+/// names exist, and that the driver can provision that type.
 async fn check_driver_and_account(
     conn: &mut SqliteConnection,
     org: &str,
+    ty: &str,
     driver_type: &str,
     driver_account: Option<&str>,
 ) -> Result<()> {
     if !BUILTIN_DRIVERS.contains(&driver_type) {
-        let row: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM drivers WHERE org_id = ? AND id = ?")
+        let body: Option<String> =
+            sqlx::query_scalar("SELECT body FROM drivers WHERE org_id = ? AND id = ?")
                 .bind(org)
                 .bind(driver_type)
                 .fetch_optional(&mut *conn)
                 .await?;
-        if row.is_none() {
+        let Some(body) = body else {
             return Err(StoreError::Invalid(format!(
                 "driver `{driver_type}` is not registered"
+            )));
+        };
+        #[derive(Deserialize)]
+        struct Declared {
+            #[serde(default)]
+            capabilities: DriverCapabilities,
+        }
+        let declared: Declared =
+            serde_json::from_str(&body).map_err(|e| corrupt("driver registration", e))?;
+        if !declared.capabilities.targets.covers(ty) {
+            return Err(StoreError::Invalid(format!(
+                "driver `{driver_type}` cannot provision resources of type `{ty}`: its \
+                 registration does not declare the `{}` target",
+                DriverTarget::of_type(ty).as_str()
             )));
         }
     }
@@ -513,7 +567,14 @@ async fn check_definition_refs(
             "resource type `{ty}` does not exist"
         )));
     }
-    check_driver_and_account(conn, org, &def.driver_type, def.driver_account.as_deref()).await?;
+    check_driver_and_account(
+        conn,
+        org,
+        ty,
+        &def.driver_type,
+        def.driver_account.as_deref(),
+    )
+    .await?;
     check_secret_stores(
         conn,
         org,
@@ -1099,10 +1160,11 @@ impl CatalogStore for SqliteStore {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        definition_exists(&mut tx, org, id).await?;
+        let ty = definition_exists(&mut tx, org, id).await?;
         check_driver_and_account(
             &mut tx,
             org,
+            &ty,
             &update.driver_type,
             update.driver_account.as_deref(),
         )

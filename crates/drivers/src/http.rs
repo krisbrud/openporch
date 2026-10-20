@@ -67,6 +67,21 @@ pub fn check_target(target: &str) -> Result<Url, HttpDriverError> {
     Ok(url)
 }
 
+/// The client [`HttpDriver::new`] builds: redirects are not followed, and,
+/// when `https_only`, an `https` target is never left for plain HTTP. One
+/// client can serve many drivers, and keeps their connections.
+pub fn default_client(https_only: bool) -> Result<Client, HttpDriverError> {
+    // `ring` is the crypto provider; installing it twice is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::builder()
+        .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .https_only(https_only)
+        .build()
+        .map_err(|e| HttpDriverError::Client(e.to_string()))
+}
+
 /// Why an external driver cannot be set up.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HttpDriverError {
@@ -106,16 +121,7 @@ impl HttpDriver {
         token: Option<String>,
     ) -> Result<Self, HttpDriverError> {
         let https = check_target(target)?.scheme() == "https";
-        // `ring` is the crypto provider; installing it twice is harmless.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
-            .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .https_only(https)
-            .build()
-            .map_err(|e| HttpDriverError::Client(e.to_string()))?;
-        Self::with_client(info, target, token, client)
+        Self::with_client(info, target, token, default_client(https)?)
     }
 
     /// Like [`HttpDriver::new`], with a caller-built client. The caller decides

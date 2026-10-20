@@ -1292,16 +1292,21 @@ A registration pins what the server relies on when it calls the driver:
 | --- | --- | --- |
 | `protocol_version` | `openporch-http/1` | The protocol the driver speaks; `openporch-http/1` is the only one supported |
 | `cookie_version` | `1` | The cookie format version the driver writes |
-| `inputs_schema` | none | JSON Schema of the driver inputs |
-| `outputs_schema` | none | JSON Schema of the driver's outputs |
+| `inputs_schema` | none | JSON Schema of the driver inputs, recorded for clients; the server does not check definitions' inputs against it |
+| `outputs_schema` | none | JSON Schema of the driver's outputs, recorded for clients; the server checks outputs against the resource type's schema, not this one |
+| `capabilities.targets.resources` | `true` | The driver provisions resources other than workloads |
+| `capabilities.targets.workloads` | `false` | The driver provisions workloads |
+| `capabilities.targets.triggers` | `false` | The driver provisions workload triggers; recorded only, since no resource type is a trigger |
 | `capabilities.observe` | `false` | `GET` reports the resource's real state, so an unknown outcome can be recovered by observing it |
 | `capabilities.recover` | `false` | A retried operation converges, so a `5xx` to a mutation may be retried |
 | `capabilities.preview` | `false` | Must be `false`: `openporch-http/1` has no preview call, so changes to existing resources need a permit |
 | `capabilities.cancel` | `false` | `POST {target}/{guresid}/cancel` stops a timed-out operation |
 
 The deployment executor reads the registration each time it calls the driver, so
-a deployment uses the registration as it is then. A deployment whose resources use
-a driver that is no longer registered is refused with `400` before anything runs.
+a deployment uses the registration as it is then. A definition whose type the
+driver does not target is refused with `400` when it is created or changed, and a
+deployment whose resources use a driver that is no longer registered, or no longer
+targets their type, is refused with `400` before anything runs.
 
 ```http
 POST /orgs/acme/resources/drivers
@@ -1320,7 +1325,10 @@ Authorization: Bearer $ADMIN_TOKEN
   "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"},
   "protocol_version": "openporch-http/1",
   "cookie_version": 1,
-  "capabilities": {"observe": true, "recover": false, "preview": false, "cancel": false}
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
 }
 ```
 

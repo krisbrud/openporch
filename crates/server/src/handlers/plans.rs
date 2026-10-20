@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use openporch_core::catalog::BUILTIN_DRIVERS;
+use openporch_core::catalog::{BUILTIN_DRIVERS, DriverTarget};
 use openporch_engine::preview::{self, DriverPlan, Entry};
 use openporch_store::{
     EnvRecord, NewPermit, NewPlan, PermitBinding, PermitRecord, PermitStore, PlanRecord, Store,
@@ -345,6 +345,17 @@ pub(super) async fn preflight(
                 "resource `{}` uses driver `{}`, which is not registered on this server; nothing \
                  changed",
                 node.descriptor, node.driver_type
+            )));
+        }
+        // Nor does a resource its driver cannot provision.
+        let ty = node.descriptor.ty.as_str();
+        if drivers.covers(&node.driver_type, ty) == Some(false) {
+            return Err(ApiError::invalid(format!(
+                "resource `{}` is of type `{ty}`, which driver `{}` cannot provision: it does \
+                 not declare the `{}` target; nothing changed",
+                node.descriptor,
+                node.driver_type,
+                DriverTarget::of_type(ty).as_str()
             )));
         }
     }

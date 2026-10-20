@@ -441,7 +441,8 @@ impl Fixture {
             .unwrap();
         }
         sqlx::query(
-            "INSERT INTO drivers (org_id, id, body, created_at) VALUES (?, 'test/fake', '{}', 0)",
+            "INSERT INTO drivers (org_id, id, body, created_at) VALUES (?, 'test/fake', \
+             '{\"capabilities\": {\"targets\": {\"workloads\": true}}}', 0)",
         )
         .bind(ORG)
         .execute(store.pool())
@@ -1233,6 +1234,43 @@ async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource()
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_driver_that_cannot_observe_is_reported_before_its_token_is_read() {
+    let f = Fixture::new().await;
+    // Registrations whose token does not exist, so reading it fails.
+    for (id, observe) in [("acme/blind", false), ("acme/seeing", true)] {
+        let body = json!({
+            "id": id, "target": "https://driver.internal/pg",
+            "token": {"store": "openporch", "ref": format!("drivers/{id}/token")},
+            "protocol_version": "openporch-http/1", "cookie_version": 1,
+            "capabilities": {"observe": observe},
+        });
+        sqlx::query("INSERT INTO drivers (org_id, id, body, created_at) VALUES (?, ?, ?, 0)")
+            .bind(ORG)
+            .bind(id)
+            .bind(body.to_string())
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+    }
+    let executor = f.executor(allow());
+    let mut job = provision_job_empty();
+    job.driver_type = "acme/blind".into();
+    match executor.observe(job.clone(), false).await.result {
+        Ok(Observed::Unknown(reason)) => assert!(reason.contains("cannot observe"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    // A driver that can observe needs its token, and the failure names the
+    // driver and the reference.
+    job.driver_type = "acme/seeing".into();
+    let error = format!(
+        "{:?}",
+        executor.observe(job, false).await.result.unwrap_err()
+    );
+    assert!(error.contains("driver `acme/seeing`"), "{error}");
+    assert!(error.contains("drivers/acme/seeing/token"), "{error}");
 }
 
 /// A job for `db`'s inputs under another identity, outside a deployment.

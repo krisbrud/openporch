@@ -19,7 +19,10 @@ The adapter is tested against the fixtures in
   "cookie_version": 1,
   "inputs_schema": {"type": "object"},
   "outputs_schema": {"type": "object"},
-  "capabilities": {"observe": true, "recover": true, "preview": false, "cancel": false}
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": true, "preview": false, "cancel": false
+  }
 }
 ```
 
@@ -30,21 +33,34 @@ store only when a deployment calls the driver, sent only in the `Authorization`
 header, and never shown in logs, errors or API responses. An error about it names
 the driver and the reference.
 
+`inputs_schema` and `outputs_schema` are recorded and returned for clients, but
+the server does not check against them: it checks a resource's outputs against its
+resource type's schema.
+
 The registration pins the protocol version, `openporch-http/1` and the only one
-supported, the cookie format version, `1` unless given, and the capabilities, all
-`false` unless given:
+supported, the cookie format version, `1` unless given, and the capabilities. The
+targets say what the driver provisions; unless given, it provisions resources other
+than workloads only. A definition may use the driver only for a type it targets:
+otherwise the definition is refused when it is written, and a deployment before
+anything runs. `triggers` is recorded but decides nothing, since triggers are
+provisioned with their workload. The other capabilities are `false` unless given:
 
 | Capability | When `true` |
 | --- | --- |
+| `targets.resources` | The driver provisions resources other than workloads. `true` unless given. |
+| `targets.workloads` | The driver provisions workloads. |
+| `targets.triggers` | The driver provisions workload triggers. Recorded only. |
 | `observe` | `GET` reports the resource's real state. openporch observes a resource whose last outcome is unknown before it changes it again; without this, an operator establishes the outcome. |
 | `recover` | A retried operation converges on the same effect, so a `5xx` to a `PUT` or `DELETE` is retried rather than left uncertain. See [below](#responses). |
 | `preview` | Must be `false`: this protocol has no preview call. Changes to resources the driver already provisioned therefore have unknown impact and need a permit. |
 | `cancel` | `POST {target}/{guresid}/cancel` stops a timed-out operation. |
 
 Each call reads the registration, and its token, as they are then, so a
-deployment never uses an earlier registration's target or token. A deployment whose resources name a driver
-that is not registered is refused before anything runs, naming the driver. A
-registration cannot be deleted while a definition or an active resource uses it.
+deployment never uses an earlier registration's target or token. A deployment
+whose resources name a driver that is not registered is refused before anything
+runs, naming the driver. A driver that cannot observe is reported as such
+without its token being read. A registration cannot be deleted while a
+definition or an active resource uses it.
 
 The request and response bodies follow the shapes of Humanitec's Driver API 0.9.3, so
 existing drivers need few changes. Full wire compatibility is not promised: the

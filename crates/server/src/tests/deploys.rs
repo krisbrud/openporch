@@ -1709,7 +1709,8 @@ async fn a_registered_external_driver_provisions_deployed_resources() {
     assert_eq!(registered["cookie_version"], 1);
     assert_eq!(
         registered["capabilities"],
-        json!({"observe": true, "recover": false, "preview": false, "cancel": false})
+        json!({"targets": {"resources": true, "workloads": false, "triggers": false},
+               "observe": true, "recover": false, "preview": false, "cancel": false})
     );
     for (id, ty, driver) in [
         ("env", "base-env", "openporch/none"),
@@ -1936,4 +1937,67 @@ async fn an_external_driver_whose_token_cannot_be_read_fails_naming_the_driver_a
     assert!(error.contains("driver `acme/pg`"), "{error}");
     assert!(error.contains("drivers/acme/pg/missing"), "{error}");
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_workload_on_a_driver_that_no_longer_provisions_workloads_is_refused_before_anything_runs()
+ {
+    let s = server().await;
+    s.app("shop").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/lambda", "target": "https://driver.internal/lambda",
+                   "capabilities": {"targets": {"workloads": true}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    for (id, ty, driver) in [
+        ("env", "base-env", "openporch/none"),
+        ("workloads", "workload", "acme/lambda"),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    // The registration no longer declares workloads, as after a concurrent
+    // change.
+    sqlx::query(
+        "UPDATE drivers SET body = json_set(body, '$.capabilities.targets.workloads', \
+         json('false')) WHERE id = 'acme/lambda'",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let delta = s.delta("web:1").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs/development/plans",
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let message = b["message"].as_str().unwrap();
+    assert!(
+        message.contains("which driver `acme/lambda` cannot provision")
+            && message.contains("`workloads` target"),
+        "{b}"
+    );
+    let (_, page) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(page["deployments"], json!([]), "{page}");
 }

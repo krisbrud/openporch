@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 192 covered, 9 manual, 31 deferred, 42 gaps.
+274 scenarios: 193 covered, 9 manual, 31 deferred, 41 gaps.

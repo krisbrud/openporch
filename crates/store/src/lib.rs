@@ -44,6 +44,7 @@ pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, Se
 pub use sqlite_audit_retention::{AuditRetention, EXPIRY_ACTION, Expiry, Retained};
 pub use sqlite_catalog::{
     CatalogStore, DefinitionRecord, DefinitionUpdate, DriverCapabilities, DriverRecord,
+    DriverTargets,
 };
 pub use sqlite_diagnostics::{AuditSummary, OperationSummary};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};

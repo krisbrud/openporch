@@ -391,6 +391,31 @@ async fn every_schema_fixture_upgrades_to_this_build() {
             .unwrap_or_else(|e| panic!("fixture {version} after upgrade: {e}"));
         assert_eq!(read_secret(&s, "shop/key").await, "fixture-secret");
 
+        // Every driver registration still reads. The ones from before schema
+        // 10 had no pins; since, `populate` registers `acme/vault`, which is
+        // checked here rather than in `observed.json`, which older fixtures'
+        // keys would not match.
+        let (st, drivers) = s.get("/orgs/acme/resources/drivers", &s.admin).await;
+        assert_eq!(st, StatusCode::OK, "fixture {version}: {drivers}");
+        if version >= 10 {
+            let vault = drivers
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == "acme/vault")
+                .unwrap_or_else(|| panic!("fixture {version}: {drivers}"));
+            assert_eq!(vault["target"], "https://driver.internal/vault", "{vault}");
+            assert_eq!(vault["protocol_version"], "openporch-http/1", "{vault}");
+            assert_eq!(vault["cookie_version"], 1, "{vault}");
+            assert_eq!(vault["capabilities"]["observe"], true, "{vault}");
+            assert_eq!(
+                vault["capabilities"]["targets"]["resources"], true,
+                "{vault}"
+            );
+            assert_eq!(vault["token"]["ref"], "drivers/acme/vault/token", "{vault}");
+            assert!(!drivers.to_string().contains("fixture-driver-token"));
+        }
+
         // The member's token still authenticates, and deployments still run.
         let alice = std::fs::read_to_string(s.dir.path().join("alice-token")).unwrap();
         let (st, b) = s.get("/orgs/acme/apps", alice.trim()).await;
