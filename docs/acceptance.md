@@ -102,14 +102,14 @@ end.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Zip function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::zip_function`; real function: manual `just e2e-aws` |
-| Image function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_from_ecr`, `::image_function_without_image` |
-| Container workload on Lambda | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `::two_containers`, `::container_files`; real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter |
-| Non-ECR image | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `::image_in_another_region` |
+| Image function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_from_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_function_without_image` |
+| Container workload on Lambda | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files`; real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter |
+| Non-ECR image | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_in_another_region` |
 | Database password | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::secret_variables_are_references`; `just e2e-aws` checks `SIGNING_KEY_SECRET_REF` in the real function |
-| Function URL | manual | `just e2e-aws` step "Call the API's URL"; config only: `unit.tftest.hcl::container_with_web_adapter_port`, `::iam_url`, `::inferred_url_is_not_public` |
+| Function URL | manual | `just e2e-aws` step "Call the API's URL"; config only: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::iam_url`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::inferred_url_is_not_public` |
 | Queue trigger | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::queue_trigger`; real mapping and message processing: `just e2e-aws` |
 | Nightly schedule | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::schedules`; `just e2e-aws` checks `cron(0 3 * * ? *) Europe/Oslo` |
-| DynamoDB access | manual | `just e2e-aws` step "Send a signed order and see the worker store it"; supporting: `unit.tftest.hcl::zip_function` (policy attachment), `examples/modules/dynamodb-table/policy/tests/policy.tftest.hcl::read_write`, `crates/engine/src/planner/tests/coprovision.rs::a_policy_is_in_place_before_the_workload_that_needs_it` |
+| DynamoDB access | manual | `just e2e-aws` step "Send a signed order and see the worker store it"; supporting: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::zip_function` (policy attachment), `examples/modules/dynamodb-table/policy/tests/policy.tftest.hcl::read_write`, `crates/engine/src/planner/tests/coprovision.rs::a_policy_is_in_place_before_the_workload_that_needs_it` |
 | Table from a workload file | covered | `examples/modules/dynamodb-table/tests/table.tftest.hcl::default_key`, `crates/drivers/src/opentofu/tests.rs::opentofu_modules_read_the_resource_inputs`, `crates/server/src/tests/e2e.rs::the_example_lambda_workloads_deploy_and_replay` |
 | Rollback to a previous artifact | manual | `just e2e-aws` step "Replay the first deployment's snapshot" (by deployment ID, not `+1`); supporting: `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (`+1`), `crates/server/src/tests/e2e.rs::the_example_lambda_workloads_deploy_and_replay` (artifact version replay) |
 | Delete environment | manual | `just e2e-aws` steps "Delete the environment with a permit for each deletion" and "Check that nothing the environment owned is left" |
@@ -198,7 +198,7 @@ end.
 | Partial success | covered | `crates/server/src/tests/resources.rs::usage_after_a_partial_failure` (database result and last success kept), `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` (`partial` convergence after a failure), `crates/engine/src/planner/tests.rs::one_branch_fails` |
 | One branch fails | covered | `crates/engine/src/planner/tests.rs::one_branch_fails` |
 | Permanent driver error | covered | `crates/engine/src/planner/tests.rs::permanent_errors_are_not_retried`, `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-400-validation.json`) |
-| Crash after creation | covered | `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation`, `::nothing_found_is_provisioned_again_with_the_same_identity` |
+| Crash after creation | covered | `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation`, `crates/engine/src/planner/tests/recovery.rs::nothing_found_is_provisioned_again_with_the_same_identity` |
 | Driver keeps running after timeout | covered | `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered`, `crates/engine/src/planner/tests/recovery.rs::an_operation_still_running_is_left_unknown` |
 | Configuration changes during execution | covered | `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (snapshot vs current; no test edits configuration while a run is in flight) |
 | Unchanged deployment | covered | `crates/server/src/tests/resources.rs::stable_across_deployments`, `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` (second plan has no effects) |
@@ -219,10 +219,10 @@ end.
 | Workload without a runtime | covered | `crates/drivers/src/tests.rs::none_returns_resolved_resource_inputs`, `crates/engine/src/planner/tests/workloads.rs::a_none_workload_stores_its_resolved_document` |
 | Deterministic password | covered | `crates/drivers/src/tests.rs::template_keeps_a_generated_password_in_its_cookie` |
 | Driver error | covered | `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-400-validation.json`), `crates/engine/src/planner/tests.rs::permanent_errors_are_not_retried` |
-| Hung driver | covered | `crates/drivers/src/tests.rs::a_driver_that_does_not_answer_times_out`, `::a_timeout_cancels_drivers_that_can`, `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered` |
+| Hung driver | covered | `crates/drivers/src/tests.rs::a_driver_that_does_not_answer_times_out`, `crates/drivers/src/tests.rs::a_timeout_cancels_drivers_that_can`, `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered` |
 | Incompatible cookie upgrade | gap (partial) | Per-call checks only: `crates/drivers/src/opentofu/tests.rs::cookies_are_checked_for_compatibility`, `crates/drivers/src/tests.rs::returned_cookies_are_checked`. No driver-upgrade activation step that rejects with affected GUResIDs; searched `activat`, `cookie_version`, `upgrade` across `crates/` |
 | Duplicate put | covered | `crates/drivers/src/http_tests.rs::duplicate_put_recovers_the_same_object` |
-| Unobservable timed-out creation | covered | `crates/engine/src/planner/tests/recovery.rs::nothing_found_by_a_driver_that_cannot_recover_waits_for_an_administrator`, `::an_unobservable_outcome_waits_for_an_administrator` |
+| Unobservable timed-out creation | covered | `crates/engine/src/planner/tests/recovery.rs::nothing_found_by_a_driver_that_cannot_recover_waits_for_an_administrator`, `crates/engine/src/planner/tests/recovery.rs::an_unobservable_outcome_waits_for_an_administrator` |
 | Conflict after a lost response | gap (partial) | 409 mapped to a non-retryable conflict: `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-409-conflict.json`), `crates/engine/src/executor/tests.rs::a_failure_after_the_driver_accepted_a_change_is_uncertain`. The executor maps `DriverError::Conflict` to a permanent failure (`crates/engine/src/executor.rs` `driver_failure`); no test shows the engine observing the prior operation after the 409 |
 
 ## kubernetes-workloads
@@ -260,17 +260,17 @@ end.
 | Inline script | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` (inline `script`, local providers); S3 bucket module against Floci: `examples/modules/s3/tests/bucket.tftest.hcl` |
 | Neither source nor script | covered | `crates/server/src/tests/catalog.rs::opentofu_definition_inputs_are_checked_when_written`, `crates/drivers/src/opentofu/tests.rs::inputs_are_checked_before_anything_runs` |
 | Table key from params | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_modules_read_the_resource_inputs`, `examples/modules/dynamodb-table/tests/table.tftest.hcl::key_sort_key_and_index` |
-| Secret workload variable | covered | `crates/drivers/src/opentofu/tests.rs::secret_resource_inputs_are_moved_out_one_by_one`, `::a_secret_inside_another_moves_with_it`, `::the_plain_variable_file_has_no_secret_input` |
+| Secret workload variable | covered | `crates/drivers/src/opentofu/tests.rs::secret_resource_inputs_are_moved_out_one_by_one`, `crates/drivers/src/opentofu/tests.rs::a_secret_inside_another_moves_with_it`, `crates/drivers/src/opentofu/tests.rs::the_plain_variable_file_has_no_secret_input` |
 | Reserved variable name | covered | `crates/server/src/tests/catalog.rs::opentofu_definition_inputs_are_checked_when_written` |
 | Git module with variables | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit` (git module with variables; the RDS module itself is milestone 2) |
 | Default AWS environment | covered | `crates/drivers/src/opentofu/tests.rs::fake_run_exports_the_default_aws_environment`; real: `just e2e-aws` |
 | Orchestrator-managed state | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice` (CI against Floci S3; once against real S3) |
 | Sensitive output | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` |
-| Environment deleted | covered | Driver destroy and state removal: `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end`, `::opentofu_s3_state_applies_twice`; environment teardown: `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`; real bucket: `just e2e-aws` |
+| Environment deleted | covered | Driver destroy and state removal: `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end`, `crates/drivers/src/opentofu/tests.rs::opentofu_s3_state_applies_twice`; environment teardown: `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`; real bucket: `just e2e-aws` |
 | Apply fails | covered | `crates/drivers/src/opentofu/tests.rs::opentofu_failures_are_reported_redacted`, `crates/engine/src/executor/tests.rs::opentofu_failure_is_redacted_in_the_deployment_log` (generic failure, not an AWS IAM error) |
-| Partial apply writes state | covered | `crates/drivers/src/opentofu/tests.rs::a_failed_apply_is_uncertain_and_keeps_what_it_ran`, `::opentofu_a_timed_out_apply_leaves_usable_state` |
-| Missing state | covered | `crates/drivers/src/opentofu/tests.rs::lost_state_needs_recovery`, `::state_lost_after_an_apply_started_is_never_replaced` |
-| Module revision removed upstream | covered | `crates/engine/src/planner/tests.rs::a_removal_whose_retained_version_is_gone_changes_nothing`, `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit`, `::deleting_a_script_resource_never_fetches_a_newer_source` |
+| Partial apply writes state | covered | `crates/drivers/src/opentofu/tests.rs::a_failed_apply_is_uncertain_and_keeps_what_it_ran`, `crates/drivers/src/opentofu/tests.rs::opentofu_a_timed_out_apply_leaves_usable_state` |
+| Missing state | covered | `crates/drivers/src/opentofu/tests.rs::lost_state_needs_recovery`, `crates/drivers/src/opentofu/tests.rs::state_lost_after_an_apply_started_is_never_replaced` |
+| Module revision removed upstream | covered | `crates/engine/src/planner/tests.rs::a_removal_whose_retained_version_is_gone_changes_nothing`, `crates/drivers/src/opentofu/tests.rs::opentofu_applies_a_git_module_and_deletes_the_retained_commit`, `crates/drivers/src/opentofu/tests.rs::deleting_a_script_resource_never_fetches_a_newer_source` |
 | State and resource accounts differ | covered | `crates/drivers/src/opentofu/tests.rs::s3_state_uses_a_workspace_per_resource_and_its_own_credentials` |
 
 ## opentofu-provider
@@ -280,7 +280,7 @@ end.
 | Configure from environment | covered | `provider/internal/provider/provider_test.go::TestConfigureFromEnvironment`, `provider/scripts/smoke.sh` |
 | Secret store | deferred | `openporch_secret_store` and `aws-ssm` adapters are tasks 13.3 / 13.2 |
 | Definition with criteria | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
-| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `::TestAccApplicationAndEnvironment` |
+| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment` |
 | Placeholder escaping | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
 | Secret value changed | covered | `provider/internal/provider/acc_catalog_test.go::TestAccValue` |
 | Service user token | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |
@@ -297,7 +297,7 @@ end.
 | Manager invites an administrator | covered | `crates/server/src/tests/mod.rs::manager_delegation_ceiling` |
 | CI service user | covered | `crates/server/src/tests/mod.rs::ci_service_user` |
 | Removal revokes access | covered | `crates/server/src/tests/mod.rs::removal_revokes_access` |
-| Manager removes an administrator | covered | `crates/server/src/tests/mod.rs::manager_delegation_ceiling`, `::managers_remove_any_non_administrator` |
+| Manager removes an administrator | covered | `crates/server/src/tests/mod.rs::manager_delegation_ceiling`, `crates/server/src/tests/mod.rs::managers_remove_any_non_administrator` |
 | Manager targets bootstrap | covered | `crates/server/src/tests/mod.rs::manager_delegation_ceiling` |
 | Manager creates or promotes an administrator | covered | `crates/server/src/tests/mod.rs::manager_delegation_ceiling` |
 | Service user exceeds issuer's authority | covered | `crates/server/src/tests/mod.rs::service_user_beyond_the_issuers_authority` |
@@ -308,7 +308,7 @@ end.
 |---|---|---|
 | Composite string | covered | `crates/core/src/placeholder.rs::composite_string` |
 | Unknown root | covered | `crates/core/src/placeholder.rs::unknown_root_names_placeholder_and_location`, `crates/core/src/graph/tests.rs::unknown_types_and_bad_placeholders_fail` |
-| Namespace from context | deferred | `k8s-namespace` is group 9 (context composition itself: `crates/core/src/placeholder.rs::composite_string`, `::context_keys`) |
+| Namespace from context | deferred | `k8s-namespace` is group 9 (context composition itself: `crates/core/src/placeholder.rs::composite_string`, `crates/core/src/placeholder.rs::context_keys`) |
 | Cloud account from a config resource | covered | `crates/core/src/placeholder.rs::guresid_and_account`, `crates/engine/src/planner/tests.rs::independent_branches_run_in_parallel` (route's `driver_account` from `${resources.dns.account}`) |
 | Whole-value object | covered | `crates/core/src/placeholder.rs::whole_value_keeps_json_type` |
 | Secret in a value input | covered | `crates/core/src/placeholder.rs::secret_in_value_input_fails` |
@@ -343,7 +343,7 @@ end.
 | Modify a built-in type | covered | `crates/server/src/tests/catalog.rs::custom_types_are_org_prefixed_and_built_ins_are_fixed` |
 | Request an undefined class | covered | `crates/core/src/graph/tests.rs::undefined_class_fails_naming_it` |
 | Missing required output | gap | Only the pure check is tested (`crates/core/src/catalog.rs::output_validation`). `ResourceType::validate_outputs` / `validate_secret_output` are never called outside `crates/core/src/catalog.rs`, so provisioning does not enforce output schemas; searched `validate_outputs`, `output_kind`, `missing output` in `crates/engine`, `crates/server` |
-| Catalog schema fixture | covered | `crates/core/src/catalog.rs::published_catalog_fixtures_are_current`, `::catalog_output_conformance` |
+| Catalog schema fixture | covered | `crates/core/src/catalog.rs::published_catalog_fixtures_are_current`, `crates/core/src/catalog.rs::catalog_output_conformance` |
 
 ## resource-definitions
 
@@ -359,7 +359,7 @@ end.
 | Add a criterion | covered | `crates/server/src/tests/catalog.rs::criteria_are_managed_one_by_one` |
 | Policy co-provisioned with a database | covered | `crates/core/src/graph/tests.rs::policy_coprovisioned_with_a_database`, `crates/engine/src/planner/tests/coprovision.rs::a_policy_is_in_place_before_the_workload_that_needs_it` |
 | Delete in use | covered | `crates/server/src/tests/catalog.rs::definition_in_use_is_kept` |
-| Policy edge required by workload | covered | `crates/engine/src/planner/tests/coprovision.rs::a_policy_is_in_place_before_the_workload_that_needs_it`, `::the_order_workloads_are_added_in_changes_nothing`, `crates/core/src/graph/tests.rs::graph_is_independent_of_definition_order` |
+| Policy edge required by workload | covered | `crates/engine/src/planner/tests/coprovision.rs::a_policy_is_in_place_before_the_workload_that_needs_it`, `crates/engine/src/planner/tests/coprovision.rs::the_order_workloads_are_added_in_changes_nothing`, `crates/core/src/graph/tests.rs::graph_is_independent_of_definition_order` |
 
 ## resource-graph
 
@@ -368,7 +368,7 @@ end.
 | Workload with a database | covered | `crates/core/src/graph/tests.rs::workload_with_a_database` |
 | Kubernetes workload definition adds cluster nodes | deferred | Group 9 (a graph-level test already exists: `crates/core/src/graph/tests.rs::kubernetes_workload_definition_adds_cluster_nodes`) |
 | Cycle | covered | `crates/core/src/graph/tests.rs::cycle_is_reported` |
-| Shared DNS per environment | gap (partial) | Per-environment identity is shown only for a private database (`crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `assert_ne!` on GUResIDs). No test deploys a `shared.*` resource to two environments and compares records/outputs; searched `shared` in `crates/server/src/tests/{e2e,resources}.rs`, `crates/engine/src/planner/tests*` |
+| Shared DNS per environment | gap (partial) | Per-environment identity is shown only for a private database (`crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `assert_ne!` on GUResIDs). No test deploys a `shared.*` resource to two environments and compares records/outputs; searched `shared` in `crates/server/src/tests/e2e.rs` and `crates/server/src/tests/resources.rs`, `crates/engine/src/planner/tests*` |
 | Inherit ID | covered | `crates/core/src/graph/tests.rs::workload_with_a_database`, `crates/core/src/placeholder.rs::resource_outputs_inherit_class_and_id` |
 | Parallel branches | covered | `crates/core/src/graph/tests.rs::parallel_branches_share_a_layer`, `crates/engine/src/planner/tests.rs::independent_branches_run_in_parallel` |
 | Database host reaches the workload | covered | `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays` (`DB_HOST: db.internal`), `crates/engine/src/planner/tests/workloads.rs::a_none_workload_stores_its_resolved_document` |
@@ -388,10 +388,10 @@ end.
 | Update creates a version | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references` |
 | Secret output stored as a reference | covered | `crates/engine/src/executor/tests.rs::a_secret_output_is_stored_and_returned_as_a_reference` |
 | Store unreachable | gap (partial) | Only cloud-account credentials naming an unsupported store are tested (`crates/engine/src/cloud/tests.rs::static_keys_come_from_the_secret_reference`). No executor test where a definition/value reference's store read fails and the resource error names store and reference; searched `unreachable`, `could not be read`, `SecretError::Store` in `crates/engine/src/executor/tests.rs`, `crates/engine/src/planner/tests.rs` |
-| Delete a store in use | covered | `crates/server/src/tests/accounts.rs::delete_a_store_in_use`, `::delete_a_store_used_by_shared_values` |
+| Delete a store in use | covered | `crates/server/src/tests/accounts.rs::delete_a_store_in_use`, `crates/server/src/tests/accounts.rs::delete_a_store_used_by_shared_values` |
 | Reference copied between applications | covered | `crates/server/src/tests/secret_use.rs::reference_copied_between_applications` |
 | Production reference in development | covered | `crates/server/src/tests/secret_use.rs::production_reference_in_development` |
-| Failure leaves a variables file | gap (partial) | Run directories are private and removed after a run or a reaped timeout (`crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only`, `::a_timed_out_run_is_interrupted_and_reaped_before_the_next`). No test leaves `secrets.tfvars.json` behind after a server crash and checks owner-only mode, removal on recovery and omission from diagnostics; searched `secrets.tfvars`, `runs/`, `mode()` in `crates/drivers/src/opentofu/tests.rs` |
+| Failure leaves a variables file | gap (partial) | Run directories are private and removed after a run or a reaped timeout (`crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only`, `crates/drivers/src/opentofu/tests.rs::a_timed_out_run_is_interrupted_and_reaped_before_the_next`). No test leaves `secrets.tfvars.json` behind after a server crash and checks owner-only mode, removal on recovery and omission from diagnostics; searched `secrets.tfvars`, `runs/`, `mode()` in `crates/drivers/src/opentofu/tests.rs` |
 | Master key unavailable | covered | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` |
 | Store depends on itself | covered | `crates/server/src/tests/accounts.rs::store_depends_on_itself` |
 | Environment secret copied to app values | covered | `crates/server/src/tests/secret_use.rs::environment_secret_copied_to_app_values` |
@@ -416,7 +416,7 @@ end.
 | Unknown field | covered | `crates/core/src/workload/tests.rs::unknown_field_is_named` |
 | Web container | covered | `crates/core/src/workload/tests.rs::web_container_implies_http_trigger` |
 | Zip function | covered | `crates/core/src/workload/tests.rs::deploy_time_artifact_is_required_and_supplied_by_name` |
-| Image function | covered | `crates/core/src/workload/tests.rs::image_function`, `::deploy_time_image_is_required` |
+| Image function | covered | `crates/core/src/workload/tests.rs::image_function`, `crates/core/src/workload/tests.rs::deploy_time_image_is_required` |
 | Queue trigger on a dependency | covered | `crates/core/src/workload/tests.rs::queue_trigger_on_a_dependency`, `crates/core/src/graph/tests.rs::queue_trigger_dependency_is_in_the_graph`, `crates/engine/src/planner/tests/workloads.rs::a_lambda_class_workload_gets_its_resolved_document` |
 | Trigger names a missing resource | covered | `crates/core/src/workload/tests.rs::trigger_names_missing_resource` |
 | Unsupported trigger for the target | deferred | `openporch/kubernetes`, group 9 |
