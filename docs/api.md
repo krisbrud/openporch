@@ -23,6 +23,12 @@ group. The examples run in order against a fresh dev server in
   one that does not exist. An object you can see but not change returns `403`.
 - **Secrets.** Secret values are accepted on write and never returned. Responses
   show secret references `{store, ref, version}` instead.
+- **Contract.** Every response, errors included, carries
+  `Openporch-Contract: 1`, the API contract version, as `GET /version` does.
+  A request may send the contract it was written for in the same header; a
+  server that does not serve it refuses the request with `400` `API-008`
+  before doing anything. `porch` and the OpenTofu provider send it, and refuse
+  a server whose responses name another contract.
 - **Work in progress.** External secret store adapters are not implemented
   yet; where a route registers something the server cannot use yet, its
   section says so.
@@ -56,6 +62,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | `API-005` | 405 | The route does not support this method. |
 | `API-006` | 413 | The body is larger than `max_body_bytes`. |
 | `API-007` | 429 | Too many requests. `Retry-After` gives the seconds to wait. |
+| `API-008` | 400 | The request's `Openporch-Contract` header names a contract this server does not serve. Nothing was done. |
 | `AUTH-001` | 401 | No valid token or session. |
 | `AUTH-002` | 403 | Authenticated, but not allowed. The message names the missing role. |
 | `SRV-001` | 500 | Internal error. The log has details under the request ID. |

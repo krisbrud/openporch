@@ -398,6 +398,64 @@ async fn health_and_version() {
     assert_eq!(body["version"], crate::VERSION);
     assert_eq!(body["contract"], "1");
     assert!(body["capabilities"].is_object());
+    // Every response names the contract, errors and unknown routes included,
+    // so clients can refuse a server they do not support.
+    for path in [
+        "/version",
+        "/orgs/acme/apps",
+        "/no-such-route",
+        "/orgs/other/apps",
+    ] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let res = s.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()[crate::api::CONTRACT_HEADER],
+            crate::handlers::CONTRACT_VERSION,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn requests_for_another_contract_change_nothing() {
+    let s = server().await;
+    let headers = [(crate::api::CONTRACT_HEADER, "2")];
+    let (status, body) = s
+        .call_with(
+            Method::POST,
+            "/orgs/acme/apps",
+            Some(&s.admin),
+            Some(json!({"id": "shop"})),
+            &headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "API-008", "{body}");
+    let (_, apps) = s.get("/orgs/acme/apps", &s.admin).await;
+    assert_eq!(apps, json!([]));
+    // The refusal keeps the caller's request ID, so it can be correlated.
+    let req = Request::builder()
+        .uri("/version")
+        .header(crate::api::CONTRACT_HEADER, "2")
+        .header("x-request-id", "contract-check")
+        .body(Body::empty())
+        .unwrap();
+    let res = s.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.headers()["x-request-id"], "contract-check");
+    assert_eq!(res.headers()[crate::api::CONTRACT_HEADER], "1");
+    // The contract it serves is accepted.
+    let headers = [(crate::api::CONTRACT_HEADER, "1")];
+    let (status, body) = s
+        .call_with(
+            Method::POST,
+            "/orgs/acme/apps",
+            Some(&s.admin),
+            Some(json!({"id": "shop"})),
+            &headers,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 #[tokio::test]
