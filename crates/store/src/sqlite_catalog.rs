@@ -34,6 +34,30 @@ pub struct DriverRecord {
     /// The bearer token sent to the driver, as a reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<SecretRef>,
+    /// The protocol the driver speaks, such as `openporch-http/1`.
+    pub protocol_version: String,
+    /// The cookie format version the driver writes.
+    pub cookie_version: u32,
+    /// JSON Schema of the driver's outputs, if published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs_schema: Option<serde_json::Value>,
+    /// What the driver supports beyond provisioning and removing resources.
+    #[serde(default)]
+    pub capabilities: DriverCapabilities,
+}
+
+/// The optional capabilities an external driver declares.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DriverCapabilities {
+    /// `GET` reports the real state of the resource.
+    pub observe: bool,
+    /// A retried operation identity converges instead of duplicating effects.
+    pub recover: bool,
+    /// The driver previews its changes.
+    pub preview: bool,
+    /// A timed-out operation can be cancelled.
+    pub cancel: bool,
 }
 
 /// A stored resource definition.

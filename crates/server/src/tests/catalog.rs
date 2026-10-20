@@ -670,6 +670,54 @@ async fn external_drivers_are_registered() {
     let (status, b) = s.get(path, &member).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert!(!b.to_string().contains("bearer-s3cret"));
+    // The registration pins the protocol, the cookie version and the
+    // capabilities, with defaults when left out.
+    assert_eq!(b["protocol_version"], "openporch-http/1", "{b}");
+    assert_eq!(b["cookie_version"], 1, "{b}");
+    assert_eq!(
+        b["capabilities"],
+        json!({"observe": false, "recover": false, "preview": false, "cancel": false})
+    );
+    let pinned = s
+        .created(
+            "/orgs/acme/resources/drivers",
+            json!({"id": "acme/pinned", "target": "https://driver.internal/pinned",
+                   "protocol_version": "openporch-http/1", "cookie_version": 3,
+                   "outputs_schema": {"type": "object"},
+                   "capabilities": {"observe": true, "recover": true, "cancel": true}}),
+        )
+        .await;
+    let (status, b) = s
+        .get("/orgs/acme/resources/drivers/acme%2Fpinned", &member)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b, pinned);
+    assert_eq!(b["cookie_version"], 3, "{b}");
+    assert_eq!(b["outputs_schema"], json!({"type": "object"}), "{b}");
+    assert_eq!(
+        b["capabilities"],
+        json!({"observe": true, "recover": true, "preview": false, "cancel": true})
+    );
+    for (body, message) in [
+        (
+            json!({"protocol_version": "openporch-http/2"}),
+            "`openporch-http/2` is not supported",
+        ),
+        // The protocol has no preview call.
+        (
+            json!({"capabilities": {"preview": true}}),
+            "`capabilities.preview` must be false",
+        ),
+        (json!({"capabilities": {"teleport": true}}), "teleport"),
+        (json!({"outputs_schema": []}), "`outputs_schema`"),
+    ] {
+        let mut body = body;
+        body["id"] = json!("acme/refused");
+        body["target"] = json!("https://driver.internal/refused");
+        let (status, b) = s.post("/orgs/acme/resources/drivers", &s.admin, body).await;
+        assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+        assert!(b["message"].as_str().unwrap().contains(message), "{b}");
+    }
     let (status, b) = s
         .post("/orgs/acme/resources/drivers", &s.admin, vault)
         .await;

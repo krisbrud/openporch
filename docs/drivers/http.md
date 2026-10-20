@@ -5,9 +5,46 @@ it with `POST /orgs/{org}/resources/drivers` (see [the API reference](../api.md)
 definitions can then use its ID as `driver_type`. openporch calls it with the
 `openporch-http/1` protocol described here.
 
-The adapter is implemented and tested against the fixtures in
-[`crates/drivers/fixtures/http`](../../crates/drivers/fixtures/http), but deployments
-do not call drivers until the deployment executor lands.
+The adapter is tested against the fixtures in
+[`crates/drivers/fixtures/http`](../../crates/drivers/fixtures/http).
+
+## Registration
+
+```json
+{
+  "id": "acme/vault-db",
+  "target": "https://drivers.acme.example/vault-db",
+  "token": {"value": "drv_7d1e"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "inputs_schema": {"type": "object"},
+  "outputs_schema": {"type": "object"},
+  "capabilities": {"observe": true, "recover": true, "preview": false, "cancel": false}
+}
+```
+
+Only `id` and `target` are required. The ID is `<namespace>/<name>`; the `openporch`
+namespace is reserved for built-in drivers. The target must be an `https` URL. The
+`token` is a secret reference, or `{value}` to store; it is read from the secret
+store only when a deployment calls the driver, sent only in the `Authorization`
+header, and never shown in logs, errors or API responses. An error about it names
+the driver and the reference.
+
+The registration pins the protocol version, `openporch-http/1` and the only one
+supported, the cookie format version, `1` unless given, and the capabilities, all
+`false` unless given:
+
+| Capability | When `true` |
+| --- | --- |
+| `observe` | `GET` reports the resource's real state. openporch observes a resource whose last outcome is unknown before it changes it again; without this, an operator establishes the outcome. |
+| `recover` | A retried operation converges on the same effect, so a `5xx` to a `PUT` or `DELETE` is retried rather than left uncertain. See [below](#responses). |
+| `preview` | Must be `false`: this protocol has no preview call. Changes to resources the driver already provisioned therefore have unknown impact and need a permit. |
+| `cancel` | `POST {target}/{guresid}/cancel` stops a timed-out operation. |
+
+Each call reads the registration, and its token, as they are then, so a
+deployment never uses an earlier registration's target or token. A deployment whose resources name a driver
+that is not registered is refused before anything runs, naming the driver. A
+registration cannot be deleted while a definition or an active resource uses it.
 
 The request and response bodies follow the shapes of Humanitec's Driver API 0.9.3, so
 existing drivers need few changes. Full wire compatibility is not promised: the

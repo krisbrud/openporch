@@ -133,6 +133,18 @@ async fn populate(s: &Server) {
             StatusCode::CREATED,
         );
     }
+    // An external driver no definition uses, so nothing calls it.
+    ok(
+        s.post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/vault", "target": "https://driver.internal/vault",
+                   "token": {"value": "fixture-driver-token"},
+                   "capabilities": {"observe": true}}),
+        )
+        .await,
+        StatusCode::CREATED,
+    );
     ok(
         s.post(
             &format!("{APP}/values"),

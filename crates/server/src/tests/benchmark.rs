@@ -214,6 +214,7 @@ async fn reference_capacity_benchmark() {
         None,
         Arc::new(registry),
         None,
+        None,
     );
     // A record, so definitions may name it; the server runs it in-process.
     sqlx::query("INSERT INTO drivers (org_id, id, body, created_at) VALUES ('acme', ?, '{}', 0)")

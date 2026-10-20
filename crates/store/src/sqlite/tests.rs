@@ -6,6 +6,7 @@ use openporch_core::sets::DeploymentSet;
 use serde_json::json;
 
 use super::*;
+use crate::{CatalogStore, DriverCapabilities};
 
 const ORG: &str = "acme";
 
@@ -281,6 +282,33 @@ fn schema_version_is_the_newest_migration() {
         Some(SCHEMA_VERSION),
         "a migration was added: raise SCHEMA_VERSION and add its schema fixture"
     );
+}
+
+#[tokio::test]
+async fn driver_registrations_from_before_pins_get_the_versions_they_spoke() {
+    let f = Fixture::new().await;
+    let old = json!({"id": "acme/vault", "target": "https://driver.internal/vault",
+                     "token": {"store": "openporch", "ref": "drivers/acme/vault/token"}});
+    sqlx::query(
+        "INSERT INTO drivers (org_id, id, body, created_at) VALUES (?, 'acme/vault', ?, 0)",
+    )
+    .bind(ORG)
+    .bind(old.to_string())
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        sqlx::query(include_str!("../../migrations/0010_driver_pins.sql"))
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+    }
+    let record = f.store.driver(ORG, "acme/vault").await.unwrap().unwrap();
+    assert_eq!(record.protocol_version, "openporch-http/1");
+    assert_eq!(record.cookie_version, 1);
+    assert_eq!(record.capabilities, DriverCapabilities::default());
+    assert_eq!(record.target, "https://driver.internal/vault");
+    assert_eq!(record.token.unwrap().reference, "drivers/acme/vault/token");
 }
 
 #[tokio::test]

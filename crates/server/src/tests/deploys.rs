@@ -956,7 +956,14 @@ async fn a_started_server_provisions_deployments() {
         assert_eq!(st, StatusCode::CREATED, "{b}");
     }
     // The OpenTofu driver is registered, with the configured state backend.
-    let tofu = s.state.drivers.facts("openporch/opentofu").unwrap();
+    let tofu = s
+        .state
+        .drivers
+        .known(&s.state.store, "acme", &["openporch/opentofu"])
+        .await
+        .unwrap()
+        .facts("openporch/opentofu")
+        .unwrap();
     assert_eq!(tofu.backend.as_deref(), Some("local state"));
 
     let (st, delta) = s
@@ -1563,4 +1570,370 @@ async fn graphs_over_the_limits_are_refused() {
     );
     let (_, page) = s.get(DEPLOYS, &s.admin).await;
     assert_eq!(page["deployments"], json!([]), "{page}");
+}
+
+/// What an external driver received.
+#[derive(Debug, Clone)]
+struct DriverCall {
+    method: String,
+    path: String,
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+type DriverCalls = Arc<std::sync::Mutex<Vec<DriverCall>>>;
+
+const DRIVER_TOKEN: &str = "drv-bearer-7f3a91c2";
+const DRIVER_PASSWORD: &str = "pw-from-the-driver-55";
+
+/// A PostgreSQL driver speaking `openporch-http/1` that reports a database
+/// on `host`.
+async fn postgres_driver(
+    axum::extract::State((calls, host)): axum::extract::State<(DriverCalls, &'static str)>,
+    method: Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    calls.lock().unwrap().push(DriverCall {
+        method: method.to_string(),
+        path: uri.path().to_owned(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
+            .collect(),
+    });
+    let guresid = uri.path().rsplit('/').next().unwrap_or_default().to_owned();
+    let mut res = if method == Method::DELETE {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        axum::Json(json!({
+            "id": guresid,
+            "type": "postgres",
+            "resource": {
+                "values": {"host": host, "name": "shop", "port": 5432},
+                "secrets": {"username": "shop", "password": DRIVER_PASSWORD},
+            },
+        }))
+        .into_response()
+    };
+    res.headers_mut().insert(
+        openporch_drivers::PROTOCOL_HEADER,
+        axum::http::HeaderValue::from_static(openporch_drivers::PROTOCOL_VERSION),
+    );
+    res
+}
+
+/// Accepts TLS connections with the test driver certificate, which the test
+/// CA signed for `127.0.0.1`.
+struct TlsListener(tokio::net::TcpListener, tokio_rustls::TlsAcceptor);
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let Ok((tcp, addr)) = self.0.accept().await else {
+                continue;
+            };
+            if let Ok(tls) = self.1.accept(tcp).await {
+                return (tls, addr);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
+/// Serves a PostgreSQL driver over HTTPS that reports `host`; returns its
+/// target and what it receives.
+async fn serve_driver(host: &'static str) -> (String, DriverCalls) {
+    use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let cert = CertificateDer::from_pem_slice(include_bytes!("fixtures/driver-test.crt")).unwrap();
+    let key = PrivateKeyDer::from_pem_slice(include_bytes!("fixtures/driver-test.key")).unwrap();
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = DriverCalls::default();
+    let app = axum::Router::new()
+        .fallback(postgres_driver)
+        .with_state((calls.clone(), host));
+    let tls = TlsListener(listener, tokio_rustls::TlsAcceptor::from(Arc::new(config)));
+    tokio::spawn(async move { axum::serve(tls, app).await });
+    (format!("https://{addr}/drivers/pg"), calls)
+}
+
+/// The client the executor calls external drivers with: one that trusts only
+/// the test CA, and otherwise behaves as the default one.
+fn driver_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = reqwest::Certificate::from_pem(include_bytes!("fixtures/driver-test-ca.crt")).unwrap();
+    reqwest::Client::builder()
+        .tls_certs_only([ca])
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_registered_external_driver_provisions_deployed_resources() {
+    let s = server().await;
+    crate::state::run_with_drivers(
+        &s.state,
+        s.state.keyring.clone().unwrap(),
+        None,
+        Arc::new(openporch_drivers::DriverRegistry::with_builtins()),
+        None,
+        Some(driver_client()),
+    );
+    s.app("shop").await;
+    let (target, calls) = serve_driver("pg.internal").await;
+    let (st, registered) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/pg", "target": target, "token": {"value": DRIVER_TOKEN},
+                   "capabilities": {"observe": true}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{registered}");
+    assert_eq!(registered["protocol_version"], "openporch-http/1");
+    assert_eq!(registered["cookie_version"], 1);
+    assert_eq!(
+        registered["capabilities"],
+        json!({"observe": true, "recover": false, "preview": false, "cancel": false})
+    );
+    for (id, ty, driver) in [
+        ("env", "base-env", "openporch/none"),
+        ("workloads", "workload", "openporch/none"),
+        ("pg", "postgres", "acme/pg"),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let env_path = "/orgs/acme/apps/shop/envs/development";
+    let retag = |image: &str| {
+        json!({"modules": {"update": {"web": [
+            {"op": "replace", "path": "/spec/containers/web/image", "value": image}]}}})
+    };
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+
+    // A preview knows the driver.
+    let (st, plan) = s
+        .post(
+            &format!("{env_path}/plans"),
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{plan}");
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let first = d["id"].as_str().unwrap().to_owned();
+    let done = s.finished(&first).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let snapshot = s
+        .state
+        .store
+        .deployment_snapshot("acme", "shop", "development", &first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot["drivers"]["acme/pg"], "openporch-http/1");
+
+    let db_path = format!("{env_path}/resources/postgres/modules.web.externals.db");
+    let (st, db) = s.get(&db_path, &s.admin).await;
+    assert_eq!(st, StatusCode::OK, "{db}");
+    assert_eq!(db["status"], "provisioned", "{db}");
+    assert_eq!(db["outputs"]["host"], "pg.internal", "{db}");
+    assert_eq!(db["outputs"]["port"], 5432, "{db}");
+    let guresid = db["guresid"].as_str().unwrap().to_owned();
+    {
+        let calls = calls.lock().unwrap();
+        let put = calls
+            .iter()
+            .find(|c| c.method == "PUT")
+            .expect("the driver was not called");
+        assert_eq!(put.path, format!("/drivers/pg/{guresid}"));
+        assert_eq!(
+            put.headers["authorization"],
+            format!("Bearer {DRIVER_TOKEN}")
+        );
+        assert_eq!(put.headers["openporch-protocol"], "openporch-http/1");
+    }
+
+    // A changed registration is used from the next job on.
+    let (moved, moved_calls) = serve_driver("pg2.internal").await;
+    sqlx::query("UPDATE drivers SET body = json_set(body, '$.target', ?) WHERE id = 'acme/pg'")
+        .bind(&moved)
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let (st, delta) = s
+        .post("/orgs/acme/apps/shop/deltas", &s.admin, retag("web:2"))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let permits = s
+        .permits_for(env_path, json!({"delta_id": delta["id"]}))
+        .await;
+    let generation = s.generation("development").await;
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": generation,
+                   "permits": permits}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let second = d["id"].as_str().unwrap().to_owned();
+    let done = s.finished(&second).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(
+        moved_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.method == "PUT"),
+        "the changed target was not called"
+    );
+    let (_, db) = s.get(&db_path, &s.admin).await;
+    assert_eq!(db["outputs"]["host"], "pg2.internal", "{db}");
+
+    // A removed registration stops the next deployment before anything runs.
+    sqlx::query("DELETE FROM drivers WHERE id = 'acme/pg'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let (st, delta) = s
+        .post("/orgs/acme/apps/shop/deltas", &s.admin, retag("web:3"))
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let generation = s.generation("development").await;
+    let (st, refused) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": generation}),
+            None,
+        )
+        .await;
+    assert_error(st, &refused, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        refused["message"].as_str().unwrap().contains("`acme/pg`"),
+        "{refused}"
+    );
+    let (_, page) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(page["deployments"].as_array().unwrap().len(), 2, "{page}");
+
+    // Neither the token nor the secret outputs are in any response or log.
+    let mut seen = vec![registered, plan, refused, page, db];
+    for id in [&first, &second] {
+        for path in [format!("{DEPLOYS}/{id}"), format!("{DEPLOYS}/{id}/logs")] {
+            let (st, b) = s.get(&path, &s.admin).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+            seen.push(b);
+        }
+    }
+    let (_, resources) = s.get(&format!("{env_path}/resources"), &s.admin).await;
+    seen.push(resources);
+    for b in seen {
+        let text = b.to_string();
+        assert!(!text.contains(DRIVER_TOKEN), "{text}");
+        assert!(!text.contains(DRIVER_PASSWORD), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn an_external_driver_whose_token_cannot_be_read_fails_naming_the_driver_and_reference() {
+    let s = server().await;
+    crate::state::run_with_drivers(
+        &s.state,
+        s.state.keyring.clone().unwrap(),
+        None,
+        Arc::new(openporch_drivers::DriverRegistry::with_builtins()),
+        None,
+        Some(driver_client()),
+    );
+    s.app("shop").await;
+    let (target, calls) = serve_driver("pg.internal").await;
+    let (st, b) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/pg", "target": target,
+                   "token": {"store": "openporch", "ref": "drivers/acme/pg/missing"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    for (id, ty, driver) in [
+        ("env", "base-env", "openporch/none"),
+        ("workloads", "workload", "openporch/none"),
+        ("pg", "postgres", "acme/pg"),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "failed", "{done}");
+    let (_, db) = s
+        .get(
+            "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db",
+            &s.admin,
+        )
+        .await;
+    let error = format!("{done} {db}");
+    assert!(error.contains("driver `acme/pg`"), "{error}");
+    assert!(error.contains("drivers/acme/pg/missing"), "{error}");
+    assert!(calls.lock().unwrap().is_empty());
 }

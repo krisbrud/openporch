@@ -15,7 +15,9 @@ use openporch_core::catalog::{
 };
 use openporch_core::ids::{self, ClassId, ResourceTypeId};
 use openporch_core::model::{Criterion, DriverInputs, Provision, ResourceDefinition, SecretRef};
-use openporch_store::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
+use openporch_store::{
+    CatalogStore, DefinitionRecord, DefinitionUpdate, DriverCapabilities, DriverRecord,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -248,6 +250,14 @@ pub struct DriverView {
     inputs_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<SecretRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cookie_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outputs_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<DriverCapabilities>,
 }
 
 fn builtin_driver(id: &str) -> DriverView {
@@ -257,6 +267,10 @@ fn builtin_driver(id: &str) -> DriverView {
         target: None,
         inputs_schema: None,
         token: None,
+        protocol_version: None,
+        cookie_version: None,
+        outputs_schema: None,
+        capabilities: None,
     }
 }
 
@@ -268,6 +282,10 @@ impl From<DriverRecord> for DriverView {
             target: Some(d.target),
             inputs_schema: d.inputs_schema,
             token: d.token,
+            protocol_version: Some(d.protocol_version),
+            cookie_version: Some(d.cookie_version),
+            outputs_schema: d.outputs_schema,
+            capabilities: Some(d.capabilities),
         }
     }
 }
@@ -308,10 +326,19 @@ pub struct DriverBody {
     inputs_schema: Option<Value>,
     /// The bearer token sent to the driver: a reference or `{value}`.
     token: Option<Value>,
+    /// The protocol the driver speaks; `openporch-http/1` when left out.
+    protocol_version: Option<String>,
+    /// The cookie format version the driver writes; `1` when left out.
+    cookie_version: Option<u32>,
+    outputs_schema: Option<Value>,
+    /// The optional capabilities; none when left out.
+    #[serde(default)]
+    capabilities: DriverCapabilities,
 }
 
 /// Registers an external driver. The ID is `<namespace>/<name>`, `openporch` is
-/// reserved and the target must be an HTTPS URL without credentials.
+/// reserved and the target must be an HTTPS URL without credentials. The
+/// registration pins the protocol and cookie versions and the capabilities.
 pub async fn create_driver(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -350,6 +377,26 @@ pub async fn create_driver(
     if body.inputs_schema.as_ref().is_some_and(|s| !s.is_object()) {
         return Err(ApiError::invalid("`inputs_schema` must be a JSON object"));
     }
+    if body.outputs_schema.as_ref().is_some_and(|s| !s.is_object()) {
+        return Err(ApiError::invalid("`outputs_schema` must be a JSON object"));
+    }
+    let protocol_version = body
+        .protocol_version
+        .unwrap_or_else(|| openporch_drivers::PROTOCOL_VERSION.to_owned());
+    if protocol_version != openporch_drivers::PROTOCOL_VERSION {
+        return Err(ApiError::invalid(format!(
+            "`protocol_version` `{protocol_version}` is not supported; this server speaks `{}`",
+            openporch_drivers::PROTOCOL_VERSION
+        )));
+    }
+    // The protocol has no preview call, so a driver claiming one would make
+    // previews promise what deployments cannot check.
+    if body.capabilities.preview {
+        return Err(ApiError::invalid(format!(
+            "`capabilities.preview` must be false: `{}` has no preview call",
+            openporch_drivers::PROTOCOL_VERSION
+        )));
+    }
     let token = body
         .token
         .as_ref()
@@ -360,6 +407,10 @@ pub async fn create_driver(
         target: target.to_string(),
         inputs_schema: body.inputs_schema,
         token: token.as_ref().and_then(|t| t.reference().cloned()),
+        protocol_version,
+        cookie_version: body.cookie_version.unwrap_or(1),
+        outputs_schema: body.outputs_schema,
+        capabilities: body.capabilities,
     };
     // Check everything before a token is written; the store checks again with
     // the change, and a token written for a rejected registration is discarded.

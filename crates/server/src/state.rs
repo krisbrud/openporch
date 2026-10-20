@@ -391,7 +391,9 @@ pub(crate) async fn start_with_drivers(
     };
     if let (Some(keyring), true) = (state.keyring.clone(), state.ready()) {
         match drivers {
-            Some(registry) => run_with_drivers(&state, keyring, image_registry, registry, None),
+            Some(registry) => {
+                run_with_drivers(&state, keyring, image_registry, registry, None, None);
+            }
             None => run_deployments(&state, keyring, image_registry),
         }
         recover_uncertain(
@@ -526,8 +528,8 @@ async fn recover_one(state: &AppState, op: &UncertainOperation, reason: &str) ->
 }
 
 /// Runs accepted deployments with the built-in drivers and the OpenTofu
-/// driver, in this process. Without the master keys nothing is accepted, so
-/// nothing runs.
+/// driver, in this process, and the external drivers registered when each
+/// job runs. Without the master keys nothing is accepted, so nothing runs.
 fn run_deployments(
     state: &AppState,
     keyring: Arc<Keyring>,
@@ -536,16 +538,25 @@ fn run_deployments(
     let tofu = state.config.opentofu();
     let backend = tofu.state.location();
     let registry = Arc::new(DriverRegistry::with_builtins().with_opentofu(tofu));
-    run_with_drivers(state, keyring, image_registry, registry, Some(backend));
+    run_with_drivers(
+        state,
+        keyring,
+        image_registry,
+        registry,
+        Some(backend),
+        None,
+    );
 }
 
-/// Runs accepted deployments with the drivers in `registry`, in this process.
+/// Runs accepted deployments with the drivers in `registry`, in this process,
+/// and the registered external drivers, called with `http_client` when set.
 pub(crate) fn run_with_drivers(
     state: &AppState,
     keyring: Arc<Keyring>,
     image_registry: Option<Arc<HttpRegistry>>,
     registry: Arc<DriverRegistry>,
     backend: Option<String>,
+    http_client: Option<reqwest::Client>,
 ) {
     state.drivers.set(registry.clone(), backend);
     let store = state.store.clone();
@@ -565,6 +576,9 @@ pub(crate) fn run_with_drivers(
     );
     if let Some(image_registry) = image_registry {
         executor = executor.with_registry(image_registry);
+    }
+    if let Some(client) = http_client {
+        executor = executor.with_http_client(client);
     }
     let configured = &state.config.limits;
     let limits = Limits {
