@@ -71,6 +71,8 @@ For the maintainer cutting a release:
 2. Run what CI does not: `just e2e-aws` against the sandbox account
    ([e2e](e2e.md)) and `just bench` ([benchmark](benchmark.md)). Record the
    results in those pages.
+   The [acceptance matrix](acceptance.md) has no gaps left, and every
+   scenario it marks manual has passed for this release.
 3. Review the dependency changes since the last release: `cargo deny check`
    passes, and every new license is in `deny.toml` for a reason.
 4. Update [compatibility](compatibility.md): the contract versions, schema

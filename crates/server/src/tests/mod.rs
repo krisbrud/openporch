@@ -24,6 +24,7 @@ struct Server {
     admin: String,
 }
 
+mod acceptance;
 mod accounts;
 mod benchmark;
 mod catalog;

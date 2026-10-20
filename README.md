@@ -33,7 +33,8 @@ lists every `porch` command, and the [API reference](docs/api.md) every route.
 [Operating openporch](docs/operations.md) covers health checks, shutdown, upgrades, backups and uninstalling.
 [Compatibility](docs/compatibility.md) lists the supported contract versions and
 the tested matrix, and [building and releasing](docs/releasing.md) the locked
-build and how to verify a release.
+build and how to verify a release. The [acceptance matrix](docs/acceptance.md)
+names what verifies each scenario of the specification.
 
 ## Development
 
