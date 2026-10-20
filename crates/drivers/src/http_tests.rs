@@ -355,6 +355,53 @@ async fn duplicate_put_recovers_the_same_object() {
 
 // Real time: paused time would jump to the deadline while waiting on sockets.
 #[tokio::test]
+async fn a_failed_poll_keeps_the_cookie_it_returned() {
+    let polled = [
+        (500, Some(json!({"message": "busy"}))),
+        (200, Some(json!({"unexpected": true}))),
+        (422, Some(json!({"message": "rejected"}))),
+    ];
+    for (status, body) in polled {
+        let mock = Shared::default();
+        {
+            let mut m = mock.lock().unwrap();
+            m.queue.push_back(Canned {
+                status: 202,
+                headers: BTreeMap::from([
+                    ("retry-after".into(), "1".into()),
+                    ("set-openporch-driver-cookie".into(), "1.b3AtMQ".into()),
+                ]),
+                body: None,
+            });
+            m.queue.push_back(Canned {
+                status,
+                headers: BTreeMap::from([(
+                    "set-openporch-driver-cookie".into(),
+                    "1.b3AtMg".into(),
+                )]),
+                body,
+            });
+        }
+        let target = serve(mock.clone()).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let settled = converge(&driver, &request(None), DEFAULT_TIMEOUT).await;
+        let err = settled.result.unwrap_err();
+        assert!(
+            !matches!(err, DriverError::WithCookie { .. }),
+            "{status}: {err:?}"
+        );
+        assert!(!err.to_string().contains("op-2"), "{err}");
+        // The poll's cookie, not the 202's, is what recovery observes with.
+        assert_eq!(
+            settled.cookie,
+            Some(Cookie::new(1, "op-2").unwrap()),
+            "{status}"
+        );
+    }
+}
+
+// Real time: paused time would jump to the deadline while waiting on sockets.
+#[tokio::test]
 async fn asynchronous_provisioning_over_http() {
     let mock = Shared::default();
     {

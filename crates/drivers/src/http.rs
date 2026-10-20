@@ -344,8 +344,12 @@ impl HttpDriver {
 
     fn observe(&self, req: &DriverRequest, reply: Reply) -> Result<Observation, DriverError> {
         match reply.status {
+            // As for a mutation, a failure's cookie is kept: a poll may return
+            // the driver's newest state with any response.
             StatusCode::OK => Ok(Observation::Ready {
-                outputs: self.outputs(req, &reply)?,
+                outputs: self
+                    .outputs(req, &reply)
+                    .map_err(|e| e.with_cookie(reply.cookie.clone()))?,
                 cookie: reply.cookie,
             }),
             StatusCode::ACCEPTED => Ok(Observation::InProgress {
@@ -359,9 +363,9 @@ impl HttpDriver {
                 reason: NOT_A_DRIVER_404.into(),
             }),
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Ok(Observation::Failed {
-                error: self.failure(req, &reply),
+                error: self.failure(req, &reply).with_cookie(reply.cookie),
             }),
-            _ => Err(self.failure(req, &reply)),
+            _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
         }
     }
 }
