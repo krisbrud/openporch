@@ -150,26 +150,6 @@ async fn organization_guard(State(state): State<AppState>, req: Request, next: N
 pub struct RequestId(pub String);
 
 async fn request_id(mut req: Request, next: Next) -> Response {
-    // A client written for another contract is refused before any handler
-    // runs, so a change it meant differently never happens.
-    if let Some(asked) = req.headers().get(CONTRACT_HEADER)
-        && asked.as_bytes() != crate::handlers::CONTRACT_VERSION.as_bytes()
-    {
-        let mut res = ApiError::new(
-            StatusCode::BAD_REQUEST,
-            code::UNSUPPORTED_CONTRACT,
-            format!(
-                "this server serves API contract {}; use a client from the same openporch release",
-                crate::handlers::CONTRACT_VERSION
-            ),
-        )
-        .into_response();
-        res.headers_mut().insert(
-            CONTRACT_HEADER,
-            HeaderValue::from_static(crate::handlers::CONTRACT_VERSION),
-        );
-        return res;
-    }
     let id = req
         .headers()
         .get("x-request-id")
@@ -177,11 +157,27 @@ async fn request_id(mut req: Request, next: Next) -> Response {
         .filter(|v| !v.is_empty() && v.len() <= 128 && v.chars().all(|c| c.is_ascii_graphic()))
         .map(str::to_owned)
         .unwrap_or_else(|| auth::random_id(16));
-    req.extensions_mut().insert(RequestId(id.clone()));
-    // Every event logged while serving the request carries its ID, at any
-    // log level.
-    let span = tracing::error_span!("request", request_id = %id);
-    let mut res = next.run(req).instrument(span).await;
+    // A client written for another contract is refused before any handler
+    // runs, so a change it meant differently never happens.
+    let mut res = if let Some(asked) = req.headers().get(CONTRACT_HEADER)
+        && asked.as_bytes() != crate::handlers::CONTRACT_VERSION.as_bytes()
+    {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            code::UNSUPPORTED_CONTRACT,
+            format!(
+                "this server serves API contract {}; use a client from the same openporch release",
+                crate::handlers::CONTRACT_VERSION
+            ),
+        )
+        .into_response()
+    } else {
+        req.extensions_mut().insert(RequestId(id.clone()));
+        // Every event logged while serving the request carries its ID, at any
+        // log level.
+        let span = tracing::error_span!("request", request_id = %id);
+        next.run(req).instrument(span).await
+    };
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);
     }

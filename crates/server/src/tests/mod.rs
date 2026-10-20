@@ -433,6 +433,17 @@ async fn requests_for_another_contract_change_nothing() {
     assert_eq!(body["error"], "API-008", "{body}");
     let (_, apps) = s.get("/orgs/acme/apps", &s.admin).await;
     assert_eq!(apps, json!([]));
+    // The refusal keeps the caller's request ID, so it can be correlated.
+    let req = Request::builder()
+        .uri("/version")
+        .header(crate::api::CONTRACT_HEADER, "2")
+        .header("x-request-id", "contract-check")
+        .body(Body::empty())
+        .unwrap();
+    let res = s.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.headers()["x-request-id"], "contract-check");
+    assert_eq!(res.headers()[crate::api::CONTRACT_HEADER], "1");
     // The contract it serves is accepted.
     let headers = [(crate::api::CONTRACT_HEADER, "1")];
     let (status, body) = s
