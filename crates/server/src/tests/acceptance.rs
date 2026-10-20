@@ -193,6 +193,27 @@ fn the_acceptance_matrix_lists_every_scenario() {
         "not in docs/acceptance.md: {missing:#?}"
     );
 
+    // The totals add up the rows.
+    let count = |status: &str| {
+        matrix
+            .lines()
+            .filter(|l| {
+                l.split('|')
+                    .nth(2)
+                    .is_some_and(|c| c.trim().starts_with(status))
+            })
+            .count()
+    };
+    let totals = format!(
+        "{} scenarios: {} covered, {} manual, {} deferred, {} gaps.",
+        count("covered") + count("manual") + count("deferred") + count("gap"),
+        count("covered"),
+        count("manual"),
+        count("deferred"),
+        count("gap")
+    );
+    assert!(matrix.contains(&totals), "the totals should read: {totals}");
+
     // Every test the matrix names, in Rust, Go or OpenTofu, exists, and every
     // file it names is there.
     let go_tests: String = files_under(&root.join("provider"), "_test.go")

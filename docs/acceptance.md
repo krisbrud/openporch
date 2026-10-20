@@ -86,7 +86,7 @@ end.
 | Revoked token | covered | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` |
 | Who may create tokens | covered | `crates/server/src/tests/mod.rs::who_may_create_tokens`, `crates/server/src/tests/mod.rs::manager_delegation_ceiling` |
 | Missing token | covered | `crates/server/src/tests/mod.rs::missing_bearer_header` |
-| Login and expiry | covered | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`; CLI hint: `crates/cli/src/tests.rs::login_with_a_token_stores_it_owner_only` (asserts "porch login" only when no credential is stored; the 401-to-relogin hint for an expired session is not asserted) |
+| Login and expiry | gap (partial) | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`; CLI hint: `crates/cli/src/tests.rs::login_with_a_token_stores_it_owner_only` (asserts "porch login" only when no credential is stored; the 401-to-relogin hint for an expired session is not asserted) |
 | GitHub device login | covered | `crates/server/src/tests/github.rs::device_login_maps_the_immutable_github_id`, `crates/cli/src/tests.rs::device_login_stores_a_session_for_the_github_user` |
 | Unknown identity | covered | `crates/server/src/tests/mod.rs::unknown_identities_need_an_invitation` |
 | Provider is locked after first login | covered | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1) |
@@ -103,7 +103,7 @@ end.
 |---|---|---|
 | Zip function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::zip_function`; real function: manual `just e2e-aws` |
 | Image function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_from_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_function_without_image` |
-| Container workload on Lambda | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files`; real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter |
+| Container workload on Lambda | gap (partial) | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files`; real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter |
 | Non-ECR image | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_in_another_region` |
 | Database password | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::secret_variables_are_references`; `just e2e-aws` checks `SIGNING_KEY_SECRET_REF` in the real function |
 | Function URL | manual | `just e2e-aws` step "Call the API's URL"; config only: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::iam_url`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::inferred_url_is_not_public` |
@@ -200,7 +200,7 @@ end.
 | Permanent driver error | covered | `crates/engine/src/planner/tests.rs::permanent_errors_are_not_retried`, `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-400-validation.json`) |
 | Crash after creation | covered | `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation`, `crates/engine/src/planner/tests/recovery.rs::nothing_found_is_provisioned_again_with_the_same_identity` |
 | Driver keeps running after timeout | covered | `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered`, `crates/engine/src/planner/tests/recovery.rs::an_operation_still_running_is_left_unknown` |
-| Configuration changes during execution | covered | `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (snapshot vs current; no test edits configuration while a run is in flight) |
+| Configuration changes during execution | gap (partial) | `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` (snapshot vs current; no test edits configuration while a run is in flight) |
 | Unchanged deployment | covered | `crates/server/src/tests/resources.rs::stable_across_deployments`, `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays`, `crates/drivers/src/opentofu/tests.rs::opentofu_runs_a_local_module_end_to_end` (second plan has no effects) |
 | Recover after a failed deployment | covered | `crates/cli/src/tests/deploys.rs::logs_replays_and_stored_deltas`, `crates/server/src/tests/deploys.rs::redeploys_replay_the_recorded_snapshot_unless_asked_for_current` |
 | Artifact no longer exists | covered | `crates/engine/src/planner/tests/workloads.rs::a_missing_artifact_stops_the_deployment_before_anything_runs`, `crates/server/src/tests/e2e.rs::a_deployment_pins_its_versions_and_replay_refuses_missing_inputs` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 221 covered, 9 manual, 31 deferred, 13 gaps.
+274 scenarios: 218 covered, 9 manual, 31 deferred, 16 gaps.
