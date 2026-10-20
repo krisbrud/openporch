@@ -432,7 +432,7 @@ where
 
     fn seal_cookie(&self, job: &ProvisionJob, cookie: &Cookie) -> Result<Sealed, ExecFailure> {
         let plain = serde_json::to_vec(cookie).map_err(|e| {
-            ExecFailure::Uncertain(format!("the driver state could not be encoded: {e}"))
+            ExecFailure::uncertain(format!("the driver state could not be encoded: {e}"))
         })?;
         Ok(self.keyring.seal(cookie_aad(job).as_bytes(), &plain))
     }
@@ -547,8 +547,10 @@ where
             None => target,
         };
         let settled = converge(driver.as_ref(), &req, timeout).await;
-        let accepted = settled.cookie != req.cookie;
-        let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
+        let newer = self.newer_cookie(job, &req, settled.cookie.as_ref());
+        let outputs = settled
+            .result
+            .map_err(|e| with_cookie(mutation_failure(e, newer.is_some()), newer.clone()))?;
         // A driver that may have made a change leaves a result that cannot be
         // kept, such as outputs its type does not allow, for recovery to
         // observe rather than as if nothing changed.
@@ -556,10 +558,25 @@ where
             .await
             .map_err(|f| match f {
                 ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changes => {
-                    ExecFailure::Uncertain(format!("the driver made the change, but {error}"))
+                    ExecFailure::uncertain(format!("the driver made the change, but {error}"))
                 }
                 f => f,
             })
+            .map_err(|f| with_cookie(f, newer))
+    }
+
+    /// The cookie a mutation left, sealed as [`Self::provisioned`] seals it,
+    /// when it differs from the one the call was given: the driver accepted
+    /// the mutation, and recovering an uncertain outcome observes with it.
+    fn newer_cookie(
+        &self,
+        job: &ProvisionJob,
+        req: &DriverRequest,
+        cookie: Option<&Cookie>,
+    ) -> Option<Sealed> {
+        let cookie = cookie.filter(|c| Some(*c) != req.cookie.as_ref())?;
+        // Encoding a cookie cannot fail; were it to, the stored cookie stays.
+        self.seal_cookie(job, cookie).ok()
     }
 
     /// What a resource that provisioned returns: its outputs, with secret
@@ -608,7 +625,7 @@ where
                 .write(&name, &SecretValue::new(secret_text(value)))
                 .await
                 .map_err(|e| {
-                    ExecFailure::Uncertain(format!(
+                    ExecFailure::uncertain(format!(
                         "the resource provisioned, but its secret output `{key}` could not be \
                          stored: {e}"
                     ))
@@ -724,8 +741,10 @@ where
         let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
         self.refresh(job, &mut req, timeout, log).await?;
         let settled = remove(driver.as_ref(), &req, timeout).await;
-        let accepted = settled.cookie != req.cookie;
-        settled.result.map_err(|e| mutation_failure(e, accepted))
+        let newer = self.newer_cookie(job, &req, settled.cookie.as_ref());
+        settled
+            .result
+            .map_err(|e| with_cookie(mutation_failure(e, newer.is_some()), newer))
     }
 
     /// Replaces the request's credentials, obtained for the plan, with ones
@@ -1242,8 +1261,11 @@ fn driver_failure(e: DriverError) -> ExecFailure {
         // again rather than retrying into it.
         DriverError::Conflict(_) => ExecFailure::Permanent(e.to_string()),
         DriverError::Timeout(_) | DriverError::Uncertain(_) => {
-            ExecFailure::Uncertain(e.to_string())
+            ExecFailure::uncertain(e.to_string())
         }
+        // `converge` and `remove` keep a failure's cookie in what they
+        // settle on; the error alone decides the failure.
+        DriverError::WithCookie { error, .. } => driver_failure(*error),
     }
 }
 
@@ -1251,12 +1273,25 @@ fn driver_failure(e: DriverError) -> ExecFailure {
 /// shows as a new cookie, any failure may have left changes behind.
 fn mutation_failure(e: DriverError, accepted: bool) -> ExecFailure {
     match driver_failure(e) {
-        f @ ExecFailure::Uncertain(_) => f,
+        f @ ExecFailure::Uncertain { .. } => f,
         ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if accepted => {
-            ExecFailure::Uncertain(format!(
+            ExecFailure::uncertain(format!(
                 "the driver accepted the change, then failed: {error}"
             ))
         }
+        f => f,
+    }
+}
+
+/// An uncertain failure with the mutation's newer cookie, if any, for the
+/// planner to store; any other failure as it is. A failure that is not
+/// uncertain changed nothing the driver reported, so its cookie is none.
+fn with_cookie(f: ExecFailure, newer: Option<Sealed>) -> ExecFailure {
+    match f {
+        ExecFailure::Uncertain { error, cookie } => ExecFailure::Uncertain {
+            error,
+            cookie: newer.or(cookie),
+        },
         f => f,
     }
 }

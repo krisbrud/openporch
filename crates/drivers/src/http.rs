@@ -471,9 +471,14 @@ impl Driver for HttpDriver {
             let reply = self
                 .call(Method::PUT, req, "", Some(body(req)), true)
                 .await?;
+            // A driver may return a cookie with any response, a failure
+            // included; it is kept for the observation that recovers an
+            // uncertain outcome.
             match reply.status {
                 StatusCode::OK => Ok(PutOutcome::Ready {
-                    outputs: self.outputs(req, &reply)?,
+                    outputs: self
+                        .outputs(req, &reply)
+                        .map_err(|e| e.with_cookie(reply.cookie.clone()))?,
                     cookie: reply.cookie,
                 }),
                 StatusCode::ACCEPTED => Ok(PutOutcome::InProgress {
@@ -484,7 +489,7 @@ impl Driver for HttpDriver {
                     outputs: DriverOutputs::default(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(req, &reply)),
+                _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
             }
         })
     }
@@ -508,7 +513,8 @@ impl Driver for HttpDriver {
                     poll_after: reply.poll_after(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(req, &reply)),
+                // As for `put`, a failure's cookie is kept.
+                _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
             }
         })
     }

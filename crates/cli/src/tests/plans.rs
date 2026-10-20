@@ -227,7 +227,7 @@ struct Uncertain;
 impl Executor for Uncertain {
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         match job.descriptor.ty.to_string().as_str() {
-            "postgres" => Err(ExecFailure::Uncertain("postgres timed out".into())),
+            "postgres" => Err(ExecFailure::uncertain("postgres timed out")),
             _ => Ok(ProvisionResult::default()),
         }
     }

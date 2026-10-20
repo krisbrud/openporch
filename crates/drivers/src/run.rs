@@ -161,7 +161,8 @@ impl<'d> Run<'d> {
     }
 
     async fn converge(&mut self) -> Result<DriverOutputs, DriverError> {
-        let mut wait = match self.bounded(self.driver.put(&self.req)).await? {
+        let put = self.bounded(self.driver.put(&self.req)).await;
+        let mut wait = match self.absorb(put)? {
             PutOutcome::Ready { outputs, cookie } => {
                 self.keep(cookie)?;
                 return Ok(outputs);
@@ -173,7 +174,8 @@ impl<'d> Run<'d> {
         };
         loop {
             self.pause(wait).await?;
-            match self.bounded(self.driver.get(&self.req)).await? {
+            let observed = self.bounded(self.driver.get(&self.req)).await;
+            match self.absorb(observed)? {
                 Observation::Ready { outputs, cookie } => {
                     self.keep(cookie)?;
                     return Ok(outputs);
@@ -182,7 +184,7 @@ impl<'d> Run<'d> {
                     self.keep(cookie)?;
                     wait = poll_after;
                 }
-                Observation::Failed { error } => return Err(error),
+                Observation::Failed { error } => return self.absorb(Err(error)),
                 Observation::Absent => {
                     return Err(DriverError::Uncertain(
                         "`put` reported an operation in progress, but `get` found no resource"
@@ -195,7 +197,8 @@ impl<'d> Run<'d> {
     }
 
     async fn remove(&mut self) -> Result<(), DriverError> {
-        let mut wait = match self.bounded(self.driver.delete(&self.req)).await? {
+        let delete = self.bounded(self.driver.delete(&self.req)).await;
+        let mut wait = match self.absorb(delete)? {
             DeleteOutcome::Deleted => return Ok(()),
             DeleteOutcome::InProgress { poll_after, cookie } => {
                 self.keep(cookie)?;
@@ -204,7 +207,8 @@ impl<'d> Run<'d> {
         };
         loop {
             self.pause(wait).await?;
-            match self.bounded(self.driver.get(&self.req)).await? {
+            let observed = self.bounded(self.driver.get(&self.req)).await;
+            match self.absorb(observed)? {
                 Observation::Absent => return Ok(()),
                 Observation::InProgress { poll_after, cookie } => {
                     self.keep(cookie)?;
@@ -215,7 +219,7 @@ impl<'d> Run<'d> {
                     self.keep(cookie)?;
                     wait = MIN_POLL;
                 }
-                Observation::Failed { error } => return Err(error),
+                Observation::Failed { error } => return self.absorb(Err(error)),
                 Observation::Unknown { reason } => return Err(DriverError::Uncertain(reason)),
             }
         }
@@ -248,6 +252,20 @@ impl<'d> Run<'d> {
                  operation stopped",
                 self.timeout
             )),
+        }
+    }
+
+    /// Records the cookie a failed call returned, as a driver may return one
+    /// with any response, and passes on the failure without it. A cookie that
+    /// cannot be kept makes the outcome uncertain, as [`Run::keep`] says.
+    fn absorb<T>(&mut self, result: Result<T, DriverError>) -> Result<T, DriverError> {
+        match result {
+            Err(e @ DriverError::WithCookie { .. }) => {
+                let (error, cookie) = e.split();
+                self.keep(cookie)?;
+                Err(error)
+            }
+            other => other,
         }
     }
 

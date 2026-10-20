@@ -337,7 +337,24 @@ pub enum ExecFailure {
         retry_after: Option<Duration>,
     },
     /// Infrastructure may have changed; recovery must observe it first.
-    Uncertain(String),
+    Uncertain {
+        /// The error.
+        error: String,
+        /// The driver's newest cookie, sealed as a provisioned resource's is,
+        /// when the mutation returned one before its outcome became unknown.
+        /// The planner stores it on the resource, so recovery observes with it.
+        cookie: Option<Sealed>,
+    },
+}
+
+impl ExecFailure {
+    /// An uncertain outcome that leaves the resource's cookie as it is.
+    pub fn uncertain(error: impl Into<String>) -> Self {
+        Self::Uncertain {
+            error: error.into(),
+            cookie: None,
+        }
+    }
 }
 
 /// The span an operation's events are logged in: they name the operation, the
@@ -407,7 +424,7 @@ pub(crate) fn log_outcome<T>(
             tracing::warn!(outcome = "retryable", error = %error, "driver finished");
             "retryable"
         }
-        Err(ExecFailure::Uncertain(e)) => {
+        Err(ExecFailure::Uncertain { error: e, .. }) => {
             tracing::warn!(outcome = "unknown", error = %e, "driver finished");
             "unknown"
         }
@@ -1011,7 +1028,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             attempt += 1;
             let (error, retry_after) = match tokio::time::timeout_at(deadline, call()).await {
                 Ok(Ok(v)) => return Ok(v),
-                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => {
+                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain { error: e, .. })) => {
                     return Err(PinError::Refused(e));
                 }
                 Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
@@ -1280,7 +1297,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             let checked = tokio::time::timeout_at(deadline, check()).await;
             let (error, retry_after) = match checked {
                 Ok(Ok(())) => return Ok(()),
-                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain(e))) => return Err(e),
+                Ok(Err(ExecFailure::Permanent(e) | ExecFailure::Uncertain { error: e, .. })) => {
+                    return Err(e);
+                }
                 Ok(Err(ExecFailure::Retryable { error, retry_after })) => (error, retry_after),
                 Err(_) => {
                     return Err(format!("the deployment ran out of time checking {what}"));
@@ -2004,32 +2023,38 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             };
             let account = job.driver_account.clone();
             let inputs = serde_json::to_value(&job.inputs).unwrap_or(Value::Null);
-            let recorded = self
-                .store
-                .record_operation_inputs(
-                    &started.operation_id,
-                    json!({
-                        "definition_id": def.id,
-                        "definition_version": version,
-                        "definition": def,
-                        "driver_type": def.driver_type,
-                        "driver_account": job.driver_account,
-                        "guresid": job.guresid,
-                        "inputs": job.inputs,
-                        "dependencies": self.dependencies,
-                    }),
-                )
-                .await
-                .map_err(|e| format!("the operation's inputs were not recorded: {e}"));
-            let result = match recorded {
-                Err(error) => Err(ExecFailure::Retryable {
-                    error,
-                    retry_after: None,
-                }),
-                Ok(()) => match self.with_prior_state(job, node).await {
-                    Ok(job) => self.provision(job).await,
-                    Err(failure) => Err(failure),
-                },
+            // The resource's prior state is read before the inputs are
+            // recorded, so the record says whether the resource existed
+            // before this operation: recovery must not take a cookie that
+            // this operation left behind for an earlier provisioning.
+            let result = match self.with_prior_state(job, node).await {
+                Err(failure) => Err(failure),
+                Ok(job) => {
+                    let recorded = self
+                        .store
+                        .record_operation_inputs(
+                            &started.operation_id,
+                            json!({
+                                "definition_id": def.id,
+                                "definition_version": version,
+                                "definition": def,
+                                "driver_type": def.driver_type,
+                                "driver_account": job.driver_account,
+                                "guresid": job.guresid,
+                                "inputs": job.inputs,
+                                "dependencies": self.dependencies,
+                                "existing": job.existing,
+                            }),
+                        )
+                        .await;
+                    match recorded {
+                        Err(e) => Err(ExecFailure::Retryable {
+                            error: format!("the operation's inputs were not recorded: {e}"),
+                            retry_after: None,
+                        }),
+                        Ok(()) => self.provision(job).await,
+                    }
+                }
             };
             drop(permit);
             let failure = match result {
@@ -2077,6 +2102,7 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                         &started.operation_id,
                         CheckpointResult::Unknown {
                             error: error.into(),
+                            cookie: None,
                         },
                     )
                     .await;
@@ -2096,11 +2122,14 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
                     .await;
                     return Err(Outcome::Failed(error));
                 }
-                ExecFailure::Uncertain(error) => {
+                ExecFailure::Uncertain { error, cookie } => {
+                    // The driver's newest cookie is kept, so recovery
+                    // observes with it.
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Unknown {
                             error: error.clone(),
+                            cookie,
                         },
                     )
                     .await;
@@ -2231,14 +2260,14 @@ impl<S: Store + 'static, E: Executor> NodeRun<S, E> {
             Ok(Err(e)) => {
                 // A panic message could hold a secret, so it is not logged.
                 tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
-                Err(ExecFailure::Uncertain(
-                    "the executor stopped unexpectedly while the resource was provisioning".into(),
+                Err(ExecFailure::uncertain(
+                    "the executor stopped unexpectedly while the resource was provisioning",
                 ))
             }
             Err(_) => {
                 abort.abort();
-                Err(ExecFailure::Uncertain(
-                    "the deployment ran out of time while the resource was provisioning".into(),
+                Err(ExecFailure::uncertain(
+                    "the deployment ran out of time while the resource was provisioning",
                 ))
             }
         }

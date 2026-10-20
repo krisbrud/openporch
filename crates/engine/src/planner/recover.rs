@@ -152,8 +152,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                             panicked = e.is_panic(),
                             "the executor stopped unexpectedly"
                         );
-                        Err(ExecFailure::Uncertain(
-                            "the executor stopped unexpectedly while observing the resource".into(),
+                        Err(ExecFailure::uncertain(
+                            "the executor stopped unexpectedly while observing the resource",
                         ))
                     });
                     drop(running);
@@ -163,8 +163,8 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 let observed = tokio::spawn(observing.instrument(span))
                     .await
                     .unwrap_or_else(|_| {
-                        Err(ExecFailure::Uncertain(
-                            "the executor stopped unexpectedly while observing the resource".into(),
+                        Err(ExecFailure::uncertain(
+                            "the executor stopped unexpectedly while observing the resource",
                         ))
                     });
                 match observed {
@@ -246,7 +246,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     Err(ExecFailure::Permanent(e)) => {
                         required(format!("the resource cannot be observed: {e}"))
                     }
-                    Err(ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain(error)) => {
+                    Err(
+                        ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain { error, .. },
+                    ) => {
                         return Err(RecoverError::Observation(error));
                     }
                 }
@@ -339,7 +341,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             cookie: r.cookie.clone(),
             target: r.target.clone(),
             pin: None,
-            existing: r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some(),
+            // Whether the resource existed before the operation, as it
+            // recorded. The resource's cookie may be one the uncertain
+            // operation itself left, so it decides only for operations
+            // recorded before this was.
+            existing: recorded
+                .get("existing")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some()
+                }),
             // A creation found finished is checked like one that finished in
             // the deployment, against the type its snapshot recorded.
             output_schema,

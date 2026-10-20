@@ -1078,12 +1078,16 @@ async fn a_restart_observes_resources_left_with_an_unknown_outcome() {
         "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db";
     let (_, db) = s.get(db_path, &s.admin).await;
 
-    // The server stops while the database's operation is open.
-    sqlx::query("UPDATE operations SET state = 'started', finished_at = NULL WHERE guresid = ?")
-        .bind(db["guresid"].as_str().unwrap())
-        .execute(s.state.store.pool())
-        .await
-        .unwrap();
+    // The server stops while the database's operation is open. The operation
+    // is made an update of a resource that existed before it.
+    sqlx::query(
+        "UPDATE operations SET state = 'started', finished_at = NULL, \
+         recovery = json_set(recovery, '$.existing', json('true')) WHERE guresid = ?",
+    )
+    .bind(db["guresid"].as_str().unwrap())
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
     let Server {
         dir, state, router, ..
     } = s;

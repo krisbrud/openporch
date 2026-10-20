@@ -1,0 +1,7 @@
+{
+  "description": "A 5xx to PUT from a driver that cannot deduplicate operations is uncertain, and the cookie that came with it is kept.",
+  "call": "put",
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 503, "headers": {"set-openporch-driver-cookie": "1.b3AtMg"}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver answered 503 to a mutation: the driver answered 503", "retryable": false, "cookie": {"version": 1, "data": "op-2"}}}
+}

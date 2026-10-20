@@ -365,7 +365,11 @@ impl RedactingLog {
     pub fn failure(&self, failure: ExecFailure) -> ExecFailure {
         match failure {
             ExecFailure::Permanent(e) => ExecFailure::Permanent(self.redact(&e)),
-            ExecFailure::Uncertain(e) => ExecFailure::Uncertain(self.redact(&e)),
+            // The cookie is sealed, so it passes on as it is.
+            ExecFailure::Uncertain { error, cookie } => ExecFailure::Uncertain {
+                error: self.redact(&error),
+                cookie,
+            },
             ExecFailure::Retryable { error, retry_after } => ExecFailure::Retryable {
                 error: self.redact(&error),
                 retry_after,

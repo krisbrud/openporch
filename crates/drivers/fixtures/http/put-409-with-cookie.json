@@ -1,0 +1,8 @@
+{
+  "description": "A driver may return a cookie with any response: a 409 to PUT keeps the new cookie for the observation that recovers the uncertain outcome.",
+  "call": "put",
+  "cookie": {"version": 1, "data": "op-1"},
+  "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef", "headers": {"openporch-driver-cookie": "1.b3AtMQ"}},
+  "response": {"status": 409, "headers": {"set-openporch-driver-cookie": "1.b3AtMg"}, "body": {"message": "operation op-0 is still running"}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver reports a conflicting operation (409), so the resource is observed before it is changed again: operation op-0 is still running", "retryable": false, "cookie": {"version": 1, "data": "op-2"}}}
+}

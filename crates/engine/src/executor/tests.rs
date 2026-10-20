@@ -73,6 +73,10 @@ struct FakeDriver {
     unsure: Mutex<bool>,
     /// The pins checked; a pin naming commit `lost` is refused.
     pin_checks: Mutex<Vec<DriverRequest>>,
+    /// `put` and `delete` answer as a conflicting operation, with the next
+    /// cookie, as an HTTP driver's 409 does.
+    conflict: Mutex<bool>,
+    gets: Mutex<Vec<DriverRequest>>,
 }
 
 impl FakeDriver {
@@ -103,7 +107,35 @@ impl FakeDriver {
             deletes: Mutex::new(Vec::new()),
             unsure: Mutex::new(false),
             pin_checks: Mutex::new(Vec::new()),
+            conflict: Mutex::new(false),
+            gets: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The cookie after `req`'s: `n=1`, `n=2` and so on.
+    fn next_cookie(req: &DriverRequest) -> Result<Cookie, DriverError> {
+        let n = req
+            .cookie
+            .as_ref()
+            .and_then(|c| c.data.strip_prefix("n=")?.parse::<u32>().ok())
+            .unwrap_or(0);
+        Cookie::new(1, format!("n={}", n + 1))
+    }
+
+    /// The conflict `put` and `delete` answer with when told to.
+    fn conflict(&self, req: &DriverRequest) -> Option<DriverError> {
+        if !*self.conflict.lock().unwrap() {
+            return None;
+        }
+        let cookie = Self::next_cookie(req).ok();
+        Some(
+            DriverError::Uncertain(
+                "the driver reports a conflicting operation (409), so the resource is \
+                 observed before it is changed again"
+                    .into(),
+            )
+            .with_cookie(cookie),
+        )
     }
 
     fn puts(&self) -> Vec<DriverRequest> {
@@ -174,7 +206,11 @@ impl Driver for FakeDriver {
     fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
         self.puts.lock().unwrap().push(req.clone());
         let fail = self.fail.lock().unwrap().clone();
+        let conflict = self.conflict(req);
         Box::pin(async move {
+            if let Some(conflict) = conflict {
+                return Err(conflict);
+            }
             let secrets = secret_values(req).join(", ");
             if let Some(fail) = fail {
                 // As a careless driver does: the secrets in its log and error.
@@ -184,19 +220,15 @@ impl Driver for FakeDriver {
                     message: format!("{fail}: {secrets}"),
                 });
             }
-            let n = req
-                .cookie
-                .as_ref()
-                .and_then(|c| c.data.strip_prefix("n=")?.parse::<u32>().ok())
-                .unwrap_or(0);
             Ok(PutOutcome::Ready {
                 outputs: Self::outputs(req),
-                cookie: Some(Cookie::new(1, format!("n={}", n + 1))?),
+                cookie: Some(Self::next_cookie(req)?),
             })
         })
     }
 
     fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        self.gets.lock().unwrap().push(req.clone());
         let unsure = *self.unsure.lock().unwrap();
         Box::pin(async move {
             if unsure {
@@ -204,8 +236,16 @@ impl Driver for FakeDriver {
                     reason: format!("cannot tell with {}", secret_values(req).join(", ")),
                 });
             }
+            // Everything the `postgres` type requires, so that a creation
+            // found finished can be recorded.
+            let mut outputs = Self::outputs(req);
+            outputs.values.insert("name".into(), json!("shop"));
+            outputs.values.insert("port".into(), json!(5432));
+            let mut secrets = outputs.secrets.expose().clone();
+            secrets.insert("username".into(), json!("shop"));
+            outputs.secrets = SecretMap::new(secrets);
             Ok(Observation::Ready {
-                outputs: Self::outputs(req),
+                outputs,
                 cookie: None,
             })
         })
@@ -213,7 +253,13 @@ impl Driver for FakeDriver {
 
     fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
         self.deletes.lock().unwrap().push(req.clone());
-        Box::pin(async { Ok(DeleteOutcome::Deleted) })
+        let conflict = self.conflict(req);
+        Box::pin(async move {
+            match conflict {
+                Some(conflict) => Err(conflict),
+                None => Ok(DeleteOutcome::Deleted),
+            }
+        })
     }
 }
 
@@ -922,6 +968,163 @@ async fn the_driver_cookie_survives_between_deployments_sealed() {
     );
 }
 
+impl Fixture {
+    /// Recovers `descriptor` with a planner on this fixture's executor.
+    async fn recover(&self, descriptor: &str) -> crate::planner::Recovered {
+        let planner = Planner::new(
+            self.store.clone(),
+            Arc::new(self.executor(Arc::new(NoPermits))),
+            Limits::default(),
+        );
+        planner
+            .recover(
+                ORG,
+                "shop",
+                "development",
+                descriptor,
+                audit(
+                    "POST",
+                    "/orgs/acme/apps/shop/envs/development/resources/recover",
+                ),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The resource's stored cookie, opened.
+    fn opened_cookie(&self, db: &openporch_store::ActiveResource) -> Option<Cookie> {
+        // The cookie is sealed for the organization and GUResID.
+        let mut job = provision_job_empty();
+        job.guresid = db.guresid.parse().unwrap();
+        job.cookie = db.cookie.clone();
+        self.executor(Arc::new(NoPermits))
+            .open_cookie(&job)
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn an_uncertain_update_keeps_the_new_cookie_for_recovery() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+
+    // The driver answers the update with a conflict and a new cookie.
+    *f.driver.conflict.lock().unwrap() = true;
+    let (deployment, outcomes) = f.deploy(&defs, allow()).await;
+    assert!(
+        matches!(
+            &outcomes[&Descriptor::parse(DB).unwrap()],
+            Outcome::Unknown(_)
+        ),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        f.driver.puts()[1].cookie,
+        Some(Cookie::new(1, "n=1").unwrap())
+    );
+    let db = f.active(DB).await;
+    assert_eq!(db.status, "unknown");
+    let sealed = db.cookie.clone().unwrap();
+    assert!(!String::from_utf8_lossy(&sealed.ciphertext).contains("n=2"));
+    assert_eq!(f.opened_cookie(&db), Some(Cookie::new(1, "n=2").unwrap()));
+    // The cookie's data is never logged or recorded.
+    let recorded = f.recorded(&deployment).await;
+    assert!(!recorded.contains("n=2"), "{recorded}");
+
+    // Recovery observes with the new cookie. The resource existed before, so
+    // finding it says nothing about the update, which the next deployment
+    // repeats.
+    *f.driver.conflict.lock().unwrap() = false;
+    let recovered = f.recover(DB).await;
+    assert!(
+        matches!(recovered, crate::planner::Recovered::Repeatable(_)),
+        "{recovered:?}"
+    );
+    let gets = f.driver.gets.lock().unwrap().clone();
+    assert_eq!(gets.len(), 1);
+    assert_eq!(gets[0].cookie, Some(Cookie::new(1, "n=2").unwrap()));
+    // The next deployment's update carries it too.
+    let (_, outcomes) = f.deploy(&defs, allow()).await;
+    all_provisioned(&outcomes);
+    assert_eq!(
+        f.driver.puts().last().unwrap().cookie,
+        Some(Cookie::new(1, "n=2").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn an_uncertain_creation_keeps_its_cookie_and_is_still_a_creation() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    *f.driver.conflict.lock().unwrap() = true;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    assert!(
+        matches!(
+            &outcomes[&Descriptor::parse(DB).unwrap()],
+            Outcome::Unknown(_)
+        ),
+        "{outcomes:?}"
+    );
+    let db = f.active(DB).await;
+    assert_eq!(f.opened_cookie(&db), Some(Cookie::new(1, "n=1").unwrap()));
+
+    // Recovery observes with the cookie, and the cookie the creation left
+    // does not make it an update: the resource found is provisioned.
+    *f.driver.conflict.lock().unwrap() = false;
+    let recovered = f.recover(DB).await;
+    assert_eq!(recovered, crate::planner::Recovered::Provisioned);
+    let gets = f.driver.gets.lock().unwrap().clone();
+    assert_eq!(gets[0].cookie, Some(Cookie::new(1, "n=1").unwrap()));
+    let db = f.active(DB).await;
+    assert_eq!(db.status, "provisioned");
+    assert_eq!(db.outputs["host"], "db.internal");
+    assert_eq!(f.opened_cookie(&db), Some(Cookie::new(1, "n=1").unwrap()));
+}
+
+#[tokio::test]
+async fn an_uncertain_deletion_returns_the_new_cookie_sealed() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let mut job = provision_job(&db, db.guresid.parse().unwrap());
+    job.cookie = db.cookie.clone();
+    let deprovision = DeprovisionJob {
+        job: job.clone(),
+        snapshot: db.snapshot.clone(),
+        recovery: db.recovery.clone(),
+    };
+    *f.driver.conflict.lock().unwrap() = true;
+    let executor = f.executor(allow());
+    let failure = executor.deprovision(deprovision).await.unwrap_err();
+    let ExecFailure::Uncertain {
+        error,
+        cookie: Some(sealed),
+    } = failure
+    else {
+        panic!("{failure:?}");
+    };
+    assert!(error.contains("conflicting operation"), "{error}");
+    assert!(!error.contains("n=2"), "{error}");
+    job.cookie = Some(sealed);
+    assert_eq!(
+        executor.open_cookie(&job).unwrap(),
+        Some(Cookie::new(1, "n=2").unwrap())
+    );
+
+    // A failure that returned no new cookie carries none, so the stored one
+    // stays.
+    *f.driver.conflict.lock().unwrap() = false;
+    *f.driver.fail.lock().unwrap() = Some("rejected".into());
+    let mut job = provision_job(&db, db.guresid.parse().unwrap());
+    job.cookie = db.cookie.clone();
+    let failure = executor.provision(job).await.unwrap_err();
+    assert!(matches!(failure, ExecFailure::Permanent(_)), "{failure:?}");
+}
+
 #[tokio::test]
 async fn a_driver_failure_is_redacted() {
     let f = Fixture::new().await;
@@ -1185,7 +1388,7 @@ fn a_failure_after_the_driver_accepted_a_change_is_uncertain() {
     ));
     assert!(matches!(
         mutation_failure(transient(), true),
-        ExecFailure::Uncertain(e) if e.contains("503 while polling")
+        ExecFailure::Uncertain { error: e, .. } if e.contains("503 while polling")
     ));
     assert!(matches!(
         mutation_failure(DriverError::Conflict("state is locked".into()), false),

@@ -475,11 +475,14 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
                     .await;
                     return Err(failed(error));
                 }
-                ExecFailure::Uncertain(error) => {
+                ExecFailure::Uncertain { error, cookie } => {
+                    // As for provisioning, the driver's newest cookie is kept
+                    // for the observation that recovers the deletion.
                     self.checkpoint(
                         &started.operation_id,
                         CheckpointResult::Unknown {
                             error: error.clone(),
+                            cookie,
                         },
                     )
                     .await;
@@ -569,6 +572,7 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             operation_id,
             CheckpointResult::Unknown {
                 error: error.into(),
+                cookie: None,
             },
         )
         .await;
@@ -594,14 +598,14 @@ impl<S: Store + 'static, E: Executor> DeleteRun<S, E> {
             Ok(Err(e)) => {
                 // A panic message could hold a secret, so it is not logged.
                 tracing::error!(panicked = e.is_panic(), "the executor stopped unexpectedly");
-                Err(ExecFailure::Uncertain(
-                    "the executor stopped unexpectedly while the resource was being deleted".into(),
+                Err(ExecFailure::uncertain(
+                    "the executor stopped unexpectedly while the resource was being deleted",
                 ))
             }
             Err(_) => {
                 abort.abort();
-                Err(ExecFailure::Uncertain(
-                    "the deployment ran out of time while the resource was being deleted".into(),
+                Err(ExecFailure::uncertain(
+                    "the deployment ran out of time while the resource was being deleted",
                 ))
             }
         }

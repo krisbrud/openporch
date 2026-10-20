@@ -380,12 +380,45 @@ pub enum DriverError {
     /// The driver does not support the request.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A failure that came with a new cookie, as a driver may return one with
+    /// any response. [`converge`] and [`remove`] record the cookie and pass on
+    /// `error`, so the cookie survives for recovery. The message is `error`'s;
+    /// the cookie's data never appears in it.
+    #[error("{error}")]
+    WithCookie {
+        error: Box<DriverError>,
+        cookie: Cookie,
+    },
 }
 
 impl DriverError {
     /// Whether the engine may retry the same operation automatically.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient { .. })
+        match self {
+            Self::Transient { .. } => true,
+            Self::WithCookie { error, .. } => error.is_retryable(),
+            _ => false,
+        }
+    }
+
+    /// The error with `cookie` attached, when there is one.
+    pub fn with_cookie(self, cookie: Option<Cookie>) -> Self {
+        match (self, cookie) {
+            (Self::WithCookie { error, .. }, Some(cookie)) => Self::WithCookie { error, cookie },
+            (error, Some(cookie)) => Self::WithCookie {
+                error: Box::new(error),
+                cookie,
+            },
+            (error, None) => error,
+        }
+    }
+
+    /// The error without a cookie, and the cookie it carried, if any.
+    pub fn split(self) -> (Self, Option<Cookie>) {
+        match self {
+            Self::WithCookie { error, cookie } => (error.split().0, Some(cookie)),
+            other => (other, None),
+        }
     }
 }
 

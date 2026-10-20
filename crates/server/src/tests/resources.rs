@@ -59,7 +59,7 @@ impl Executor for Fake {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
         }
         if self.uncertain.lock().unwrap().contains(&ty) {
-            return Err(ExecFailure::Uncertain(format!("{ty} timed out")));
+            return Err(ExecFailure::uncertain(format!("{ty} timed out")));
         }
         let mut result = ProvisionResult::default();
         if job.driver_type == "openporch/opentofu" {
