@@ -223,7 +223,7 @@ end.
 | Incompatible cookie upgrade | gap (partial) | Per-call checks only: `crates/drivers/src/opentofu/tests.rs::cookies_are_checked_for_compatibility`, `crates/drivers/src/tests.rs::returned_cookies_are_checked`. No driver-upgrade activation step that rejects with affected GUResIDs; searched `activat`, `cookie_version`, `upgrade` across `crates/` |
 | Duplicate put | covered | `crates/drivers/src/http_tests.rs::duplicate_put_recovers_the_same_object` |
 | Unobservable timed-out creation | covered | `crates/engine/src/planner/tests/recovery.rs::nothing_found_by_a_driver_that_cannot_recover_waits_for_an_administrator`, `crates/engine/src/planner/tests/recovery.rs::an_unobservable_outcome_waits_for_an_administrator` |
-| Conflict after a lost response | gap (partial) | 409 mapped to a non-retryable conflict: `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-409-conflict.json`), `crates/engine/src/executor/tests.rs::a_failure_after_the_driver_accepted_a_change_is_uncertain`. The executor maps `DriverError::Conflict` to a permanent failure (`crates/engine/src/executor.rs` `driver_failure`); no test shows the engine observing the prior operation after the 409 |
+| Conflict after a lost response | covered | `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-409-conflict.json`, `delete-409.json`: a 409 to a mutation leaves the outcome uncertain), `crates/drivers/src/http_tests.rs::duplicate_put_recovers_the_same_object`; an uncertain outcome is observed before another mutation: `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered`, `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation` |
 
 ## kubernetes-workloads
 
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 191 covered, 9 manual, 31 deferred, 43 gaps.
+274 scenarios: 192 covered, 9 manual, 31 deferred, 42 gaps.

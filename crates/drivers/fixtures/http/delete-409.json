@@ -1,5 +1,5 @@
 {
-  "description": "A 409 to DELETE is a conflict to observe.",
+  "description": "A 409 to DELETE leaves the outcome uncertain, so the resource is observed before it is changed again.",
   "call": "delete",
   "request": {
     "method": "DELETE",
@@ -13,8 +13,8 @@
   },
   "expect": {
     "error": {
-      "kind": "conflict",
-      "message": "still provisioning",
+      "kind": "uncertain",
+      "message": "the driver reports a conflicting operation (409), so the resource is observed before it is changed again: still provisioning",
       "retryable": false
     }
   }

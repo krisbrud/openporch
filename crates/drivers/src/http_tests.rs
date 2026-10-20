@@ -337,7 +337,15 @@ async fn duplicate_put_recovers_the_same_object() {
         .await
         .result
         .unwrap_err();
-    assert_eq!(err, DriverError::Conflict("fingerprint changed".into()));
+    // The conflict is observed, not repeated into.
+    assert_eq!(
+        err,
+        DriverError::Uncertain(
+            "the driver reports a conflicting operation (409), so the resource is observed \
+             before it is changed again: fingerprint changed"
+                .into()
+        )
+    );
 }
 
 // Real time: paused time would jump to the deadline while waiting on sockets.
