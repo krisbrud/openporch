@@ -91,7 +91,18 @@ pub enum Error {
     /// The server's response did not have the expected shape.
     #[error("unexpected response from the server: {0}")]
     Decode(String),
+    /// The server serves an API contract this client does not support.
+    #[error(
+        "the server serves API contract {0}, but this client supports contract {CONTRACT_VERSION}: \
+         use a client from the same openporch release as the server"
+    )]
+    UnsupportedContract(String),
 }
+
+/// The API contract version this client supports.
+pub const CONTRACT_VERSION: &str = "1";
+/// The response header in which servers name their API contract version.
+pub const CONTRACT_HEADER: &str = "openporch-contract";
 
 impl Error {
     /// The HTTP status of an API error.
@@ -343,6 +354,17 @@ impl Client {
             req = req.json(body);
         }
         let res = req.send().await.map_err(|e| Error::Transport(chain(&e)))?;
+        // Servers before the header served contract 1.
+        if let Some(contract) = res.headers().get(CONTRACT_HEADER)
+            && contract.as_bytes() != CONTRACT_VERSION.as_bytes()
+        {
+            let shown: String = String::from_utf8_lossy(contract.as_bytes())
+                .chars()
+                .take(32)
+                .flat_map(char::escape_debug)
+                .collect();
+            return Err(Error::UnsupportedContract(shown));
+        }
         let status = res.status();
         let bytes = res.bytes().await.map_err(|e| Error::Transport(chain(&e)))?;
         let value = if bytes.is_empty() {

@@ -23,6 +23,12 @@ import (
 // maxBody is the largest response body the client reads.
 const maxBody = 16 << 20
 
+// ContractVersion is the API contract version this provider supports.
+const ContractVersion = "1"
+
+// contractHeader names the server's API contract version on every response.
+const contractHeader = "Openporch-Contract"
+
 // ErrInvalidToken is returned by New for a token that cannot be sent in a header.
 var ErrInvalidToken = errors.New("the token contains invalid characters")
 
@@ -184,6 +190,14 @@ func (c *Client) DoWithHeaders(ctx context.Context, method, path string, headers
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer res.Body.Close()
+	// Servers from before the header serve contract 1.
+	if contract := res.Header.Get(contractHeader); contract != "" && contract != ContractVersion {
+		if len(contract) > 32 {
+			contract = contract[:32]
+		}
+		return fmt.Errorf("the server serves API contract %q, but this provider supports contract %s: "+
+			"use a provider from the same openporch release as the server", contract, ContractVersion)
+	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, maxBody+1))
 	if err != nil {
 		return fmt.Errorf("%s %s: reading the response: %w", method, path, err)

@@ -23,6 +23,10 @@ group. The examples run in order against a fresh dev server in
   one that does not exist. An object you can see but not change returns `403`.
 - **Secrets.** Secret values are accepted on write and never returned. Responses
   show secret references `{store, ref, version}` instead.
+- **Contract.** Every response, errors included, carries
+  `Openporch-Contract: 1`, the API contract version, as `GET /version` does.
+  `porch` and the OpenTofu provider refuse a server that names another one,
+  saying which contract each side supports.
 - **Work in progress.** External secret store adapters are not implemented
   yet; where a route registers something the server cannot use yet, its
   section says so.

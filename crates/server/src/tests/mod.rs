@@ -398,6 +398,22 @@ async fn health_and_version() {
     assert_eq!(body["version"], crate::VERSION);
     assert_eq!(body["contract"], "1");
     assert!(body["capabilities"].is_object());
+    // Every response names the contract, errors and unknown routes included,
+    // so clients can refuse a server they do not support.
+    for path in [
+        "/version",
+        "/orgs/acme/apps",
+        "/no-such-route",
+        "/orgs/other/apps",
+    ] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let res = s.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()[crate::api::CONTRACT_HEADER],
+            crate::handlers::CONTRACT_VERSION,
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]

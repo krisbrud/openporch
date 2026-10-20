@@ -165,8 +165,17 @@ async fn request_id(mut req: Request, next: Next) -> Response {
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);
     }
+    // Clients refuse a server whose contract they do not support, whatever
+    // they asked.
+    res.headers_mut().insert(
+        CONTRACT_HEADER,
+        HeaderValue::from_static(crate::handlers::CONTRACT_VERSION),
+    );
     res
 }
+
+/// The response header naming the API contract version on every response.
+pub const CONTRACT_HEADER: &str = "openporch-contract";
 
 /// The authenticated caller of a request.
 #[derive(Debug, Clone)]

@@ -8,6 +8,8 @@ mod deploys;
 mod diagnostics;
 mod envs;
 mod health;
+
+pub use health::CONTRACT_VERSION;
 mod login;
 mod members;
 mod metrics;

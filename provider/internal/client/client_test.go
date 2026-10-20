@@ -128,3 +128,29 @@ func TestOrgPathsEscapeSegments(t *testing.T) {
 		t.Fatalf("OrgPath: %s", got)
 	}
 }
+
+func TestServersOfAnotherContractAreRefusedClearly(t *testing.T) {
+	contract := "2"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if contract != "" {
+			w.Header().Set("Openporch-Contract", contract)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"alice","type":"user"}`))
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, "acme", "opt_secret-value", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CurrentUser(context.Background()); err == nil || !strings.Contains(err.Error(), "API contract \"2\"") {
+		t.Fatalf("expected a contract error, got %v", err)
+	}
+	// The supported contract, and servers from before the header.
+	for _, contract = range []string{"1", ""} {
+		if _, err := c.CurrentUser(context.Background()); err != nil {
+			t.Fatalf("contract %q: %v", contract, err)
+		}
+	}
+}

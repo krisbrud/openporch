@@ -10,7 +10,7 @@ major version.
 
 | Contract | Version this release supports | Where it is declared | When it is unsupported |
 | --- | --- | --- | --- |
-| HTTP API | `1` | `contract` in `GET /version`; [API reference](api.md) | A request a route does not know gets `404`; an unknown field in a body gets `400` |
+| HTTP API | `1` | The `Openporch-Contract` header on every response, and `contract` in `GET /version`; [API reference](api.md) | `porch` and the provider refuse a server that names another contract, naming both versions. A request a route does not know gets `404`; an unknown field in a body gets `400` |
 | Workload documents | `apiVersion: openporch.dev/v1`, `kind: Workload` | [`schemas/workload-v1.json`](../schemas/workload-v1.json) | Refused with `400` naming the field |
 | Score import | `apiVersion: score.dev/v1b1` | `crates/core/src/workload.rs` | Refused with `400` |
 | Resource type catalog | `v1` | [`schemas/catalog/v1`](../schemas/catalog/v1) | Inputs and outputs outside a type's schema are refused |
