@@ -43,7 +43,11 @@ async fn with_databases(server: &DevServer) -> Machine {
     server
         .post(
             "/orgs/acme/resources/defs",
-            json!({"id": "pg", "type": "postgres", "driver_type": "openporch/echo", "criteria": [{}]}),
+            json!({"id": "pg", "type": "postgres", "driver_type": "openporch/echo", "criteria": [{}],
+                   "driver_inputs": {
+                       "values": {"host": "db.internal", "name": "shop", "port": 5432},
+                       "secret_refs": {"username": {"value": "shop"},
+                                       "password": {"value": "change-me"}}}}),
         )
         .await;
     m

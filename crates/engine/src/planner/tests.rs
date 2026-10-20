@@ -172,6 +172,8 @@ struct Fake {
     observations: Mutex<BTreeMap<String, Observed>>,
     /// The descriptors observed, in order.
     observed: Mutex<Vec<String>>,
+    /// The output schema each observation was asked to check, in order.
+    observed_schemas: Mutex<Vec<Option<ResourceType>>>,
     /// Whether observations panic.
     observe_panics: std::sync::atomic::AtomicBool,
 }
@@ -509,6 +511,10 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push(job.descriptor.to_string());
+        self.observed_schemas
+            .lock()
+            .unwrap()
+            .push(job.output_schema.clone());
         assert!(
             !self
                 .observe_panics

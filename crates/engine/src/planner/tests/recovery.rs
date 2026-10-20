@@ -198,6 +198,36 @@ async fn a_crash_after_creation_is_recovered_by_observation() {
 }
 
 #[tokio::test]
+async fn a_recovered_creation_is_checked_against_the_type_its_deployment_recorded() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[("postgres", Behavior::Crash)]);
+    let planner = Arc::new(planner(&f, &fake, fast()));
+    let deployment = f.accept().await;
+    let id = deployment.id.clone();
+    crash(&f, &planner, deployment, || async {
+        fake.objects.lock().unwrap().values().any(|d| d == DB)
+    })
+    .await;
+    // The deployment recorded a postgres type of its own, as one with a custom
+    // type does: recovery checks the outputs against it, not the built-in.
+    let mut recorded = builtin_type(&"postgres".parse().unwrap()).unwrap();
+    recorded.name = "Recorded postgres".into();
+    sqlx::query(
+        "UPDATE deployments SET snapshot = json_set(snapshot, '$.types', json(?)) WHERE id = ?",
+    )
+    .bind(json!({"postgres": recorded}).to_string())
+    .bind(&id)
+    .execute(f.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        f.recover(&planner, DB).await.unwrap(),
+        Recovered::Provisioned
+    );
+    assert_eq!(*fake.observed_schemas.lock().unwrap(), vec![Some(recorded)]);
+}
+
+#[tokio::test]
 async fn a_crash_before_the_result_is_recorded_is_recovered_by_observation() {
     let f = Fixture::new().await;
     let fake = Fake::with(&[]);

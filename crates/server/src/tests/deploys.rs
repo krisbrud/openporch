@@ -433,6 +433,51 @@ async fn requests_are_checked_before_acceptance() {
 }
 
 #[tokio::test]
+async fn snapshots_without_recorded_types_are_not_replayed() {
+    let s = server().await;
+    let gate = s.deployable().await;
+    let delta = s.delta("web:1").await;
+    let (_, first) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta, "expected_generation": 0}),
+            None,
+        )
+        .await;
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    gate.add_permits(1);
+    s.finished(&first_id).await;
+    // A snapshot written before types were recorded would replay without
+    // checking any driver's outputs, so it is refused.
+    sqlx::query(
+        "UPDATE deployments SET snapshot = json_set(json_remove(snapshot, '$.types'), \
+         '$.version', 4) WHERE id = ?",
+    )
+    .bind(&first_id)
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"deploy_id": first_id, "expected_generation": 1}),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(b.to_string().contains("no replayable snapshot"), "{b}");
+    let (status, b) = s
+        .deploy(
+            &s.admin,
+            json!({"deploy_id": first_id, "replay": "current", "expected_generation": 1}),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{b}");
+    gate.add_permits(1);
+}
+
+#[tokio::test]
 async fn redeploys_replay_the_recorded_snapshot_unless_asked_for_current() {
     let s = server().await;
     let gate = s.deployable().await;
@@ -714,6 +759,177 @@ async fn a_delta_changed_after_it_was_read_is_not_frozen() {
     assert_eq!(s.generation("development").await, 0);
 }
 
+const DB_PATH: &str =
+    "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db";
+
+/// Deploys a postgres database whose `driver` returns no `host`, which must
+/// fail naming it without leaking the password, and returns the database.
+async fn deploy_without_host(s: &Server, driver: &str) -> Value {
+    s.app("shop").await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "pg",
+            "postgres",
+            driver,
+            json!({"values": {"name": "shop", "port": 5432},
+                   "secret_refs": {"username": {"value": "shop"},
+                                   "password": {"value": "hunter2-secret"}}}),
+        ),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
+                       "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let (st, d) = s
+        .deploy(
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let done = s.finished(d["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "failed", "{done}");
+    let error = done["error"].as_str().unwrap();
+    assert!(
+        error.contains("output `host` of resource type `postgres` is missing"),
+        "{error}"
+    );
+    assert!(!done.to_string().contains("hunter2"), "{done}");
+    // The workload that would have read `host` never ran.
+    let (_, workload) = s
+        .get(
+            "/orgs/acme/apps/shop/envs/development/resources/workload/modules.web",
+            &s.admin,
+        )
+        .await;
+    assert_ne!(workload["status"], "provisioned", "{workload}");
+    s.get(DB_PATH, &s.admin).await.1
+}
+
+/// `resource-catalog`: a driver's outputs that miss what the resource type
+/// requires fail the resource, naming the output, before anything uses them.
+#[tokio::test]
+async fn a_missing_required_output_fails_the_resource() {
+    let s = server().await;
+    // `openporch/echo` plans no changes, so nothing exists to recover.
+    let db = deploy_without_host(&s, "openporch/echo").await;
+    assert_eq!(db["status"], "failed", "{db}");
+}
+
+/// `test/changing`: `openporch/echo`, but it cannot preview, so its calls may
+/// change infrastructure.
+#[derive(Debug)]
+struct Changing(openporch_drivers::Echo, openporch_drivers::DriverInfo);
+
+impl openporch_drivers::Driver for Changing {
+    fn info(&self) -> &openporch_drivers::DriverInfo {
+        &self.1
+    }
+
+    fn plan<'a>(
+        &'a self,
+        _req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Plan> {
+        Box::pin(async { Ok(openporch_drivers::Plan::Unknown) })
+    }
+
+    fn plan_delete<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Plan> {
+        self.0.plan_delete(req)
+    }
+
+    fn put<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::PutOutcome> {
+        self.0.put(req)
+    }
+
+    fn get<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Observation> {
+        self.0.get(req)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::DeleteOutcome> {
+        self.0.delete(req)
+    }
+}
+
+/// A driver that may have changed infrastructure leaves outputs its type does
+/// not allow for recovery to observe, and recovery leaves them to an
+/// administrator rather than recording them.
+#[tokio::test]
+async fn invalid_outputs_after_a_change_are_left_for_recovery() {
+    use openporch_drivers::{Driver, DriverRegistry, Echo};
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
+    let echo = Echo::new();
+    let mut info = echo.info().clone();
+    info.id = "test/changing".into();
+    let mut drivers = DriverRegistry::with_builtins();
+    drivers
+        .register(Arc::new(Changing(echo, info)) as Arc<_>)
+        .unwrap();
+    let state = crate::state::start_with_drivers(
+        config,
+        None,
+        Arc::new(openporch_engine::cloud::AwsSts::new()),
+        Some(Arc::new(drivers)),
+    )
+    .await
+    .unwrap();
+    let s = super::server_from(dir, state);
+    // A record, so definitions may name the driver; it runs in-process.
+    sqlx::query(
+        "INSERT INTO drivers (org_id, id, body, created_at) \
+         VALUES ('acme', 'test/changing', '{}', 0)",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let db = deploy_without_host(&s, "test/changing").await;
+    assert_eq!(db["status"], "unknown", "{db}");
+    let (st, recovered) = s
+        .post(&format!("{DB_PATH}/recover"), &s.admin, json!({}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{recovered}");
+    assert_eq!(recovered["outcome"], "recovery_required", "{recovered}");
+    assert!(
+        recovered["reason"]
+            .as_str()
+            .unwrap()
+            .contains("output `host` of resource type `postgres` is missing"),
+        "{recovered}"
+    );
+    assert!(!recovered.to_string().contains("hunter2"), "{recovered}");
+}
+
 #[tokio::test]
 async fn a_started_server_provisions_deployments() {
     let s = server().await;
@@ -725,7 +941,8 @@ async fn a_started_server_provisions_deployments() {
             "pg",
             "postgres",
             "openporch/echo",
-            json!({"values": {"host": "db.internal"}}),
+            json!({"values": {"host": "db.internal", "name": "shop", "port": 5432},
+                   "secret_refs": {"username": {"value": "shop"}, "password": {"value": "change-me"}}}),
         ),
     ] {
         let (st, b) = s
@@ -831,7 +1048,9 @@ async fn a_restart_observes_resources_left_with_an_unknown_outcome() {
                 "/orgs/acme/resources/defs",
                 &s.admin,
                 json!({"id": id, "type": ty, "driver_type": driver,
-                       "driver_inputs": {"values": {"host": "db.internal"}}, "criteria": [{}]}),
+                       "driver_inputs": {"values": {"host": "db.internal", "name": "shop", "port": 5432},
+                                         "secret_refs": {"username": {"value": "shop"}, "password": {"value": "change-me"}}},
+                       "criteria": [{}]}),
             )
             .await;
         assert_eq!(st, StatusCode::CREATED, "{b}");

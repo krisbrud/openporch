@@ -510,7 +510,9 @@ where
             timeout,
             target,
         } = self.request(job, &job.inputs.sources, true, log).await?;
-        match self.plan(driver.as_ref(), &req, timeout, false).await? {
+        let plan = self.plan(driver.as_ref(), &req, timeout, false).await?;
+        let changes = !matches!(plan, Plan::NoEffects);
+        match plan {
             Plan::NoEffects => log.info("the driver plans no changes"),
             Plan::Actions {
                 actions,
@@ -547,8 +549,17 @@ where
         let settled = converge(driver.as_ref(), &req, timeout).await;
         let accepted = settled.cookie != req.cookie;
         let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
+        // A driver that may have made a change leaves a result that cannot be
+        // kept, such as outputs its type does not allow, for recovery to
+        // observe rather than as if nothing changed.
         self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
             .await
+            .map_err(|f| match f {
+                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changes => {
+                    ExecFailure::Uncertain(format!("the driver made the change, but {error}"))
+                }
+                f => f,
+            })
     }
 
     /// What a resource that provisioned returns: its outputs, with secret
@@ -570,6 +581,21 @@ where
             ..ProvisionResult::default()
         };
         let secrets = outputs.secrets.expose();
+        // Outputs that do not match the type would reach the resources that use
+        // them, so the resource fails, naming the output. Messages name outputs
+        // and types, never values.
+        if let Some(ty) = &job.output_schema {
+            let names = secrets.keys().cloned().collect();
+            ty.validate_outputs(&result.outputs, &names)
+                .and_then(|()| {
+                    secrets
+                        .iter()
+                        .try_for_each(|(name, value)| ty.validate_secret_output(name, value))
+                })
+                .map_err(|e| {
+                    ExecFailure::Permanent(format!("the driver's outputs are invalid: {e}"))
+                })?;
+        }
         let mut texts = Vec::new();
         for value in secrets.values() {
             secret_texts(value, &mut texts);
