@@ -712,11 +712,17 @@ where
                 cookie,
             ),
             Observation::Ready { outputs, cookie } => {
-                // A driver that returns no cookie, or one it cannot read, leaves
-                // the last one in place. The result carries it sealed, as after
-                // provisioning; when the result cannot be kept, the cookie is
-                // kept on its own.
-                let cookie = cookie.filter(|c| check_cookie(driver.info(), c).is_ok());
+                // A creation found finished with a cookie its driver cannot read
+                // could not be changed again, so its outcome stays unknown, as
+                // after provisioning.
+                if let Some(c) = &cookie
+                    && let Err(e) = check_cookie(driver.info(), c)
+                {
+                    return Err(ExecFailure::uncertain(e)).into();
+                }
+                // A driver that returns no cookie leaves the last one in place.
+                // The result carries it sealed, as after provisioning; when the
+                // result cannot be kept, the cookie is kept on its own.
                 let kept = cookie.clone().or(req.cookie.clone());
                 let result = self
                     .provisioned(job, outputs, kept.as_ref(), target, log)

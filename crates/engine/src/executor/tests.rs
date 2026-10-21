@@ -1765,7 +1765,20 @@ async fn an_observation_keeps_only_a_cookie_the_driver_can_read() {
     // A cookie in a version the driver does not declare is not kept.
     *f.driver.get_fails.lock().unwrap() = false;
     *f.driver.observed_cookie.lock().unwrap() = Some(Cookie::new(2, "n=8").unwrap());
-    let observed = executor.observe(job, false).await;
+    let observed = executor.observe(job.clone(), false).await;
     assert!(observed.result.is_ok(), "{observed:?}");
+    assert!(observed.cookie.is_none());
+
+    // A creation found finished with one cannot be recorded: the resource
+    // could not be changed again, so the outcome stays unknown.
+    let mut creation = job;
+    creation.existing = false;
+    let observed = executor.observe(creation, false).await;
+    match observed.result {
+        Err(ExecFailure::Uncertain { error, .. }) => {
+            assert!(error.contains("version 2"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(observed.cookie.is_none());
 }
