@@ -49,7 +49,8 @@ pub fn check_definition_inputs(
     }
 }
 pub use run::{
-    DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
+    DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, check_cookie, converge, remove,
+    with_timeout,
 };
 pub use template::Template;
 
@@ -298,8 +299,8 @@ pub enum PutOutcome {
 /// What `get` observed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
-    /// Nothing exists for the GUResID.
-    Absent,
+    /// Nothing exists for the GUResID. A driver may still return a cookie.
+    Absent { cookie: Option<Cookie> },
     /// An operation is still running; poll again after `poll_after`.
     InProgress {
         poll_after: Duration,
@@ -312,8 +313,12 @@ pub enum Observation {
     },
     /// The last operation failed.
     Failed { error: DriverError },
-    /// The driver cannot tell; an operator must establish the outcome.
-    Unknown { reason: String },
+    /// The driver cannot tell; an operator must establish the outcome. A cookie
+    /// returned with the answer is kept for that.
+    Unknown {
+        reason: String,
+        cookie: Option<Cookie>,
+    },
 }
 
 /// The result of `delete`.
@@ -380,12 +385,45 @@ pub enum DriverError {
     /// The driver does not support the request.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A failure that came with a new cookie, as a driver may return one with
+    /// any response. [`converge`] and [`remove`] record the cookie and pass on
+    /// `error`, so the cookie survives for recovery. The message is `error`'s;
+    /// the cookie's data never appears in it.
+    #[error("{error}")]
+    WithCookie {
+        error: Box<DriverError>,
+        cookie: Cookie,
+    },
 }
 
 impl DriverError {
     /// Whether the engine may retry the same operation automatically.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient { .. })
+        match self {
+            Self::Transient { .. } => true,
+            Self::WithCookie { error, .. } => error.is_retryable(),
+            _ => false,
+        }
+    }
+
+    /// The error with `cookie` attached, when there is one.
+    pub fn with_cookie(self, cookie: Option<Cookie>) -> Self {
+        match (self, cookie) {
+            (Self::WithCookie { error, .. }, Some(cookie)) => Self::WithCookie { error, cookie },
+            (error, Some(cookie)) => Self::WithCookie {
+                error: Box::new(error),
+                cookie,
+            },
+            (error, None) => error,
+        }
+    }
+
+    /// The error without a cookie, and the cookie it carried, if any.
+    pub fn split(self) -> (Self, Option<Cookie>) {
+        match self {
+            Self::WithCookie { error, cookie } => (error.split().0, Some(cookie)),
+            other => (other, None),
+        }
     }
 }
 

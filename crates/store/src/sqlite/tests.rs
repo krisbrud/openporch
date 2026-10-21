@@ -892,6 +892,7 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
         },
         CheckpointResult::Unknown {
             error: "still unsure".into(),
+            cookie: None,
         },
         CheckpointResult::Deleted,
     ] {
@@ -917,6 +918,90 @@ async fn restart_fails_interrupted_work_and_blocks_uncertain_resources() {
         .unwrap();
     let again = f.start(&d2.deployment().id, DB).await.unwrap();
     assert_eq!(again.guresid, op.guresid);
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_keeps_the_newest_cookie() {
+    let f = Fixture::new().await;
+    let sealed = |data: &str| crate::secrets::Sealed {
+        key_id: "k1".into(),
+        nonce: vec![0; 12],
+        ciphertext: data.as_bytes().to_vec(),
+    };
+    let unknown = |cookie| CheckpointResult::Unknown {
+        error: "the driver reports a conflicting operation (409)".into(),
+        cookie,
+    };
+    let observed = |cookie: &str| {
+        let CheckpointResult::Provisioned(mut p) = provisioned("db1") else {
+            unreachable!()
+        };
+        p.cookie = Some(sealed(cookie));
+        CheckpointResult::Provisioned(p)
+    };
+    let d1 = f.deploy("nginx:1").await;
+
+    // A mutation whose outcome is unknown leaves the cookie its driver
+    // returned on the resource, for recovery to observe with.
+    let op = f.start(&d1.id, DB).await.unwrap();
+    f.store
+        .checkpoint_operation(&op.operation_id, unknown(Some(sealed("c1"))))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c1")));
+    f.store
+        .checkpoint_operation(&op.operation_id, observed("c1"))
+        .await
+        .unwrap();
+
+    // Without a newer cookie, the stored one stays.
+    let op = f.start(&d1.id, DB).await.unwrap();
+    f.store
+        .checkpoint_operation(&op.operation_id, unknown(None))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c1")));
+    f.store
+        .checkpoint_operation(&op.operation_id, observed("c1"))
+        .await
+        .unwrap();
+
+    // A newer one replaces it.
+    let op = f.start(&d1.id, DB).await.unwrap();
+    f.store
+        .checkpoint_operation(&op.operation_id, unknown(Some(sealed("c2"))))
+        .await
+        .unwrap();
+    let r = f.resource(DB).await.unwrap();
+    assert_eq!(r.status, "unknown");
+    assert_eq!(r.cookie, Some(sealed("c2")));
+
+    // Observing it during recovery may return a newer one still.
+    f.store
+        .keep_recovery_cookie(&op.operation_id, Some(&sealed("c2")), &sealed("c3"))
+        .await
+        .unwrap();
+    let r = f.resource(DB).await.unwrap();
+    assert_eq!(r.status, "unknown");
+    assert_eq!(r.cookie, Some(sealed("c3")));
+    // A slower recovery that started from an older one does not replace it.
+    f.store
+        .keep_recovery_cookie(&op.operation_id, Some(&sealed("c2")), &sealed("old"))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c3")));
+
+    // Once the outcome is known, nothing changes.
+    let first = op.operation_id.clone();
+    f.store
+        .checkpoint_operation(&op.operation_id, observed("c3"))
+        .await
+        .unwrap();
+    f.store
+        .keep_recovery_cookie(&first, Some(&sealed("c3")), &sealed("c4"))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c3")));
 }
 
 #[tokio::test]

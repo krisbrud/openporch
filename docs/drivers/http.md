@@ -80,6 +80,14 @@ format version the driver declares and `data` is base64url without padding. Cook
 are limited to 10 KB of data. A response may carry `Openporch-Protocol`; if it names
 another protocol version, the response is rejected.
 
+A cookie that comes with a failed `PUT` or `DELETE`, such as a `409` or `5xx`, is
+kept too. A new cookie shows that the driver accepted the mutation, so the
+failure leaves the outcome uncertain; the cookie is stored, sealed, on the
+resource, and the `GET` that recovers the outcome and every later call send it.
+A failure without a cookie leaves the stored one as it is. A cookie that is
+malformed, too large or in another version cannot be kept, so the outcome is
+uncertain whatever the status.
+
 | Status | `PUT` | `GET` | `DELETE` |
 | --- | --- | --- | --- |
 | `200` | Ready, with the body above | Ready, with the body above | Deleted |

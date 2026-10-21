@@ -1604,6 +1604,41 @@ impl Store for SqliteStore {
         }))
     }
 
+    async fn keep_recovery_cookie(
+        &self,
+        operation_id: &str,
+        observed_with: Option<&Sealed>,
+        cookie: &Sealed,
+    ) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let op: Option<(String, String)> = sqlx::query_as(
+            "SELECT org_id, guresid FROM operations WHERE id = ? AND state = 'unknown'",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((org, guresid)) = op else {
+            return Ok(());
+        };
+        self.check_org(&org)?;
+        // Sealing uses a fresh nonce, so equal nonces and ciphertexts mean the
+        // same sealed cookie.
+        sqlx::query(
+            "UPDATE active_resources SET cookie_key_id = ?, cookie_nonce = ?, cookie = ? \
+             WHERE guresid = ? AND cookie_nonce IS ? AND cookie IS ?",
+        )
+        .bind(&cookie.key_id)
+        .bind(&cookie.nonce)
+        .bind(&cookie.ciphertext)
+        .bind(&guresid)
+        .bind(observed_with.map(|c| &c.nonce))
+        .bind(observed_with.map(|c| &c.ciphertext))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn resolve_operation(
         &self,
         operation_id: &str,
@@ -2508,13 +2543,29 @@ impl SqliteStore {
                     None,
                 )
             }
-            CheckpointResult::Unknown { error } => (
-                "unknown",
-                Some("unknown"),
-                "unknown",
-                Some(error.clone()),
-                None,
-            ),
+            CheckpointResult::Unknown { error, cookie } => {
+                // A newer cookie replaces the stored one, so recovery observes
+                // with it; without one, the stored cookie stays.
+                if let Some(cookie) = cookie {
+                    sqlx::query(
+                        "UPDATE active_resources SET cookie_key_id = ?, cookie_nonce = ?, \
+                         cookie = ? WHERE guresid = ?",
+                    )
+                    .bind(&cookie.key_id)
+                    .bind(&cookie.nonce)
+                    .bind(&cookie.ciphertext)
+                    .bind(&guresid)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                (
+                    "unknown",
+                    Some("unknown"),
+                    "unknown",
+                    Some(error.clone()),
+                    None,
+                )
+            }
         };
         if let Some(status) = resource_status {
             sqlx::query(

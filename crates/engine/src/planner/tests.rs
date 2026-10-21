@@ -170,10 +170,14 @@ struct Fake {
     /// How observations answer, by resource type, instead of from the
     /// objects.
     observations: Mutex<BTreeMap<String, Observed>>,
+    /// The newer cookie those observations return.
+    observed_cookie: Mutex<Option<Sealed>>,
     /// The descriptors observed, in order.
     observed: Mutex<Vec<String>>,
     /// The output schema each observation was asked to check, in order.
     observed_schemas: Mutex<Vec<Option<ResourceType>>>,
+    /// Whether each observation was told the resource existed before.
+    observed_existing: Mutex<Vec<bool>>,
     /// Whether observations panic.
     observe_panics: std::sync::atomic::AtomicBool,
 }
@@ -505,7 +509,7 @@ impl Executor for Fake {
         }
     }
 
-    async fn observe(&self, job: ProvisionJob, _deleting: bool) -> Result<Observed, ExecFailure> {
+    async fn observe(&self, job: ProvisionJob, _deleting: bool) -> Observation {
         let ty = job.descriptor.ty.to_string();
         self.observed
             .lock()
@@ -515,6 +519,7 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push(job.output_schema.clone());
+        self.observed_existing.lock().unwrap().push(job.existing);
         assert!(
             !self
                 .observe_panics
@@ -522,21 +527,25 @@ impl Executor for Fake {
             "the driver crashed while observing"
         );
         if let Some(observed) = self.observations.lock().unwrap().get(&ty) {
-            return Ok(observed.clone());
+            return Observation {
+                result: Ok(observed.clone()),
+                cookie: self.observed_cookie.lock().unwrap().clone(),
+            };
         }
         let exists = self
             .objects
             .lock()
             .unwrap()
             .contains_key(job.guresid.as_str());
-        Ok(if exists {
+        if exists {
             Observed::Ready {
                 result: Box::new(self.result(&ty, job.guresid.as_str()).await),
                 repeatable: true,
             }
         } else {
             Observed::Absent { repeatable: true }
-        })
+        }
+        .into()
     }
 }
 

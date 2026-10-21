@@ -110,6 +110,20 @@ pub struct Settled<T> {
     pub cookie: Option<Cookie>,
 }
 
+/// Why a cookie a driver returned cannot be kept: it is too large, or in a
+/// version the driver does not declare.
+pub fn check_cookie(info: &crate::DriverInfo, cookie: &Cookie) -> Result<(), String> {
+    cookie.check().map_err(|e| e.to_string())?;
+    let declared = info.cookie_version;
+    if cookie.version != declared {
+        return Err(format!(
+            "the driver returned a version {} cookie but declares version {declared}",
+            cookie.version
+        ));
+    }
+    Ok(())
+}
+
 /// Converges a resource: calls `put` and, while it reports `in_progress`, polls
 /// `get` until the resource is ready, all within `timeout`. Each call receives the
 /// latest cookie; a call that returns none leaves it unchanged.
@@ -161,7 +175,8 @@ impl<'d> Run<'d> {
     }
 
     async fn converge(&mut self) -> Result<DriverOutputs, DriverError> {
-        let mut wait = match self.bounded(self.driver.put(&self.req)).await? {
+        let put = self.bounded(self.driver.put(&self.req)).await;
+        let mut wait = match self.absorb(put)? {
             PutOutcome::Ready { outputs, cookie } => {
                 self.keep(cookie)?;
                 return Ok(outputs);
@@ -172,8 +187,10 @@ impl<'d> Run<'d> {
             }
         };
         loop {
-            self.pause(wait).await?;
-            match self.bounded(self.driver.get(&self.req)).await? {
+            let paused = self.pause(wait).await;
+            self.absorb(paused)?;
+            let observed = self.bounded(self.driver.get(&self.req)).await;
+            match self.absorb(observed)? {
                 Observation::Ready { outputs, cookie } => {
                     self.keep(cookie)?;
                     return Ok(outputs);
@@ -182,20 +199,25 @@ impl<'d> Run<'d> {
                     self.keep(cookie)?;
                     wait = poll_after;
                 }
-                Observation::Failed { error } => return Err(error),
-                Observation::Absent => {
+                Observation::Failed { error } => return self.absorb(Err(error)),
+                Observation::Absent { cookie } => {
+                    self.keep(cookie)?;
                     return Err(DriverError::Uncertain(
                         "`put` reported an operation in progress, but `get` found no resource"
                             .into(),
                     ));
                 }
-                Observation::Unknown { reason } => return Err(DriverError::Uncertain(reason)),
+                Observation::Unknown { reason, cookie } => {
+                    self.keep(cookie)?;
+                    return Err(DriverError::Uncertain(reason));
+                }
             }
         }
     }
 
     async fn remove(&mut self) -> Result<(), DriverError> {
-        let mut wait = match self.bounded(self.driver.delete(&self.req)).await? {
+        let delete = self.bounded(self.driver.delete(&self.req)).await;
+        let mut wait = match self.absorb(delete)? {
             DeleteOutcome::Deleted => return Ok(()),
             DeleteOutcome::InProgress { poll_after, cookie } => {
                 self.keep(cookie)?;
@@ -203,9 +225,12 @@ impl<'d> Run<'d> {
             }
         };
         loop {
-            self.pause(wait).await?;
-            match self.bounded(self.driver.get(&self.req)).await? {
-                Observation::Absent => return Ok(()),
+            let paused = self.pause(wait).await;
+            self.absorb(paused)?;
+            let observed = self.bounded(self.driver.get(&self.req)).await;
+            match self.absorb(observed)? {
+                // Gone: like a finished `delete`, nothing of it is kept.
+                Observation::Absent { .. } => return Ok(()),
                 Observation::InProgress { poll_after, cookie } => {
                     self.keep(cookie)?;
                     wait = poll_after;
@@ -215,8 +240,11 @@ impl<'d> Run<'d> {
                     self.keep(cookie)?;
                     wait = MIN_POLL;
                 }
-                Observation::Failed { error } => return Err(error),
-                Observation::Unknown { reason } => return Err(DriverError::Uncertain(reason)),
+                Observation::Failed { error } => return self.absorb(Err(error)),
+                Observation::Unknown { reason, cookie } => {
+                    self.keep(cookie)?;
+                    return Err(DriverError::Uncertain(reason));
+                }
             }
         }
     }
@@ -234,20 +262,47 @@ impl<'d> Run<'d> {
     }
 
     /// The error for a timed-out operation, after asking the driver to cancel it
-    /// when it can.
+    /// when it can. A cookie the cancellation returned rides on the error, for
+    /// [`Run::absorb`] to record.
     async fn timed_out(&self) -> DriverError {
         if !self.driver.info().capabilities.cancel {
             return DriverError::Timeout(self.timeout);
         }
-        match tokio::time::timeout(CANCEL_GRACE, self.driver.cancel(&self.req)).await {
-            Ok(Ok(Observation::Absent | Observation::Failed { .. })) => {
-                DriverError::Timeout(self.timeout)
-            }
-            _ => DriverError::Uncertain(format!(
+        let cancelled = tokio::time::timeout(CANCEL_GRACE, self.driver.cancel(&self.req)).await;
+        let (stopped, cookie) = match cancelled {
+            Ok(Ok(Observation::Absent { cookie })) => (true, cookie),
+            Ok(Ok(Observation::Failed { error })) => (true, error.split().1),
+            Ok(Ok(
+                Observation::InProgress { cookie, .. }
+                | Observation::Ready { cookie, .. }
+                | Observation::Unknown { cookie, .. },
+            )) => (false, cookie),
+            Ok(Err(error)) => (false, error.split().1),
+            Err(_) => (false, None),
+        };
+        let error = if stopped {
+            DriverError::Timeout(self.timeout)
+        } else {
+            DriverError::Uncertain(format!(
                 "the driver did not finish within {:?} and did not confirm that the \
                  operation stopped",
                 self.timeout
-            )),
+            ))
+        };
+        error.with_cookie(cookie)
+    }
+
+    /// Records the cookie a failed call returned, as a driver may return one
+    /// with any response, and passes on the failure without it. A cookie that
+    /// cannot be kept makes the outcome uncertain, as [`Run::keep`] says.
+    fn absorb<T>(&mut self, result: Result<T, DriverError>) -> Result<T, DriverError> {
+        match result {
+            Err(e @ DriverError::WithCookie { .. }) => {
+                let (error, cookie) = e.split();
+                self.keep(cookie)?;
+                Err(error)
+            }
+            other => other,
         }
     }
 
@@ -258,16 +313,7 @@ impl<'d> Run<'d> {
         let Some(cookie) = cookie else {
             return Ok(());
         };
-        cookie
-            .check()
-            .map_err(|e| DriverError::Uncertain(e.to_string()))?;
-        let declared = self.driver.info().cookie_version;
-        if cookie.version != declared {
-            return Err(DriverError::Uncertain(format!(
-                "the driver returned a version {} cookie but declares version {declared}",
-                cookie.version
-            )));
-        }
+        check_cookie(self.driver.info(), &cookie).map_err(DriverError::Uncertain)?;
         self.req.cookie = Some(cookie);
         Ok(())
     }
