@@ -449,9 +449,18 @@ func (r *driver) Update(ctx context.Context, req resource.UpdateRequest, resp *r
 		apiError(&resp.Diagnostics, "updating the driver", err)
 		var apiErr *client.Error
 		if errors.As(err, &apiErr) && strings.Contains(apiErr.Message, "other than the token it holds now") {
-			resp.Diagnostics.AddAttributeError(path.Root("token"), "Token changed outside OpenTofu",
-				"The driver's token changed outside OpenTofu since the last refresh; run "+
-					"`tofu apply -refresh-only` or plan again, and the token is written again.")
+			if !plan.TokenRef.IsNull() {
+				// A configured reference is the user's to change; a refresh
+				// cannot fix it.
+				resp.Diagnostics.AddAttributeError(path.Root("token_ref"), "Not the driver's current token",
+					"`token_ref` names one of the driver's own secrets that is no longer the token it "+
+						"holds. Update `token_ref` to the driver's current token reference, or set "+
+						"`token` to write a new value.")
+			} else {
+				resp.Diagnostics.AddAttributeError(path.Root("token"), "Token changed outside OpenTofu",
+					"The driver's token changed outside OpenTofu since the last refresh; run "+
+						"`tofu apply -refresh-only` or plan again, and the token is written again.")
+			}
 		}
 		return
 	}

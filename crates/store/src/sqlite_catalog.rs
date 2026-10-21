@@ -531,20 +531,37 @@ async fn check_driver_record(
         check_no_open_operations(conn, org, id).await?;
         // Active resources hold cookies of the version the driver writes now.
         if driver.cookie_version != stored.cookie_version {
-            let envs: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT app_id || '/' || env_id FROM active_resources \
-                 WHERE org_id = ? AND driver_type = ? ORDER BY 1 LIMIT 5",
+            // Named by GUResID, the identity the cookies belong to; the first
+            // ten, with a count of the rest.
+            const SHOWN: i64 = 10;
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM active_resources WHERE org_id = ? AND driver_type = ?",
             )
             .bind(org)
             .bind(id)
-            .fetch_all(&mut *conn)
+            .fetch_one(&mut *conn)
             .await?;
-            if !envs.is_empty() {
+            if total > 0 {
+                let shown: Vec<String> = sqlx::query_scalar(
+                    "SELECT '`' || guresid || '` (' || app_id || '/' || env_id || ')' \
+                     FROM active_resources WHERE org_id = ? AND driver_type = ? \
+                     ORDER BY guresid LIMIT ?",
+                )
+                .bind(org)
+                .bind(id)
+                .bind(SHOWN)
+                .fetch_all(&mut *conn)
+                .await?;
+                let more = if total > SHOWN {
+                    format!(" and {} more", total - SHOWN)
+                } else {
+                    String::new()
+                };
                 return Err(StoreError::Conflict(format!(
                     "the cookie version of driver `{id}` cannot change from {} while it has \
-                     active resources in {}",
+                     active resources, whose cookies are of that version: {}{more}",
                     stored.cookie_version,
-                    envs.join(", ")
+                    shown.join(", ")
                 )));
             }
         }

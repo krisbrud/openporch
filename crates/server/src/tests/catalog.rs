@@ -1124,10 +1124,39 @@ async fn external_drivers_are_replaced() {
         )
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let message = b["message"].as_str().unwrap();
     assert!(
-        b["message"].as_str().unwrap().contains("shop/production"),
+        message.contains("`shop-production-vault` (shop/production)"),
         "{b}"
     );
+    // The first ten GUResIDs are named, with a count of the rest.
+    for n in 0..11 {
+        sqlx::query(
+            "INSERT INTO active_resources (org_id, app_id, env_id, descriptor, guresid, \
+             definition_id, definition_version, status, created_at, updated_at, driver_type) \
+             VALUES ('acme', 'shop', 'development', ?, ?, 'vault', 1, 'provisioned', 0, 0, \
+             'acme/vault-db')",
+        )
+        .bind(format!("config.default.shared.v{n:02}"))
+        .bind(format!("g-{n:02}"))
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    }
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4", "cookie_version": 3}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let message = b["message"].as_str().unwrap();
+    assert!(
+        message.contains("`g-09` (shop/development) and 2 more"),
+        "{b}"
+    );
+    assert!(!message.contains("g-10"), "{b}");
     let (status, b) = s
         .put(
             path,

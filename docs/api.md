@@ -1368,7 +1368,8 @@ cannot be replaced (`409`). A replacement is refused with `409` while an
 operation the driver ran is still running or has an outcome that is not known
 yet, since its cookie and recovery depend on the registration, and a
 `cookie_version` change is refused with `409` while the driver has active
-resources, whose cookies are of the current version. It is refused with `400`
+resources, whose cookies are of the current version; the error names their
+GUResIDs, the first ten and a count of the rest. It is refused with `400`
 when the driver would no longer target the type of a definition that uses it. Deployments use the new registration from their next
 driver call.
 

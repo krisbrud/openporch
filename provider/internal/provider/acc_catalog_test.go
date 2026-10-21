@@ -548,6 +548,35 @@ resource "openporch_resource_definition" "d" {
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{"token", "token_ref", "written_token_ref"},
 			},
+			{
+				// A reference to an earlier version of the driver's own token
+				// cannot be fixed by a refresh, and the error says so.
+				Config: fmt.Sprintf(`
+resource "openporch_driver" "d" {
+  id     = %q
+  target = "https://drivers-v2.acme.example/vault"
+  token_ref = {
+    store   = "openporch"
+    ref     = "drivers/%s/token"
+    version = "1"
+  }
+  inputs_schema = {
+    type     = "object"
+    required = ["path"]
+  }
+  capabilities = {
+    observe = true
+  }
+}
+
+resource "openporch_resource_definition" "d" {
+  id          = %q
+  type        = "config"
+  driver_type = openporch_driver.d.id
+}
+`, id, id, defID),
+				ExpectError: regexp.MustCompile("Update `token_ref` to the driver's current token"),
+			},
 		},
 	})
 }
