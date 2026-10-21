@@ -14,15 +14,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::Instrument;
 
-use openporch_drivers::DriverRegistry;
+use openporch_drivers::{DriverInfo, DriverRegistry};
+use openporch_engine::executor::registered_driver_info;
 use openporch_engine::planner::{
     Deployment, DestructiveAction, Executor, PermitCheck, PermitRequest, PinError, Planner,
     RecoverError, Recovered,
 };
 use openporch_engine::preview::DriverFacts;
 use openporch_store::{
-    ApprovalRequest, AuditIntent, DeploymentKind, PermitStore, PermitUse, SqliteStore, Store,
-    StoreError,
+    ApprovalRequest, AuditIntent, CatalogStore, DeploymentKind, PermitStore, PermitUse,
+    SqliteStore, Store, StoreError,
 };
 use serde_json::Value;
 
@@ -547,22 +548,65 @@ impl Drivers {
         *current = (registry, backend);
     }
 
+    /// What this server knows now about drivers `ids`: the in-process ones,
+    /// and the external ones registered in `org`. The executor reads a
+    /// registration again when it calls the driver.
+    pub async fn known(
+        &self,
+        store: &SqliteStore,
+        org: &str,
+        ids: &[&str],
+    ) -> Result<KnownDrivers, StoreError> {
+        let (registry, backend) = self.0.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut infos = BTreeMap::new();
+        for &id in ids {
+            if infos.contains_key(id) {
+                continue;
+            }
+            let info = match registry.get(id) {
+                Some(driver) => Some(driver.info().clone()),
+                None => store
+                    .driver(org, id)
+                    .await?
+                    .map(|r| registered_driver_info(&r)),
+            };
+            if let Some(info) = info {
+                infos.insert(id.to_owned(), info);
+            }
+        }
+        Ok(KnownDrivers { infos, backend })
+    }
+}
+
+/// What [`Drivers::known`] found about some drivers.
+#[derive(Debug, Default)]
+pub struct KnownDrivers {
+    infos: BTreeMap<String, DriverInfo>,
+    /// Where the OpenTofu driver keeps state.
+    backend: Option<String>,
+}
+
+impl KnownDrivers {
     /// The protocol version of driver `id`; `None` for a driver this server
     /// cannot run.
     pub fn protocol(&self, id: &str) -> Option<String> {
-        let current = self.0.read().unwrap_or_else(|e| e.into_inner());
-        Some(current.0.get(id)?.info().protocol_version.clone())
+        Some(self.infos.get(id)?.protocol_version.clone())
+    }
+
+    /// Whether driver `id` can provision resources of type `ty`; `None` for a
+    /// driver this server cannot run.
+    pub fn covers(&self, id: &str, ty: &str) -> Option<bool> {
+        Some(self.infos.get(id)?.capabilities.targets.covers(ty))
     }
 
     /// What a preview knows about driver `id`; `None` for a driver this
     /// server cannot run.
     pub fn facts(&self, id: &str) -> Option<DriverFacts> {
-        let current = self.0.read().unwrap_or_else(|e| e.into_inner());
-        let driver = current.0.get(id)?;
+        let info = self.infos.get(id)?;
         Some(DriverFacts {
-            preview: driver.info().capabilities.preview,
+            preview: info.capabilities.preview,
             backend: (id == "openporch/opentofu")
-                .then(|| current.1.clone())
+                .then(|| self.backend.clone())
                 .flatten(),
         })
     }

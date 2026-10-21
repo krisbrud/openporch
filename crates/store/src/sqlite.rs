@@ -213,7 +213,7 @@ impl SqliteStore {
 
 /// The schema version this build reads and writes: its newest migration. It
 /// migrates older databases forward and refuses newer ones.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub(crate) fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()

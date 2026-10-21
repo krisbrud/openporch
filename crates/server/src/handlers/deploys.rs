@@ -456,15 +456,16 @@ async fn snapshot(
         .filter(|t| graph.nodes.values().any(|n| n.descriptor.ty == t.id))
         .map(|t| (t.id.to_string(), t))
         .collect();
+    let ids: Vec<&str> = graph
+        .nodes
+        .values()
+        .map(|n| n.driver_type.as_str())
+        .collect();
+    let known = state.drivers.known(&state.store, org, &ids).await?;
     let drivers: BTreeMap<String, Option<String>> = graph
         .nodes
         .values()
-        .map(|n| {
-            (
-                n.driver_type.clone(),
-                state.drivers.protocol(&n.driver_type),
-            )
-        })
+        .map(|n| (n.driver_type.clone(), known.protocol(&n.driver_type)))
         .collect();
     let mut snapshot = json!({
         "version": SNAPSHOT_VERSION,
@@ -691,8 +692,11 @@ async fn pin_secrets(state: &AppState, snapshot: &mut Value) -> ApiResult<()> {
 /// Checks that what a recorded snapshot needs still exists: its drivers at
 /// the protocol version it ran with, and the secret versions it pinned.
 async fn check_replay(state: &AppState, source: &str, snapshot: &mut Value) -> ApiResult<()> {
-    for (driver, protocol) in snapshot["drivers"].as_object().into_iter().flatten() {
-        let now = state.drivers.protocol(driver);
+    let recorded = snapshot["drivers"].as_object().cloned().unwrap_or_default();
+    let ids: Vec<&str> = recorded.keys().map(String::as_str).collect();
+    let known = state.drivers.known(&state.store, state.org(), &ids).await?;
+    for (driver, protocol) in &recorded {
+        let now = known.protocol(driver);
         if now.is_none() || now.as_deref() != protocol.as_str() {
             return Err(ApiError::invalid(format!(
                 "deployment `{source}` used driver `{driver}` at protocol {}, which this server \

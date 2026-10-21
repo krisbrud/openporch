@@ -26,7 +26,7 @@ mod template;
 pub use echo::Echo;
 pub use http::{
     COOKIE_HEADER, FINGERPRINT_HEADER, HttpDriver, HttpDriverError, OPERATION_HEADER,
-    PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER, check_target,
+    PROTOCOL_HEADER, PROTOCOL_VERSION, SET_COOKIE_HEADER, check_target, default_client,
 };
 pub use none::NoneDriver;
 pub use opentofu::{
@@ -433,6 +433,16 @@ pub struct Targets {
     pub resources: bool,
     pub workloads: bool,
     pub triggers: bool,
+}
+
+impl Targets {
+    /// Whether the driver can provision resources of type `ty`.
+    pub fn covers(&self, ty: &str) -> bool {
+        match openporch_core::catalog::DriverTarget::of_type(ty) {
+            openporch_core::catalog::DriverTarget::Resource => self.resources,
+            openporch_core::catalog::DriverTarget::Workload => self.workloads,
+        }
+    }
 }
 
 /// What a driver supports beyond `put`, `get` and `delete`.

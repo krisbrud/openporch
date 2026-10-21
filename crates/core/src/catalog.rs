@@ -284,6 +284,36 @@ pub const BUILTIN_DRIVERS: &[&str] = &[
 /// The driver namespace reserved for built-in drivers.
 pub const BUILTIN_DRIVER_NAMESPACE: &str = "openporch";
 
+/// What a driver provisions for a resource of some type. Drivers declare
+/// which targets they support; triggers are provisioned with their workload,
+/// so no resource type is a trigger target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverTarget {
+    /// A resource other than a workload.
+    Resource,
+    /// A workload.
+    Workload,
+}
+
+impl DriverTarget {
+    /// The target a resource of type `ty` needs.
+    pub fn of_type(ty: &str) -> Self {
+        if ty == "workload" {
+            Self::Workload
+        } else {
+            Self::Resource
+        }
+    }
+
+    /// The target's name in a driver's `capabilities.targets`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resource => "resources",
+            Self::Workload => "workloads",
+        }
+    }
+}
+
 /// The built-in resource types.
 pub fn builtin_types() -> Vec<ResourceType> {
     use ResourceUse::{Direct, Implicit, Indirect};
@@ -590,6 +620,14 @@ mod tests {
         assert_eq!(pg.output_kind("password"), Some(OutputKind::Secret));
         assert_eq!(pg.output_kind("hostname"), None);
         assert!(!pg.has_open_outputs());
+    }
+
+    #[test]
+    fn only_workloads_need_the_workload_driver_target() {
+        assert_eq!(DriverTarget::of_type("workload"), DriverTarget::Workload);
+        for ty in ["postgres", "base-env", "acme/vault"] {
+            assert_eq!(DriverTarget::of_type(ty), DriverTarget::Resource, "{ty}");
+        }
     }
 
     #[test]

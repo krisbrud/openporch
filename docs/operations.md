@@ -418,14 +418,15 @@ run a compatible openporch version or restore a compatible backup
 
 Each build runs on one schema version, its newest migration, and migrates
 older databases forward to it on start. `openporch version` names the release
-and that schema version, as in `openporch 0.1.0 (schema 9)`. A newer schema is
+and that schema version, as in `openporch 0.1.0 (schema 10)`. A newer schema is
 never opened by an older build, even when the newer migrations only added
 columns: no downgrade pair is supported. The tested pairs are:
 
-| Schema written by | Upgraded to schema 9 | Opened by the build of the schema before |
+| Schema written by | Upgraded to schema 10 | Opened by the build of the schema before |
 | --- | --- | --- |
 | 8 (milestone 1 before protected environment types) | yes, from a fixture | refused, simulated |
-| 9 (protected environment types) | not applicable | refused, simulated, and checked once by running the schema 8 build |
+| 9 (protected environment types) | yes, from a fixture | refused, simulated, and checked once by running the schema 8 build |
+| 10 (external driver registrations pin versions and capabilities) | not applicable | refused, simulated |
 
 A refused start writes nothing to the database; it only takes the
 installation lock. "Simulated" means a test runs the current build's version

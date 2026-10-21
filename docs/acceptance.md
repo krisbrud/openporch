@@ -214,7 +214,7 @@ end.
 |---|---|---|
 | Asynchronous provisioning | covered | `crates/drivers/src/tests.rs::asynchronous_provisioning_polls_get_until_ready`, `crates/drivers/src/http_tests.rs::asynchronous_provisioning_over_http` |
 | Cookie round trip | covered | `crates/drivers/src/tests.rs::cookie_round_trip`, `crates/engine/src/executor/tests.rs::the_driver_cookie_survives_between_deployments_sealed` |
-| Register an external driver | gap (partial) | Registration and definition use: `crates/server/src/tests/catalog.rs::external_drivers_are_registered`; HTTP calls to a target: `crates/drivers/src/http_tests.rs`. But "provisioning calls that URL" is never exercised and appears unimplemented: `crates/server/src/state.rs` runs deployments with `DriverRegistry::with_builtins().with_opentofu(..)` and nothing in `crates/server` or `crates/engine` constructs an `HttpDriver` from a registered driver |
+| Register an external driver | covered | `crates/server/src/tests/catalog.rs::external_drivers_are_registered`, `crates/server/src/tests/deploys.rs::a_registered_external_driver_provisions_deployed_resources` (a deployment calls the registered target with its token) |
 | Static database instance | covered | `crates/drivers/src/tests.rs::echo_returns_driver_inputs` |
 | Workload without a runtime | covered | `crates/drivers/src/tests.rs::none_returns_resolved_resource_inputs`, `crates/engine/src/planner/tests/workloads.rs::a_none_workload_stores_its_resolved_document` |
 | Deterministic password | covered | `crates/drivers/src/tests.rs::template_keeps_a_generated_password_in_its_cookie` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 192 covered, 9 manual, 31 deferred, 42 gaps.
+274 scenarios: 193 covered, 9 manual, 31 deferred, 41 gaps.
