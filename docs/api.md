@@ -2212,7 +2212,10 @@ driver, cloud account and inputs the operation recorded, and the definition's
 own secrets even if the definition no longer matches the resource, as a
 deletion does. It observes with the driver's latest cookie: one the uncertain
 operation returned before it failed replaces the resource's last cookie, and
-does not make a creation count as an update. One that cannot be settled then, for example because a
+does not make that operation's creation count as an update. A later
+deployment does treat a resource with a cookie as one that may exist, so a
+creation retried after it was found absent is planned like a change: a driver
+that cannot preview it needs an unknown-impact permit. One that cannot be settled then, for example because a
 deployment started first, and one left unknown by a timeout, waits for an
 explicit recovery. `POST .../recover` does the same on request and returns
 what the observation established as `outcome`, with the resource as it is now

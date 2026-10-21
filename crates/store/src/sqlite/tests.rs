@@ -978,12 +978,18 @@ async fn an_unknown_outcome_keeps_the_newest_cookie() {
 
     // Observing it during recovery may return a newer one still.
     f.store
-        .keep_recovery_cookie(&op.operation_id, &sealed("c3"))
+        .keep_recovery_cookie(&op.operation_id, Some(&sealed("c2")), &sealed("c3"))
         .await
         .unwrap();
     let r = f.resource(DB).await.unwrap();
     assert_eq!(r.status, "unknown");
     assert_eq!(r.cookie, Some(sealed("c3")));
+    // A slower recovery that started from an older one does not replace it.
+    f.store
+        .keep_recovery_cookie(&op.operation_id, Some(&sealed("c2")), &sealed("old"))
+        .await
+        .unwrap();
+    assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c3")));
 
     // Once the outcome is known, nothing changes.
     let first = op.operation_id.clone();
@@ -992,7 +998,7 @@ async fn an_unknown_outcome_keeps_the_newest_cookie() {
         .await
         .unwrap();
     f.store
-        .keep_recovery_cookie(&first, &sealed("c4"))
+        .keep_recovery_cookie(&first, Some(&sealed("c3")), &sealed("c4"))
         .await
         .unwrap();
     assert_eq!(f.resource(DB).await.unwrap().cookie, Some(sealed("c3")));

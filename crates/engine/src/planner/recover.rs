@@ -119,6 +119,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             Err(reason) => required(reason),
             Ok(job) => {
                 let account = job.driver_account.as_ref().map(ToString::to_string);
+                // The cookie the observation starts with, so that a newer one
+                // is not overwritten by a slower recovery's older one.
+                let observed_with = job.cookie.clone();
                 // A resource that existed before the operation says nothing,
                 // by existing, about whether an update took effect.
                 let updating = !deleting && job.existing && !restored;
@@ -176,7 +179,7 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                 if let Some(cookie) = cookie
                     && let Err(e) = self
                         .store
-                        .keep_recovery_cookie(&op.operation_id, &cookie)
+                        .keep_recovery_cookie(&op.operation_id, observed_with.as_ref(), &cookie)
                         .await
                 {
                     tracing::error!(error = %e, "could not keep the driver's state");
@@ -359,13 +362,16 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             // Whether the resource existed before the operation, as it
             // recorded. The resource's cookie may be one the uncertain
             // operation itself left, so it decides only for operations
-            // recorded before this was.
-            existing: recorded
-                .get("existing")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(|| {
-                    r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some()
-                }),
+            // recorded before this was. A restored resource is one the
+            // backup records, whatever its last operation was: its recovery
+            // record is a copy of the put that created it.
+            existing: recorded.get("restored") == Some(&Value::Bool(true))
+                || recorded
+                    .get("existing")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some()
+                    }),
             // A creation found finished is checked like one that finished in
             // the deployment, against the type its snapshot recorded.
             output_schema,

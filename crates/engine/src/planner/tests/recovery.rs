@@ -313,6 +313,24 @@ async fn nothing_found_is_provisioned_again_with_the_same_identity() {
 }
 
 #[tokio::test]
+async fn a_restored_resource_is_observed_as_one_that_existed() {
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let planner = Arc::new(planner(&f, &fake, fast()));
+    // Created once, so the only put it recorded was its creation.
+    let outcomes = planner.run(f.accept().await).await;
+    assert!(outcomes.values().all(|o| *o == Outcome::Provisioned));
+    f.store.mark_restored().await.unwrap();
+    assert_eq!(
+        f.recover(&planner, DB).await.unwrap(),
+        Recovered::Provisioned
+    );
+    // What the backup records is confirmed, not recorded again as a
+    // creation.
+    assert_eq!(*fake.observed_existing.lock().unwrap(), [true]);
+}
+
+#[tokio::test]
 async fn an_operation_still_running_is_left_unknown() {
     let f = Fixture::new().await;
     let fake = Fake::with(&[("postgres", Behavior::Crash)]);

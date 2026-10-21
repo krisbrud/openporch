@@ -388,10 +388,13 @@ pub trait Store: Send + Sync {
     /// Replaces the stored cookie of the resource an operation whose outcome
     /// is still unknown ran on, with the newer one observing it returned, so
     /// the next call to the driver carries it. Nothing changes once the
-    /// outcome is known.
+    /// outcome is known, or when the stored cookie is no longer `observed_with`,
+    /// the one the observation started with: another recovery stored a newer
+    /// one meanwhile.
     fn keep_recovery_cookie(
         &self,
         operation_id: &str,
+        observed_with: Option<&secrets::Sealed>,
         cookie: &secrets::Sealed,
     ) -> impl Future<Output = Result<()>> + Send;
 

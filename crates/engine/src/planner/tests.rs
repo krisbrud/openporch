@@ -176,6 +176,8 @@ struct Fake {
     observed: Mutex<Vec<String>>,
     /// The output schema each observation was asked to check, in order.
     observed_schemas: Mutex<Vec<Option<ResourceType>>>,
+    /// Whether each observation was told the resource existed before.
+    observed_existing: Mutex<Vec<bool>>,
     /// Whether observations panic.
     observe_panics: std::sync::atomic::AtomicBool,
 }
@@ -517,6 +519,7 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push(job.output_schema.clone());
+        self.observed_existing.lock().unwrap().push(job.existing);
         assert!(
             !self
                 .observe_panics
