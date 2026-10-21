@@ -449,26 +449,15 @@ async fn write_driver(
     ctx: &Ctx,
     mut record: DriverRecord,
     token: Option<PlannedSecret>,
-    create: bool,
+    based_on: Option<&DriverRecord>,
 ) -> ApiResult<DriverRecord> {
     let org = state.org();
     let id = record.id.clone();
-    // The token a replacement keeps, which the store checks is still the one
-    // the registration holds, so a stale request cannot undo a rotation.
-    let kept = token
-        .as_ref()
-        .and_then(|t| t.reference())
-        .filter(|r| {
-            r.store == openporch_store::secrets::BUILTIN_STORE
-                && r.reference.starts_with(&format!("drivers/{id}/"))
-        })
-        .cloned();
-    let change = if create {
-        DriverChange::Create
-    } else {
-        DriverChange::Replace {
-            kept: kept.as_ref(),
-        }
+    // A replacement names the registration it was built from, so the store
+    // refuses it when that changed in the meantime.
+    let change = match based_on {
+        None => DriverChange::Create,
+        Some(based_on) => DriverChange::Replace { based_on },
     };
     state
         .store
@@ -481,16 +470,18 @@ async fn write_driver(
             let name = format!("drivers/{id}/token");
             record.token = Some(t.materialize(&primary, &name, &mut written).await?);
         }
-        if create {
-            let audit = ctx.audit(org, "driver.create", &id);
-            state.store.create_driver(org, &record, audit).await?;
-        } else {
-            let audit = ctx.audit(org, "driver.update", &id);
-            let kept = kept.as_ref();
-            state
-                .store
-                .replace_driver(org, &record, kept, audit)
-                .await?;
+        match based_on {
+            None => {
+                let audit = ctx.audit(org, "driver.create", &id);
+                state.store.create_driver(org, &record, audit).await?;
+            }
+            Some(based_on) => {
+                let audit = ctx.audit(org, "driver.update", &id);
+                state
+                    .store
+                    .replace_driver(org, &record, based_on, audit)
+                    .await?;
+            }
         }
         Ok::<_, ApiError>(())
     }
@@ -516,7 +507,7 @@ pub async fn create_driver(
         .take()
         .ok_or_else(|| ApiError::invalid("`id` is required"))?;
     let (record, token) = plan_driver(&id, body, None)?;
-    let record = write_driver(&state, &ctx, record, token, true).await?;
+    let record = write_driver(&state, &ctx, record, token, None).await?;
     Ok((StatusCode::CREATED, Json(record.into())))
 }
 
@@ -549,7 +540,7 @@ pub async fn replace_driver(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("driver `{id}` not found")))?;
     let (record, token) = plan_driver(&id, body, Some(&current))?;
-    let record = write_driver(&state, &ctx, record, token, false).await?;
+    let record = write_driver(&state, &ctx, record, token, Some(&current)).await?;
     Ok(Json(record.into()))
 }
 

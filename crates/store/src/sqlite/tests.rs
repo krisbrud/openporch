@@ -1246,7 +1246,7 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
     };
     let missing = f
         .store
-        .replace_driver(ORG, &driver, None, system("PUT", "/drivers"))
+        .replace_driver(ORG, &driver, &driver, system("PUT", "/drivers"))
         .await
         .unwrap_err();
     assert!(matches!(missing, StoreError::NotFound(_)), "{missing}");
@@ -1260,7 +1260,12 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
     };
     let e = f
         .store
-        .check_driver(ORG, &builtin, DriverChange::Replace { kept: None }, None)
+        .check_driver(
+            ORG,
+            &builtin,
+            DriverChange::Replace { based_on: &driver },
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(e, StoreError::Conflict(_)), "{e}");
@@ -1269,7 +1274,7 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
         .check_driver(
             ORG,
             &driver,
-            DriverChange::Replace { kept: None },
+            DriverChange::Replace { based_on: &driver },
             Some("ci"),
         )
         .await
@@ -1282,7 +1287,7 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
         ..driver.clone()
     };
     f.store
-        .replace_driver(ORG, &moved, None, system("PUT", "/drivers"))
+        .replace_driver(ORG, &moved, &driver, system("PUT", "/drivers"))
         .await
         .unwrap();
     assert_eq!(
@@ -1315,13 +1320,13 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
             .check_driver(
                 ORG,
                 &workloads_only,
-                DriverChange::Replace { kept: None },
+                DriverChange::Replace { based_on: &moved },
                 None,
             )
             .await
             .unwrap_err(),
         f.store
-            .replace_driver(ORG, &workloads_only, None, system("PUT", "/drivers"))
+            .replace_driver(ORG, &workloads_only, &moved, system("PUT", "/drivers"))
             .await
             .unwrap_err(),
     ] {
@@ -1345,10 +1350,13 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
         .unwrap();
         let e = f
             .store
-            .replace_driver(ORG, &driver, None, system("PUT", "/drivers"))
+            .replace_driver(ORG, &driver, &moved, system("PUT", "/drivers"))
             .await
             .unwrap_err();
-        assert!(matches!(e, StoreError::Conflict(_)), "{state}: {e}");
+        assert!(
+            matches!(&e, StoreError::Conflict(m) if m.contains("not known yet")),
+            "{state}: {e}"
+        );
         sqlx::query("DELETE FROM operations")
             .execute(f.store.pool())
             .await
@@ -1356,10 +1364,10 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
     }
     assert_eq!(
         f.store.driver(ORG, "acme/vault").await.unwrap(),
-        Some(moved)
+        Some(moved.clone())
     );
     f.store
-        .replace_driver(ORG, &driver, None, system("PUT", "/drivers"))
+        .replace_driver(ORG, &driver, &moved, system("PUT", "/drivers"))
         .await
         .unwrap();
     assert_eq!(
@@ -1367,49 +1375,71 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
         Some(driver.clone())
     );
 
-    // A replacement keeps the driver's own token only while it is still the one
-    // the registration holds, so a stale request cannot undo a rotation.
+    // A replacement is refused when the registration it was built from
+    // changed meanwhile, so a stale request cannot undo a token rotation or
+    // restore what another replacement changed.
     let token = |version: &str| SecretRef {
         store: "openporch".into(),
         reference: "drivers/acme/vault/token".into(),
         version: Some(version.into()),
     };
-    let rotated = DriverRecord {
-        token: Some(token("2")),
-        ..driver.clone()
-    };
-    f.store
-        .replace_driver(ORG, &rotated, None, system("PUT", "/drivers"))
-        .await
-        .unwrap();
-    let stale = DriverRecord {
+    let with_token = DriverRecord {
         token: Some(token("1")),
         ..driver.clone()
     };
-    let e = f
-        .store
-        .replace_driver(ORG, &stale, Some(&token("1")), system("PUT", "/drivers"))
+    f.store
+        .replace_driver(ORG, &with_token, &driver, system("PUT", "/drivers"))
         .await
-        .unwrap_err();
-    assert!(
-        matches!(&e, StoreError::Invalid(m) if m.contains("holds now")),
-        "{e}"
-    );
+        .unwrap();
+    let rotated = DriverRecord {
+        token: Some(token("2")),
+        capabilities: DriverCapabilities {
+            observe: true,
+            ..DriverCapabilities::default()
+        },
+        ..with_token.clone()
+    };
+    f.store
+        .replace_driver(ORG, &rotated, &with_token, system("PUT", "/drivers"))
+        .await
+        .unwrap();
+    // Built from `with_token`: keeps token 1 and its capabilities.
+    let stale = DriverRecord {
+        target: "https://driver.internal/v3".into(),
+        ..with_token.clone()
+    };
+    for e in [
+        f.store
+            .check_driver(
+                ORG,
+                &stale,
+                DriverChange::Replace {
+                    based_on: &with_token,
+                },
+                None,
+            )
+            .await
+            .unwrap_err(),
+        f.store
+            .replace_driver(ORG, &stale, &with_token, system("PUT", "/drivers"))
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(&e, StoreError::Conflict(m) if m.contains("changed while")),
+            "{e}"
+        );
+    }
     assert_eq!(
         f.store.driver(ORG, "acme/vault").await.unwrap(),
         Some(rotated.clone())
     );
     let moved_again = DriverRecord {
         target: "https://driver.internal/v3".into(),
-        ..rotated
+        ..rotated.clone()
     };
     f.store
-        .replace_driver(
-            ORG,
-            &moved_again,
-            Some(&token("2")),
-            system("PUT", "/drivers"),
-        )
+        .replace_driver(ORG, &moved_again, &rotated, system("PUT", "/drivers"))
         .await
         .unwrap();
     assert_eq!(

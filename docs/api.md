@@ -1362,8 +1362,9 @@ deleting the definitions that use the driver. It takes the body of `POST` withou
 `capabilities` object replaces them, with its own fields' defaults. The schemas
 and a `token` left out are removed. `{value}` writes a new version of the token,
 and the reference the registration holds now, given back unchanged, keeps it;
-any other secret under `drivers/{id}/`, such as an earlier version or one a
-concurrent change replaced, must be entered again (`400`). Built-in drivers
+any other secret under `drivers/{id}/`, such as an earlier version, must be
+entered again (`400`). A registration changed by another request while this one
+was handled is not overwritten: the request is refused with `409`, to be retried. Built-in drivers
 cannot be replaced (`409`). A replacement is refused with `409` while an
 operation the driver ran is still running or has an outcome that is not known
 yet, since its cookie and recovery depend on the registration, and a

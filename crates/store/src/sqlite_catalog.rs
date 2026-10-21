@@ -49,15 +49,15 @@ pub struct DriverRecord {
 }
 
 /// Which write of a driver registration to check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DriverChange<'a> {
     /// A new registration.
     Create,
-    /// A replacement. `kept` is the driver's own token the replacement keeps,
-    /// which must still be the one the registration holds.
+    /// A replacement of the registration `based_on`, as the request read it.
     Replace {
-        /// The kept token, if the replacement keeps one of the driver's own.
-        kept: Option<&'a SecretRef>,
+        /// The registration the replacement was built from, which must still
+        /// be the stored one.
+        based_on: &'a DriverRecord,
     },
 }
 
@@ -226,14 +226,15 @@ pub trait CatalogStore: Send + Sync {
     /// while an operation the driver ran has an outcome that is not known yet, and
     /// when the driver would no longer target the type of a definition using it.
     ///
-    /// `kept` is the driver's own token the replacement keeps; it must be the
-    /// token the registration holds when the change commits. The cookie version
+    /// `based_on` is the registration the replacement was built from, as read
+    /// before; a registration changed since is refused with a conflict, so
+    /// overlapping replacements cannot undo each other. The cookie version
     /// cannot change while the driver has active resources.
     fn replace_driver(
         &self,
         org: &str,
         driver: &DriverRecord,
-        kept: Option<&SecretRef>,
+        based_on: &DriverRecord,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -484,7 +485,7 @@ pub(crate) async fn check_ref_stores(
 }
 
 /// Checks a driver registration: on create that its ID is free; on replace that
-/// it exists, still holds the token the replacement keeps, has no operation of
+/// it exists unchanged since the replacement read it, has no operation of
 /// unknown outcome, keeps its cookie version while it has active resources and
 /// still targets the types of the definitions using it; and that its token's
 /// store is registered.
@@ -495,7 +496,7 @@ async fn check_driver_record(
     change: DriverChange<'_>,
 ) -> Result<()> {
     let id = driver.id.as_str();
-    let create = change == DriverChange::Create;
+    let create = matches!(change, DriverChange::Create);
     if !create && BUILTIN_DRIVERS.contains(&id) {
         return Err(StoreError::Conflict(format!(
             "built-in driver `{id}` cannot be modified"
@@ -510,22 +511,19 @@ async fn check_driver_record(
     if create && (BUILTIN_DRIVERS.contains(&id) || stored.is_some()) {
         return Err(StoreError::AlreadyExists(format!("driver `{id}`")));
     }
-    if let DriverChange::Replace { kept } = change {
+    if let DriverChange::Replace { based_on } = change {
         let Some(stored) = stored else {
             return Err(StoreError::NotFound(format!("driver `{id}`")));
         };
         let stored: DriverRecord =
             serde_json::from_str(&stored).map_err(|e| corrupt("driver registration", e))?;
-        // Checked here, in the transaction, so a replacement read before a
-        // concurrent rotation cannot put the earlier token back.
-        if let Some(kept) = kept
-            && stored.token.as_ref() != Some(kept)
-        {
-            return Err(StoreError::Invalid(
-                "`token` must not reference this driver's own secrets other than the token it \
-                 holds now; give the token as `{value}`"
-                    .to_owned(),
-            ));
+        // A replacement fills what it leaves out, and checks the token it keeps,
+        // from the registration it read; checked here, in the transaction, so a
+        // concurrent change, such as a token rotation, is never undone.
+        if stored != *based_on {
+            return Err(StoreError::Conflict(format!(
+                "driver `{id}` changed while this request was being handled; retry"
+            )));
         }
         // Cookies and recovery depend on the registration an operation ran with.
         check_no_open_operations(conn, org, id).await?;
@@ -1144,14 +1142,14 @@ impl CatalogStore for SqliteStore {
         &self,
         org: &str,
         driver: &DriverRecord,
-        kept: Option<&SecretRef>,
+        based_on: &DriverRecord,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let id = driver.id.as_str();
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        check_driver_record(&mut tx, org, driver, DriverChange::Replace { kept }).await?;
+        check_driver_record(&mut tx, org, driver, DriverChange::Replace { based_on }).await?;
         let updated = sqlx::query("UPDATE drivers SET body = ? WHERE org_id = ? AND id = ?")
             .bind(serde_json::to_string(driver)?)
             .bind(org)
