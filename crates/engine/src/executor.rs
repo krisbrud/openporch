@@ -187,20 +187,21 @@ where
             ExecFailure::Permanent(format!("driver `{id}` cannot be called: {e}"))
         };
         let client = match self.http_client.get() {
-            Some(client) => Some(client.clone()),
-            // Registration requires `https`; any other target gets a client
-            // of its own that may speak plain HTTP.
+            Some(client) => client.clone(),
+            // Registration requires `https`, and the token must never travel in
+            // plain text, so a target stored any other way is refused.
             None if record.target.starts_with("https://") => {
                 let client = default_client(true).map_err(cannot)?;
-                Some(self.http_client.get_or_init(|| client).clone())
+                self.http_client.get_or_init(|| client).clone()
             }
-            None => None,
+            None => {
+                return Err(ExecFailure::Permanent(format!(
+                    "driver `{id}` cannot be called: its target is not an https URL"
+                )));
+            }
         };
-        let driver = match client {
-            Some(client) => HttpDriver::with_client(info, &record.target, token, client),
-            None => HttpDriver::new(info, &record.target, token),
-        }
-        .map_err(cannot)?;
+        let driver =
+            HttpDriver::with_client(info, &record.target, token, client).map_err(cannot)?;
         Ok(Arc::new(driver))
     }
 

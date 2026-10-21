@@ -1889,11 +1889,15 @@ async fn an_external_driver_whose_token_cannot_be_read_fails_naming_the_driver_a
         .post(
             "/orgs/acme/resources/drivers",
             &s.admin,
-            json!({"id": "acme/pg", "target": target,
-                   "token": {"store": "openporch", "ref": "drivers/acme/pg/missing"}}),
+            json!({"id": "acme/pg", "target": target, "token": {"value": DRIVER_TOKEN}}),
         )
         .await;
     assert_eq!(st, StatusCode::CREATED, "{b}");
+    // The token is gone from the store, as after a botched restore.
+    sqlx::query("DELETE FROM secret_versions WHERE ref = 'drivers/acme/pg/token'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
     for (id, ty, driver) in [
         ("env", "base-env", "openporch/none"),
         ("workloads", "workload", "openporch/none"),
@@ -1935,7 +1939,7 @@ async fn an_external_driver_whose_token_cannot_be_read_fails_naming_the_driver_a
         .await;
     let error = format!("{done} {db}");
     assert!(error.contains("driver `acme/pg`"), "{error}");
-    assert!(error.contains("drivers/acme/pg/missing"), "{error}");
+    assert!(error.contains("drivers/acme/pg/token"), "{error}");
     assert!(calls.lock().unwrap().is_empty());
 }
 

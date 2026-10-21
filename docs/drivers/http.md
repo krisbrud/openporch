@@ -60,7 +60,18 @@ deployment never uses an earlier registration's target or token. A deployment
 whose resources name a driver that is not registered is refused before anything
 runs, naming the driver. A driver that cannot observe is reported as such
 without its token being read. A registration cannot be deleted while a
-definition or an active resource uses it.
+definition or an active resource uses it, or while an operation it ran has an
+outcome that is not known yet. A registration's token reference cannot name a
+secret under `drivers/{id}/` that it did not write itself, so a driver registered
+again under a deleted one's ID never inherits its token. openporch calls only
+`https` targets, so the token never travels in plain text.
+
+Driver targets are not limited to public addresses: registering one is an
+administrator's decision, and drivers commonly run on internal hosts. A target
+on a loopback or link-local address, such as a cloud metadata endpoint, is
+called like any other. Registrations made before `targets` existed provision
+resources other than workloads; register a driver again with
+`targets.workloads` to use it for workloads.
 
 The request and response bodies follow the shapes of Humanitec's Driver API 0.9.3, so
 existing drivers need few changes. Full wire compatibility is not promised: the

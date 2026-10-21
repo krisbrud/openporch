@@ -402,6 +402,17 @@ pub async fn create_driver(
         .as_ref()
         .map(|t| PlannedSecret::new("`token`", t))
         .transpose()?;
+    // A driver's own secrets are written by its registration. One left by an
+    // earlier registration under the same ID belongs to that driver, and must
+    // not reach a new target without being entered again.
+    if let Some(r) = token.as_ref().and_then(|t| t.reference())
+        && r.store == openporch_store::secrets::BUILTIN_STORE
+        && r.reference.starts_with(&format!("drivers/{id}/"))
+    {
+        return Err(ApiError::invalid(
+            "`token` must not reference this driver's own secrets; give the token as `{value}`",
+        ));
+    }
     let mut record = DriverRecord {
         id: id.clone(),
         target: target.to_string(),

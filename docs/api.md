@@ -1340,7 +1340,18 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 200 OK
 
-{"id": "acme/vault-db", "builtin": false, "protocol_version": "openporch-http/1", "capabilities": {"observe": true}}
+{
+  "id": "acme/vault-db",
+  "builtin": false,
+  "target": "https://drivers.acme.example/vault-db",
+  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
+}
 ```
 
 ```http

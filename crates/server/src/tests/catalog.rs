@@ -751,6 +751,47 @@ async fn external_drivers_are_registered() {
     let (status, b) = s.delete("/orgs/acme/resources/defs/web", &s.admin).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
 
+    // A registration under the same ID cannot inherit its predecessor's token.
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/vault-secret", "target": "https://elsewhere.internal/vault",
+                   "token": {"store": "openporch", "ref": "drivers/acme/vault-secret/token"}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("own secrets"),
+        "{b}"
+    );
+    s.created("/orgs/acme/resources/drivers", vault.clone())
+        .await;
+
+    // Nor can a registration be deleted while an operation it ran has an
+    // outcome nobody knows yet: recovery observes with that driver.
+    sqlx::query(
+        "INSERT INTO operations (id, org_id, app_id, env_id, deployment_id, guresid, kind, \
+         input_fingerprint, state, started_at, driver_type) \
+         VALUES ('op-open', 'acme', 'shop', 'development', 'd-1', 'g-1', 'put', 'f', \
+         'unknown', 0, 'acme/vault-secret')",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("not known yet"),
+        "{b}"
+    );
+    sqlx::query("UPDATE operations SET state = 'failed' WHERE id = 'op-open'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+
     for (body, message) in [
         (json!({"capabilities": {"targets": {"pods": true}}}), "pods"),
         (

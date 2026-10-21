@@ -1046,6 +1046,24 @@ impl CatalogStore for SqliteStore {
                 envs.join(", ")
             )));
         }
+        // An operation still running or of unknown outcome is observed and
+        // recovered with the driver it ran, which may no longer be the one its
+        // resource records.
+        let open: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT app_id || '/' || env_id FROM operations \
+             WHERE org_id = ? AND driver_type = ? AND state IN ('started', 'unknown') \
+             ORDER BY 1 LIMIT 5",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !open.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "driver `{id}` has operations in {} whose outcome is not known yet",
+                open.join(", ")
+            )));
+        }
         let deleted = sqlx::query("DELETE FROM drivers WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)
