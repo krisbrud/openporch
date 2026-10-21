@@ -476,12 +476,13 @@ resource "openporch_resource_definition" "d" {
 		},
 		Steps: []resource.TestStep{
 			{
-				// The server normalizes the target; the configured one is kept.
-				Config: config("https://Drivers.ACME.example:443", "first-token"),
+				// The server normalizes the target, resolving dot segments Go does not;
+				// the configured one is kept.
+				Config: config("https://Drivers.ACME.example:443/a/../vault", "first-token"),
 				ConfigStateChecks: []statecheck.StateCheck{
 					written("1"),
 					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("target"),
-						knownvalue.StringExact("https://Drivers.ACME.example:443")),
+						knownvalue.StringExact("https://Drivers.ACME.example:443/a/../vault")),
 					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("protocol_version"),
 						knownvalue.StringExact("openporch-http/1")),
 					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("cookie_version"),
@@ -494,7 +495,7 @@ resource "openporch_resource_definition" "d" {
 			},
 			{
 				// A new token is a new version, written in place.
-				Config: config("https://Drivers.ACME.example:443", "second-token"),
+				Config: config("https://Drivers.ACME.example:443/a/../vault", "second-token"),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: append([]plancheck.PlanCheck{
 						plancheck.ExpectUnknownValue("openporch_driver.d", tfjsonpath.New("written_token_ref")),

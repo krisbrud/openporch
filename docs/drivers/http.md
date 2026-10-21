@@ -64,7 +64,8 @@ definition or an active resource uses it, or while an operation it ran has an
 outcome that is not known yet. It can be replaced in place with
 `PUT /orgs/{org}/resources/drivers/{driver}`, to rotate its token or move its
 target, except while an operation it ran has an outcome that is not known yet, and
-only while it still targets the types of the definitions using it. A registration's token reference cannot name a
+only while it still targets the types of the definitions using it. Its cookie
+version stays while it has active resources. A registration's token reference cannot name a
 secret under `drivers/{id}/` other than the token it holds now, so a driver
 registered again under a deleted one's ID never inherits its token. openporch calls only
 `https` targets, so the token never travels in plain text.

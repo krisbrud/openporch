@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/url"
 	"strings"
 
@@ -293,12 +295,44 @@ func (m driverModel) body(ctx context.Context, prior *driverModel) (client.Drive
 }
 
 // apply records the server's registration in m.
-func (m *driverModel) apply(ctx context.Context, d *client.Driver) diag.Diagnostics {
+// keepTarget says whether m's target stands for the server's, which the server
+// writes as its URL parser does: after a write, the configured target is kept;
+// on read, while the server's target is still the one written then (saved in
+// private state), or, without one, as after an import, when it is m's target
+// normalized.
+func (m *driverModel) keepTarget(server string, saved []byte) bool {
+	if m.Target.IsNull() || m.Target.IsUnknown() {
+		return false
+	}
+	var written string
+	if len(saved) > 0 && json.Unmarshal(saved, &written) == nil {
+		return written == server
+	}
+	return normalizeTarget(m.Target.ValueString()) == server
+}
+
+// serverTargetKey is the private state key holding the target as the server
+// wrote it.
+const serverTargetKey = "server_target"
+
+func saveServerTarget(ctx context.Context, private interface {
+	SetKey(context.Context, string, []byte) diag.Diagnostics
+}, target string) diag.Diagnostics {
+	b, err := json.Marshal(target)
+	if err != nil {
+		var diags diag.Diagnostics
+		diags.AddError("Unexpected driver target", err.Error())
+		return diags
+	}
+	return private.SetKey(ctx, serverTargetKey, b)
+}
+
+// apply records the server's registration in m; the target only when keep is
+// false.
+func (m *driverModel) apply(ctx context.Context, d *client.Driver, keep bool) diag.Diagnostics {
 	var diags diag.Diagnostics
 	m.ID = types.StringValue(d.ID)
-	// The server writes the target as its URL parser does; a configured target
-	// it only normalized is kept as configured.
-	if m.Target.IsNull() || m.Target.IsUnknown() || normalizeTarget(m.Target.ValueString()) != d.Target {
+	if !keep {
 		m.Target = types.StringValue(d.Target)
 	}
 	m.ProtocolVersion = types.StringValue(d.ProtocolVersion)
@@ -366,7 +400,8 @@ func (r *driver) Create(ctx context.Context, req resource.CreateRequest, resp *r
 		return
 	}
 	plan.Written = types.ObjectNull(secretRefAttrTypes)
-	resp.Diagnostics.Append(plan.apply(ctx, d)...)
+	resp.Diagnostics.Append(plan.apply(ctx, d, true)...)
+	resp.Diagnostics.Append(saveServerTarget(ctx, resp.Private, d.Target)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 
@@ -390,7 +425,10 @@ func (r *driver) Read(ctx context.Context, req resource.ReadRequest, resp *resou
 			"`"+d.ID+"` is a built-in driver; only external drivers can be managed.")
 		return
 	}
-	resp.Diagnostics.Append(state.apply(ctx, d)...)
+	saved, diags := req.Private.GetKey(ctx, serverTargetKey)
+	resp.Diagnostics.Append(diags...)
+	resp.Diagnostics.Append(state.apply(ctx, d, state.keepTarget(d.Target, saved))...)
+	resp.Diagnostics.Append(saveServerTarget(ctx, resp.Private, d.Target)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
@@ -409,13 +447,20 @@ func (r *driver) Update(ctx context.Context, req resource.UpdateRequest, resp *r
 	d, err := r.client.ReplaceDriver(ctx, plan.ID.ValueString(), body)
 	if err != nil {
 		apiError(&resp.Diagnostics, "updating the driver", err)
+		var apiErr *client.Error
+		if errors.As(err, &apiErr) && strings.Contains(apiErr.Message, "other than the token it holds now") {
+			resp.Diagnostics.AddAttributeError(path.Root("token"), "Token changed outside OpenTofu",
+				"The driver's token changed outside OpenTofu since the last refresh; run "+
+					"`tofu apply -refresh-only` or plan again, and the token is written again.")
+		}
 		return
 	}
 	plan.Written = state.Written
 	if !plan.Token.Equal(state.Token) {
 		plan.Written = types.ObjectNull(secretRefAttrTypes)
 	}
-	resp.Diagnostics.Append(plan.apply(ctx, d)...)
+	resp.Diagnostics.Append(plan.apply(ctx, d, true)...)
+	resp.Diagnostics.Append(saveServerTarget(ctx, resp.Private, d.Target)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
 }
 

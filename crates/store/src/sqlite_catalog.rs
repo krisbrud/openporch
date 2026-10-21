@@ -48,6 +48,19 @@ pub struct DriverRecord {
     pub capabilities: DriverCapabilities,
 }
 
+/// Which write of a driver registration to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverChange<'a> {
+    /// A new registration.
+    Create,
+    /// A replacement. `kept` is the driver's own token the replacement keeps,
+    /// which must still be the one the registration holds.
+    Replace {
+        /// The kept token, if the replacement keeps one of the driver's own.
+        kept: Option<&'a SecretRef>,
+    },
+}
+
 /// The optional capabilities an external driver declares.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -212,21 +225,26 @@ pub trait CatalogStore: Send + Sync {
     /// Replaces a registered driver's target, token, pins and capabilities. Refused
     /// while an operation the driver ran has an outcome that is not known yet, and
     /// when the driver would no longer target the type of a definition using it.
+    ///
+    /// `kept` is the driver's own token the replacement keeps; it must be the
+    /// token the registration holds when the change commits. The cookie version
+    /// cannot change while the driver has active resources.
     fn replace_driver(
         &self,
         org: &str,
         driver: &DriverRecord,
+        kept: Option<&SecretRef>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Runs the checks of [`CatalogStore::create_driver`] (`create`) or
+    /// Runs the checks of [`CatalogStore::create_driver`] or
     /// [`CatalogStore::replace_driver`] without changing anything, so a request
     /// that would be rejected writes no token first.
     fn check_driver(
         &self,
         org: &str,
         driver: &DriverRecord,
-        create: bool,
+        change: DriverChange<'_>,
         actor: Option<&str>,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -465,36 +483,71 @@ pub(crate) async fn check_ref_stores(
     Ok(())
 }
 
-/// Checks a driver registration: on `create` that its ID is free, otherwise that
-/// it exists, has no operation of unknown outcome and still targets the types of
-/// the definitions using it; and that its token's store is registered.
+/// Checks a driver registration: on create that its ID is free; on replace that
+/// it exists, still holds the token the replacement keeps, has no operation of
+/// unknown outcome, keeps its cookie version while it has active resources and
+/// still targets the types of the definitions using it; and that its token's
+/// store is registered.
 async fn check_driver_record(
     conn: &mut SqliteConnection,
     org: &str,
     driver: &DriverRecord,
-    create: bool,
+    change: DriverChange<'_>,
 ) -> Result<()> {
     let id = driver.id.as_str();
+    let create = change == DriverChange::Create;
     if !create && BUILTIN_DRIVERS.contains(&id) {
         return Err(StoreError::Conflict(format!(
             "built-in driver `{id}` cannot be modified"
         )));
     }
-    let taken: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM drivers WHERE org_id = ? AND id = ?")
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT body FROM drivers WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)
             .fetch_optional(&mut *conn)
             .await?;
-    if create && (BUILTIN_DRIVERS.contains(&id) || taken.is_some()) {
+    if create && (BUILTIN_DRIVERS.contains(&id) || stored.is_some()) {
         return Err(StoreError::AlreadyExists(format!("driver `{id}`")));
     }
-    if !create {
-        if taken.is_none() {
+    if let DriverChange::Replace { kept } = change {
+        let Some(stored) = stored else {
             return Err(StoreError::NotFound(format!("driver `{id}`")));
+        };
+        let stored: DriverRecord =
+            serde_json::from_str(&stored).map_err(|e| corrupt("driver registration", e))?;
+        // Checked here, in the transaction, so a replacement read before a
+        // concurrent rotation cannot put the earlier token back.
+        if let Some(kept) = kept
+            && stored.token.as_ref() != Some(kept)
+        {
+            return Err(StoreError::Invalid(
+                "`token` must not reference this driver's own secrets other than the token it \
+                 holds now; give the token as `{value}`"
+                    .to_owned(),
+            ));
         }
         // Cookies and recovery depend on the registration an operation ran with.
         check_no_open_operations(conn, org, id).await?;
+        // Active resources hold cookies of the version the driver writes now.
+        if driver.cookie_version != stored.cookie_version {
+            let envs: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT app_id || '/' || env_id FROM active_resources \
+                 WHERE org_id = ? AND driver_type = ? ORDER BY 1 LIMIT 5",
+            )
+            .bind(org)
+            .bind(id)
+            .fetch_all(&mut *conn)
+            .await?;
+            if !envs.is_empty() {
+                return Err(StoreError::Conflict(format!(
+                    "the cookie version of driver `{id}` cannot change from {} while it has \
+                     active resources in {}",
+                    stored.cookie_version,
+                    envs.join(", ")
+                )));
+            }
+        }
         let users: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, type FROM definitions WHERE org_id = ? AND driver_type = ? ORDER BY id",
         )
@@ -1048,7 +1101,7 @@ impl CatalogStore for SqliteStore {
         let id = driver.id.as_str();
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        check_driver_record(&mut tx, org, driver, true).await?;
+        check_driver_record(&mut tx, org, driver, DriverChange::Create).await?;
         let res = sqlx::query(
             "INSERT INTO drivers (org_id, id, body, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
         )
@@ -1074,13 +1127,14 @@ impl CatalogStore for SqliteStore {
         &self,
         org: &str,
         driver: &DriverRecord,
+        kept: Option<&SecretRef>,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let id = driver.id.as_str();
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        check_driver_record(&mut tx, org, driver, false).await?;
+        check_driver_record(&mut tx, org, driver, DriverChange::Replace { kept }).await?;
         let updated = sqlx::query("UPDATE drivers SET body = ? WHERE org_id = ? AND id = ?")
             .bind(serde_json::to_string(driver)?)
             .bind(org)
@@ -1099,13 +1153,13 @@ impl CatalogStore for SqliteStore {
         &self,
         org: &str,
         driver: &DriverRecord,
-        create: bool,
+        change: DriverChange<'_>,
         actor: Option<&str>,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut conn = self.pool().acquire().await?;
         check_admin_authority(&mut conn, org, actor).await?;
-        check_driver_record(&mut conn, org, driver, create).await
+        check_driver_record(&mut conn, org, driver, change).await
     }
 
     async fn delete_driver(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {

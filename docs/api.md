@@ -1357,15 +1357,19 @@ Authorization: Bearer $ADMIN_TOKEN
 
 `PUT` replaces a registration in place, so a new token or target does not mean
 deleting the definitions that use the driver. It takes the body of `POST` without
-`id` (or with the same `id`), checked the same way; fields left out take their
-defaults, and a `token` left out is removed. `{value}` writes a new version of the
-token, and the reference the registration holds now, given back unchanged, keeps
-it; any other secret under `drivers/{id}/`, such as an earlier version, must be
-entered again. Built-in drivers cannot be replaced (`409`). A replacement is
-refused with `409` while an operation the driver ran is still running or has an
-outcome that is not known yet, since its cookie and recovery depend on the
-registration, and with `400` when the driver would no longer target the type of a
-definition that uses it. Deployments use the new registration from their next
+`id` (or with the same `id`), checked the same way. `protocol_version`,
+`cookie_version` and `capabilities` left out keep their current values; a given
+`capabilities` object replaces them, with its own fields' defaults. The schemas
+and a `token` left out are removed. `{value}` writes a new version of the token,
+and the reference the registration holds now, given back unchanged, keeps it;
+any other secret under `drivers/{id}/`, such as an earlier version or one a
+concurrent change replaced, must be entered again (`400`). Built-in drivers
+cannot be replaced (`409`). A replacement is refused with `409` while an
+operation the driver ran is still running or has an outcome that is not known
+yet, since its cookie and recovery depend on the registration, and a
+`cookie_version` change is refused with `409` while the driver has active
+resources, whose cookies are of the current version. It is refused with `400`
+when the driver would no longer target the type of a definition that uses it. Deployments use the new registration from their next
 driver call.
 
 ```http

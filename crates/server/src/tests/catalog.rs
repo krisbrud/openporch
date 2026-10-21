@@ -930,6 +930,24 @@ async fn external_drivers_are_replaced() {
         )
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    // Whatever the body.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/drivers/openporch%2Fecho",
+            Some(&s.admin),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/drivers/openporch%2Fecho",
+            &s.admin,
+            json!({"teleport": true}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
     let (status, b) = s
         .put(
             path,
@@ -976,7 +994,22 @@ async fn external_drivers_are_replaced() {
         .await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert_eq!(b["token"], second, "{b}");
-    assert_eq!(b["cookie_version"], 1, "{b}");
+    // Pins and capabilities left out stay as they are.
+    assert_eq!(b["cookie_version"], 2, "{b}");
+    assert_eq!(b["protocol_version"], "openporch-http/1", "{b}");
+    assert_eq!(b["capabilities"]["recover"], true, "{b}");
+    // A given capabilities object replaces them, with its own defaults.
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v3", "token": second,
+                   "capabilities": {"observe": true}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["capabilities"]["recover"], false, "{b}");
+    assert_eq!(b["cookie_version"], 2, "{b}");
     for token in [
         first.clone(),
         json!({"store": "openporch", "ref": "drivers/acme/vault-db/token"}),
@@ -1074,6 +1107,35 @@ async fn external_drivers_are_replaced() {
         .await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert!(b.get("token").is_none(), "{b}");
+
+    // Active resources hold cookies of the version the driver writes, so it
+    // stays while they exist.
+    s.active_resource("shop", "production", "config.default.shared.vault", "vault")
+        .await;
+    sqlx::query("UPDATE active_resources SET driver_type = 'acme/vault-db'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4", "cookie_version": 3}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(
+        b["message"].as_str().unwrap().contains("shop/production"),
+        "{b}"
+    );
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v5", "cookie_version": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
 
     let (_, page) = s
         .get(
