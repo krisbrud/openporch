@@ -797,6 +797,37 @@ async fn a_reference_whose_grant_was_removed_fails_before_any_driver_call() {
     assert_eq!(f.driver.puts().len(), 1, "the driver was called again");
 }
 
+/// The Store unreachable scenario: a referenced store cannot be read during a
+/// deployment, so the resource fails with an error that names the store and
+/// the reference, not the value, and its driver is not called.
+#[tokio::test]
+async fn an_unreadable_store_fails_the_resource_naming_store_and_reference() {
+    let f = Fixture::new().await;
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "openporch", "ref": "defs/pg/master"}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    // The built-in store's versions can no longer be read.
+    sqlx::query("ALTER TABLE secret_versions RENAME TO secret_versions_away")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, DB);
+    assert!(
+        error.contains("secret `defs/pg/master` in store `openporch` could not be read"),
+        "{error}"
+    );
+    assert!(!error.contains(MASTER), "{error}");
+    assert!(f.driver.puts().is_empty(), "the driver was called");
+    let recorded = f.recorded(&deployment).await;
+    assert!(recorded.contains("defs/pg/master"), "{recorded}");
+    assert!(!recorded.contains(MASTER), "{recorded}");
+}
+
 #[tokio::test]
 async fn a_definition_that_no_longer_matches_does_not_get_its_secrets() {
     let f = Fixture::new().await;

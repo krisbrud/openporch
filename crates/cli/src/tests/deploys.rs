@@ -155,6 +155,66 @@ async fn deploy_and_wait() {
     assert_eq!(deploys(&server).await.len(), 1);
 }
 
+/// The Image function scenario of `workload-spec`: a function whose image
+/// package is `.` is accepted, and deploying it requires
+/// `--image main=<ref>`, the name `--image` gives a workload's function.
+#[tokio::test]
+async fn an_image_function_is_deployed_with_its_image_from_the_command_line() {
+    const IMAGE_FUNCTION: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: api}
+function:
+  package: {type: image, image: .}
+"#;
+    const IMAGE: &str = "111122223333.dkr.ecr.eu-west-1.amazonaws.com/api@sha256:\
+        0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let server = DevServer::start(None).await;
+    let m = deployable(&server, json!({"driver_type": "openporch/none"})).await;
+    let f = file(&m, "workload.yaml", IMAGE_FUNCTION);
+
+    // Without the image, the command fails naming the flag, and nothing is
+    // deployed.
+    let r = m.porch(&["workload", "deploy", "-f", &f], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("--image main="), "{r:?}");
+    assert!(deploys(&server).await.is_empty());
+
+    let r = m
+        .porch(
+            &[
+                "workload",
+                "deploy",
+                "-f",
+                &f,
+                "--image",
+                &format!("main={IMAGE}"),
+                "--wait",
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let d = &deploys(&server).await[0];
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let set = admin_client(&server)
+        .request(
+            Method::GET,
+            &format!(
+                "/orgs/acme/apps/shop/sets/{}",
+                d["set_id"].as_str().unwrap()
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        set["modules"]["api"]["spec"]["function"]["package"],
+        json!({"type": "image", "image": IMAGE}),
+        "{set}"
+    );
+}
+
 /// `--wait` exits non-zero when the deployment fails.
 #[tokio::test]
 async fn waiting_on_a_failed_deployment_fails() {

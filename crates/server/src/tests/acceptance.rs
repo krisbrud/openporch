@@ -154,6 +154,95 @@ async fn every_route_refuses_members_without_its_permission() {
     }
 }
 
+/// Every route that needs a credential, called with none, with another scheme
+/// or with a bearer token that is not one, answers `401` and is not
+/// processed: the organization's state and audit log are as they were.
+#[tokio::test]
+async fn requests_without_a_valid_credential_are_not_processed() {
+    let s = server().await;
+    s.app("shop").await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "dev", "type": "development"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    s.member("ci", "member").await;
+    let reads = [
+        "/orgs/acme/apps",
+        "/orgs/acme/apps/shop",
+        "/orgs/acme/apps/shop/envs",
+        "/orgs/acme/apps/shop/envs/dev",
+        "/orgs/acme/apps/shop/envs/dev/deploys",
+        "/orgs/acme/apps/shop/values",
+        "/orgs/acme/users",
+        "/orgs/acme/users/ci/tokens",
+        "/orgs/acme/env-types",
+        "/orgs/acme/resources/defs",
+        "/orgs/acme/resources/drivers",
+        "/orgs/acme/secretstores",
+        "/orgs/acme/invitations",
+    ];
+    let snapshot = || async {
+        let mut out = Vec::new();
+        for path in reads {
+            let (status, body) = s.get(path, &s.admin).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            out.push(body);
+        }
+        out
+    };
+    let audited = || async { s.state.store.audit_entries("acme", 100_000).await.unwrap() };
+    let before = snapshot().await;
+    let audit_before = audited().await;
+
+    let credentials: [&[(&str, &str)]; 3] = [
+        &[],
+        &[("authorization", "Basic YWRtaW46YWRtaW4=")],
+        &[("authorization", "Bearer opt_not-a-token")],
+    ];
+    let mut refused = 0;
+    for spec in s
+        .specs
+        .iter()
+        .filter(|r| r.permission != Permission::Public)
+    {
+        let path = spec
+            .path
+            .split('/')
+            .map(|seg| match seg {
+                "{org}" => "acme",
+                "{app}" => "shop",
+                "{env}" => "dev",
+                "{user}" => "ci",
+                s if s.starts_with('{') => "x",
+                s => s,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        // A body that would be valid for the most common mutations.
+        let body =
+            (spec.method != Method::GET).then(|| json!({"id": "ghost", "type": "development"}));
+        for headers in credentials {
+            let (status, b) = s
+                .call_with(spec.method.clone(), &path, None, body.clone(), headers)
+                .await;
+            assert_error(status, &b, StatusCode::UNAUTHORIZED, "AUTH-001");
+            refused += 1;
+        }
+    }
+    assert!(refused > 3 * 50, "only {refused} requests were refused");
+
+    assert_eq!(snapshot().await, before);
+    assert_eq!(audited().await.len(), audit_before.len());
+    assert_eq!(
+        s.get("/orgs/acme/apps/ghost", &s.admin).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
 /// `docs/acceptance.md` lists every scenario of every spec with a known status,
 /// and every test it names exists.
 #[test]
