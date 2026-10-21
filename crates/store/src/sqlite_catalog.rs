@@ -209,12 +209,24 @@ pub trait CatalogStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Runs the checks of [`CatalogStore::create_driver`] without changing
-    /// anything, so a request that would be rejected writes no token first.
+    /// Replaces a registered driver's target, token, pins and capabilities. Refused
+    /// while an operation the driver ran has an outcome that is not known yet, and
+    /// when the driver would no longer target the type of a definition using it.
+    fn replace_driver(
+        &self,
+        org: &str,
+        driver: &DriverRecord,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Runs the checks of [`CatalogStore::create_driver`] (`create`) or
+    /// [`CatalogStore::replace_driver`] without changing anything, so a request
+    /// that would be rejected writes no token first.
     fn check_driver(
         &self,
         org: &str,
         driver: &DriverRecord,
+        create: bool,
         actor: Option<&str>,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -453,21 +465,55 @@ pub(crate) async fn check_ref_stores(
     Ok(())
 }
 
-/// Checks that a new driver's ID is free and its token's store is registered.
+/// Checks a driver registration: on `create` that its ID is free, otherwise that
+/// it exists, has no operation of unknown outcome and still targets the types of
+/// the definitions using it; and that its token's store is registered.
 async fn check_driver_record(
     conn: &mut SqliteConnection,
     org: &str,
     driver: &DriverRecord,
+    create: bool,
 ) -> Result<()> {
     let id = driver.id.as_str();
+    if !create && BUILTIN_DRIVERS.contains(&id) {
+        return Err(StoreError::Conflict(format!(
+            "built-in driver `{id}` cannot be modified"
+        )));
+    }
     let taken: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM drivers WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)
             .fetch_optional(&mut *conn)
             .await?;
-    if BUILTIN_DRIVERS.contains(&id) || taken.is_some() {
+    if create && (BUILTIN_DRIVERS.contains(&id) || taken.is_some()) {
         return Err(StoreError::AlreadyExists(format!("driver `{id}`")));
+    }
+    if !create {
+        if taken.is_none() {
+            return Err(StoreError::NotFound(format!("driver `{id}`")));
+        }
+        // Cookies and recovery depend on the registration an operation ran with.
+        check_no_open_operations(conn, org, id).await?;
+        let users: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, type FROM definitions WHERE org_id = ? AND driver_type = ? ORDER BY id",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let uncovered: Vec<String> = users
+            .into_iter()
+            .filter(|(_, ty)| !driver.capabilities.targets.covers(ty))
+            .map(|(def, ty)| format!("`{def}` (`{ty}`)"))
+            .take(5)
+            .collect();
+        if !uncovered.is_empty() {
+            return Err(StoreError::Invalid(format!(
+                "driver `{id}` would no longer provision the types of definitions {} that use it",
+                uncovered.join(", ")
+            )));
+        }
     }
     if let Some(token) = &driver.token {
         let mut inputs = DriverInputs::default();
@@ -476,6 +522,28 @@ async fn check_driver_record(
             serde_json::to_value(token).map_err(|e| corrupt("driver token", e))?,
         );
         check_secret_stores(conn, org, SecretOwner::Driver(id), &inputs).await?;
+    }
+    Ok(())
+}
+
+/// Refuses a change to driver `id` while an operation it ran is still running or
+/// of unknown outcome: such an operation is observed and recovered with the
+/// registration it ran, which may no longer be the one its resource records.
+async fn check_no_open_operations(conn: &mut SqliteConnection, org: &str, id: &str) -> Result<()> {
+    let open: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT app_id || '/' || env_id FROM operations \
+         WHERE org_id = ? AND driver_type = ? AND state IN ('started', 'unknown') \
+         ORDER BY 1 LIMIT 5",
+    )
+    .bind(org)
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !open.is_empty() {
+        return Err(StoreError::Conflict(format!(
+            "driver `{id}` has operations in {} whose outcome is not known yet",
+            open.join(", ")
+        )));
     }
     Ok(())
 }
@@ -980,7 +1048,7 @@ impl CatalogStore for SqliteStore {
         let id = driver.id.as_str();
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
-        check_driver_record(&mut tx, org, driver).await?;
+        check_driver_record(&mut tx, org, driver, true).await?;
         let res = sqlx::query(
             "INSERT INTO drivers (org_id, id, body, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
         )
@@ -1002,16 +1070,42 @@ impl CatalogStore for SqliteStore {
         Ok(())
     }
 
+    async fn replace_driver(
+        &self,
+        org: &str,
+        driver: &DriverRecord,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let id = driver.id.as_str();
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        check_driver_record(&mut tx, org, driver, false).await?;
+        let updated = sqlx::query("UPDATE drivers SET body = ? WHERE org_id = ? AND id = ?")
+            .bind(serde_json::to_string(driver)?)
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("driver `{id}`")));
+        }
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn check_driver(
         &self,
         org: &str,
         driver: &DriverRecord,
+        create: bool,
         actor: Option<&str>,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut conn = self.pool().acquire().await?;
         check_admin_authority(&mut conn, org, actor).await?;
-        check_driver_record(&mut conn, org, driver).await
+        check_driver_record(&mut conn, org, driver, create).await
     }
 
     async fn delete_driver(&self, org: &str, id: &str, audit: AuditIntent) -> Result<()> {
@@ -1046,24 +1140,7 @@ impl CatalogStore for SqliteStore {
                 envs.join(", ")
             )));
         }
-        // An operation still running or of unknown outcome is observed and
-        // recovered with the driver it ran, which may no longer be the one its
-        // resource records.
-        let open: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT app_id || '/' || env_id FROM operations \
-             WHERE org_id = ? AND driver_type = ? AND state IN ('started', 'unknown') \
-             ORDER BY 1 LIMIT 5",
-        )
-        .bind(org)
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
-        if !open.is_empty() {
-            return Err(StoreError::Conflict(format!(
-                "driver `{id}` has operations in {} whose outcome is not known yet",
-                open.join(", ")
-            )));
-        }
+        check_no_open_operations(&mut tx, org, id).await?;
         let deleted = sqlx::query("DELETE FROM drivers WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)

@@ -321,7 +321,8 @@ pub async fn get_driver(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriverBody {
-    id: String,
+    /// Required on create; must match the path on replace.
+    id: Option<String>,
     target: String,
     inputs_schema: Option<Value>,
     /// The bearer token sent to the driver: a reference or `{value}`.
@@ -336,17 +337,15 @@ pub struct DriverBody {
     capabilities: DriverCapabilities,
 }
 
-/// Registers an external driver. The ID is `<namespace>/<name>`, `openporch` is
-/// reserved and the target must be an HTTPS URL without credentials. The
-/// registration pins the protocol and cookie versions and the capabilities.
-pub async fn create_driver(
-    State(state): State<AppState>,
-    ctx: Ctx,
-    JsonBody(body): JsonBody<Value>,
-) -> ApiResult<(StatusCode, Json<DriverView>)> {
-    let body: DriverBody = secret_inputs::parse_body(body)?;
-    let org = state.org();
-    let id = body.id;
+/// Checks a registration body for driver `id` and plans its token. `current` is
+/// the token the registration holds now, which a replacement may keep; no other
+/// secret under `drivers/{id}/` may be referenced. Error messages never show the
+/// token's value.
+fn plan_driver(
+    id: &str,
+    body: DriverBody,
+    current: Option<&SecretRef>,
+) -> ApiResult<(DriverRecord, Option<PlannedSecret>)> {
     let valid = id
         .split_once('/')
         .is_some_and(|(ns, name)| ids::is_valid_object_id(ns) && ids::is_valid_object_id(name));
@@ -404,17 +403,20 @@ pub async fn create_driver(
         .transpose()?;
     // A driver's own secrets are written by its registration. One left by an
     // earlier registration under the same ID belongs to that driver, and must
-    // not reach a new target without being entered again.
+    // not reach a new target without being entered again. A replacement may
+    // keep the token it holds, exactly as it is.
     if let Some(r) = token.as_ref().and_then(|t| t.reference())
         && r.store == openporch_store::secrets::BUILTIN_STORE
         && r.reference.starts_with(&format!("drivers/{id}/"))
+        && current != Some(r)
     {
         return Err(ApiError::invalid(
-            "`token` must not reference this driver's own secrets; give the token as `{value}`",
+            "`token` must not reference this driver's own secrets other than the token it \
+             holds now; give the token as `{value}`",
         ));
     }
-    let mut record = DriverRecord {
-        id: id.clone(),
+    let record = DriverRecord {
+        id: id.to_owned(),
         target: target.to_string(),
         inputs_schema: body.inputs_schema,
         token: token.as_ref().and_then(|t| t.reference().cloned()),
@@ -423,23 +425,40 @@ pub async fn create_driver(
         outputs_schema: body.outputs_schema,
         capabilities: body.capabilities,
     };
-    // Check everything before a token is written; the store checks again with
-    // the change, and a token written for a rejected registration is discarded.
+    Ok((record, token))
+}
+
+/// Writes a `{value}` token as a new version of `drivers/{id}/token` and creates
+/// or replaces the registration. Everything is checked before the token is
+/// written; the store checks again with the change, and a token written for a
+/// rejected registration is discarded.
+async fn write_driver(
+    state: &AppState,
+    ctx: &Ctx,
+    mut record: DriverRecord,
+    token: Option<PlannedSecret>,
+    create: bool,
+) -> ApiResult<DriverRecord> {
+    let org = state.org();
+    let id = record.id.clone();
     state
         .store
-        .check_driver(org, &record, Some(&ctx.principal.id))
+        .check_driver(org, &record, create, Some(&ctx.principal.id))
         .await?;
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::primary(state)?;
     let mut written = Vec::new();
     let result = async {
         if let Some(t) = token {
             let name = format!("drivers/{id}/token");
             record.token = Some(t.materialize(&primary, &name, &mut written).await?);
         }
-        state
-            .store
-            .create_driver(org, &record, ctx.audit(org, "driver.create", &id))
-            .await?;
+        if create {
+            let audit = ctx.audit(org, "driver.create", &id);
+            state.store.create_driver(org, &record, audit).await?;
+        } else {
+            let audit = ctx.audit(org, "driver.update", &id);
+            state.store.replace_driver(org, &record, audit).await?;
+        }
         Ok::<_, ApiError>(())
     }
     .await;
@@ -447,7 +466,55 @@ pub async fn create_driver(
         secret_inputs::discard(&primary, written).await;
         return Err(e);
     }
+    Ok(record)
+}
+
+/// Registers an external driver. The ID is `<namespace>/<name>`, `openporch` is
+/// reserved and the target must be an HTTPS URL without credentials. The
+/// registration pins the protocol and cookie versions and the capabilities.
+pub async fn create_driver(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody<Value>,
+) -> ApiResult<(StatusCode, Json<DriverView>)> {
+    let mut body: DriverBody = secret_inputs::parse_body(body)?;
+    let id = body
+        .id
+        .take()
+        .ok_or_else(|| ApiError::invalid("`id` is required"))?;
+    let (record, token) = plan_driver(&id, body, None)?;
+    let record = write_driver(&state, &ctx, record, token, true).await?;
     Ok((StatusCode::CREATED, Json(record.into())))
+}
+
+/// Replaces an external driver's registration: its target, token, pins and
+/// capabilities, checked like a new one. The token it holds is kept when given
+/// back as its reference, and `{value}` writes a new version. Refused while an
+/// operation the driver ran has an outcome that is not known yet, or when the
+/// driver would no longer target the type of a definition using it.
+pub async fn replace_driver(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, id)): Path<(String, String)>,
+    JsonBody(body): JsonBody<Value>,
+) -> ApiResult<Json<DriverView>> {
+    let mut body: DriverBody = secret_inputs::parse_body(body)?;
+    if BUILTIN_DRIVERS.contains(&id.as_str()) {
+        return Err(ApiError::conflict(format!(
+            "built-in driver `{id}` cannot be modified"
+        )));
+    }
+    if body.id.take().is_some_and(|b| b != id) {
+        return Err(ApiError::invalid("`id` cannot be changed"));
+    }
+    let current = state
+        .store
+        .driver(state.org(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("driver `{id}` not found")))?;
+    let (record, token) = plan_driver(&id, body, current.token.as_ref())?;
+    let record = write_driver(&state, &ctx, record, token, false).await?;
+    Ok(Json(record.into()))
 }
 
 pub async fn delete_driver(

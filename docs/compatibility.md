@@ -61,6 +61,9 @@ The provider and the server are released together. A provider talks to a
 server of the same release; a newer provider can send attributes an older
 server does not know, which the server refuses with `400`. For example,
 `openporch_environment_type.protected` needs a server with schema 9 or later.
+Likewise, `openporch_driver` needs a server with
+`PUT /orgs/{org}/resources/drivers/{driver}`, which an older server does not
+have, so its changes are refused there; registering and deleting drivers work.
 
 Integrations planned for later milestones are not available in this release:
 Kubernetes and EKS targets, AWS Secrets Manager and SSM secret stores, generic

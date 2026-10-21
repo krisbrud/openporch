@@ -25,6 +25,7 @@ in `examples/`. It offers these resources, each importable, and the
 | `openporch_environment_type_user` | `TYPE/USER` |
 | `openporch_resource_definition` | `DEFINITION` |
 | `openporch_resource_definition_criteria` | `DEFINITION/CRITERION` |
+| `openporch_driver` (external HTTP drivers) | `NAMESPACE/NAME` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
@@ -66,13 +67,14 @@ resource "openporch_resource_definition_criteria" "staging" {
 
 ## Secrets
 
-`openporch_value`, `openporch_cloud_account` and
-`openporch_resource_definition` take secrets in two ways. A
-secret value (`secret_value`, or an entry of `secrets` or `driver_secrets`) is
+`openporch_value`, `openporch_cloud_account`, `openporch_resource_definition`
+and `openporch_driver` take secrets in two ways. A secret value
+(`secret_value`, `token`, or an entry of `secrets` or `driver_secrets`) is
 written to the built-in store, and the server keeps only a reference to it,
-which the provider records in `written_secret_ref(s)`. A reference
-(`secret_ref`, or an entry of `secret_refs` or `driver_secret_refs`) points at a
-secret already in a store. In `driver_secrets`, a whole placeholder such as
+which the provider records in `written_secret_ref(s)` or `written_token_ref`.
+A reference (`secret_ref`, `token_ref`, or an entry of `secret_refs` or
+`driver_secret_refs`) points at a secret already in a store. In
+`driver_secrets`, a whole placeholder such as
 `$${resources.db.outputs.password}` is not a value: it stays a template that the
 executor resolves at deployment.
 

@@ -49,6 +49,7 @@ cat >"$work/examples/variables.tf" <<'TF'
 variable "payment_api_key" { sensitive = true }
 variable "aws_secret_access_key" { sensitive = true }
 variable "redis_auth_token" { sensitive = true }
+variable "driver_token" { sensitive = true }
 TF
 (cd "$work/examples" && tofu validate -no-color)
 
