@@ -1183,6 +1183,120 @@ async fn external_drivers_are_replaced() {
     assert!(!page.to_string().contains("s3cret"), "{page}");
 }
 
+/// The Actor recorded scenario: a definition names the service user that
+/// created it.
+#[tokio::test]
+async fn a_definition_records_the_service_user_that_created_it() {
+    let s = server().await;
+    let ci = s.member("ci", "administrator").await;
+    let (status, created) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &ci,
+            json!({"id": "dns", "type": "dns", "driver_type": "openporch/echo"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["created_by"], "ci", "{created}");
+    let (_, read) = s.get("/orgs/acme/resources/defs/dns", &s.admin).await;
+    assert_eq!(read["created_by"], "ci", "{read}");
+    let (_, list) = s.get("/orgs/acme/resources/defs", &s.admin).await;
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == "dns")
+        .unwrap();
+    assert_eq!(listed["created_by"], "ci", "{listed}");
+}
+
+/// The Incompatible cookie upgrade scenario: a driver whose cookie version
+/// changes cannot read the cookies its active resources hold, so the change
+/// is refused naming their GUResIDs, and the registration and the resources'
+/// management metadata stay as they were.
+#[tokio::test]
+async fn a_cookie_version_change_is_refused_while_resources_hold_cookies() {
+    let s = server().await;
+    let path = "/orgs/acme/resources/drivers/acme%2Fvault-db";
+    s.created(
+        "/orgs/acme/resources/drivers",
+        json!({"id": "acme/vault-db", "target": "https://drivers.acme.example/vault-db",
+               "token": {"value": "first-s3cret"}, "capabilities": {"observe": true}}),
+    )
+    .await;
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "vault", "type": "config", "driver_type": "acme/vault-db"}),
+    )
+    .await;
+    let (_, registered) = s.get(path, &s.admin).await;
+    assert_eq!(registered["cookie_version"], 1, "{registered}");
+    s.active_resource("shop", "production", "config.default.shared.vault", "vault")
+        .await;
+    sqlx::query(
+        "UPDATE active_resources SET driver_type = 'acme/vault-db', cookie_key_id = 'k1', \
+         cookie_nonce = X'00', cookie = X'0102030405', recovery = '{\"note\": 1}'",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let metadata = || async {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<Vec<u8>>,
+                String,
+                String,
+            ),
+        >(
+            "SELECT guresid, driver_type, cookie_key_id, cookie, recovery, status \
+             FROM active_resources",
+        )
+        .fetch_all(s.state.store.pool())
+        .await
+        .unwrap()
+    };
+    let before = metadata().await;
+
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v2", "token": registered["token"],
+                   "cookie_version": 2}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let message = b["message"].as_str().unwrap();
+    assert!(
+        message.contains("`shop-production-vault` (shop/production)"),
+        "{b}"
+    );
+    assert!(!b.to_string().contains("s3cret"), "{b}");
+    // Nothing changed: not the registration, not the resources.
+    assert_eq!(s.get(path, &s.admin).await.1, registered);
+    assert_eq!(metadata().await, before);
+
+    // Without active resources holding its cookies, the version may change.
+    sqlx::query("DELETE FROM active_resources")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v2", "token": registered["token"],
+                   "cookie_version": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["cookie_version"], 2, "{b}");
+}
+
 #[tokio::test]
 async fn catalog_changes_are_audited() {
     let s = server().await;
