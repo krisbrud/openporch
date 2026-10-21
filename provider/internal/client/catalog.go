@@ -152,3 +152,73 @@ func (c *Client) Account(ctx context.Context, id string) (*Account, error) {
 func (c *Client) DeleteAccount(ctx context.Context, id string) error {
 	return c.Do(ctx, http.MethodDelete, c.OrgPath("resources", "accounts", id), nil, nil)
 }
+
+// DriverTargets says what an external driver provisions.
+type DriverTargets struct {
+	Resources bool `json:"resources"`
+	Workloads bool `json:"workloads"`
+	Triggers  bool `json:"triggers"`
+}
+
+// DriverCapabilities are what an external driver supports beyond provisioning
+// and removing resources.
+type DriverCapabilities struct {
+	Targets DriverTargets `json:"targets"`
+	Observe bool          `json:"observe"`
+	Recover bool          `json:"recover"`
+	Preview bool          `json:"preview"`
+	Cancel  bool          `json:"cancel"`
+}
+
+// Driver is a driver registration. Built-in drivers have only an ID.
+type Driver struct {
+	ID              string              `json:"id"`
+	Builtin         bool                `json:"builtin"`
+	Target          string              `json:"target"`
+	InputsSchema    map[string]any      `json:"inputs_schema,omitempty"`
+	Token           *SecretRef          `json:"token,omitempty"`
+	ProtocolVersion string              `json:"protocol_version"`
+	CookieVersion   int64               `json:"cookie_version"`
+	OutputsSchema   map[string]any      `json:"outputs_schema,omitempty"`
+	Capabilities    *DriverCapabilities `json:"capabilities,omitempty"`
+}
+
+// DriverWrite is the body that registers or replaces an external driver. Fields
+// left out take the server's defaults; Capabilities holds only the fields set.
+type DriverWrite struct {
+	ID              string         `json:"id,omitempty"`
+	Target          string         `json:"target"`
+	InputsSchema    any            `json:"inputs_schema,omitempty"`
+	Token           *SecretWrite   `json:"token,omitempty"`
+	ProtocolVersion string         `json:"protocol_version,omitempty"`
+	CookieVersion   *int64         `json:"cookie_version,omitempty"`
+	OutputsSchema   any            `json:"outputs_schema,omitempty"`
+	Capabilities    map[string]any `json:"capabilities,omitempty"`
+}
+
+// CreateDriver registers an external driver.
+func (c *Client) CreateDriver(ctx context.Context, body DriverWrite) (*Driver, error) {
+	var d Driver
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("resources", "drivers"), body, &d)
+	return &d, err
+}
+
+// ReplaceDriver replaces an external driver's registration.
+func (c *Client) ReplaceDriver(ctx context.Context, id string, body DriverWrite) (*Driver, error) {
+	var d Driver
+	body.ID = ""
+	err := c.Do(ctx, http.MethodPut, c.OrgPath("resources", "drivers", id), body, &d)
+	return &d, err
+}
+
+// Driver reads a driver, built-in or registered.
+func (c *Client) Driver(ctx context.Context, id string) (*Driver, error) {
+	var d Driver
+	err := c.Do(ctx, http.MethodGet, c.OrgPath("resources", "drivers", id), nil, &d)
+	return &d, err
+}
+
+// DeleteDriver deletes an external driver nothing uses.
+func (c *Client) DeleteDriver(ctx context.Context, id string) error {
+	return c.Do(ctx, http.MethodDelete, c.OrgPath("resources", "drivers", id), nil, nil)
+}

@@ -417,3 +417,166 @@ resource "openporch_cloud_account" "role" {
 		},
 	})
 }
+
+func driverVersion(t *testing.T, c *client.Client, id string) string {
+	t.Helper()
+	d, err := c.Driver(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Token == nil {
+		return ""
+	}
+	return d.Token.Version
+}
+
+func TestAccDriver(t *testing.T) {
+	c := apiClient(t)
+	id := "acc/" + randomID("driver")
+	defID := randomID("acc-def")
+	config := func(target, token string) string {
+		return fmt.Sprintf(`
+resource "openporch_driver" "d" {
+  id     = %q
+  target = %q
+  token  = %q
+  inputs_schema = {
+    type     = "object"
+    required = ["path"]
+  }
+  capabilities = {
+    observe = true
+  }
+}
+
+# A definition that uses the driver stays through token and target changes.
+resource "openporch_resource_definition" "d" {
+  id          = %q
+  type        = "config"
+  driver_type = openporch_driver.d.id
+}
+`, id, target, token, defID)
+	}
+	written := func(version string) statecheck.StateCheck {
+		return statecheck.ExpectKnownValue("openporch_driver.d",
+			tfjsonpath.New("written_token_ref").AtMapKey("version"), knownvalue.StringExact(version))
+	}
+	updated := []plancheck.PlanCheck{
+		plancheck.ExpectResourceAction("openporch_driver.d", plancheck.ResourceActionUpdate),
+		plancheck.ExpectResourceAction("openporch_resource_definition.d", plancheck.ResourceActionNoop),
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		CheckDestroy: func(*terraform.State) error {
+			if _, err := c.Driver(context.Background(), id); !client.IsNotFound(err) {
+				return fmt.Errorf("driver %s still exists: %v", id, err)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				// The server normalizes the target, resolving dot segments Go does not;
+				// the configured one is kept.
+				Config: config("https://Drivers.ACME.example:443/a/../vault", "first-token"),
+				ConfigStateChecks: []statecheck.StateCheck{
+					written("1"),
+					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("target"),
+						knownvalue.StringExact("https://Drivers.ACME.example:443/a/../vault")),
+					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("protocol_version"),
+						knownvalue.StringExact("openporch-http/1")),
+					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("cookie_version"),
+						knownvalue.Int64Exact(1)),
+					statecheck.ExpectKnownValue("openporch_driver.d",
+						tfjsonpath.New("capabilities").AtMapKey("targets").AtMapKey("resources"), knownvalue.Bool(true)),
+					statecheck.ExpectKnownValue("openporch_driver.d",
+						tfjsonpath.New("capabilities").AtMapKey("observe"), knownvalue.Bool(true)),
+				},
+			},
+			{
+				// A new token is a new version, written in place.
+				Config: config("https://Drivers.ACME.example:443/a/../vault", "second-token"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: append([]plancheck.PlanCheck{
+						plancheck.ExpectUnknownValue("openporch_driver.d", tfjsonpath.New("written_token_ref")),
+					}, updated...),
+				},
+				ConfigStateChecks: []statecheck.StateCheck{written("2")},
+			},
+			{
+				// The target moves in place and the token keeps its version.
+				Config: config("https://drivers-v2.acme.example/vault", "second-token"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: updated,
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					written("2"),
+					statecheck.ExpectKnownValue("openporch_driver.d", tfjsonpath.New("target"),
+						knownvalue.StringExact("https://drivers-v2.acme.example/vault")),
+				},
+			},
+			{
+				// A token written outside OpenTofu is written again.
+				PreConfig: func() {
+					other := "changed-elsewhere"
+					_, err := c.ReplaceDriver(context.Background(), id, client.DriverWrite{
+						Target: "https://drivers-v2.acme.example/vault",
+						Token:  &client.SecretWrite{Value: &other},
+						InputsSchema: map[string]any{
+							"type": "object", "required": []string{"path"},
+						},
+						Capabilities: map[string]any{"observe": true},
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if v := driverVersion(t, c, id); v != "3" {
+						t.Fatalf("version %s after the outside write, want 3", v)
+					}
+				},
+				Config: config("https://drivers-v2.acme.example/vault", "second-token"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: updated,
+				},
+				ConfigStateChecks: []statecheck.StateCheck{written("4")},
+			},
+			{
+				// The token is imported as its reference.
+				ResourceName:            "openporch_driver.d",
+				ImportState:             true,
+				ImportStateId:           id,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"token", "token_ref", "written_token_ref"},
+			},
+			{
+				// A reference to an earlier version of the driver's own token
+				// cannot be fixed by a refresh, and the error says so.
+				Config: fmt.Sprintf(`
+resource "openporch_driver" "d" {
+  id     = %q
+  target = "https://drivers-v2.acme.example/vault"
+  token_ref = {
+    store   = "openporch"
+    ref     = "drivers/%s/token"
+    version = "1"
+  }
+  inputs_schema = {
+    type     = "object"
+    required = ["path"]
+  }
+  capabilities = {
+    observe = true
+  }
+}
+
+resource "openporch_resource_definition" "d" {
+  id          = %q
+  type        = "config"
+  driver_type = openporch_driver.d.id
+}
+`, id, id, defID),
+				ExpectError: regexp.MustCompile("Update `token_ref` to the driver's current token"),
+			},
+		},
+	})
+}

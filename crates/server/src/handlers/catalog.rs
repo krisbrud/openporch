@@ -16,7 +16,8 @@ use openporch_core::catalog::{
 use openporch_core::ids::{self, ClassId, ResourceTypeId};
 use openporch_core::model::{Criterion, DriverInputs, Provision, ResourceDefinition, SecretRef};
 use openporch_store::{
-    CatalogStore, DefinitionRecord, DefinitionUpdate, DriverCapabilities, DriverRecord,
+    CatalogStore, DefinitionRecord, DefinitionUpdate, DriverCapabilities, DriverChange,
+    DriverRecord,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -321,32 +322,34 @@ pub async fn get_driver(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriverBody {
-    id: String,
+    /// Required on create; must match the path on replace.
+    id: Option<String>,
     target: String,
     inputs_schema: Option<Value>,
     /// The bearer token sent to the driver: a reference or `{value}`.
     token: Option<Value>,
-    /// The protocol the driver speaks; `openporch-http/1` when left out.
+    /// The protocol the driver speaks; when left out, `openporch-http/1` on
+    /// create and the stored one on replace.
     protocol_version: Option<String>,
-    /// The cookie format version the driver writes; `1` when left out.
+    /// The cookie format version the driver writes; when left out, `1` on
+    /// create and the stored one on replace.
     cookie_version: Option<u32>,
     outputs_schema: Option<Value>,
-    /// The optional capabilities; none when left out.
-    #[serde(default)]
-    capabilities: DriverCapabilities,
+    /// The optional capabilities; when left out, none on create and the stored
+    /// ones on replace. Fields left out of a given object take their defaults.
+    capabilities: Option<DriverCapabilities>,
 }
 
-/// Registers an external driver. The ID is `<namespace>/<name>`, `openporch` is
-/// reserved and the target must be an HTTPS URL without credentials. The
-/// registration pins the protocol and cookie versions and the capabilities.
-pub async fn create_driver(
-    State(state): State<AppState>,
-    ctx: Ctx,
-    JsonBody(body): JsonBody<Value>,
-) -> ApiResult<(StatusCode, Json<DriverView>)> {
-    let body: DriverBody = secret_inputs::parse_body(body)?;
-    let org = state.org();
-    let id = body.id;
+/// Checks a registration body for driver `id` and plans its token. `current` is
+/// the registration a replacement replaces: its pins and capabilities stay when
+/// the body leaves them out, and its token may be kept; no other secret under
+/// `drivers/{id}/` may be referenced. Error messages never show the token's
+/// value.
+fn plan_driver(
+    id: &str,
+    body: DriverBody,
+    current: Option<&DriverRecord>,
+) -> ApiResult<(DriverRecord, Option<PlannedSecret>)> {
     let valid = id
         .split_once('/')
         .is_some_and(|(ns, name)| ids::is_valid_object_id(ns) && ids::is_valid_object_id(name));
@@ -382,6 +385,7 @@ pub async fn create_driver(
     }
     let protocol_version = body
         .protocol_version
+        .or_else(|| current.map(|c| c.protocol_version.clone()))
         .unwrap_or_else(|| openporch_drivers::PROTOCOL_VERSION.to_owned());
     if protocol_version != openporch_drivers::PROTOCOL_VERSION {
         return Err(ApiError::invalid(format!(
@@ -391,7 +395,11 @@ pub async fn create_driver(
     }
     // The protocol has no preview call, so a driver claiming one would make
     // previews promise what deployments cannot check.
-    if body.capabilities.preview {
+    let capabilities = body
+        .capabilities
+        .or_else(|| current.map(|c| c.capabilities))
+        .unwrap_or_default();
+    if capabilities.preview {
         return Err(ApiError::invalid(format!(
             "`capabilities.preview` must be false: `{}` has no preview call",
             openporch_drivers::PROTOCOL_VERSION
@@ -404,42 +412,77 @@ pub async fn create_driver(
         .transpose()?;
     // A driver's own secrets are written by its registration. One left by an
     // earlier registration under the same ID belongs to that driver, and must
-    // not reach a new target without being entered again.
+    // not reach a new target without being entered again. A replacement may
+    // keep the token it holds, exactly as it is.
     if let Some(r) = token.as_ref().and_then(|t| t.reference())
         && r.store == openporch_store::secrets::BUILTIN_STORE
         && r.reference.starts_with(&format!("drivers/{id}/"))
+        && current.and_then(|c| c.token.as_ref()) != Some(r)
     {
         return Err(ApiError::invalid(
-            "`token` must not reference this driver's own secrets; give the token as `{value}`",
+            "`token` must not reference this driver's own secrets other than the token it \
+             holds now; give the token as `{value}`",
         ));
     }
-    let mut record = DriverRecord {
-        id: id.clone(),
+    let record = DriverRecord {
+        id: id.to_owned(),
         target: target.to_string(),
         inputs_schema: body.inputs_schema,
         token: token.as_ref().and_then(|t| t.reference().cloned()),
         protocol_version,
-        cookie_version: body.cookie_version.unwrap_or(1),
+        cookie_version: body
+            .cookie_version
+            .or_else(|| current.map(|c| c.cookie_version))
+            .unwrap_or(1),
         outputs_schema: body.outputs_schema,
-        capabilities: body.capabilities,
+        capabilities,
     };
-    // Check everything before a token is written; the store checks again with
-    // the change, and a token written for a rejected registration is discarded.
+    Ok((record, token))
+}
+
+/// Writes a `{value}` token as a new version of `drivers/{id}/token` and creates
+/// or replaces the registration. Everything is checked before the token is
+/// written; the store checks again with the change, and a token written for a
+/// rejected registration is discarded.
+async fn write_driver(
+    state: &AppState,
+    ctx: &Ctx,
+    mut record: DriverRecord,
+    token: Option<PlannedSecret>,
+    based_on: Option<&DriverRecord>,
+) -> ApiResult<DriverRecord> {
+    let org = state.org();
+    let id = record.id.clone();
+    // A replacement names the registration it was built from, so the store
+    // refuses it when that changed in the meantime.
+    let change = match based_on {
+        None => DriverChange::Create,
+        Some(based_on) => DriverChange::Replace { based_on },
+    };
     state
         .store
-        .check_driver(org, &record, Some(&ctx.principal.id))
+        .check_driver(org, &record, change, Some(&ctx.principal.id))
         .await?;
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::primary(state)?;
     let mut written = Vec::new();
     let result = async {
         if let Some(t) = token {
             let name = format!("drivers/{id}/token");
             record.token = Some(t.materialize(&primary, &name, &mut written).await?);
         }
-        state
-            .store
-            .create_driver(org, &record, ctx.audit(org, "driver.create", &id))
-            .await?;
+        match based_on {
+            None => {
+                let audit = ctx.audit(org, "driver.create", &id);
+                state.store.create_driver(org, &record, audit).await?;
+            }
+            Some(based_on) => {
+                let audit = ctx.audit(org, "driver.update", &id);
+                state
+                    .store
+                    .replace_driver(org, &record, based_on, audit)
+                    .await?;
+            }
+        }
         Ok::<_, ApiError>(())
     }
     .await;
@@ -447,7 +490,58 @@ pub async fn create_driver(
         secret_inputs::discard(&primary, written).await;
         return Err(e);
     }
+    Ok(record)
+}
+
+/// Registers an external driver. The ID is `<namespace>/<name>`, `openporch` is
+/// reserved and the target must be an HTTPS URL without credentials. The
+/// registration pins the protocol and cookie versions and the capabilities.
+pub async fn create_driver(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    JsonBody(body): JsonBody<Value>,
+) -> ApiResult<(StatusCode, Json<DriverView>)> {
+    let mut body: DriverBody = secret_inputs::parse_body(body)?;
+    let id = body
+        .id
+        .take()
+        .ok_or_else(|| ApiError::invalid("`id` is required"))?;
+    let (record, token) = plan_driver(&id, body, None)?;
+    let record = write_driver(&state, &ctx, record, token, None).await?;
     Ok((StatusCode::CREATED, Json(record.into())))
+}
+
+/// Replaces an external driver's registration: its target, token, pins and
+/// capabilities, checked like a new one. Pins and capabilities left out stay as
+/// they are. The token it holds is kept when given
+/// back as its reference, and `{value}` writes a new version. Refused while an
+/// operation the driver ran has an outcome that is not known yet, or when the
+/// driver would no longer target the type of a definition using it.
+pub async fn replace_driver(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, id)): Path<(String, String)>,
+    body: Result<JsonBody<Value>, ApiError>,
+) -> ApiResult<Json<DriverView>> {
+    // Before the body, so any request for a built-in driver gets `409`.
+    if BUILTIN_DRIVERS.contains(&id.as_str()) {
+        return Err(ApiError::conflict(format!(
+            "built-in driver `{id}` cannot be modified"
+        )));
+    }
+    let JsonBody(body) = body?;
+    let mut body: DriverBody = secret_inputs::parse_body(body)?;
+    if body.id.take().is_some_and(|b| b != id) {
+        return Err(ApiError::invalid("`id` cannot be changed"));
+    }
+    let current = state
+        .store
+        .driver(state.org(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("driver `{id}` not found")))?;
+    let (record, token) = plan_driver(&id, body, Some(&current))?;
+    let record = write_driver(&state, &ctx, record, token, Some(&current)).await?;
+    Ok(Json(record.into()))
 }
 
 pub async fn delete_driver(

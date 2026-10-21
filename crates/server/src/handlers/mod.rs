@@ -547,6 +547,12 @@ pub fn api(state: AppState) -> Api {
             catalog::get_driver,
         )
         .route(
+            put(),
+            "/orgs/{org}/resources/drivers/{driver}",
+            Org(OrgPerm::Administer),
+            catalog::replace_driver,
+        )
+        .route(
             delete(),
             "/orgs/{org}/resources/drivers/{driver}",
             Org(OrgPerm::Administer),

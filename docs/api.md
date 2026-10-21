@@ -1277,6 +1277,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/resources/drivers` | org read |
 | POST | `/orgs/{org}/resources/drivers` | administer |
 | GET | `/orgs/{org}/resources/drivers/{driver}` | org read |
+| PUT | `/orgs/{org}/resources/drivers/{driver}` | administer |
 | DELETE | `/orgs/{org}/resources/drivers/{driver}` | administer |
 
 The built-in drivers are `openporch/echo`, `openporch/none`, `openporch/template`
@@ -1345,6 +1346,49 @@ Authorization: Bearer $ADMIN_TOKEN
   "builtin": false,
   "target": "https://drivers.acme.example/vault-db",
   "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
+}
+```
+
+`PUT` replaces a registration in place, so a new token or target does not mean
+deleting the definitions that use the driver. It takes the body of `POST` without
+`id` (or with the same `id`), checked the same way. `protocol_version`,
+`cookie_version` and `capabilities` left out keep their current values; a given
+`capabilities` object replaces them, with its own fields' defaults. The schemas
+and a `token` left out are removed. `{value}` writes a new version of the token,
+and the reference the registration holds now, given back unchanged, keeps it;
+any other secret under `drivers/{id}/`, such as an earlier version, must be
+entered again (`400`). A registration changed by another request while this one
+was handled is not overwritten: the request is refused with `409`, to be retried. Built-in drivers
+cannot be replaced (`409`). A replacement is refused with `409` while an
+operation the driver ran is still running or has an outcome that is not known
+yet, since its cookie and recovery depend on the registration, and a
+`cookie_version` change is refused with `409` while the driver has active
+resources, whose cookies are of the current version; the error names their
+GUResIDs, the first ten and a count of the rest. It is refused with `400`
+when the driver would no longer target the type of a definition that uses it. Deployments use the new registration from their next
+driver call.
+
+```http
+PUT /orgs/acme/resources/drivers/acme%2Fvault-db
+Authorization: Bearer $ADMIN_TOKEN
+
+{"target": "https://drivers-v2.acme.example/vault-db", "token": {"value": "drv_93ac"}, "capabilities": {"observe": true}}
+```
+
+```http-response
+200 OK
+
+{
+  "id": "acme/vault-db",
+  "builtin": false,
+  "target": "https://drivers-v2.acme.example/vault-db",
+  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "2"},
   "protocol_version": "openporch-http/1",
   "cookie_version": 1,
   "capabilities": {
