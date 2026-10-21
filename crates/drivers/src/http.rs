@@ -206,6 +206,11 @@ impl HttpDriver {
         };
         let status = res.status();
         let headers = res.headers().clone();
+        let cookie = headers
+            .get(SET_COOKIE_HEADER)
+            .map(|v| parse_cookie(v.as_bytes()));
+        // A cookie that arrived is kept even with a response rejected below.
+        let arrived = cookie.clone().flatten();
         if let Some(version) = headers.get(PROTOCOL_HEADER)
             && version.as_bytes() != PROTOCOL_VERSION.as_bytes()
         {
@@ -220,11 +225,12 @@ impl HttpDriver {
                     code: None,
                     message,
                 }
-            });
+            }
+            .with_cookie(arrived));
         }
-        let cookie = match headers.get(SET_COOKIE_HEADER) {
+        let cookie = match cookie {
             None => None,
-            Some(v) => Some(parse_cookie(v.as_bytes()).ok_or_else(|| {
+            Some(parsed) => Some(parsed.ok_or_else(|| {
                 DriverError::Uncertain("the driver returned a malformed cookie".into())
             })?),
         };

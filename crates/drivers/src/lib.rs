@@ -49,7 +49,8 @@ pub fn check_definition_inputs(
     }
 }
 pub use run::{
-    DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, converge, remove, with_timeout,
+    DEFAULT_TIMEOUT, MAX_TIMEOUT, Settled, call_timeout, check_cookie, converge, remove,
+    with_timeout,
 };
 pub use template::Template;
 

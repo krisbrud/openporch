@@ -363,14 +363,32 @@ async fn duplicate_put_recovers_the_same_object() {
 #[tokio::test]
 async fn an_unreadable_mutation_response_keeps_its_cookie() {
     let new = Cookie::new(1, "op-2").unwrap();
-    for call in ["put", "delete"] {
-        let mock = Shared::default();
-        mock.lock().unwrap().queue.push_back(Canned {
+    let cookie = || {
+        (
+            "set-openporch-driver-cookie".to_owned(),
+            "1.b3AtMg".to_owned(),
+        )
+    };
+    let replies = [
+        // Larger than a response may be.
+        Canned {
             status: 200,
-            headers: BTreeMap::from([("set-openporch-driver-cookie".into(), "1.b3AtMg".into())]),
-            // Larger than a response may be.
+            headers: BTreeMap::from([cookie()]),
             body: Some(json!({"padding": "x".repeat(5 << 20)})),
-        });
+        },
+        // In another protocol.
+        Canned {
+            status: 200,
+            headers: BTreeMap::from([cookie(), ("openporch-protocol".into(), "99".into())]),
+            body: Some(json!({})),
+        },
+    ];
+    for (call, reply) in ["put", "delete"]
+        .into_iter()
+        .flat_map(|call| replies.iter().map(move |r| (call, r)))
+    {
+        let mock = Shared::default();
+        mock.lock().unwrap().queue.push_back(reply.clone());
         let target = serve(mock.clone()).await;
         let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
         let req = request(Some(Cookie::new(1, "op-1").unwrap()));

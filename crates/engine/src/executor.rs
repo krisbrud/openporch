@@ -17,8 +17,8 @@ use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
     Action, Cookie, Driver, DriverContext, DriverError, DriverOutputs, DriverRegistry,
-    DriverRequest, Observation, Operation, Plan, SecretMap, call_timeout, converge, remove,
-    with_timeout,
+    DriverRequest, Observation, Operation, Plan, SecretMap, call_timeout, check_cookie, converge,
+    remove, with_timeout,
 };
 use openporch_store::secrets::{Keyring, Sealed, SecretError, SecretStore, SecretValue};
 use openporch_store::{AccountStore, CatalogStore, SecretOwner, SecretUseStore, StoreError};
@@ -645,15 +645,15 @@ where
         job: &ProvisionJob,
         deleting: bool,
         log: &mut RedactingLog,
-    ) -> Result<Observing, ExecFailure> {
+    ) -> Observing {
         if let Some(driver) = self.drivers.get(&job.driver_type)
             && !driver.info().capabilities.observe
         {
-            return Ok(Observed::Unknown(format!(
+            return Observed::Unknown(format!(
                 "driver `{}` cannot observe resources",
                 job.driver_type
             ))
-            .into());
+            .into();
         }
         let sources = if job.inputs.sources.is_empty() {
             inferred_sources(job)
@@ -668,14 +668,24 @@ where
             req,
             timeout,
             target,
-        } = self.request(job, &sources, false, log).await?;
-        let observation =
-            with_timeout(timeout, driver.get(&req))
-                .await
-                .map_err(|e| ExecFailure::Retryable {
-                    error: format!("the resource could not be observed: {e}"),
-                    retry_after: None,
-                })?;
+        } = match self.request(job, &sources, false, log).await {
+            Ok(call) => call,
+            Err(e) => return Err(e).into(),
+        };
+        let observation = match with_timeout(timeout, driver.get(&req)).await {
+            Ok(observation) => observation,
+            // A cookie that came with the failure is kept all the same.
+            Err(e) => {
+                let (e, cookie) = e.split();
+                return Observing {
+                    result: Err(ExecFailure::Retryable {
+                        error: format!("the resource could not be observed: {e}"),
+                        retry_after: None,
+                    }),
+                    cookie: self.observed_cookie(job, &req, driver.as_ref(), cookie),
+                };
+            }
+        };
         let repeatable = driver.info().capabilities.recover;
         // Whatever the driver reports, a cookie it returned is kept.
         let (observed, cookie) = match observation {
@@ -702,23 +712,45 @@ where
                 cookie,
             ),
             Observation::Ready { outputs, cookie } => {
-                // A driver that returns no cookie leaves the last one in place.
-                // The result carries it sealed, as after provisioning.
-                let cookie = cookie.or(req.cookie.clone());
-                let observed = Observed::Ready {
-                    result: Box::new(
-                        self.provisioned(job, outputs, cookie.as_ref(), target, log)
-                            .await?,
-                    ),
-                    repeatable,
+                // A driver that returns no cookie, or one it cannot read, leaves
+                // the last one in place. The result carries it sealed, as after
+                // provisioning; when the result cannot be kept, the cookie is
+                // kept on its own.
+                let cookie = cookie.filter(|c| check_cookie(driver.info(), c).is_ok());
+                let kept = cookie.clone().or(req.cookie.clone());
+                let result = self
+                    .provisioned(job, outputs, kept.as_ref(), target, log)
+                    .await
+                    .map(|result| Observed::Ready {
+                        result: Box::new(result),
+                        repeatable,
+                    });
+                let cookie = match result {
+                    Ok(_) => None,
+                    Err(_) => self.observed_cookie(job, &req, driver.as_ref(), cookie),
                 };
-                return Ok(observed.into());
+                return Observing { result, cookie };
             }
         };
-        Ok(Observing {
-            observed,
-            cookie: self.newer_cookie(job, &req, cookie.as_ref()),
-        })
+        Observing {
+            result: Ok(observed),
+            cookie: self.observed_cookie(job, &req, driver.as_ref(), cookie),
+        }
+    }
+
+    /// The cookie an observation returned, sealed, when it is newer than the
+    /// one the observation was given and the driver can read it: a cookie
+    /// too large, or in a version the driver does not declare, leaves the
+    /// stored one in place.
+    fn observed_cookie(
+        &self,
+        job: &ProvisionJob,
+        req: &DriverRequest,
+        driver: &dyn Driver,
+        cookie: Option<Cookie>,
+    ) -> Option<Sealed> {
+        let cookie = cookie.filter(|c| check_cookie(driver.info(), c).is_ok())?;
+        self.newer_cookie(job, req, Some(&cookie))
     }
 
     async fn run_deprovision(
@@ -1069,22 +1101,20 @@ where
             .map_err(|f| log.failure(f))
     }
 
-    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Result<Observing, ExecFailure> {
+    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Observing {
         let mut log = job.log.redacting();
-        let Observing { observed, cookie } = self
-            .run_observe(&job, deleting, &mut log)
-            .await
-            .map_err(|f| log.failure(f))?;
+        let Observing { result, cookie } = self.run_observe(&job, deleting, &mut log).await;
         // What the driver said goes into records, so it is redacted too.
-        let observed = match observed {
-            Observed::Failed { error, repeatable } => Observed::Failed {
+        let result = match result {
+            Ok(Observed::Failed { error, repeatable }) => Ok(Observed::Failed {
                 error: log.redact(&error),
                 repeatable,
-            },
-            Observed::Unknown(reason) => Observed::Unknown(log.redact(&reason)),
-            other => other,
+            }),
+            Ok(Observed::Unknown(reason)) => Ok(Observed::Unknown(log.redact(&reason))),
+            Ok(other) => Ok(other),
+            Err(f) => Err(log.failure(f)),
         };
-        Ok(Observing { observed, cookie })
+        Observing { result, cookie }
     }
 }
 

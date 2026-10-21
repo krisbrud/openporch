@@ -507,11 +507,7 @@ impl Executor for Fake {
         }
     }
 
-    async fn observe(
-        &self,
-        job: ProvisionJob,
-        _deleting: bool,
-    ) -> Result<Observation, ExecFailure> {
+    async fn observe(&self, job: ProvisionJob, _deleting: bool) -> Observation {
         let ty = job.descriptor.ty.to_string();
         self.observed
             .lock()
@@ -528,17 +524,17 @@ impl Executor for Fake {
             "the driver crashed while observing"
         );
         if let Some(observed) = self.observations.lock().unwrap().get(&ty) {
-            return Ok(Observation {
-                observed: observed.clone(),
+            return Observation {
+                result: Ok(observed.clone()),
                 cookie: self.observed_cookie.lock().unwrap().clone(),
-            });
+            };
         }
         let exists = self
             .objects
             .lock()
             .unwrap()
             .contains_key(job.guresid.as_str());
-        Ok(if exists {
+        if exists {
             Observed::Ready {
                 result: Box::new(self.result(&ty, job.guresid.as_str()).await),
                 repeatable: true,
@@ -546,7 +542,7 @@ impl Executor for Fake {
         } else {
             Observed::Absent { repeatable: true }
         }
-        .into())
+        .into()
     }
 }
 

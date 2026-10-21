@@ -73,6 +73,8 @@ struct FakeDriver {
     unsure: Mutex<bool>,
     /// The cookie `get` returns.
     observed_cookie: Mutex<Option<Cookie>>,
+    /// `get` fails, returning that cookie all the same.
+    get_fails: Mutex<bool>,
     /// The pins checked; a pin naming commit `lost` is refused.
     pin_checks: Mutex<Vec<DriverRequest>>,
     /// `put` and `delete` answer as a conflicting operation, with the next
@@ -109,6 +111,7 @@ impl FakeDriver {
             deletes: Mutex::new(Vec::new()),
             unsure: Mutex::new(false),
             observed_cookie: Mutex::default(),
+            get_fails: Mutex::default(),
             pin_checks: Mutex::new(Vec::new()),
             conflict: Mutex::new(false),
             gets: Mutex::new(Vec::new()),
@@ -234,7 +237,15 @@ impl Driver for FakeDriver {
         self.gets.lock().unwrap().push(req.clone());
         let unsure = *self.unsure.lock().unwrap();
         let cookie = self.observed_cookie.lock().unwrap().clone();
+        let fails = *self.get_fails.lock().unwrap();
         Box::pin(async move {
+            if fails {
+                return Err(DriverError::Transient {
+                    message: "unavailable".into(),
+                    retry_after: None,
+                }
+                .with_cookie(cookie));
+            }
             if unsure {
                 return Ok(Observation::Unknown {
                     reason: format!("cannot tell with {}", secret_values(req).join(", ")),
@@ -1205,7 +1216,7 @@ async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource()
 
     // The resource existed before, so its state proves nothing about an
     // update and nothing is stored for it.
-    match executor.observe(job.clone(), false).await.unwrap().observed {
+    match executor.observe(job.clone(), false).await.result.unwrap() {
         Observed::Ready { result, repeatable } => {
             assert!(repeatable);
             assert!(result.secret_outputs.is_empty(), "{result:?}");
@@ -1215,7 +1226,7 @@ async fn an_observation_is_redacted_and_keeps_nothing_for_an_existing_resource()
     }
     // What a driver says while observing is redacted like any failure.
     *f.driver.unsure.lock().unwrap() = true;
-    match executor.observe(job, false).await.unwrap().observed {
+    match executor.observe(job, false).await.result.unwrap() {
         Observed::Unknown(reason) => {
             assert!(reason.contains("[REDACTED]"), "{reason}");
             assert!(!reason.contains(MASTER), "{reason}");
@@ -1721,4 +1732,40 @@ async fn ecr_images_are_pinned_to_their_digest_with_the_workloads_account() {
             "{image}: {failure:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_observation_keeps_only_a_cookie_the_driver_can_read() {
+    let f = Fixture::new().await;
+    let defs = f.define(plain_pg(), "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let job = provision_job(&db, db.guresid.parse().unwrap());
+    let executor = f.executor(allow());
+    let opened = |sealed: Option<Sealed>| {
+        let mut job = job.clone();
+        job.cookie = sealed;
+        executor.open_cookie(&job).unwrap()
+    };
+
+    // A failed observation keeps the cookie that came with it.
+    *f.driver.get_fails.lock().unwrap() = true;
+    *f.driver.observed_cookie.lock().unwrap() = Some(Cookie::new(1, "n=7").unwrap());
+    let observed = executor.observe(job.clone(), false).await;
+    assert!(
+        matches!(observed.result, Err(ExecFailure::Retryable { .. })),
+        "{observed:?}"
+    );
+    assert_eq!(
+        opened(observed.cookie),
+        Some(Cookie::new(1, "n=7").unwrap())
+    );
+
+    // A cookie in a version the driver does not declare is not kept.
+    *f.driver.get_fails.lock().unwrap() = false;
+    *f.driver.observed_cookie.lock().unwrap() = Some(Cookie::new(2, "n=8").unwrap());
+    let observed = executor.observe(job, false).await;
+    assert!(observed.result.is_ok(), "{observed:?}");
+    assert!(observed.cookie.is_none());
 }

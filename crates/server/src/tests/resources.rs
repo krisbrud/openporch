@@ -96,14 +96,13 @@ impl Executor for Fake {
         Ok(())
     }
 
-    async fn observe(&self, _: ProvisionJob, _: bool) -> Result<Observation, ExecFailure> {
-        Ok(self
-            .observation
+    async fn observe(&self, _: ProvisionJob, _: bool) -> Observation {
+        self.observation
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(|| Observed::Unknown("nothing to observe".into()))
-            .into())
+            .into()
     }
 }
 

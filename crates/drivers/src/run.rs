@@ -110,6 +110,20 @@ pub struct Settled<T> {
     pub cookie: Option<Cookie>,
 }
 
+/// Why a cookie a driver returned cannot be kept: it is too large, or in a
+/// version the driver does not declare.
+pub fn check_cookie(info: &crate::DriverInfo, cookie: &Cookie) -> Result<(), String> {
+    cookie.check().map_err(|e| e.to_string())?;
+    let declared = info.cookie_version;
+    if cookie.version != declared {
+        return Err(format!(
+            "the driver returned a version {} cookie but declares version {declared}",
+            cookie.version
+        ));
+    }
+    Ok(())
+}
+
 /// Converges a resource: calls `put` and, while it reports `in_progress`, polls
 /// `get` until the resource is ready, all within `timeout`. Each call receives the
 /// latest cookie; a call that returns none leaves it unchanged.
@@ -299,16 +313,7 @@ impl<'d> Run<'d> {
         let Some(cookie) = cookie else {
             return Ok(());
         };
-        cookie
-            .check()
-            .map_err(|e| DriverError::Uncertain(e.to_string()))?;
-        let declared = self.driver.info().cookie_version;
-        if cookie.version != declared {
-            return Err(DriverError::Uncertain(format!(
-                "the driver returned a version {} cookie but declares version {declared}",
-                cookie.version
-            )));
-        }
+        check_cookie(self.driver.info(), &cookie).map_err(DriverError::Uncertain)?;
         self.req.cookie = Some(cookie);
         Ok(())
     }

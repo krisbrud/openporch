@@ -460,9 +460,9 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         job: ProvisionJob,
         deleting: bool,
-    ) -> impl Future<Output = Result<Observation, ExecFailure>> + Send {
+    ) -> impl Future<Output = Observation> + Send {
         let _ = (job, deleting);
-        async { Ok(Observed::Unknown("this executor cannot observe resources".into()).into()) }
+        async { Observed::Unknown("this executor cannot observe resources".into()).into() }
     }
 
     /// Checks that the artifacts a workload deploys still exist, before the
@@ -616,24 +616,31 @@ pub struct ArtifactCheck {
     pub artifacts: Vec<String>,
 }
 
-/// What observing a resource found, with the cookie the driver returned
-/// alongside, sealed, when it differs from the one it was given. Recovery
-/// stores that cookie whatever it concludes, so the next call to the driver
-/// carries the newest state.
+/// What observing a resource found, or why observing failed, with the
+/// cookie the driver returned alongside, sealed, when it differs from the one
+/// it was given and the driver can read it. Recovery stores that cookie
+/// whatever it concludes, so the next call to the driver carries the newest
+/// state.
 #[derive(Debug, Clone)]
 pub struct Observation {
     /// What the driver reported.
-    pub observed: Observed,
+    pub result: Result<Observed, ExecFailure>,
     /// The newer cookie, if any.
     pub cookie: Option<Sealed>,
 }
 
-impl From<Observed> for Observation {
-    fn from(observed: Observed) -> Self {
+impl From<Result<Observed, ExecFailure>> for Observation {
+    fn from(result: Result<Observed, ExecFailure>) -> Self {
         Self {
-            observed,
+            result,
             cookie: None,
         }
+    }
+}
+
+impl From<Observed> for Observation {
+    fn from(observed: Observed) -> Self {
+        Ok(observed).into()
     }
 }
 

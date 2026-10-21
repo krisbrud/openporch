@@ -153,41 +153,35 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                             panicked = e.is_panic(),
                             "the executor stopped unexpectedly"
                         );
-                        Err(ExecFailure::uncertain(
+                        Observation::from(Err(ExecFailure::uncertain(
                             "the executor stopped unexpectedly while observing the resource",
-                        ))
+                        )))
                     });
                     drop(running);
-                    super::log_outcome("observe", started, &observed);
+                    super::log_outcome("observe", started, &observed.result);
                     observed
                 };
-                let observed = tokio::spawn(observing.instrument(span))
+                let Observation {
+                    result: observed,
+                    cookie,
+                } = tokio::spawn(observing.instrument(span))
                     .await
                     .unwrap_or_else(|_| {
-                        Err(ExecFailure::uncertain(
+                        Observation::from(Err(ExecFailure::uncertain(
                             "the executor stopped unexpectedly while observing the resource",
-                        ))
+                        )))
                     });
-                // A newer cookie is kept whatever the observation concludes, so
-                // the next call to the driver, a recovery's included, carries it.
-                let observed = match observed {
-                    Ok(Observation {
-                        observed,
-                        cookie: Some(cookie),
-                    }) => {
-                        if let Err(e) = self
-                            .store
-                            .keep_recovery_cookie(&op.operation_id, &cookie)
-                            .await
-                        {
-                            tracing::error!(error = %e, "could not keep the driver's state");
-                            return Err(e.into());
-                        }
-                        Ok(observed)
-                    }
-                    Ok(Observation { observed, .. }) => Ok(observed),
-                    Err(e) => Err(e),
-                };
+                // A newer cookie is kept whatever the observation concludes, a
+                // failure included, so the next call to the driver carries it.
+                if let Some(cookie) = cookie
+                    && let Err(e) = self
+                        .store
+                        .keep_recovery_cookie(&op.operation_id, &cookie)
+                        .await
+                {
+                    tracing::error!(error = %e, "could not keep the driver's state");
+                    return Err(e.into());
+                }
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
                     Ok(Observed::Absent { .. }) if deleting => (
