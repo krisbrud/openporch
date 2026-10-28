@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -166,5 +167,55 @@ func TestTheTokenIsSensitive(t *testing.T) {
 		if a.Name == "token" && !a.Sensitive {
 			t.Fatal("the token attribute is not sensitive")
 		}
+	}
+}
+
+// TestTheSchemaHasNoDeploymentResource is the "Reviewer looks for a deploy
+// resource" scenario: the schema has no resource or data source that deploys,
+// and the provider's documentation points to `porch score deploy`.
+func TestTheSchemaHasNoDeploymentResource(t *testing.T) {
+	srv, err := providerserver.NewProtocol6WithError(New("test")())()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.GetProviderSchema(context.Background(), &tfprotov6.GetProviderSchemaRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := errorText(resp.Diagnostics); e != "" {
+		t.Fatal(e)
+	}
+	if len(resp.ResourceSchemas) < 10 {
+		t.Fatalf("only %d resources in the schema", len(resp.ResourceSchemas))
+	}
+	names := []string{}
+	for name := range resp.ResourceSchemas {
+		names = append(names, name)
+	}
+	for name := range resp.DataSourceSchemas {
+		names = append(names, name)
+	}
+	for name := range resp.EphemeralResourceSchemas {
+		names = append(names, name)
+	}
+	for name := range resp.ActionSchemas {
+		names = append(names, name)
+	}
+	for _, name := range names {
+		if strings.Contains(strings.ToLower(name), "deploy") {
+			t.Errorf("the schema has %q", name)
+		}
+	}
+
+	pointer := "porch score deploy"
+	if d := resp.Provider.Block.Description; !strings.Contains(d, pointer) {
+		t.Errorf("the provider's description does not point to %q: %s", pointer, d)
+	}
+	docs, err := os.ReadFile("../../docs/index.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(docs), pointer) {
+		t.Errorf("docs/index.md does not point to %q", pointer)
 	}
 }

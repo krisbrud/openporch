@@ -583,3 +583,81 @@ async fn ecr_images_are_pinned_to_digests_with_the_definitions_account() {
         "{e:?}"
     );
 }
+
+/// The Secret in a composite string scenario, before the executor: the
+/// converted workload and the deployment's graph keep
+/// `Bearer ${values.API_TOKEN}` as written, and the planner hands the
+/// executor an unresolved expression of literal text and the secret's
+/// reference, never a value.
+#[tokio::test]
+async fn a_secret_in_a_composite_string_stays_an_expression_until_the_executor() {
+    const EXPRESSION: &str = "Bearer ${values.API_TOKEN}";
+    let doc = WEB.replace(
+        r#"      DB_PASSWORD: "${resources.db.password}""#,
+        &format!("      DB_PASSWORD: \"${{resources.db.password}}\"\n      AUTH: \"{EXPRESSION}\""),
+    );
+    assert!(doc.contains(EXPRESSION), "{doc}");
+
+    // Conversion keeps the expression.
+    let converted = Workload::parse(&doc, None)
+        .unwrap()
+        .to_module(&builtin_types())
+        .unwrap();
+    let module = serde_json::to_value(&converted.module).unwrap();
+    assert_eq!(
+        module["spec"]["containers"]["web"]["variables"]["AUTH"], EXPRESSION,
+        "{module}"
+    );
+
+    let f = Fixture::new().await;
+    let fake = Fake::with(&[]);
+    let mut deployment = f.accept_set(Some(&doc), definitions()).await.unwrap();
+    let token = SecretRef {
+        store: "openporch".into(),
+        reference: "apps/shop/values/API_TOKEN".into(),
+        version: Some("1".into()),
+    };
+    deployment
+        .values
+        .insert("API_TOKEN".into(), SharedValue::Secret(token.clone()));
+    // So does the graph the deployment was accepted with.
+    let graph = serde_json::to_string(&deployment.graph).unwrap();
+    assert!(graph.contains(EXPRESSION), "{graph}");
+
+    let outcomes = planner(&f, &fake, fast()).run(deployment).await;
+    assert_eq!(outcomes[&d(WORKLOAD)], Outcome::Provisioned, "{outcomes:?}");
+    let job = fake.job(WORKLOAD);
+    let Resolved::Object(inputs) = &job.inputs.resource else {
+        panic!("{:?}", job.inputs.resource);
+    };
+    let field = |items: &[(String, Resolved)], name: &str| {
+        items
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, r)| r.clone())
+            .unwrap_or_else(|| panic!("no `{name}` in {items:?}"))
+    };
+    let mut at = Resolved::Object(inputs.clone());
+    for name in ["spec", "containers", "web", "variables", "AUTH"] {
+        let Resolved::Object(items) = &at else {
+            panic!("`{name}` is not inside an object: {at:?}");
+        };
+        at = field(items, name);
+    }
+    let Resolved::Secret(expr) = &at else {
+        panic!("AUTH is not a secret expression: {at:?}");
+    };
+    assert_eq!(
+        expr.parts,
+        vec![
+            SecretPart::Literal("Bearer ".into()),
+            SecretPart::Secret(token.clone()),
+        ]
+    );
+    // The executor learns where the reference came from, to check its use.
+    assert!(
+        job.inputs.sources.iter().any(|(r, _)| *r == token),
+        "{:?}",
+        job.inputs.sources
+    );
+}

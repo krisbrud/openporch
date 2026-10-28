@@ -661,3 +661,75 @@ async fn cancel_needs_the_capability() {
         DriverError::Unsupported("cancellation".into())
     );
 }
+
+/// The External driver redirects credentials scenario: a driver that answers
+/// with a redirect to another origin is not followed, so its token and the
+/// request's secrets never reach that origin, and the call fails with an error
+/// that redacts the secrets the driver echoed.
+#[tokio::test]
+async fn redirects_are_not_followed_and_credentials_stay_with_the_driver() {
+    // The origin the driver redirects to records anything that reaches it.
+    let elsewhere = Shared::default();
+    elsewhere.lock().unwrap().respond = Some(Box::new(|_, _| Canned {
+        status: 200,
+        body: Some(json!({"id": "0123456789abcdef0123456789abcdef"})),
+        ..Canned::default()
+    }));
+    let other = serve(elsewhere.clone()).await;
+    for status in [301, 302, 303, 307, 308] {
+        let mock = Shared::default();
+        let location = format!("{other}/0123456789abcdef0123456789abcdef");
+        mock.lock().unwrap().respond = Some(Box::new(move |_, _| Canned {
+            status,
+            headers: BTreeMap::from([("location".to_owned(), location.clone())]),
+            body: Some(json!({"message": "moved; the password was hunter2"})),
+        }));
+        let target = serve(mock.clone()).await;
+        assert_ne!(
+            reqwest::Url::parse(&target).unwrap().origin(),
+            reqwest::Url::parse(&other).unwrap().origin()
+        );
+        let driver =
+            HttpDriver::new(info(Capabilities::default()), &target, Some(TOKEN.into())).unwrap();
+        let req = request(None);
+        let errors = [
+            ("put", driver.put(&req).await.map(|_| ()).unwrap_err()),
+            ("delete", driver.delete(&req).await.map(|_| ()).unwrap_err()),
+            ("get", driver.get(&req).await.map(|_| ()).unwrap_err()),
+        ];
+        for (call, err) in &errors {
+            let shown = format!("{err} {err:?}");
+            assert!(
+                shown.contains(&status.to_string()),
+                "{status} {call}: {shown}"
+            );
+            for secret in [TOKEN, "hunter2", "s3cret"] {
+                assert!(!shown.contains(secret), "{status} {call}: {shown}");
+            }
+            assert!(shown.contains("[REDACTED]"), "{status} {call}: {shown}");
+        }
+        // A mutation that was redirected may still have reached a driver, so
+        // its outcome is uncertain and observed before anything is retried.
+        assert!(
+            matches!(errors[0].1, DriverError::Uncertain(_)),
+            "{:?}",
+            errors[0]
+        );
+        assert!(
+            matches!(errors[1].1, DriverError::Uncertain(_)),
+            "{:?}",
+            errors[1]
+        );
+        // The driver was called once per call, with its token.
+        let recorded = mock.lock().unwrap().recorded.clone();
+        assert_eq!(recorded.len(), 3, "{status}");
+        for r in &recorded {
+            assert_eq!(
+                r.headers.get("authorization"),
+                Some(&format!("Bearer {TOKEN}"))
+            );
+        }
+    }
+    // Nothing, and so no token, reached the other origin.
+    assert!(elsewhere.lock().unwrap().recorded.is_empty());
+}
