@@ -42,7 +42,10 @@ pub use secret_use::{SecretOwner, SecretUseStore};
 pub use sqlite::{SCHEMA_VERSION, SqliteStore, StoreStats, check_schema};
 pub use sqlite_accounts::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 pub use sqlite_audit_retention::{AuditRetention, EXPIRY_ACTION, Expiry, Retained};
-pub use sqlite_catalog::{CatalogStore, DefinitionRecord, DefinitionUpdate, DriverRecord};
+pub use sqlite_catalog::{
+    CatalogStore, DefinitionRecord, DefinitionUpdate, DriverCapabilities, DriverChange,
+    DriverRecord, DriverTargets,
+};
 pub use sqlite_diagnostics::{AuditSummary, OperationSummary};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
 pub use sqlite_permits::{
@@ -383,6 +386,19 @@ pub trait Store: Send + Sync {
         operation_id: &str,
         resolution: Resolution,
         audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Replaces the stored cookie of the resource an operation whose outcome
+    /// is still unknown ran on, with the newer one observing it returned, so
+    /// the next call to the driver carries it. Nothing changes once the
+    /// outcome is known, or when the stored cookie is no longer `observed_with`,
+    /// the one the observation started with: another recovery stored a newer
+    /// one meanwhile.
+    fn keep_recovery_cookie(
+        &self,
+        operation_id: &str,
+        observed_with: Option<&secrets::Sealed>,
+        cookie: &secrets::Sealed,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Records the status of a resource that no operation decided in a

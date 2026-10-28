@@ -8,6 +8,8 @@ mod deploys;
 mod diagnostics;
 mod envs;
 mod health;
+
+pub use health::CONTRACT_VERSION;
 mod login;
 mod members;
 mod metrics;
@@ -543,6 +545,12 @@ pub fn api(state: AppState) -> Api {
             "/orgs/{org}/resources/drivers/{driver}",
             Org(OrgPerm::ReadMembers),
             catalog::get_driver,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/resources/drivers/{driver}",
+            Org(OrgPerm::Administer),
+            catalog::replace_driver,
         )
         .route(
             delete(),

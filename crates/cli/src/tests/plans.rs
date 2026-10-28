@@ -43,7 +43,11 @@ async fn with_databases(server: &DevServer) -> Machine {
     server
         .post(
             "/orgs/acme/resources/defs",
-            json!({"id": "pg", "type": "postgres", "driver_type": "openporch/echo", "criteria": [{}]}),
+            json!({"id": "pg", "type": "postgres", "driver_type": "openporch/echo", "criteria": [{}],
+                   "driver_inputs": {
+                       "values": {"host": "db.internal", "name": "shop", "port": 5432},
+                       "secret_refs": {"username": {"value": "shop"},
+                                       "password": {"value": "change-me"}}}}),
         )
         .await;
     m
@@ -223,7 +227,7 @@ struct Uncertain;
 impl Executor for Uncertain {
     async fn provision(&self, job: ProvisionJob) -> Result<ProvisionResult, ExecFailure> {
         match job.descriptor.ty.to_string().as_str() {
-            "postgres" => Err(ExecFailure::Uncertain("postgres timed out".into())),
+            "postgres" => Err(ExecFailure::uncertain("postgres timed out")),
             _ => Ok(ProvisionResult::default()),
         }
     }

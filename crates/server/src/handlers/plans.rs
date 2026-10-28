@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use openporch_core::catalog::{BUILTIN_DRIVERS, DriverTarget};
 use openporch_engine::preview::{self, DriverPlan, Entry};
 use openporch_store::{
     EnvRecord, NewPermit, NewPlan, PermitBinding, PermitRecord, PermitStore, PlanRecord, Store,
@@ -327,6 +328,37 @@ pub(super) async fn preflight(
     )
     .await
     .map_err(ApiError::invalid)?;
+    let ids: Vec<&str> = deployment
+        .graph
+        .nodes
+        .values()
+        .map(|n| n.driver_type.as_str())
+        .collect();
+    let drivers = state.drivers.known(&state.store, org, &ids).await?;
+    // An external driver removed since its definition was written: nothing
+    // runs. A built-in this server cannot describe previews as unknown impact.
+    for node in deployment.graph.nodes.values() {
+        if !BUILTIN_DRIVERS.contains(&node.driver_type.as_str())
+            && drivers.facts(&node.driver_type).is_none()
+        {
+            return Err(ApiError::invalid(format!(
+                "resource `{}` uses driver `{}`, which is not registered on this server; nothing \
+                 changed",
+                node.descriptor, node.driver_type
+            )));
+        }
+        // Nor does a resource its driver cannot provision.
+        let ty = node.descriptor.ty.as_str();
+        if drivers.covers(&node.driver_type, ty) == Some(false) {
+            return Err(ApiError::invalid(format!(
+                "resource `{}` is of type `{ty}`, which driver `{}` cannot provision: it does \
+                 not declare the `{}` target; nothing changed",
+                node.descriptor,
+                node.driver_type,
+                DriverTarget::of_type(ty).as_str()
+            )));
+        }
+    }
     let active = state.store.active_resources(org, &env.app, &env.id).await?;
     // Only the latest attempt's refused driver plans are current.
     let latest = state
@@ -351,15 +383,13 @@ pub(super) async fn preflight(
             )
         })
         .collect();
-    preview::preview(&deployment, &active, |id| state.drivers.facts(id), &plans).map_err(
-        |migrations| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                code::MIGRATION_REQUIRED,
-                migrations.join("; "),
-            )
-        },
-    )
+    preview::preview(&deployment, &active, |id| drivers.facts(id), &plans).map_err(|migrations| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            code::MIGRATION_REQUIRED,
+            migrations.join("; "),
+        )
+    })
 }
 
 /// What an acceptance checks `presented` permits against: every previewed

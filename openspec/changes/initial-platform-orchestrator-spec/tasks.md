@@ -127,7 +127,7 @@ Before archiving the first release, move unimplemented later-stage requirements/
 - [x] 14.3 Run the declared reference benchmark and record p95 planning/API latency and peak memory/disk results; verify the thresholds in `control-plane-operations`
 - [x] 14.4 Implement protected environment types; verify destructive permits in a protected environment require an administrator and unknown-impact changes are denied until planned
 - [ ] 14.5 Publish the API/workload/driver/provider compatibility matrix and owned schemas, locked build instructions, release checksums/provenance, CONTRIBUTING and SECURITY policy; verify a clean tagged build, fixtures and quickstart doc tests
-- [ ] 14.6 Complete the first-release acceptance matrix: every enabled capability scenario passes, fault-injection recovery and authorization-negative suites pass, a real Lambda invocation/replay/teardown passes, and deferred integrations are explicitly reported unavailable
+- [ ] 14.6 Complete the first-release acceptance matrix: every enabled capability scenario passes, fault-injection recovery and authorization-negative suites pass, a real Lambda invocation/replay/teardown passes, and deferred integrations are explicitly reported unavailable. Status: `docs/acceptance.md` maps every scenario to what verifies it, and a test keeps it current; `every_route_refuses_members_without_its_permission` is the authorization-negative suite. Open: the gaps the matrix lists, the fault-injection suite and a real Lambda run for the release
 
 ## Workflow follow-up
 - Move deferred integration requirements into separate changes before archiving the completed milestone; do not mark unimplemented contracts complete.

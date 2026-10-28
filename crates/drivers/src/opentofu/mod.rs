@@ -1921,10 +1921,13 @@ impl Driver for OpenTofu {
         Box::pin(async move {
             let state = match self.state(req).await {
                 Ok(State::Present(state)) => state,
-                Ok(State::Absent | State::Unapplied) => return Ok(Observation::Absent),
+                Ok(State::Absent | State::Unapplied) => {
+                    return Ok(Observation::Absent { cookie: None });
+                }
                 Err(e) => {
                     return Ok(Observation::Unknown {
                         reason: e.to_string(),
+                        cookie: None,
                     });
                 }
             };

@@ -243,7 +243,7 @@ async fn a_timeout_cancels_drivers_that_can() {
     let timeout = Duration::from_secs(5);
 
     // A confirmed cancellation leaves a plain timeout.
-    let stopped = Hung(info.clone(), Some(Observation::Absent));
+    let stopped = Hung(info.clone(), Some(Observation::Absent { cookie: None }));
     let err = converge(&stopped, &request(), timeout)
         .await
         .result
@@ -256,7 +256,10 @@ async fn a_timeout_cancels_drivers_that_can() {
             poll_after: Duration::ZERO,
             cookie: None,
         }),
-        Some(Observation::Unknown { reason: "?".into() }),
+        Some(Observation::Unknown {
+            reason: "?".into(),
+            cookie: None,
+        }),
         None,
     ] {
         let driver = Hung(info.clone(), cancel);
@@ -265,6 +268,62 @@ async fn a_timeout_cancels_drivers_that_can() {
             .result
             .unwrap_err();
         assert!(matches!(err, DriverError::Uncertain(_)), "{err}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancellation_keeps_the_cookie_it_returned() {
+    let mut info = Echo::new().info().clone();
+    info.capabilities.cancel = true;
+    let timeout = Duration::from_secs(5);
+    let new = Cookie::new(0, "op-9").unwrap();
+    let failed = DriverError::Invalid {
+        code: None,
+        message: "stopped".into(),
+    }
+    .with_cookie(Some(new.clone()));
+    for (cancel, stopped) in [
+        (
+            Observation::Absent {
+                cookie: Some(new.clone()),
+            },
+            true,
+        ),
+        (Observation::Failed { error: failed }, true),
+        (
+            Observation::InProgress {
+                poll_after: Duration::ZERO,
+                cookie: Some(new.clone()),
+            },
+            false,
+        ),
+        (
+            Observation::Unknown {
+                reason: "?".into(),
+                cookie: Some(new.clone()),
+            },
+            false,
+        ),
+    ] {
+        let driver = Hung(info.clone(), Some(cancel));
+        for settled in [
+            {
+                let s = converge(&driver, &request(), timeout).await;
+                Settled {
+                    result: s.result.map(|_| ()),
+                    cookie: s.cookie,
+                }
+            },
+            remove(&driver, &request(), timeout).await,
+        ] {
+            let err = settled.result.unwrap_err();
+            if stopped {
+                assert_eq!(err, DriverError::Timeout(timeout));
+            } else {
+                assert!(matches!(err, DriverError::Uncertain(_)), "{err}");
+            }
+            assert_eq!(settled.cookie, Some(new.clone()));
+        }
     }
 }
 
@@ -323,7 +382,7 @@ async fn failed_absent_and_unknown_observations() {
     assert_eq!(settled.cookie, Some(Cookie::new(0, "op-7").unwrap()));
     assert_eq!(invalid.to_string(), "PG-1: bad version");
 
-    let absent = Then(info.clone(), Observation::Absent, None);
+    let absent = Then(info.clone(), Observation::Absent { cookie: None }, None);
     assert!(matches!(
         converge(&absent, &r, DEFAULT_TIMEOUT).await.result,
         Err(DriverError::Uncertain(_))
@@ -335,6 +394,7 @@ async fn failed_absent_and_unknown_observations() {
         info,
         Observation::Unknown {
             reason: "lost the operation".into(),
+            cookie: None,
         },
         Some(Cookie::new(0, "op-8").unwrap()),
     );
@@ -417,13 +477,17 @@ async fn returned_cookies_are_checked() {
         version: 2,
         data: "x".repeat(MAX_COOKIE_BYTES + 1),
     };
-    let driver = Then(info.clone(), Observation::Absent, Some(big));
+    let driver = Then(
+        info.clone(),
+        Observation::Absent { cookie: None },
+        Some(big),
+    );
     let settled = converge(&driver, &request(), DEFAULT_TIMEOUT).await;
     // An operation may be running, so the outcome is uncertain rather than invalid.
     assert!(matches!(settled.result, Err(DriverError::Uncertain(_))));
     assert_eq!(settled.cookie, None);
     let old = Cookie::new(1, "abc").unwrap();
-    let driver = Then(info, Observation::Absent, Some(old));
+    let driver = Then(info, Observation::Absent { cookie: None }, Some(old));
     let err = converge(&driver, &request(), DEFAULT_TIMEOUT)
         .await
         .result

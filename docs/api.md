@@ -23,6 +23,12 @@ group. The examples run in order against a fresh dev server in
   one that does not exist. An object you can see but not change returns `403`.
 - **Secrets.** Secret values are accepted on write and never returned. Responses
   show secret references `{store, ref, version}` instead.
+- **Contract.** Every response, errors included, carries
+  `Openporch-Contract: 1`, the API contract version, as `GET /version` does.
+  A request may send the contract it was written for in the same header; a
+  server that does not serve it refuses the request with `400` `API-008`
+  before doing anything. `porch` and the OpenTofu provider send it, and refuse
+  a server whose responses name another contract.
 - **Work in progress.** External secret store adapters are not implemented
   yet; where a route registers something the server cannot use yet, its
   section says so.
@@ -56,6 +62,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | `API-005` | 405 | The route does not support this method. |
 | `API-006` | 413 | The body is larger than `max_body_bytes`. |
 | `API-007` | 429 | Too many requests. `Retry-After` gives the seconds to wait. |
+| `API-008` | 400 | The request's `Openporch-Contract` header names a contract this server does not serve. Nothing was done. |
 | `AUTH-001` | 401 | No valid token or session. |
 | `AUTH-002` | 403 | Authenticated, but not allowed. The message names the missing role. |
 | `SRV-001` | 500 | Internal error. The log has details under the request ID. |
@@ -1150,6 +1157,15 @@ Built-in types, such as `postgres`, `s3`, `sqs` and `workload`, are listed with
 their input and output schemas. Custom types are named `<org>/<name>`. `use` is
 `direct` (workloads request it), `indirect` (only other resources reference it) or
 `implicit` (one per environment). Output schemas have `values` and `secrets`.
+A resource whose driver returns outputs that miss a required output, have the
+wrong JSON type, or put a secret output in `values` fails, and the error names
+the output. When the driver may have changed infrastructure (it did not plan
+"no changes"), the resource's outcome is `unknown` until recovery observes it;
+if its outputs still do not match, it waits for an administrator
+(`recovery_required`). A deployment checks against
+the types as they were when it was accepted; a snapshot replay uses the schemas
+it recorded. Snapshots from servers that did not record types cannot be
+replayed; deploy them with `"replay": "current"`.
 `PUT` replaces the whole type, so schemas left out reset to their defaults.
 
 ```http
@@ -1261,20 +1277,43 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/orgs/{org}/resources/drivers` | org read |
 | POST | `/orgs/{org}/resources/drivers` | administer |
 | GET | `/orgs/{org}/resources/drivers/{driver}` | org read |
+| PUT | `/orgs/{org}/resources/drivers/{driver}` | administer |
 | DELETE | `/orgs/{org}/resources/drivers/{driver}` | administer |
 
 The built-in drivers are `openporch/echo`, `openporch/none`, `openporch/template`
-and `openporch/opentofu`. An external driver will be reached over HTTPS, with its
-`token` sent as a bearer token; the token is a secret reference or `{value}`.
-[docs/drivers/http.md](drivers/http.md) describes the protocol. External drivers
-can be registered now, but deployments do not call any driver until the deployment
-executor is implemented.
+and `openporch/opentofu`. An external driver is reached over HTTPS at its
+`target`, with its `token` sent as a bearer token; the token is a secret reference
+or `{value}`, and is read only when a deployment calls the driver.
+[docs/drivers/http.md](drivers/http.md) describes the protocol. Definitions may name
+a registered driver as `driver_type`, and deployments call it.
+
+A registration pins what the server relies on when it calls the driver:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `protocol_version` | `openporch-http/1` | The protocol the driver speaks; `openporch-http/1` is the only one supported |
+| `cookie_version` | `1` | The cookie format version the driver writes |
+| `inputs_schema` | none | JSON Schema of the driver inputs, recorded for clients; the server does not check definitions' inputs against it |
+| `outputs_schema` | none | JSON Schema of the driver's outputs, recorded for clients; the server checks outputs against the resource type's schema, not this one |
+| `capabilities.targets.resources` | `true` | The driver provisions resources other than workloads |
+| `capabilities.targets.workloads` | `false` | The driver provisions workloads |
+| `capabilities.targets.triggers` | `false` | The driver provisions workload triggers; recorded only, since no resource type is a trigger |
+| `capabilities.observe` | `false` | `GET` reports the resource's real state, so an unknown outcome can be recovered by observing it |
+| `capabilities.recover` | `false` | A retried operation converges, so a `5xx` to a mutation may be retried |
+| `capabilities.preview` | `false` | Must be `false`: `openporch-http/1` has no preview call, so changes to existing resources need a permit |
+| `capabilities.cancel` | `false` | `POST {target}/{guresid}/cancel` stops a timed-out operation |
+
+The deployment executor reads the registration each time it calls the driver, so
+a deployment uses the registration as it is then. A definition whose type the
+driver does not target is refused with `400` when it is created or changed, and a
+deployment whose resources use a driver that is no longer registered, or no longer
+targets their type, is refused with `400` before anything runs.
 
 ```http
 POST /orgs/acme/resources/drivers
 Authorization: Bearer $ADMIN_TOKEN
 
-{"id": "acme/vault-db", "target": "https://drivers.acme.example/vault-db", "token": {"value": "drv_7d1e"}}
+{"id": "acme/vault-db", "target": "https://drivers.acme.example/vault-db", "token": {"value": "drv_7d1e"}, "capabilities": {"observe": true}}
 ```
 
 ```http-response
@@ -1284,7 +1323,13 @@ Authorization: Bearer $ADMIN_TOKEN
   "id": "acme/vault-db",
   "builtin": false,
   "target": "https://drivers.acme.example/vault-db",
-  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"}
+  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
 }
 ```
 
@@ -1296,7 +1341,61 @@ Authorization: Bearer $ADMIN_TOKEN
 ```http-response
 200 OK
 
-{"id": "acme/vault-db", "builtin": false}
+{
+  "id": "acme/vault-db",
+  "builtin": false,
+  "target": "https://drivers.acme.example/vault-db",
+  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "1"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
+}
+```
+
+`PUT` replaces a registration in place, so a new token or target does not mean
+deleting the definitions that use the driver. It takes the body of `POST` without
+`id` (or with the same `id`), checked the same way. `protocol_version`,
+`cookie_version` and `capabilities` left out keep their current values; a given
+`capabilities` object replaces them, with its own fields' defaults. The schemas
+and a `token` left out are removed. `{value}` writes a new version of the token,
+and the reference the registration holds now, given back unchanged, keeps it;
+any other secret under `drivers/{id}/`, such as an earlier version, must be
+entered again (`400`). A registration changed by another request while this one
+was handled is not overwritten: the request is refused with `409`, to be retried. Built-in drivers
+cannot be replaced (`409`). A replacement is refused with `409` while an
+operation the driver ran is still running or has an outcome that is not known
+yet, since its cookie and recovery depend on the registration, and a
+`cookie_version` change is refused with `409` while the driver has active
+resources, whose cookies are of the current version; the error names their
+GUResIDs, the first ten and a count of the rest. It is refused with `400`
+when the driver would no longer target the type of a definition that uses it. Deployments use the new registration from their next
+driver call.
+
+```http
+PUT /orgs/acme/resources/drivers/acme%2Fvault-db
+Authorization: Bearer $ADMIN_TOKEN
+
+{"target": "https://drivers-v2.acme.example/vault-db", "token": {"value": "drv_93ac"}, "capabilities": {"observe": true}}
+```
+
+```http-response
+200 OK
+
+{
+  "id": "acme/vault-db",
+  "builtin": false,
+  "target": "https://drivers-v2.acme.example/vault-db",
+  "token": {"store": "openporch", "ref": "drivers/acme/vault-db/token", "version": "2"},
+  "protocol_version": "openporch-http/1",
+  "cookie_version": 1,
+  "capabilities": {
+    "targets": {"resources": true, "workloads": false, "triggers": false},
+    "observe": true, "recover": false, "preview": false, "cancel": false
+  }
+}
 ```
 
 ```http
@@ -2194,7 +2293,12 @@ After a restart the server observes each resource whose operation the
 restart interrupted with its driver's read-only `get`, using the identity,
 driver, cloud account and inputs the operation recorded, and the definition's
 own secrets even if the definition no longer matches the resource, as a
-deletion does. One that cannot be settled then, for example because a
+deletion does. It observes with the driver's latest cookie: one the uncertain
+operation returned before it failed replaces the resource's last cookie, and
+does not make that operation's creation count as an update. A later
+deployment does treat a resource with a cookie as one that may exist, so a
+creation retried after it was found absent is planned like a change: a driver
+that cannot preview it needs an unknown-impact permit. One that cannot be settled then, for example because a
 deployment started first, and one left unknown by a timeout, waits for an
 explicit recovery. `POST .../recover` does the same on request and returns
 what the observation established as `outcome`, with the resource as it is now

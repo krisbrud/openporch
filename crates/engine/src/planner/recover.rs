@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use openporch_core::catalog::ResourceType;
 use openporch_core::ids::{AccountId, DefinitionId, Descriptor, Guresid};
 use openporch_store::{
     AuditIntent, CheckpointResult, OperationKind, Provisioned, Resolution, Store, StoreError,
@@ -17,7 +18,8 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::{
-    ExecFailure, Executor, JobContext, JobInputs, JobLog, Observed, Planner, ProvisionJob,
+    ExecFailure, Executor, JobContext, JobInputs, JobLog, Observation, Observed, Planner,
+    ProvisionJob,
 };
 
 /// How long observing a resource may take.
@@ -117,6 +119,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             Err(reason) => required(reason),
             Ok(job) => {
                 let account = job.driver_account.as_ref().map(ToString::to_string);
+                // The cookie the observation starts with, so that a newer one
+                // is not overwritten by a slower recovery's older one.
+                let observed_with = job.cookie.clone();
                 // A resource that existed before the operation says nothing,
                 // by existing, about whether an update took effect.
                 let updating = !deleting && job.existing && !restored;
@@ -151,21 +156,35 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                             panicked = e.is_panic(),
                             "the executor stopped unexpectedly"
                         );
-                        Err(ExecFailure::Uncertain(
-                            "the executor stopped unexpectedly while observing the resource".into(),
-                        ))
+                        Observation::from(Err(ExecFailure::uncertain(
+                            "the executor stopped unexpectedly while observing the resource",
+                        )))
                     });
                     drop(running);
-                    super::log_outcome("observe", started, &observed);
+                    super::log_outcome("observe", started, &observed.result);
                     observed
                 };
-                let observed = tokio::spawn(observing.instrument(span))
+                let Observation {
+                    result: observed,
+                    cookie,
+                } = tokio::spawn(observing.instrument(span))
                     .await
                     .unwrap_or_else(|_| {
-                        Err(ExecFailure::Uncertain(
-                            "the executor stopped unexpectedly while observing the resource".into(),
-                        ))
+                        Observation::from(Err(ExecFailure::uncertain(
+                            "the executor stopped unexpectedly while observing the resource",
+                        )))
                     });
+                // A newer cookie is kept whatever the observation concludes, a
+                // failure included, so the next call to the driver carries it.
+                if let Some(cookie) = cookie
+                    && let Err(e) = self
+                        .store
+                        .keep_recovery_cookie(&op.operation_id, observed_with.as_ref(), &cookie)
+                        .await
+                {
+                    tracing::error!(error = %e, "could not keep the driver's state");
+                    return Err(e.into());
+                }
                 match observed {
                     Ok(Observed::InProgress) => return Ok(Recovered::InProgress),
                     Ok(Observed::Absent { .. }) if deleting => (
@@ -245,7 +264,9 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
                     Err(ExecFailure::Permanent(e)) => {
                         required(format!("the resource cannot be observed: {e}"))
                     }
-                    Err(ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain(error)) => {
+                    Err(
+                        ExecFailure::Retryable { error, .. } | ExecFailure::Uncertain { error, .. },
+                    ) => {
                         return Err(RecoverError::Observation(error));
                     }
                 }
@@ -302,10 +323,14 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             .ok_or_else(|| format!("environment `{app}/{env}` no longer exists"))?
             .env_type;
         let invalid_id = |what: &str| format!("the stored {what} ID is invalid");
+        let descriptor = Descriptor::parse(&r.descriptor).map_err(|_| invalid_id("resource"))?;
+        let output_schema = self
+            .recorded_type(org, app, env, &op.deployment_id, &descriptor)
+            .await?;
         Ok(ProvisionJob {
             operation_id: op.operation_id.clone(),
             attempt: op.attempt,
-            descriptor: Descriptor::parse(&r.descriptor).map_err(|_| invalid_id("resource"))?,
+            descriptor: descriptor.clone(),
             guresid: r
                 .guresid
                 .parse::<Guresid>()
@@ -334,10 +359,57 @@ impl<S: Store + 'static, E: Executor> Planner<S, E> {
             cookie: r.cookie.clone(),
             target: r.target.clone(),
             pin: None,
-            existing: r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some(),
+            // Whether the resource existed before the operation, as it
+            // recorded. The resource's cookie may be one the uncertain
+            // operation itself left, so it decides only for operations
+            // recorded before this was. A restored resource is one the
+            // backup records, whatever its last operation was: its recovery
+            // record is a copy of the put that created it.
+            existing: recorded.get("restored") == Some(&Value::Bool(true))
+                || recorded
+                    .get("existing")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        r.last_deploy_id.is_some() || r.cookie.is_some() || r.target.is_some()
+                    }),
+            // A creation found finished is checked like one that finished in
+            // the deployment, against the type its snapshot recorded.
+            output_schema,
             deadline: Instant::now() + OBSERVE_TIMEOUT,
             log: JobLog::discard(),
         })
+    }
+}
+
+impl<S: Store + 'static, E: Executor> Planner<S, E> {
+    /// The type the operation's deployment recorded for the resource, whose
+    /// output schema a creation found finished must satisfy. Snapshots from
+    /// before types were recorded fall back to the built-in type, if any.
+    async fn recorded_type(
+        &self,
+        org: &str,
+        app: &str,
+        env: &str,
+        deployment_id: &str,
+        descriptor: &Descriptor,
+    ) -> Result<Option<ResourceType>, String> {
+        let snapshot = self
+            .store
+            .deployment_snapshot(org, app, env, deployment_id)
+            .await
+            .map_err(|e| format!("the operation's deployment could not be read: {e}"))?;
+        let recorded = snapshot
+            .as_ref()
+            .and_then(|s| s["types"].get(descriptor.ty.as_str()));
+        match recorded {
+            Some(ty) => serde_json::from_value(ty.clone()).map(Some).map_err(|e| {
+                format!(
+                    "the deployment's recorded type `{}` is unreadable: {e}",
+                    descriptor.ty
+                )
+            }),
+            None => Ok(crate::planner::builtin_type(&descriptor.ty)),
+        }
     }
 }
 

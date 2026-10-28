@@ -203,3 +203,38 @@ async fn dot_segments_are_refused_before_sending() {
         .unwrap_err();
     assert!(matches!(err, Error::Transport(_)), "{err}");
 }
+
+#[tokio::test]
+async fn servers_of_another_contract_are_refused_clearly() {
+    let app = Router::new()
+        .route(
+            "/orgs/acme/apps",
+            get(|| async { ([(CONTRACT_HEADER, "2")], axum::Json(serde_json::json!([]))) }),
+        )
+        .route(
+            "/orgs/acme/current-user",
+            get(|headers: HeaderMap| async move {
+                // Requests name the contract the client was written for.
+                assert_eq!(headers[CONTRACT_HEADER], CONTRACT_VERSION);
+                ([(CONTRACT_HEADER, "1")], axum::Json(serde_json::json!({})))
+            }),
+        )
+        .route(
+            "/version",
+            get(|| async { axum::Json(serde_json::json!({})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = Client::new(&format!("http://{addr}"), "acme", Some(token())).unwrap();
+
+    let err = client.apps().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::UnsupportedContract(v) if v == "2"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("same openporch release"), "{err}");
+    client.current_user().await.unwrap();
+    // Servers from before the header serve contract 1.
+    client.request(Method::GET, "/version", None).await.unwrap();
+}

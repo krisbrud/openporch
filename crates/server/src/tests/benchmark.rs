@@ -214,13 +214,18 @@ async fn reference_capacity_benchmark() {
         None,
         Arc::new(registry),
         None,
+        None,
     );
-    // A record, so definitions may name it; the server runs it in-process.
-    sqlx::query("INSERT INTO drivers (org_id, id, body, created_at) VALUES ('acme', ?, '{}', 0)")
-        .bind(DRIVER)
-        .execute(s.state.store.pool())
-        .await
-        .unwrap();
+    // A record, so definitions, workloads' among them, may name it; the
+    // server runs it in-process.
+    sqlx::query(
+        "INSERT INTO drivers (org_id, id, body, created_at) \
+         VALUES ('acme', ?, '{\"capabilities\": {\"targets\": {\"workloads\": true}}}', 0)",
+    )
+    .bind(DRIVER)
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
     platform(&s).await;
     let s = Arc::new(s);
 

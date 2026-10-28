@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use openporch_core::canonical::to_canonical_string;
-use openporch_core::catalog::{ClassRegistry, builtin_types};
+use openporch_core::catalog::{ClassRegistry, ResourceType, builtin_types};
 use openporch_core::graph::{GraphInput, ResourceGraph, build_graph};
 use openporch_core::sets::{Delta, DeploymentSet, apply_delta};
 use openporch_engine::cloud::{EcrImage, S3Version, in_ecr, pinned_image};
@@ -35,7 +35,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The snapshot format this server writes and replays.
-pub(super) const SNAPSHOT_VERSION: u64 = 4;
+pub(super) const SNAPSHOT_VERSION: u64 = 5;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -449,15 +449,23 @@ async fn snapshot(
             )
         })
         .collect();
+    // The types the graph uses, whose output schemas the driver's outputs must
+    // satisfy, as they are now: a replay checks against the same schemas.
+    let used_types: BTreeMap<String, &ResourceType> = types
+        .iter()
+        .filter(|t| graph.nodes.values().any(|n| n.descriptor.ty == t.id))
+        .map(|t| (t.id.to_string(), t))
+        .collect();
+    let ids: Vec<&str> = graph
+        .nodes
+        .values()
+        .map(|n| n.driver_type.as_str())
+        .collect();
+    let known = state.drivers.known(&state.store, org, &ids).await?;
     let drivers: BTreeMap<String, Option<String>> = graph
         .nodes
         .values()
-        .map(|n| {
-            (
-                n.driver_type.clone(),
-                state.drivers.protocol(&n.driver_type),
-            )
-        })
+        .map(|n| (n.driver_type.clone(), known.protocol(&n.driver_type)))
         .collect();
     let mut snapshot = json!({
         "version": SNAPSHOT_VERSION,
@@ -465,6 +473,7 @@ async fn snapshot(
         "permits": req.permits,
         "graph": graph,
         "definitions": used,
+        "types": used_types,
         "drivers": drivers,
         "values": values(state, env).await?,
     });
@@ -683,8 +692,11 @@ async fn pin_secrets(state: &AppState, snapshot: &mut Value) -> ApiResult<()> {
 /// Checks that what a recorded snapshot needs still exists: its drivers at
 /// the protocol version it ran with, and the secret versions it pinned.
 async fn check_replay(state: &AppState, source: &str, snapshot: &mut Value) -> ApiResult<()> {
-    for (driver, protocol) in snapshot["drivers"].as_object().into_iter().flatten() {
-        let now = state.drivers.protocol(driver);
+    let recorded = snapshot["drivers"].as_object().cloned().unwrap_or_default();
+    let ids: Vec<&str> = recorded.keys().map(String::as_str).collect();
+    let known = state.drivers.known(&state.store, state.org(), &ids).await?;
+    for (driver, protocol) in &recorded {
+        let now = known.protocol(driver);
         if now.is_none() || now.as_deref() != protocol.as_str() {
             return Err(ApiError::invalid(format!(
                 "deployment `{source}` used driver `{driver}` at protocol {}, which this server \

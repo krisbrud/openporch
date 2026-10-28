@@ -21,6 +21,9 @@ pub mod code {
     pub const TOO_LARGE: &str = "API-006";
     /// `429`: too many requests; retry after the `Retry-After` seconds.
     pub const RATE_LIMITED: &str = "API-007";
+    /// `400`: the client asked for an API contract this server does not
+    /// serve; nothing was done.
+    pub const UNSUPPORTED_CONTRACT: &str = "API-008";
     /// No valid credential.
     pub const UNAUTHENTICATED: &str = "AUTH-001";
     /// The principal lacks the permission.
