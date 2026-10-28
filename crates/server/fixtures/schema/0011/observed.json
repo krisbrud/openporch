@@ -1,0 +1,347 @@
+{
+  "/orgs/acme/apps": [
+    {
+      "id": "shop",
+      "name": "shop",
+      "created_at": 1793218724766,
+      "created_by": "bootstrap",
+      "state": "active"
+    }
+  ],
+  "/orgs/acme/users": [
+    {
+      "id": "alice",
+      "type": "service",
+      "name": "alice",
+      "role": "member",
+      "created_at": 1793218724760,
+      "created_by": "bootstrap"
+    },
+    {
+      "id": "bootstrap",
+      "type": "service",
+      "name": "Bootstrap administrator",
+      "role": "administrator",
+      "created_at": 1793218724752
+    }
+  ],
+  "/orgs/acme/env-types": [
+    {
+      "id": "development",
+      "description": "Default environment type",
+      "protected": false,
+      "created_at": 1793218724744
+    },
+    {
+      "id": "production",
+      "description": "Live traffic",
+      "protected": false,
+      "created_at": 1793218724771
+    }
+  ],
+  "/orgs/acme/env-types/production/users": [
+    {
+      "user": "alice",
+      "role": "deployer"
+    }
+  ],
+  "/orgs/acme/resources/defs": [
+    {
+      "id": "env",
+      "name": "env",
+      "type": "base-env",
+      "driver_type": "openporch/none",
+      "driver_inputs": {
+        "values": {}
+      },
+      "criteria": [
+        {
+          "id": "ae90a5636739ffcc"
+        }
+      ],
+      "version": 1,
+      "created_at": 1793218724783,
+      "created_by": "bootstrap",
+      "updated_at": 1793218724783
+    },
+    {
+      "id": "workloads",
+      "name": "workloads",
+      "type": "workload",
+      "driver_type": "openporch/none",
+      "driver_inputs": {
+        "values": {}
+      },
+      "criteria": [
+        {
+          "id": "cd90e2a964ec8610"
+        }
+      ],
+      "version": 1,
+      "created_at": 1793218724788,
+      "created_by": "bootstrap",
+      "updated_at": 1793218724788
+    }
+  ],
+  "/orgs/acme/apps/shop/envs": [
+    {
+      "app": "shop",
+      "id": "development",
+      "name": "Development",
+      "type": "development",
+      "state": "active",
+      "generation": 2,
+      "desired_set_id": "WJloTvdfrLDUflaENMDyCuYuZXymg-uChMKudAZ33cY",
+      "last_successful_set_id": "WJloTvdfrLDUflaENMDyCuYuZXymg-uChMKudAZ33cY",
+      "last_successful_deploy_id": "b78403e329499cc58c4062e006675dce",
+      "latest_deployment": {
+        "id": "b78403e329499cc58c4062e006675dce",
+        "kind": "deploy",
+        "status": "succeeded",
+        "created_at": 1793218724884,
+        "finished_at": 1793218724923
+      },
+      "convergence": "converged"
+    },
+    {
+      "app": "shop",
+      "id": "production",
+      "name": "production",
+      "type": "production",
+      "state": "active",
+      "generation": 1,
+      "desired_set_id": "SWU2Nx6XRUW4t3x0zt5eJWpA3QPUECDj0yQguAF8Qno",
+      "last_successful_set_id": "SWU2Nx6XRUW4t3x0zt5eJWpA3QPUECDj0yQguAF8Qno",
+      "last_successful_deploy_id": "7a2ac6a267cbf8985b228fe6ec1d3a86",
+      "latest_deployment": {
+        "id": "7a2ac6a267cbf8985b228fe6ec1d3a86",
+        "kind": "deploy",
+        "status": "succeeded",
+        "created_at": 1793218724939,
+        "finished_at": 1793218724973
+      },
+      "convergence": "converged"
+    }
+  ],
+  "/orgs/acme/apps/shop/values": [
+    {
+      "key": "API_URL",
+      "description": "Public API",
+      "value": "https://api.example",
+      "is_secret": false,
+      "updated_at": 1793218724798
+    }
+  ],
+  "/orgs/acme/apps/shop/envs/development/resources": {
+    "resources": [
+      {
+        "app": "shop",
+        "env": "development",
+        "descriptor": "base-env.default#base-env",
+        "guresid": "2b4bc914598c4aaede66bb06fac8a92f",
+        "definition_id": "env",
+        "definition_version": 1,
+        "driver_type": "openporch/none",
+        "driver_account": null,
+        "status": "provisioned",
+        "ownership": "owned",
+        "outputs": {},
+        "secret_outputs": [],
+        "dependencies": [],
+        "scheduled_deletion": false,
+        "usage": {
+          "last_deploy_id": "b78403e329499cc58c4062e006675dce",
+          "deploys_ago": 0,
+          "referenced": true
+        },
+        "observed_at": 1793218724920,
+        "created_at": 1793218724820
+      },
+      {
+        "app": "shop",
+        "env": "development",
+        "descriptor": "workload.default#modules.web",
+        "guresid": "9c27523393028cf43531c0e7f55a1a71",
+        "definition_id": "workloads",
+        "definition_version": 1,
+        "driver_type": "openporch/none",
+        "driver_account": null,
+        "status": "provisioned",
+        "ownership": "owned",
+        "outputs": {
+          "id": "web",
+          "class": "default",
+          "spec": {
+            "containers": {
+              "web": {
+                "image": "nginx:1"
+              }
+            }
+          },
+          "dependencies": {}
+        },
+        "secret_outputs": [],
+        "dependencies": [],
+        "scheduled_deletion": false,
+        "usage": {
+          "last_deploy_id": "b78403e329499cc58c4062e006675dce",
+          "deploys_ago": 0,
+          "referenced": true
+        },
+        "observed_at": 1793218724906,
+        "created_at": 1793218724820
+      },
+      {
+        "app": "shop",
+        "env": "development",
+        "descriptor": "workload.default#modules.worker",
+        "guresid": "6f7e828ac41081dfe1f6235d4da11448",
+        "definition_id": "workloads",
+        "definition_version": 1,
+        "driver_type": "openporch/none",
+        "driver_account": null,
+        "status": "provisioned",
+        "ownership": "owned",
+        "outputs": {
+          "id": "worker",
+          "class": "default",
+          "spec": {
+            "containers": {
+              "worker": {
+                "image": "busybox:1"
+              }
+            }
+          },
+          "dependencies": {}
+        },
+        "secret_outputs": [],
+        "dependencies": [],
+        "scheduled_deletion": false,
+        "usage": {
+          "last_deploy_id": "b78403e329499cc58c4062e006675dce",
+          "deploys_ago": 0,
+          "referenced": true
+        },
+        "observed_at": 1793218724912,
+        "created_at": 1793218724890
+      }
+    ]
+  },
+  "/orgs/acme/apps/shop/envs/production/resources": {
+    "resources": [
+      {
+        "app": "shop",
+        "env": "production",
+        "descriptor": "base-env.default#base-env",
+        "guresid": "267cb7bcea22d012ece25ba3cded6320",
+        "definition_id": "env",
+        "definition_version": 1,
+        "driver_type": "openporch/none",
+        "driver_account": null,
+        "status": "provisioned",
+        "ownership": "owned",
+        "outputs": {},
+        "secret_outputs": [],
+        "dependencies": [],
+        "scheduled_deletion": false,
+        "usage": {
+          "last_deploy_id": "7a2ac6a267cbf8985b228fe6ec1d3a86",
+          "deploys_ago": 0,
+          "referenced": true
+        },
+        "observed_at": 1793218724953,
+        "created_at": 1793218724944
+      },
+      {
+        "app": "shop",
+        "env": "production",
+        "descriptor": "workload.default#modules.web",
+        "guresid": "e2ea87c2ca67147c12c86241a616ac78",
+        "definition_id": "workloads",
+        "definition_version": 1,
+        "driver_type": "openporch/none",
+        "driver_account": null,
+        "status": "provisioned",
+        "ownership": "owned",
+        "outputs": {
+          "id": "web",
+          "class": "default",
+          "spec": {
+            "containers": {
+              "web": {
+                "image": "nginx:1"
+              }
+            }
+          },
+          "dependencies": {}
+        },
+        "secret_outputs": [],
+        "dependencies": [],
+        "scheduled_deletion": false,
+        "usage": {
+          "last_deploy_id": "7a2ac6a267cbf8985b228fe6ec1d3a86",
+          "deploys_ago": 0,
+          "referenced": true
+        },
+        "observed_at": 1793218724969,
+        "created_at": 1793218724944
+      }
+    ]
+  },
+  "/orgs/acme/apps/shop/envs/development/deploys": {
+    "deployments": [
+      {
+        "id": "b78403e329499cc58c4062e006675dce",
+        "app": "shop",
+        "env": "development",
+        "seq": 2,
+        "kind": "deploy",
+        "actor": "bootstrap",
+        "set_id": "WJloTvdfrLDUflaENMDyCuYuZXymg-uChMKudAZ33cY",
+        "delta_id": "32c42c3468d412cbf8b8",
+        "comment": "",
+        "generation": 2,
+        "status": "succeeded",
+        "error": null,
+        "created_at": 1793218724884,
+        "finished_at": 1793218724923
+      },
+      {
+        "id": "9da97be17fd5a13848cbef02a75cef1c",
+        "app": "shop",
+        "env": "development",
+        "seq": 1,
+        "kind": "deploy",
+        "actor": "bootstrap",
+        "set_id": "SWU2Nx6XRUW4t3x0zt5eJWpA3QPUECDj0yQguAF8Qno",
+        "delta_id": "0d47d3caf63f83541cc4",
+        "comment": "",
+        "generation": 1,
+        "status": "succeeded",
+        "error": null,
+        "created_at": 1793218724814,
+        "finished_at": 1793218724852
+      }
+    ]
+  },
+  "/orgs/acme/apps/shop/envs/production/deploys": {
+    "deployments": [
+      {
+        "id": "7a2ac6a267cbf8985b228fe6ec1d3a86",
+        "app": "shop",
+        "env": "production",
+        "seq": 1,
+        "kind": "deploy",
+        "actor": "bootstrap",
+        "set_id": "SWU2Nx6XRUW4t3x0zt5eJWpA3QPUECDj0yQguAF8Qno",
+        "delta_id": "0d47d3caf63f83541cc4",
+        "comment": "",
+        "generation": 1,
+        "status": "succeeded",
+        "error": null,
+        "created_at": 1793218724939,
+        "finished_at": 1793218724973
+      }
+    ]
+  }
+}

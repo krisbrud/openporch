@@ -146,6 +146,11 @@ fn error_json(e: &DriverError) -> Value {
         DriverError::Timeout(d) => json!({"kind": "timeout", "secs": d.as_secs()}),
         DriverError::Uncertain(m) => json!({"kind": "uncertain", "message": m}),
         DriverError::Unsupported(m) => json!({"kind": "unsupported", "message": m}),
+        DriverError::WithCookie { error, cookie } => {
+            let mut v = error_json(error);
+            v["cookie"] = serde_json::to_value(cookie).unwrap();
+            v
+        }
     };
     v["retryable"] = json!(e.is_retryable());
     v
@@ -173,13 +178,20 @@ fn summary<T>(r: Result<T, DriverError>, f: impl FnOnce(T) -> Value) -> Value {
 
 fn observation_json(o: Observation) -> Value {
     match o {
-        Observation::Absent => json!({"absent": null}),
+        Observation::Absent { cookie: None } => json!({"absent": null}),
+        Observation::Absent { cookie } => json!({"absent": {"cookie": cookie_json(&cookie)}}),
         Observation::InProgress { poll_after, cookie } => {
             json!({"in_progress": {"poll_after_secs": poll_after.as_secs(), "cookie": cookie_json(&cookie)}})
         }
         Observation::Ready { outputs, cookie } => json!({"ready": outputs_json(&outputs, &cookie)}),
         Observation::Failed { error } => json!({"failed": error_json(&error)}),
-        Observation::Unknown { reason } => json!({"unknown": reason}),
+        Observation::Unknown {
+            reason,
+            cookie: None,
+        } => json!({"unknown": reason}),
+        Observation::Unknown { reason, cookie } => {
+            json!({"unknown": {"reason": reason, "cookie": cookie_json(&cookie)}})
+        }
     }
 }
 
@@ -337,7 +349,115 @@ async fn duplicate_put_recovers_the_same_object() {
         .await
         .result
         .unwrap_err();
-    assert_eq!(err, DriverError::Conflict("fingerprint changed".into()));
+    // The conflict is observed, not repeated into.
+    assert_eq!(
+        err,
+        DriverError::Uncertain(
+            "the driver reports a conflicting operation (409), so the resource is observed \
+             before it is changed again: fingerprint changed"
+                .into()
+        )
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_mutation_response_keeps_its_cookie() {
+    let new = Cookie::new(1, "op-2").unwrap();
+    let cookie = || {
+        (
+            "set-openporch-driver-cookie".to_owned(),
+            "1.b3AtMg".to_owned(),
+        )
+    };
+    let replies = [
+        // Larger than a response may be.
+        Canned {
+            status: 200,
+            headers: BTreeMap::from([cookie()]),
+            body: Some(json!({"padding": "x".repeat(5 << 20)})),
+        },
+        // In another protocol.
+        Canned {
+            status: 200,
+            headers: BTreeMap::from([cookie(), ("openporch-protocol".into(), "99".into())]),
+            body: Some(json!({})),
+        },
+    ];
+    for (call, reply) in ["put", "delete"]
+        .into_iter()
+        .flat_map(|call| replies.iter().map(move |r| (call, r)))
+    {
+        let mock = Shared::default();
+        mock.lock().unwrap().queue.push_back(reply.clone());
+        let target = serve(mock.clone()).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let req = request(Some(Cookie::new(1, "op-1").unwrap()));
+        let settled = match call {
+            "put" => {
+                let s = converge(&driver, &req, DEFAULT_TIMEOUT).await;
+                Settled {
+                    result: s.result.map(|_| ()),
+                    cookie: s.cookie,
+                }
+            }
+            _ => remove(&driver, &req, DEFAULT_TIMEOUT).await,
+        };
+        let err = settled.result.unwrap_err();
+        assert!(matches!(err, DriverError::Uncertain(_)), "{call}: {err:?}");
+        assert_eq!(settled.cookie, Some(new.clone()), "{call}");
+    }
+}
+
+// Real time: paused time would jump to the deadline while waiting on sockets.
+#[tokio::test]
+async fn a_failed_poll_keeps_the_cookie_it_returned() {
+    let polled = [
+        (500, false, Some(json!({"message": "busy"}))),
+        (200, false, Some(json!({"unexpected": true}))),
+        (422, false, Some(json!({"message": "rejected"}))),
+        // The driver's own 404, and one from anything else.
+        (404, true, Some(json!({"message": "gone"}))),
+        (404, false, None),
+    ];
+    for (status, spoken, body) in polled {
+        let mut headers =
+            BTreeMap::from([("set-openporch-driver-cookie".into(), "1.b3AtMg".into())]);
+        if spoken {
+            headers.insert("openporch-protocol".into(), PROTOCOL_VERSION.into());
+        }
+        let mock = Shared::default();
+        {
+            let mut m = mock.lock().unwrap();
+            m.queue.push_back(Canned {
+                status: 202,
+                headers: BTreeMap::from([
+                    ("retry-after".into(), "1".into()),
+                    ("set-openporch-driver-cookie".into(), "1.b3AtMQ".into()),
+                ]),
+                body: None,
+            });
+            m.queue.push_back(Canned {
+                status,
+                headers,
+                body,
+            });
+        }
+        let target = serve(mock.clone()).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let settled = converge(&driver, &request(None), DEFAULT_TIMEOUT).await;
+        let err = settled.result.unwrap_err();
+        assert!(
+            !matches!(err, DriverError::WithCookie { .. }),
+            "{status}: {err:?}"
+        );
+        assert!(!err.to_string().contains("op-2"), "{err}");
+        // The poll's cookie, not the 202's, is what recovery observes with.
+        assert_eq!(
+            settled.cookie,
+            Some(Cookie::new(1, "op-2").unwrap()),
+            "{status}"
+        );
+    }
 }
 
 // Real time: paused time would jump to the deadline while waiting on sockets.
@@ -376,6 +496,71 @@ async fn asynchronous_provisioning_over_http() {
     assert_eq!(calls, ["PUT", "GET", "GET"]);
     // Polls carry the cookie from the 202.
     assert_eq!(recorded[1].headers[COOKIE_HEADER], "1.b3AtMQ");
+}
+
+#[tokio::test]
+async fn a_failed_mutation_keeps_the_cookie_it_returned() {
+    let old = Cookie::new(1, "op-1").unwrap();
+    let new = Cookie::new(1, "op-2").unwrap();
+    for (status, call) in [
+        (409, "put"),
+        (503, "put"),
+        (409, "delete"),
+        (500, "delete"),
+        // A 404 without `Openporch-Protocol` is uncertain, and its cookie is
+        // still kept.
+        (404, "delete"),
+    ] {
+        let mock = Shared::default();
+        mock.lock().unwrap().queue.push_back(Canned {
+            status,
+            headers: BTreeMap::from([("set-openporch-driver-cookie".into(), "1.b3AtMg".into())]),
+            body: Some(json!({"message": "busy"})),
+        });
+        let target = serve(mock.clone()).await;
+        let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+        let req = request(Some(old.clone()));
+        let settled = match call {
+            "put" => {
+                let s = converge(&driver, &req, DEFAULT_TIMEOUT).await;
+                Settled {
+                    result: s.result.map(|_| ()),
+                    cookie: s.cookie,
+                }
+            }
+            _ => remove(&driver, &req, DEFAULT_TIMEOUT).await,
+        };
+        // The outcome is uncertain, the error carries no cookie of its own,
+        // and the new cookie is what recovery observes with.
+        let err = settled.result.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Uncertain(_)),
+            "{call} {status}: {err:?}"
+        );
+        assert_eq!(settled.cookie, Some(new.clone()), "{call} {status}");
+        // The cookie's data never shows in the error.
+        assert!(!err.to_string().contains("op-2"), "{err}");
+    }
+
+    // A cookie in a version the driver does not declare cannot be kept: the
+    // outcome is uncertain even for a failure that was definite, and the old
+    // cookie stays.
+    let mock = Shared::default();
+    mock.lock().unwrap().queue.push_back(Canned {
+        status: 400,
+        headers: BTreeMap::from([("set-openporch-driver-cookie".into(), "2.b3AtMg".into())]),
+        body: Some(json!({"message": "bad input"})),
+    });
+    let target = serve(mock.clone()).await;
+    let driver = HttpDriver::new(info(Capabilities::default()), &target, None).unwrap();
+    let settled = converge(&driver, &request(Some(old.clone())), DEFAULT_TIMEOUT).await;
+    assert_eq!(
+        settled.result.unwrap_err(),
+        DriverError::Uncertain(
+            "the driver returned a version 2 cookie but declares version 1".into()
+        )
+    );
+    assert_eq!(settled.cookie, Some(old));
 }
 
 #[test]

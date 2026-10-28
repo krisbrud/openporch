@@ -670,6 +670,149 @@ async fn external_drivers_are_registered() {
     let (status, b) = s.get(path, &member).await;
     assert_eq!(status, StatusCode::OK, "{b}");
     assert!(!b.to_string().contains("bearer-s3cret"));
+    // The registration pins the protocol, the cookie version and the
+    // capabilities, with defaults when left out.
+    assert_eq!(b["protocol_version"], "openporch-http/1", "{b}");
+    assert_eq!(b["cookie_version"], 1, "{b}");
+    assert_eq!(
+        b["capabilities"],
+        json!({"targets": {"resources": true, "workloads": false, "triggers": false},
+               "observe": false, "recover": false, "preview": false, "cancel": false})
+    );
+    let pinned = s
+        .created(
+            "/orgs/acme/resources/drivers",
+            json!({"id": "acme/pinned", "target": "https://driver.internal/pinned",
+                   "protocol_version": "openporch-http/1", "cookie_version": 3,
+                   "outputs_schema": {"type": "object"},
+                   "capabilities": {"targets": {"resources": false, "workloads": true},
+                                    "observe": true, "recover": true, "cancel": true}}),
+        )
+        .await;
+    let (status, b) = s
+        .get("/orgs/acme/resources/drivers/acme%2Fpinned", &member)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b, pinned);
+    assert_eq!(b["cookie_version"], 3, "{b}");
+    assert_eq!(b["outputs_schema"], json!({"type": "object"}), "{b}");
+    assert_eq!(
+        b["capabilities"],
+        json!({"targets": {"resources": false, "workloads": true, "triggers": false},
+               "observe": true, "recover": true, "preview": false, "cancel": true})
+    );
+
+    // A definition may use a driver only for what it declares it provisions,
+    // when it is created and when it is changed.
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "web", "type": "workload", "driver_type": "acme/vault-secret"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"]
+            .as_str()
+            .unwrap()
+            .contains("driver `acme/vault-secret` cannot provision resources of type `workload`"),
+        "{b}"
+    );
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/defs",
+            &s.admin,
+            json!({"id": "pinned-pg", "type": "postgres", "driver_type": "acme/pinned"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("`resources`"),
+        "{b}"
+    );
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "web", "type": "workload", "driver_type": "acme/pinned"}),
+    )
+    .await;
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/defs/web",
+            &s.admin,
+            json!({"driver_type": "acme/vault-secret"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("`workloads`"),
+        "{b}"
+    );
+    let (status, b) = s.delete("/orgs/acme/resources/defs/web", &s.admin).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+
+    // A registration under the same ID cannot inherit its predecessor's token.
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+    let (status, b) = s
+        .post(
+            "/orgs/acme/resources/drivers",
+            &s.admin,
+            json!({"id": "acme/vault-secret", "target": "https://elsewhere.internal/vault",
+                   "token": {"store": "openporch", "ref": "drivers/acme/vault-secret/token"}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("own secrets"),
+        "{b}"
+    );
+    s.created("/orgs/acme/resources/drivers", vault.clone())
+        .await;
+
+    // Nor can a registration be deleted while an operation it ran has an
+    // outcome nobody knows yet: recovery observes with that driver.
+    sqlx::query(
+        "INSERT INTO operations (id, org_id, app_id, env_id, deployment_id, guresid, kind, \
+         input_fingerprint, state, started_at, driver_type) \
+         VALUES ('op-open', 'acme', 'shop', 'development', 'd-1', 'g-1', 'put', 'f', \
+         'unknown', 0, 'acme/vault-secret')",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let (status, b) = s.delete(path, &s.admin).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+    assert!(
+        b["message"].as_str().unwrap().contains("not known yet"),
+        "{b}"
+    );
+    sqlx::query("UPDATE operations SET state = 'failed' WHERE id = 'op-open'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+
+    for (body, message) in [
+        (json!({"capabilities": {"targets": {"pods": true}}}), "pods"),
+        (
+            json!({"protocol_version": "openporch-http/2"}),
+            "`openporch-http/2` is not supported",
+        ),
+        // The protocol has no preview call.
+        (
+            json!({"capabilities": {"preview": true}}),
+            "`capabilities.preview` must be false",
+        ),
+        (json!({"capabilities": {"teleport": true}}), "teleport"),
+        (json!({"outputs_schema": []}), "`outputs_schema`"),
+    ] {
+        let mut body = body;
+        body["id"] = json!("acme/refused");
+        body["target"] = json!("https://driver.internal/refused");
+        let (status, b) = s.post("/orgs/acme/resources/drivers", &s.admin, body).await;
+        assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+        assert!(b["message"].as_str().unwrap().contains(message), "{b}");
+    }
     let (status, b) = s
         .post("/orgs/acme/resources/drivers", &s.admin, vault)
         .await;
@@ -745,6 +888,299 @@ async fn external_drivers_are_registered() {
         .unwrap();
     let (status, b) = s.delete(path, &s.admin).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{b}");
+}
+
+#[tokio::test]
+async fn external_drivers_are_replaced() {
+    use openporch_store::secrets::SecretStore as _;
+    let s = server().await;
+    let member = s.member("mia", "member").await;
+    let path = "/orgs/acme/resources/drivers/acme%2Fvault-db";
+    let created = s
+        .created(
+            "/orgs/acme/resources/drivers",
+            json!({"id": "acme/vault-db", "target": "https://drivers.acme.example/vault-db",
+                   "token": {"value": "first-s3cret"}, "capabilities": {"observe": true}}),
+        )
+        .await;
+    let first = created["token"].clone();
+    assert_eq!(first["ref"], "drivers/acme/vault-db/token", "{created}");
+
+    let (status, b) = s
+        .put(
+            path,
+            &member,
+            json!({"target": "https://drivers.acme.example/vault-db"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/drivers/acme%2Fmissing",
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/missing"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/drivers/openporch%2Fecho",
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/echo"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    // Whatever the body.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/drivers/openporch%2Fecho",
+            Some(&s.admin),
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let (status, b) = s
+        .put(
+            "/orgs/acme/resources/drivers/openporch%2Fecho",
+            &s.admin,
+            json!({"teleport": true}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"id": "acme/other", "target": "https://drivers.acme.example/vault-db"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+
+    // A rotated token is a new version; the target moves in place, normalized.
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://Drivers.ACME.example:443/v2", "token": {"value": "second-s3cret"},
+                   "cookie_version": 2, "capabilities": {"observe": true, "recover": true}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert!(!b.to_string().contains("s3cret"), "{b}");
+    assert_eq!(b["target"], "https://drivers.acme.example/v2", "{b}");
+    assert_eq!(b["cookie_version"], 2, "{b}");
+    assert_eq!(b["capabilities"]["recover"], true, "{b}");
+    let second = b["token"].clone();
+    assert_eq!(second["ref"], first["ref"], "{b}");
+    assert_ne!(second["version"], first["version"], "{b}");
+    let (_, got) = s.get(path, &member).await;
+    assert_eq!(got, b);
+    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let token: openporch_core::model::SecretRef = serde_json::from_value(second.clone()).unwrap();
+    assert_eq!(
+        primary.read(&token).await.unwrap().expose(),
+        "second-s3cret"
+    );
+
+    // The token it holds is kept when given back; an earlier version, or
+    // another secret under the driver, must be entered again.
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v3", "token": second}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["token"], second, "{b}");
+    // Pins and capabilities left out stay as they are.
+    assert_eq!(b["cookie_version"], 2, "{b}");
+    assert_eq!(b["protocol_version"], "openporch-http/1", "{b}");
+    assert_eq!(b["capabilities"]["recover"], true, "{b}");
+    // A given capabilities object replaces them, with its own defaults.
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v3", "token": second,
+                   "capabilities": {"observe": true}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["capabilities"]["recover"], false, "{b}");
+    assert_eq!(b["cookie_version"], 2, "{b}");
+    for token in [
+        first.clone(),
+        json!({"store": "openporch", "ref": "drivers/acme/vault-db/token"}),
+        json!({"store": "openporch", "ref": "drivers/acme/vault-db/other", "version": "1"}),
+    ] {
+        let (status, b) = s
+            .put(
+                path,
+                &s.admin,
+                json!({"target": "https://drivers.acme.example/v3", "token": token}),
+            )
+            .await;
+        assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+        assert!(
+            b["message"].as_str().unwrap().contains("own secrets"),
+            "{b}"
+        );
+    }
+    // Validated like a registration.
+    for (body, message) in [
+        (json!({"target": "http://drivers.acme.example"}), "https"),
+        (
+            json!({"target": "https://drivers.acme.example", "capabilities": {"preview": true}}),
+            "`capabilities.preview` must be false",
+        ),
+        (
+            json!({"target": "https://drivers.acme.example", "protocol_version": "openporch-http/2"}),
+            "not supported",
+        ),
+        (
+            json!({"target": "https://drivers.acme.example", "token": {"store": "missing", "ref": "x"}}),
+            "missing",
+        ),
+    ] {
+        let (status, b) = s.put(path, &s.admin, body).await;
+        assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+        assert!(b["message"].as_str().unwrap().contains(message), "{b}");
+    }
+
+    // A definition keeps the types it uses covered.
+    s.created(
+        "/orgs/acme/resources/defs",
+        json!({"id": "vault", "type": "config", "driver_type": "acme/vault-db"}),
+    )
+    .await;
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v3", "token": second,
+                   "capabilities": {"targets": {"resources": false, "workloads": true}}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(b["message"].as_str().unwrap().contains("`vault`"), "{b}");
+
+    // Nor is it replaced while an operation it ran has an unknown outcome.
+    sqlx::query(
+        "INSERT INTO operations (id, org_id, app_id, env_id, deployment_id, guresid, kind, \
+         input_fingerprint, state, started_at, driver_type) \
+         VALUES ('op-open', 'acme', 'shop', 'development', 'd-1', 'g-1', 'put', 'f', \
+         'started', 0, 'acme/vault-db')",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4", "token": {"value": "third-s3cret"}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(
+        b["message"].as_str().unwrap().contains("not known yet"),
+        "{b}"
+    );
+    assert!(!b.to_string().contains("s3cret"), "{b}");
+    let (_, got) = s.get(path, &member).await;
+    assert_eq!(got["token"], second, "{got}");
+    assert_eq!(got["target"], "https://drivers.acme.example/v3", "{got}");
+    sqlx::query("UPDATE operations SET state = 'succeeded' WHERE id = 'op-open'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+
+    // Leaving the token out removes it.
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert!(b.get("token").is_none(), "{b}");
+
+    // Active resources hold cookies of the version the driver writes, so it
+    // stays while they exist.
+    s.active_resource("shop", "production", "config.default.shared.vault", "vault")
+        .await;
+    sqlx::query("UPDATE active_resources SET driver_type = 'acme/vault-db'")
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4", "cookie_version": 3}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let message = b["message"].as_str().unwrap();
+    assert!(
+        message.contains("`shop-production-vault` (shop/production)"),
+        "{b}"
+    );
+    // The first ten GUResIDs are named, with a count of the rest.
+    for n in 0..11 {
+        sqlx::query(
+            "INSERT INTO active_resources (org_id, app_id, env_id, descriptor, guresid, \
+             definition_id, definition_version, status, created_at, updated_at, driver_type) \
+             VALUES ('acme', 'shop', 'development', ?, ?, 'vault', 1, 'provisioned', 0, 0, \
+             'acme/vault-db')",
+        )
+        .bind(format!("config.default.shared.v{n:02}"))
+        .bind(format!("g-{n:02}"))
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    }
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v4", "cookie_version": 3}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let message = b["message"].as_str().unwrap();
+    assert!(
+        message.contains("`g-09` (shop/development) and 2 more"),
+        "{b}"
+    );
+    assert!(!message.contains("g-10"), "{b}");
+    let (status, b) = s
+        .put(
+            path,
+            &s.admin,
+            json!({"target": "https://drivers.acme.example/v5", "cookie_version": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+
+    let (_, page) = s
+        .get(
+            "/orgs/acme/audit-logs?method=PUT&path_prefix=/orgs/acme/resources/drivers",
+            &s.admin,
+        )
+        .await;
+    let actions: Vec<&str> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["result"] != "denied")
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"driver.update"), "{page}");
+    assert!(!page.to_string().contains("s3cret"), "{page}");
 }
 
 #[tokio::test]

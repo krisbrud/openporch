@@ -68,7 +68,7 @@ impl Driver for Gated {
                 .unwrap()
                 .contains(&req.guresid.as_str().to_owned());
             if gone {
-                Ok(Observation::Absent)
+                Ok(Observation::Absent { cookie: None })
             } else {
                 self.0.get(req).await
             }
@@ -172,7 +172,9 @@ async fn backup_and_restore_drill() {
                 "/orgs/acme/resources/defs",
                 &s.admin,
                 json!({"id": id, "type": ty, "driver_type": driver,
-                       "driver_inputs": {"values": {"host": format!("{id}.internal")}},
+                       "driver_inputs": {"values": {
+                           "host": format!("{id}.internal"), "name": id, "port": 5432},
+                           "secret_refs": {"username": {"value": "shop"}, "password": {"value": "change-me"}}},
                        "criteria": [{}]}),
             )
             .await;

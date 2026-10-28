@@ -3,5 +3,5 @@
   "call": "put",
   "request": {"method": "PUT", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
   "response": {"status": 409, "body": {"message": "operation op-0 is still running"}},
-  "expect": {"error": {"kind": "conflict", "message": "operation op-0 is still running", "retryable": false}}
+  "expect": {"error": {"kind": "uncertain", "message": "the driver reports a conflicting operation (409), so the resource is observed before it is changed again: operation op-0 is still running", "retryable": false}}
 }

@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use openporch_core::model::SecretRef;
 use openporch_engine::planner::{
-    DeprovisionJob, ExecFailure, Executor, Limits, Observed, Planner, ProvisionJob, ProvisionResult,
+    DeprovisionJob, ExecFailure, Executor, Limits, Observation, Observed, Planner, ProvisionJob,
+    ProvisionResult,
 };
 use serde_json::{Value, json};
 
@@ -59,7 +60,7 @@ impl Executor for Fake {
             return Err(ExecFailure::Permanent(format!("{ty} is unavailable")));
         }
         if self.uncertain.lock().unwrap().contains(&ty) {
-            return Err(ExecFailure::Uncertain(format!("{ty} timed out")));
+            return Err(ExecFailure::uncertain(format!("{ty} timed out")));
         }
         let mut result = ProvisionResult::default();
         if job.driver_type == "openporch/opentofu" {
@@ -95,13 +96,13 @@ impl Executor for Fake {
         Ok(())
     }
 
-    async fn observe(&self, _: ProvisionJob, _: bool) -> Result<Observed, ExecFailure> {
-        Ok(self
-            .observation
+    async fn observe(&self, _: ProvisionJob, _: bool) -> Observation {
+        self.observation
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| Observed::Unknown("nothing to observe".into())))
+            .unwrap_or_else(|| Observed::Unknown("nothing to observe".into()))
+            .into()
     }
 }
 

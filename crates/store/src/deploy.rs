@@ -361,6 +361,11 @@ pub enum CheckpointResult {
     Unknown {
         /// The redacted error.
         error: String,
+        /// The driver's newest cookie, sealed, when the operation returned one
+        /// before its outcome became unknown. It replaces the resource's
+        /// cookie, so recovery observes with it; none leaves the resource's
+        /// cookie as it is.
+        cookie: Option<Sealed>,
     },
 }
 

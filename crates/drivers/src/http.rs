@@ -67,6 +67,21 @@ pub fn check_target(target: &str) -> Result<Url, HttpDriverError> {
     Ok(url)
 }
 
+/// The client [`HttpDriver::new`] builds: redirects are not followed, and,
+/// when `https_only`, an `https` target is never left for plain HTTP. One
+/// client can serve many drivers, and keeps their connections.
+pub fn default_client(https_only: bool) -> Result<Client, HttpDriverError> {
+    // `ring` is the crypto provider; installing it twice is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::builder()
+        .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .https_only(https_only)
+        .build()
+        .map_err(|e| HttpDriverError::Client(e.to_string()))
+}
+
 /// Why an external driver cannot be set up.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HttpDriverError {
@@ -106,16 +121,7 @@ impl HttpDriver {
         token: Option<String>,
     ) -> Result<Self, HttpDriverError> {
         let https = check_target(target)?.scheme() == "https";
-        // `ring` is the crypto provider; installing it twice is harmless.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
-            .user_agent(concat!("openporch/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .https_only(https)
-            .build()
-            .map_err(|e| HttpDriverError::Client(e.to_string()))?;
-        Self::with_client(info, target, token, client)
+        Self::with_client(info, target, token, default_client(https)?)
     }
 
     /// Like [`HttpDriver::new`], with a caller-built client. The caller decides
@@ -206,19 +212,11 @@ impl HttpDriver {
         };
         let status = res.status();
         let headers = res.headers().clone();
-        let mut body = Vec::new();
-        loop {
-            match res.chunk().await {
-                Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > MAX_BODY_BYTES {
-                        return Err(lost("the driver's response is larger than 4 MiB"));
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(_) => return Err(lost("reading the driver's response failed")),
-            }
-        }
+        let cookie = headers
+            .get(SET_COOKIE_HEADER)
+            .map(|v| parse_cookie(v.as_bytes()));
+        // A cookie that arrived is kept even with a response rejected below.
+        let arrived = cookie.clone().flatten();
         if let Some(version) = headers.get(PROTOCOL_HEADER)
             && version.as_bytes() != PROTOCOL_VERSION.as_bytes()
         {
@@ -233,14 +231,34 @@ impl HttpDriver {
                     code: None,
                     message,
                 }
-            });
+            }
+            .with_cookie(arrived));
         }
-        let cookie = match headers.get(SET_COOKIE_HEADER) {
+        let cookie = match cookie {
             None => None,
-            Some(v) => Some(parse_cookie(v.as_bytes()).ok_or_else(|| {
+            Some(parsed) => Some(parsed.ok_or_else(|| {
                 DriverError::Uncertain("the driver returned a malformed cookie".into())
             })?),
         };
+        // The headers arrived, so a cookie in them is kept even when the body
+        // does not.
+        let mut body = Vec::new();
+        loop {
+            match res.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > MAX_BODY_BYTES {
+                        return Err(
+                            lost("the driver's response is larger than 4 MiB").with_cookie(cookie)
+                        );
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(lost("reading the driver's response failed").with_cookie(cookie));
+                }
+            }
+        }
         Ok(Reply {
             status,
             spoken: headers.contains_key(PROTOCOL_HEADER),
@@ -314,6 +332,13 @@ impl HttpDriver {
                 code: None,
                 message: format!("the driver refused the credentials ({status})"),
             },
+            // A conflicting operation may be this one, retried after its
+            // response was lost: the resource is observed before anything is
+            // changed again, never mutated blindly.
+            409 if reply.mutation => DriverError::Uncertain(format!(
+                "the driver reports a conflicting operation (409), so the resource is \
+                 observed before it is changed again: {message}"
+            )),
             409 => DriverError::Conflict(message),
             429 => DriverError::Transient {
                 message,
@@ -337,8 +362,12 @@ impl HttpDriver {
 
     fn observe(&self, req: &DriverRequest, reply: Reply) -> Result<Observation, DriverError> {
         match reply.status {
+            // As for a mutation, a failure's cookie is kept: a poll may return
+            // the driver's newest state with any response.
             StatusCode::OK => Ok(Observation::Ready {
-                outputs: self.outputs(req, &reply)?,
+                outputs: self
+                    .outputs(req, &reply)
+                    .map_err(|e| e.with_cookie(reply.cookie.clone()))?,
                 cookie: reply.cookie,
             }),
             StatusCode::ACCEPTED => Ok(Observation::InProgress {
@@ -347,14 +376,17 @@ impl HttpDriver {
             }),
             // Only a driver's own 404 means absent: a proxy or a wrong path
             // must not make openporch forget a live resource.
-            StatusCode::NOT_FOUND if reply.spoken => Ok(Observation::Absent),
+            StatusCode::NOT_FOUND if reply.spoken => Ok(Observation::Absent {
+                cookie: reply.cookie,
+            }),
             StatusCode::NOT_FOUND => Ok(Observation::Unknown {
                 reason: NOT_A_DRIVER_404.into(),
+                cookie: reply.cookie,
             }),
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => Ok(Observation::Failed {
-                error: self.failure(req, &reply),
+                error: self.failure(req, &reply).with_cookie(reply.cookie),
             }),
-            _ => Err(self.failure(req, &reply)),
+            _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
         }
     }
 }
@@ -464,9 +496,14 @@ impl Driver for HttpDriver {
             let reply = self
                 .call(Method::PUT, req, "", Some(body(req)), true)
                 .await?;
+            // A driver may return a cookie with any response, a failure
+            // included; it is kept for the observation that recovers an
+            // uncertain outcome.
             match reply.status {
                 StatusCode::OK => Ok(PutOutcome::Ready {
-                    outputs: self.outputs(req, &reply)?,
+                    outputs: self
+                        .outputs(req, &reply)
+                        .map_err(|e| e.with_cookie(reply.cookie.clone()))?,
                     cookie: reply.cookie,
                 }),
                 StatusCode::ACCEPTED => Ok(PutOutcome::InProgress {
@@ -477,7 +514,7 @@ impl Driver for HttpDriver {
                     outputs: DriverOutputs::default(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(req, &reply)),
+                _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
             }
         })
     }
@@ -496,12 +533,16 @@ impl Driver for HttpDriver {
                 StatusCode::OK | StatusCode::NO_CONTENT => Ok(DeleteOutcome::Deleted),
                 // The driver's own 404 means it is already gone.
                 StatusCode::NOT_FOUND if reply.spoken => Ok(DeleteOutcome::Deleted),
-                StatusCode::NOT_FOUND => Err(DriverError::Uncertain(NOT_A_DRIVER_404.into())),
+                // Whatever answered, a cookie it returned is kept.
+                StatusCode::NOT_FOUND => {
+                    Err(DriverError::Uncertain(NOT_A_DRIVER_404.into()).with_cookie(reply.cookie))
+                }
                 StatusCode::ACCEPTED => Ok(DeleteOutcome::InProgress {
                     poll_after: reply.poll_after(),
                     cookie: reply.cookie,
                 }),
-                _ => Err(self.failure(req, &reply)),
+                // As for `put`, a failure's cookie is kept.
+                _ => Err(self.failure(req, &reply).with_cookie(reply.cookie)),
             }
         })
     }

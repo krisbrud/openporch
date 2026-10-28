@@ -1,0 +1,7 @@
+{
+  "description": "A 409 to DELETE with a new cookie is uncertain, and the cookie is kept for the observation.",
+  "call": "delete",
+  "request": {"method": "DELETE", "path": "/drivers/pg/0123456789abcdef0123456789abcdef"},
+  "response": {"status": 409, "headers": {"set-openporch-driver-cookie": "1.b3AtMg"}, "body": {"message": "still provisioning"}},
+  "expect": {"error": {"kind": "uncertain", "message": "the driver reports a conflicting operation (409), so the resource is observed before it is changed again: still provisioning", "retryable": false, "cookie": {"version": 1, "data": "op-2"}}}
+}

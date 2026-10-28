@@ -16,12 +16,14 @@ use openporch_core::ids::{AccountId, DefinitionId, Descriptor};
 use openporch_core::model::{ResourceContext, SecretRef};
 use openporch_core::placeholder::Resolved;
 use openporch_drivers::{
-    Action, Cookie, Driver, DriverContext, DriverError, DriverOutputs, DriverRegistry,
-    DriverRequest, Observation, Operation, Plan, SecretMap, call_timeout, converge, remove,
-    with_timeout,
+    Action, Capabilities, Cookie, Driver, DriverContext, DriverError, DriverInfo, DriverOutputs,
+    DriverRegistry, DriverRequest, HttpDriver, HttpDriverError, Observation, Operation, Plan,
+    SecretMap, Targets, call_timeout, check_cookie, converge, default_client, remove, with_timeout,
 };
 use openporch_store::secrets::{Keyring, Sealed, SecretError, SecretStore, SecretValue};
-use openporch_store::{AccountStore, CatalogStore, SecretOwner, SecretUseStore, StoreError};
+use openporch_store::{
+    AccountStore, CatalogStore, DriverRecord, SecretOwner, SecretUseStore, StoreError,
+};
 use serde_json::{Map, Value};
 use tokio::time::Instant;
 
@@ -31,8 +33,8 @@ use crate::cloud::{
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
-    JobContext, JobLog, Observed, PermitCheck, PermitRequest, ProvisionJob, ProvisionResult,
-    RedactingLog, SecretSource,
+    JobContext, JobLog, Observation as Observing, Observed, PermitCheck, PermitRequest,
+    ProvisionJob, ProvisionResult, RedactingLog, SecretSource,
 };
 use crate::registry::{Lookup, OciImage, Reference, Registry, pinned_from_tag};
 
@@ -60,6 +62,26 @@ pub struct LocalExecutor<S> {
     /// Reads images in registries other than ECR; none when they are not
     /// pinned or checked.
     registry: Option<Arc<dyn Registry>>,
+    /// The client external drivers with `https` targets are called with,
+    /// built on first use unless one is given, so their connections are kept.
+    http_client: std::sync::OnceLock<reqwest::Client>,
+}
+
+/// A job's driver, before an external one's token is read.
+enum Found {
+    /// An in-process driver.
+    InProcess(Arc<dyn Driver>),
+    /// An external driver's registration, with what it says about the driver.
+    Registered(Box<(DriverRecord, DriverInfo)>),
+}
+
+impl Found {
+    fn info(&self) -> &DriverInfo {
+        match self {
+            Self::InProcess(driver) => driver.info(),
+            Self::Registered(found) => &found.1,
+        }
+    }
 }
 
 impl<S> std::fmt::Debug for LocalExecutor<S> {
@@ -95,6 +117,7 @@ where
             cloud,
             checks,
             registry: None,
+            http_client: std::sync::OnceLock::new(),
         }
     }
 
@@ -102,6 +125,95 @@ where
     pub fn with_registry(mut self, registry: Arc<dyn Registry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Calls external drivers with `client`, which decides its own redirect,
+    /// HTTPS and timeout settings, instead of the default one.
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = std::sync::OnceLock::from(client);
+        self
+    }
+
+    /// The driver of `job`, without reading anything secret: an in-process
+    /// one, or the external driver's registration as it is now. The
+    /// registration is read for every job, so a changed or removed one takes
+    /// effect at once.
+    async fn find_driver(&self, job: &ProvisionJob) -> Result<Found, ExecFailure> {
+        let id = job.driver_type.as_str();
+        if let Some(driver) = self.drivers.get(id) {
+            return Ok(Found::InProcess(driver));
+        }
+        let record = self
+            .store
+            .driver(job.context.org.as_str(), id)
+            .await
+            .map_err(|e| store_failure(e, &format!("driver `{id}` could not be read")))?
+            .ok_or_else(|| {
+                ExecFailure::Permanent(format!("driver `{id}` is not registered on this server"))
+            })?;
+        let info = registered_driver_info(&record);
+        Ok(Found::Registered(Box::new((record, info))))
+    }
+
+    /// The driver `found` names, ready to call. An external driver's token is
+    /// authorized and read here, registered with `log`, and never named by
+    /// value in a failure.
+    async fn open_driver(
+        &self,
+        job: &ProvisionJob,
+        found: Found,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn Driver>, ExecFailure> {
+        let (record, info) = match found {
+            Found::InProcess(driver) => return Ok(driver),
+            Found::Registered(found) => *found,
+        };
+        let id = record.id.as_str();
+        let token = match &record.token {
+            None => None,
+            Some(r) => {
+                let failed = |f: ExecFailure| {
+                    prefixed(f, &format!("the token of driver `{id}` could not be used"))
+                };
+                self.authorize(&job.context, &[SecretOwner::Driver(id)], r)
+                    .await
+                    .map_err(failed)?;
+                let value = self.read(r).await.map_err(failed)?;
+                log.secret([value.expose()]);
+                Some(value.expose().to_owned())
+            }
+        };
+        let cannot = |e: HttpDriverError| {
+            ExecFailure::Permanent(format!("driver `{id}` cannot be called: {e}"))
+        };
+        let client = match self.http_client.get() {
+            Some(client) => client.clone(),
+            // Registration requires `https`, and the token must never travel in
+            // plain text, so a target stored any other way is refused.
+            None if record.target.starts_with("https://") => {
+                let client = default_client(true).map_err(cannot)?;
+                self.http_client.get_or_init(|| client).clone()
+            }
+            None => {
+                return Err(ExecFailure::Permanent(format!(
+                    "driver `{id}` cannot be called: its target is not an https URL"
+                )));
+            }
+        };
+        let driver =
+            HttpDriver::with_client(info, &record.target, token, client).map_err(cannot)?;
+        Ok(Arc::new(driver))
+    }
+
+    /// The driver of `job`, ready to call: [`Self::find_driver`] and then
+    /// [`Self::open_driver`].
+    async fn driver(
+        &self,
+        job: &ProvisionJob,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn Driver>, ExecFailure> {
+        let found = self.find_driver(job).await?;
+        self.open_driver(job, found, log).await
     }
 
     /// Everything a driver call needs, with the secrets the job uses read and
@@ -113,12 +225,20 @@ where
         check_criteria: bool,
         log: &mut RedactingLog,
     ) -> Result<Call, ExecFailure> {
-        let driver = self.drivers.get(&job.driver_type).ok_or_else(|| {
-            ExecFailure::Permanent(format!(
-                "driver `{}` is not registered on this server",
-                job.driver_type
-            ))
-        })?;
+        let driver = self.driver(job, log).await?;
+        self.request_with(driver, job, sources, check_criteria, log)
+            .await
+    }
+
+    /// [`Self::request`] for `driver`, already found.
+    async fn request_with(
+        &self,
+        driver: Arc<dyn Driver>,
+        job: &ProvisionJob,
+        sources: &[(SecretRef, SecretSource)],
+        check_criteria: bool,
+        log: &mut RedactingLog,
+    ) -> Result<Call, ExecFailure> {
         let values = match &job.inputs.values {
             Value::Object(values) => values.clone(),
             Value::Null => Map::new(),
@@ -432,7 +552,7 @@ where
 
     fn seal_cookie(&self, job: &ProvisionJob, cookie: &Cookie) -> Result<Sealed, ExecFailure> {
         let plain = serde_json::to_vec(cookie).map_err(|e| {
-            ExecFailure::Uncertain(format!("the driver state could not be encoded: {e}"))
+            ExecFailure::uncertain(format!("the driver state could not be encoded: {e}"))
         })?;
         Ok(self.keyring.seal(cookie_aad(job).as_bytes(), &plain))
     }
@@ -510,7 +630,9 @@ where
             timeout,
             target,
         } = self.request(job, &job.inputs.sources, true, log).await?;
-        match self.plan(driver.as_ref(), &req, timeout, false).await? {
+        let plan = self.plan(driver.as_ref(), &req, timeout, false).await?;
+        let changes = !matches!(plan, Plan::NoEffects);
+        match plan {
             Plan::NoEffects => log.info("the driver plans no changes"),
             Plan::Actions {
                 actions,
@@ -545,10 +667,38 @@ where
             None => target,
         };
         let settled = converge(driver.as_ref(), &req, timeout).await;
-        let accepted = settled.cookie != req.cookie;
-        let outputs = settled.result.map_err(|e| mutation_failure(e, accepted))?;
+        let newer = self.newer_cookie(job, &req, settled.cookie.as_ref());
+        let outputs = settled
+            .result
+            .map_err(|e| with_cookie(mutation_failure(e, newer.is_some()), newer.clone()))?;
+        // A driver that may have made a change, or returned a new cookie and
+        // so accepted one, leaves a result that cannot be kept, such as
+        // outputs its type does not allow, for recovery to observe rather than
+        // as if nothing changed.
+        let changed = changes || newer.is_some();
         self.provisioned(job, outputs, settled.cookie.as_ref(), target, log)
             .await
+            .map_err(|f| match f {
+                ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if changed => {
+                    ExecFailure::uncertain(format!("the driver made the change, but {error}"))
+                }
+                f => f,
+            })
+            .map_err(|f| with_cookie(f, newer))
+    }
+
+    /// The cookie a mutation left, sealed as [`Self::provisioned`] seals it,
+    /// when it differs from the one the call was given: the driver accepted
+    /// the mutation, and recovering an uncertain outcome observes with it.
+    fn newer_cookie(
+        &self,
+        job: &ProvisionJob,
+        req: &DriverRequest,
+        cookie: Option<&Cookie>,
+    ) -> Option<Sealed> {
+        let cookie = cookie.filter(|c| Some(*c) != req.cookie.as_ref())?;
+        // Encoding a cookie cannot fail; were it to, the stored cookie stays.
+        self.seal_cookie(job, cookie).ok()
     }
 
     /// What a resource that provisioned returns: its outputs, with secret
@@ -570,6 +720,21 @@ where
             ..ProvisionResult::default()
         };
         let secrets = outputs.secrets.expose();
+        // Outputs that do not match the type would reach the resources that use
+        // them, so the resource fails, naming the output. Messages name outputs
+        // and types, never values.
+        if let Some(ty) = &job.output_schema {
+            let names = secrets.keys().cloned().collect();
+            ty.validate_outputs(&result.outputs, &names)
+                .and_then(|()| {
+                    secrets
+                        .iter()
+                        .try_for_each(|(name, value)| ty.validate_secret_output(name, value))
+                })
+                .map_err(|e| {
+                    ExecFailure::Permanent(format!("the driver's outputs are invalid: {e}"))
+                })?;
+        }
         let mut texts = Vec::new();
         for value in secrets.values() {
             secret_texts(value, &mut texts);
@@ -582,7 +747,7 @@ where
                 .write(&name, &SecretValue::new(secret_text(value)))
                 .await
                 .map_err(|e| {
-                    ExecFailure::Uncertain(format!(
+                    ExecFailure::uncertain(format!(
                         "the resource provisioned, but its secret output `{key}` could not be \
                          stored: {e}"
                     ))
@@ -600,15 +765,24 @@ where
         job: &ProvisionJob,
         deleting: bool,
         log: &mut RedactingLog,
-    ) -> Result<Observed, ExecFailure> {
-        if let Some(driver) = self.drivers.get(&job.driver_type)
-            && !driver.info().capabilities.observe
-        {
-            return Ok(Observed::Unknown(format!(
+    ) -> Observing {
+        // A driver that cannot observe is reported before its token is read,
+        // so a secret store outage cannot hide that an operator must decide.
+        let found = match self.find_driver(job).await {
+            Ok(found) => found,
+            Err(e) => return Err(e).into(),
+        };
+        if !found.info().capabilities.observe {
+            return Observed::Unknown(format!(
                 "driver `{}` cannot observe resources",
                 job.driver_type
-            )));
+            ))
+            .into();
         }
+        let driver = match self.open_driver(job, found, log).await {
+            Ok(driver) => driver,
+            Err(e) => return Err(e).into(),
+        };
         let sources = if job.inputs.sources.is_empty() {
             inferred_sources(job)
         } else {
@@ -622,41 +796,95 @@ where
             req,
             timeout,
             target,
-        } = self.request(job, &sources, false, log).await?;
-        let observation =
-            with_timeout(timeout, driver.get(&req))
-                .await
-                .map_err(|e| ExecFailure::Retryable {
-                    error: format!("the resource could not be observed: {e}"),
-                    retry_after: None,
-                })?;
+        } = match self.request_with(driver, job, &sources, false, log).await {
+            Ok(call) => call,
+            Err(e) => return Err(e).into(),
+        };
+        let observation = match with_timeout(timeout, driver.get(&req)).await {
+            Ok(observation) => observation,
+            // A cookie that came with the failure is kept all the same.
+            Err(e) => {
+                let (e, cookie) = e.split();
+                return Observing {
+                    result: Err(ExecFailure::Retryable {
+                        error: format!("the resource could not be observed: {e}"),
+                        retry_after: None,
+                    }),
+                    cookie: self.observed_cookie(job, &req, driver.as_ref(), cookie),
+                };
+            }
+        };
         let repeatable = driver.info().capabilities.recover;
-        Ok(match observation {
-            Observation::Absent => Observed::Absent { repeatable },
-            Observation::InProgress { .. } => Observed::InProgress,
-            Observation::Failed { error } => Observed::Failed {
-                error: error.to_string(),
-                repeatable,
-            },
-            Observation::Unknown { reason } => Observed::Unknown(reason),
+        // Whatever the driver reports, a cookie it returned is kept.
+        let (observed, cookie) = match observation {
+            Observation::Absent { cookie } => (Observed::Absent { repeatable }, cookie),
+            Observation::InProgress { cookie, .. } => (Observed::InProgress, cookie),
+            Observation::Failed { error } => {
+                let (error, cookie) = error.split();
+                (
+                    Observed::Failed {
+                        error: error.to_string(),
+                        repeatable,
+                    },
+                    cookie,
+                )
+            }
+            Observation::Unknown { reason, cookie } => (Observed::Unknown(reason), cookie),
             // Only a creation's result is kept: for a resource that existed
             // before, nothing is stored.
-            Observation::Ready { .. } if deleting || job.existing => Observed::Ready {
-                result: Box::default(),
-                repeatable,
-            },
-            Observation::Ready { outputs, cookie } => {
-                // A driver that returns no cookie leaves the last one in place.
-                let cookie = cookie.or(req.cookie.clone());
+            Observation::Ready { cookie, .. } if deleting || job.existing => (
                 Observed::Ready {
-                    result: Box::new(
-                        self.provisioned(job, outputs, cookie.as_ref(), target, log)
-                            .await?,
-                    ),
+                    result: Box::default(),
                     repeatable,
+                },
+                cookie,
+            ),
+            Observation::Ready { outputs, cookie } => {
+                // A creation found finished with a cookie its driver cannot read
+                // could not be changed again, so its outcome stays unknown, as
+                // after provisioning.
+                if let Some(c) = &cookie
+                    && let Err(e) = check_cookie(driver.info(), c)
+                {
+                    return Err(ExecFailure::uncertain(e)).into();
                 }
+                // A driver that returns no cookie leaves the last one in place.
+                // The result carries it sealed, as after provisioning; when the
+                // result cannot be kept, the cookie is kept on its own.
+                let kept = cookie.clone().or(req.cookie.clone());
+                let result = self
+                    .provisioned(job, outputs, kept.as_ref(), target, log)
+                    .await
+                    .map(|result| Observed::Ready {
+                        result: Box::new(result),
+                        repeatable,
+                    });
+                let cookie = match result {
+                    Ok(_) => None,
+                    Err(_) => self.observed_cookie(job, &req, driver.as_ref(), cookie),
+                };
+                return Observing { result, cookie };
             }
-        })
+        };
+        Observing {
+            result: Ok(observed),
+            cookie: self.observed_cookie(job, &req, driver.as_ref(), cookie),
+        }
+    }
+
+    /// The cookie an observation returned, sealed, when it is newer than the
+    /// one the observation was given and the driver can read it: a cookie
+    /// too large, or in a version the driver does not declare, leaves the
+    /// stored one in place.
+    fn observed_cookie(
+        &self,
+        job: &ProvisionJob,
+        req: &DriverRequest,
+        driver: &dyn Driver,
+        cookie: Option<Cookie>,
+    ) -> Option<Sealed> {
+        let cookie = cookie.filter(|c| check_cookie(driver.info(), c).is_ok())?;
+        self.newer_cookie(job, req, Some(&cookie))
     }
 
     async fn run_deprovision(
@@ -698,8 +926,10 @@ where
         let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
         self.refresh(job, &mut req, timeout, log).await?;
         let settled = remove(driver.as_ref(), &req, timeout).await;
-        let accepted = settled.cookie != req.cookie;
-        settled.result.map_err(|e| mutation_failure(e, accepted))
+        let newer = self.newer_cookie(job, &req, settled.cookie.as_ref());
+        settled
+            .result
+            .map_err(|e| with_cookie(mutation_failure(e, newer.is_some()), newer))
     }
 
     /// Replaces the request's credentials, obtained for the plan, with ones
@@ -1005,21 +1235,20 @@ where
             .map_err(|f| log.failure(f))
     }
 
-    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Result<Observed, ExecFailure> {
+    async fn observe(&self, job: ProvisionJob, deleting: bool) -> Observing {
         let mut log = job.log.redacting();
-        let observed = self
-            .run_observe(&job, deleting, &mut log)
-            .await
-            .map_err(|f| log.failure(f))?;
+        let Observing { result, cookie } = self.run_observe(&job, deleting, &mut log).await;
         // What the driver said goes into records, so it is redacted too.
-        Ok(match observed {
-            Observed::Failed { error, repeatable } => Observed::Failed {
+        let result = match result {
+            Ok(Observed::Failed { error, repeatable }) => Ok(Observed::Failed {
                 error: log.redact(&error),
                 repeatable,
-            },
-            Observed::Unknown(reason) => Observed::Unknown(log.redact(&reason)),
-            other => other,
-        })
+            }),
+            Ok(Observed::Unknown(reason)) => Ok(Observed::Unknown(log.redact(&reason))),
+            Ok(other) => Ok(other),
+            Err(f) => Err(log.failure(f)),
+        };
+        Observing { result, cookie }
     }
 }
 
@@ -1216,8 +1445,11 @@ fn driver_failure(e: DriverError) -> ExecFailure {
         // again rather than retrying into it.
         DriverError::Conflict(_) => ExecFailure::Permanent(e.to_string()),
         DriverError::Timeout(_) | DriverError::Uncertain(_) => {
-            ExecFailure::Uncertain(e.to_string())
+            ExecFailure::uncertain(e.to_string())
         }
+        // `converge` and `remove` keep a failure's cookie in what they
+        // settle on; the error alone decides the failure.
+        DriverError::WithCookie { error, .. } => driver_failure(*error),
     }
 }
 
@@ -1225,13 +1457,66 @@ fn driver_failure(e: DriverError) -> ExecFailure {
 /// shows as a new cookie, any failure may have left changes behind.
 fn mutation_failure(e: DriverError, accepted: bool) -> ExecFailure {
     match driver_failure(e) {
-        f @ ExecFailure::Uncertain(_) => f,
+        f @ ExecFailure::Uncertain { .. } => f,
         ExecFailure::Permanent(error) | ExecFailure::Retryable { error, .. } if accepted => {
-            ExecFailure::Uncertain(format!(
+            ExecFailure::uncertain(format!(
                 "the driver accepted the change, then failed: {error}"
             ))
         }
         f => f,
+    }
+}
+
+/// An uncertain failure with the mutation's newer cookie, if any, for the
+/// planner to store; any other failure as it is. A failure that is not
+/// uncertain changed nothing the driver reported, so its cookie is none.
+fn with_cookie(f: ExecFailure, newer: Option<Sealed>) -> ExecFailure {
+    match f {
+        ExecFailure::Uncertain { error, cookie } => ExecFailure::Uncertain {
+            error,
+            cookie: newer.or(cookie),
+        },
+        f => f,
+    }
+}
+
+/// `f` with its message after `what`.
+fn prefixed(f: ExecFailure, what: &str) -> ExecFailure {
+    match f {
+        ExecFailure::Permanent(m) => ExecFailure::Permanent(format!("{what}: {m}")),
+        ExecFailure::Retryable { error, retry_after } => ExecFailure::Retryable {
+            error: format!("{what}: {error}"),
+            retry_after,
+        },
+        ExecFailure::Uncertain { error, cookie } => ExecFailure::Uncertain {
+            error: format!("{what}: {error}"),
+            cookie,
+        },
+    }
+}
+
+/// What a registration says about an external driver.
+pub fn registered_driver_info(record: &DriverRecord) -> DriverInfo {
+    let any_object = || serde_json::json!({"type": "object"});
+    let c = record.capabilities;
+    let t = c.targets;
+    DriverInfo {
+        id: record.id.clone(),
+        protocol_version: record.protocol_version.clone(),
+        cookie_version: record.cookie_version,
+        input_schema: record.inputs_schema.clone().unwrap_or_else(any_object),
+        output_schema: record.outputs_schema.clone().unwrap_or_else(any_object),
+        capabilities: Capabilities {
+            targets: Targets {
+                resources: t.resources,
+                workloads: t.workloads,
+                triggers: t.triggers,
+            },
+            observe: c.observe,
+            recover: c.recover,
+            preview: c.preview,
+            cancel: c.cancel,
+        },
     }
 }
 

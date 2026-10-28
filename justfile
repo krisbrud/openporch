@@ -38,6 +38,10 @@ bench:
     cargo test --release -p openporch-server --lib --no-run
     OPENPORCH_BENCH_OUT=target/benchmark.json taskset -c 0,1 cargo test --release -p openporch-server --lib reference_capacity_benchmark -- --ignored --nocapture
 
+# Build release archives for this host into DIR, as the release workflow does.
+release-archive dir="dist":
+    scripts/release-archive.sh {{dir}}
+
 # Check dependency licenses, advisories and sources.
 deny:
     cargo deny check
