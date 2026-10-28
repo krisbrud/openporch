@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use openporch_core::graph::{Node, ResourceGraph};
 use openporch_core::ids::Descriptor;
 use openporch_core::model::ResourceDefinition;
+use openporch_store::secrets::Sealed;
 use serde_json::{Value, json};
 
 use super::*;
@@ -558,6 +559,30 @@ fn a_digest_follows_what_the_change_acts_on() {
     assert_ne!(
         first,
         run(&recovered, &db, account("arn:aws:iam::1:role/a"))
+    );
+    // The driver state a recovery checkpoints changes, even when its inputs
+    // and outputs stay the same.
+    let mut checkpointed = queue.clone();
+    checkpointed.recovery = json!({"etag": "2"});
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
+    );
+    let mut checkpointed = queue.clone();
+    checkpointed.snapshot = json!({"size": "large"});
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
+    );
+    let mut checkpointed = queue.clone();
+    checkpointed.cookie = Some(Sealed {
+        key_id: "k1".into(),
+        nonce: vec![1; 12],
+        ciphertext: vec![2; 16],
+    });
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
     );
     // Its status alone does not.
     let mut status = queue.clone();

@@ -156,9 +156,27 @@ pub fn config_digests(deployment: &Deployment) -> BTreeMap<String, String> {
 }
 
 /// What the environment recorded about `r` when it last changed, which a
-/// change acts on even when its configuration stays the same.
+/// change acts on even when its configuration stays the same. That includes
+/// the driver state a recovery can checkpoint without a deployment: the
+/// cookie (as a fingerprint of its ciphertext), snapshot and recovery
+/// metadata.
 fn recorded(r: &ActiveResource) -> serde_json::Value {
+    let cookie = r.cookie.as_ref().map(|c| {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(c.key_id.as_bytes());
+        h.update([0]);
+        h.update(&c.nonce);
+        h.update(&c.ciphertext);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    });
     serde_json::json!({
+        "cookie": cookie,
+        "snapshot": r.snapshot,
+        "recovery": r.recovery,
         "last_deploy_id": r.last_deploy_id,
         "inputs": r.inputs,
         "outputs": r.outputs,
