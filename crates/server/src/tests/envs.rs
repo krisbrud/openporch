@@ -88,6 +88,37 @@ async fn application_starts_with_an_undeployed_development_environment() {
     assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
 }
 
+/// The Empty environment scenario: an environment created without a source
+/// exists, has no deployments and no active resources.
+#[tokio::test]
+async fn a_new_environment_has_no_deployments_or_resources() {
+    let s = server().await;
+    s.app("shop").await;
+    s.env_type("staging").await;
+    let (status, env) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "staging", "type": "staging"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{env}");
+    let path = "/orgs/acme/apps/shop/envs/staging";
+    let (status, got) = s.get(path, &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["id"], "staging");
+    assert_eq!(got["type"], "staging");
+    assert_eq!(got["convergence"], "never_deployed", "{got}");
+    assert!(got.get("delta_id").is_none(), "{got}");
+
+    let (status, page) = s.get(&format!("{path}/deploys"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["deployments"], json!([]), "{page}");
+    let (status, resources) = s.get(&format!("{path}/resources"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{resources}");
+    assert_eq!(resources["resources"], json!([]), "{resources}");
+}
+
 #[tokio::test]
 async fn environments_need_developer_and_deployer() {
     let s = server().await;

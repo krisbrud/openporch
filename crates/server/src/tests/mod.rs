@@ -528,11 +528,12 @@ async fn first_start_bootstraps_an_administrator() {
 async fn tokens_are_shown_once_and_revocable() {
     let s = server().await;
     s.member("ci", "member").await;
+    let expires_at = openporch_store::now_ms() + 86_400_000;
     let (status, body) = s
         .post(
             "/orgs/acme/users/ci/tokens",
             &s.admin,
-            json!({"id": "deploy", "description": "CI"}),
+            json!({"id": "deploy", "description": "CI", "expires_at": expires_at}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -540,11 +541,46 @@ async fn tokens_are_shown_once_and_revocable() {
     assert_eq!(body["id"], "deploy");
 
     assert_eq!(s.get("/orgs/acme/current-user", &token).await.1["id"], "ci");
+    // Later reads show the token's metadata, never the token or its hash.
     let (_, info) = s.get("/orgs/acme/users/ci/tokens/deploy", &s.admin).await;
-    assert!(info.get("token").is_none(), "{info}");
-    assert!(info["last_used_at"].is_i64(), "{info}");
     let (_, list) = s.get("/orgs/acme/users/ci/tokens", &s.admin).await;
-    assert!(list.to_string().find(&token).is_none());
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "deploy")
+        .unwrap()
+        .clone();
+    assert_eq!(listed, info);
+    let mut keys: Vec<&str> = info
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "created_at",
+            "created_by",
+            "description",
+            "expires_at",
+            "id",
+            "last_used_at"
+        ],
+        "{info}"
+    );
+    assert_eq!(info["id"], "deploy");
+    assert_eq!(info["description"], "CI");
+    assert_eq!(info["expires_at"], expires_at);
+    assert!(info["created_at"].is_i64(), "{info}");
+    assert!(info["last_used_at"].is_i64(), "{info}");
+    assert_eq!(info["created_by"], "bootstrap");
+    let secret = token.strip_prefix(auth::TOKEN_PREFIX).unwrap();
+    for read in [&info, &list] {
+        assert!(!read.to_string().contains(secret), "{read}");
+    }
 
     let (status, _) = s
         .delete("/orgs/acme/users/ci/tokens/deploy", &s.admin)
@@ -627,6 +663,50 @@ async fn who_may_create_tokens() {
         s.get("/orgs/acme/users/erin/tokens", &member).await.0,
         StatusCode::FORBIDDEN
     );
+    // Administrators create tokens for service users.
+    let (status, body) = s
+        .post(
+            "/orgs/acme/users/erin/tokens",
+            &s.admin,
+            json!({"id": "ci"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let erin = body["token"].as_str().unwrap();
+    assert_eq!(s.get("/orgs/acme/current-user", erin).await.1["id"], "erin");
+    // Managers issue service-user tokens only within the delegation ceiling:
+    // for a member, but not for an administrator or for a service user with
+    // authority the manager lacks.
+    let manager = s.member("carol", "manager").await;
+    s.member("root-ci", "administrator").await;
+    s.app("shop").await;
+    s.member("ci-shop", "member").await;
+    s.grant_app("shop", "ci-shop", "developer").await;
+    let (status, body) = s
+        .post(
+            "/orgs/acme/users/erin/tokens",
+            &manager,
+            json!({"id": "m1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for user in ["root-ci", "ci-shop"] {
+        let (status, body) = s
+            .post(
+                &format!("/orgs/acme/users/{user}/tokens"),
+                &manager,
+                json!({"id": "m1"}),
+            )
+            .await;
+        assert_error(status, &body, StatusCode::FORBIDDEN, "AUTH-002");
+        let (_, tokens) = s
+            .get(&format!("/orgs/acme/users/{user}/tokens"), &s.admin)
+            .await;
+        assert!(
+            tokens.as_array().unwrap().iter().all(|t| t["id"] != "m1"),
+            "{tokens}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1583,6 +1663,21 @@ async fn hidden_and_missing_applications_are_404_and_mutations_are_audited() {
     s.app("billing").await;
     let member = s.member("dev", "member").await;
     let viewer = s.member("auditor", "orgViewer").await;
+    // A member with no role on `billing` reads it as if it did not exist.
+    let (status, hidden) = s.get("/orgs/acme/apps/billing", &member).await;
+    assert_error(status, &hidden, StatusCode::NOT_FOUND, "API-001");
+    let (status, missing) = s.get("/orgs/acme/apps/nope", &member).await;
+    assert_error(status, &missing, StatusCode::NOT_FOUND, "API-001");
+    assert_eq!(
+        hidden["message"]
+            .as_str()
+            .unwrap()
+            .replace("billing", "nope"),
+        missing["message"],
+        "{hidden} {missing}"
+    );
+    let (status, body) = s.get("/orgs/acme/apps/billing/envs", &member).await;
+    assert_error(status, &body, StatusCode::NOT_FOUND, "API-001");
     let (status, body) = s.delete("/orgs/acme/apps/billing", &member).await;
     assert_error(status, &body, StatusCode::NOT_FOUND, "API-001");
     let (status, _) = s.delete("/orgs/acme/apps/nope", &viewer).await;
