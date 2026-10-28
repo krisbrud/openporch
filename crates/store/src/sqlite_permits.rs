@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqliteConnection;
 
-use crate::audit::{self, AuditIntent};
+use crate::audit::{self, AuditIntent, AuditOutcome};
 use crate::identity::{check_admin_authority, check_env_authority};
 use crate::sqlite::SqliteStore;
 use crate::{Result, StoreError, now_ms, random_hex};
@@ -229,7 +229,8 @@ pub trait PermitStore: Send + Sync {
 }
 
 /// A permit as `use_permit` reads it: ID, issuer, GUResID, driver plan
-/// fingerprint, base generation, expiry and binding.
+/// fingerprint, base generation, expiry, binding, first use and the audit
+/// entry of its issue.
 type PermitRow = (
     String,
     String,
@@ -238,11 +239,31 @@ type PermitRow = (
     i64,
     i64,
     Option<String>,
+    Option<i64>,
+    Option<String>,
 );
 
 /// A permit as `bind_permits` reads it: descriptor, action, base
-/// generation, configuration digest, expiry, binding and issuer.
-type BindRow = (String, String, i64, String, i64, Option<String>, String);
+/// generation, configuration digest, expiry, binding, issuer and the audit
+/// entry of its issue.
+type BindRow = (
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// A permit a deployment's acceptance bound.
+#[derive(Debug)]
+pub(crate) struct BoundPermit {
+    descriptor: String,
+    action: String,
+    issued_entry: Option<String>,
+}
 
 type PlanRow = (
     String,
@@ -404,6 +425,11 @@ impl PermitStore for SqliteStore {
         for p in &permits {
             check_protection(&mut tx, org, &env_type, &p.action, &issuer).await?;
         }
+        let audit = AuditIntent {
+            target: Some(format!("{app}/{env}/{plan}")),
+            ..audit
+        };
+        let issued_entry = audit::insert(&mut tx, &audit, None, None).await?;
         let mut records = Vec::new();
         for p in permits {
             let record = PermitRecord {
@@ -421,7 +447,8 @@ impl PermitStore for SqliteStore {
             sqlx::query(
                 "INSERT INTO permits (org_id, id, app_id, env_id, plan_id, descriptor, guresid, \
                  action, plan_fingerprint, base_generation, config_digest, issuer_id, \
-                 created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 created_at, expires_at, issued_entry) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(org)
             .bind(&record.id)
@@ -437,15 +464,11 @@ impl PermitStore for SqliteStore {
             .bind(&issuer)
             .bind(now)
             .bind(record.expires_at)
+            .bind(&issued_entry)
             .execute(&mut *tx)
             .await?;
             records.push(record);
         }
-        let audit = AuditIntent {
-            target: Some(format!("{app}/{env}/{plan}")),
-            ..audit
-        };
-        audit::insert(&mut tx, &audit, None, None).await?;
         tx.commit().await?;
         Ok(records)
     }
@@ -457,10 +480,43 @@ impl PermitStore for SqliteStore {
                 "a detach uses its permit inside the detach itself".into(),
             ));
         }
+        let deployment = u.deployment.unwrap_or_default();
         let mut tx = self.begin().await?;
-        consume_permit(&mut tx, &u).await?;
-        tx.commit().await?;
-        Ok(())
+        let used = consume_permit(&mut tx, &u).await;
+        let (accepted, intent) =
+            acceptance_intent(&mut tx, u.org, u.app, u.env, deployment).await?;
+        let target = Some(format!("{}/{}/{}", u.app, u.env, u.descriptor));
+        match used {
+            Ok(used) => {
+                if used.first {
+                    let intent = AuditIntent {
+                        action: "permit.use".to_owned(),
+                        target,
+                        outcome: AuditOutcome::Succeeded,
+                        reason: Some(u.action.to_owned()),
+                        ..intent
+                    };
+                    let correlates = used.issued_entry.as_deref();
+                    audit::insert(&mut tx, &intent, Some(deployment), correlates).await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+            // A refused action is recorded with the deployment it stopped.
+            Err(StoreError::ApprovalRequired(e)) => {
+                let intent = AuditIntent {
+                    action: "permit.use".to_owned(),
+                    target,
+                    outcome: AuditOutcome::Denied,
+                    reason: Some("approval_required".to_owned()),
+                    ..intent
+                };
+                audit::insert(&mut tx, &intent, Some(deployment), accepted.as_deref()).await?;
+                tx.commit().await?;
+                Err(StoreError::ApprovalRequired(e))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn permit_envs(
@@ -555,10 +611,21 @@ impl PermitStore for SqliteStore {
     }
 }
 
+/// A permit an action used.
+pub(crate) struct UsedPermit {
+    /// The audit entry that recorded its issue.
+    pub issued_entry: Option<String>,
+    /// Whether this is its first use, rather than a retry's.
+    pub first: bool,
+}
+
 /// Authorizes a destructive action with a permit inside the caller's
 /// transaction, as [`PermitStore::use_permit`] describes; a detach passes
 /// the permits it presents, which only a detach may consume this way.
-pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_>) -> Result<()> {
+pub(crate) async fn consume_permit(
+    conn: &mut SqliteConnection,
+    u: &PermitUse<'_>,
+) -> Result<UsedPermit> {
     if u.deployment.is_none() && u.action != "detach" {
         return Err(StoreError::Invalid(format!(
             "a {} permit is used only by the deployment it is bound to",
@@ -570,7 +637,7 @@ pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_
         Some(deployment) => {
             sqlx::query_as(
                 "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
-                     expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
+                     expires_at, bound_to, used_at, issued_entry FROM permits WHERE org_id = ? AND app_id = ? \
                      AND env_id = ? AND bound_to = ? AND descriptor = ? AND action = ? \
                      ORDER BY id",
             )
@@ -588,7 +655,7 @@ pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_
             for id in u.presented {
                 let row: Option<PermitRow> = sqlx::query_as(
                     "SELECT id, issuer_id, guresid, plan_fingerprint, base_generation, \
-                         expires_at, bound_to FROM permits WHERE org_id = ? AND app_id = ? \
+                         expires_at, bound_to, used_at, issued_entry FROM permits WHERE org_id = ? AND app_id = ? \
                          AND env_id = ? AND id = ? AND descriptor = ? AND action = ?",
                 )
                 .bind(u.org)
@@ -614,7 +681,18 @@ pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_
     .await?;
     let now = now_ms();
     let mut refused = Vec::new();
-    for (id, issuer, guresid, fingerprint, base_generation, expires_at, bound_to) in candidates {
+    for (
+        id,
+        issuer,
+        guresid,
+        fingerprint,
+        base_generation,
+        expires_at,
+        bound_to,
+        used_at,
+        issued,
+    ) in candidates
+    {
         if guresid.is_some() && guresid.as_deref() != u.guresid {
             refused.push(format!("permit `{id}` is for another resource identity"));
             continue;
@@ -662,7 +740,10 @@ pub(crate) async fn consume_permit(conn: &mut SqliteConnection, u: &PermitUse<'_
         .bind(&id)
         .execute(&mut *conn)
         .await?;
-        return Ok(());
+        return Ok(UsedPermit {
+            issued_entry: issued,
+            first: used_at.is_none(),
+        });
     }
     let what = format!("{} of `{}`", u.action, u.descriptor);
     Err(StoreError::ApprovalRequired(if refused.is_empty() {
@@ -747,7 +828,8 @@ async fn env_type(conn: &mut SqliteConnection, org: &str, app: &str, env: &str) 
 /// acceptance and before the generation moves: each must be for the
 /// environment, unexpired, unused, issued at `generation` for a resource
 /// whose configuration is still the previewed one, and every known
-/// destructive action must have one.
+/// destructive action must have one. Returns the permits it bound, for
+/// [`audit_bound`].
 pub(crate) async fn bind_permits(
     conn: &mut SqliteConnection,
     org: &str,
@@ -756,9 +838,10 @@ pub(crate) async fn bind_permits(
     generation: i64,
     deployment: &str,
     binding: &PermitBinding,
-) -> Result<()> {
+) -> Result<Vec<BoundPermit>> {
     let now = now_ms();
     let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut bound = Vec::new();
     let presented: BTreeSet<&String> = binding.presented.iter().collect();
     let env_type = if presented.is_empty() {
         String::new()
@@ -768,7 +851,7 @@ pub(crate) async fn bind_permits(
     for id in presented {
         let row: Option<BindRow> = sqlx::query_as(
             "SELECT descriptor, action, base_generation, config_digest, expires_at, \
-                 bound_to, issuer_id FROM permits \
+                 bound_to, issuer_id, issued_entry FROM permits \
                  WHERE org_id = ? AND app_id = ? AND env_id = ? AND id = ?",
         )
         .bind(org)
@@ -777,7 +860,16 @@ pub(crate) async fn bind_permits(
         .bind(id)
         .fetch_optional(&mut *conn)
         .await?;
-        let Some((descriptor, action, base_generation, digest, expires_at, bound_to, issuer)) = row
+        let Some((
+            descriptor,
+            action,
+            base_generation,
+            digest,
+            expires_at,
+            bound_to,
+            issuer,
+            issued,
+        )) = row
         else {
             return Err(StoreError::PermitInvalid(format!(
                 "permit `{id}` was not issued for `{app}/{env}`"
@@ -824,7 +916,12 @@ pub(crate) async fn bind_permits(
             .bind(id)
             .execute(&mut *conn)
             .await?;
-        covered.insert((descriptor, action));
+        covered.insert((descriptor.clone(), action.clone()));
+        bound.push(BoundPermit {
+            descriptor,
+            action,
+            issued_entry: issued,
+        });
     }
     let missing: Vec<String> = binding
         .required
@@ -838,7 +935,90 @@ pub(crate) async fn bind_permits(
             missing.join(", ")
         )));
     }
+    Ok(bound)
+}
+
+/// Records the binding of each of `bound` to `deployment`, after the
+/// acceptance's own entry `accepted` so that entry stays the first of the
+/// deployment's: as part of the same request, correlated with the permit's
+/// issue.
+pub(crate) async fn audit_bound(
+    conn: &mut SqliteConnection,
+    accepted: &AuditIntent,
+    app: &str,
+    env: &str,
+    deployment: &str,
+    bound: &[BoundPermit],
+) -> Result<()> {
+    for permit in bound {
+        let intent = AuditIntent {
+            action: "permit.bind".to_owned(),
+            target: Some(format!("{app}/{env}/{}", permit.descriptor)),
+            outcome: AuditOutcome::Accepted,
+            reason: Some(permit.action.clone()),
+            ..accepted.clone()
+        };
+        let correlates = permit.issued_entry.as_deref();
+        audit::insert(&mut *conn, &intent, Some(deployment), correlates).await?;
+    }
     Ok(())
+}
+
+/// The request that accepted `deployment` in `app/env`, as entries about it
+/// repeat it, with the ID of its entry; without that entry, a deploy request
+/// by an unknown actor.
+pub(crate) async fn acceptance_intent(
+    conn: &mut SqliteConnection,
+    org: &str,
+    app: &str,
+    env: &str,
+    deployment: &str,
+) -> Result<(Option<String>, AuditIntent)> {
+    /// The accepted entry's ID, actor, request ID, method, path and target.
+    type Accepted = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+    );
+    let accepted: Option<Accepted> = sqlx::query_as(
+        "SELECT id, actor_id, request_id, method, path, target FROM audit_log \
+         WHERE org_id = ? AND operation_id = ? AND outcome = 'accepted' ORDER BY seq LIMIT 1",
+    )
+    .bind(org)
+    .bind(deployment)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let (id, actor, request_id, method, path, target) = match accepted {
+        Some((id, actor, request_id, method, path, target)) => {
+            (Some(id), actor, request_id, method, path, target)
+        }
+        None => (
+            None,
+            None,
+            None,
+            "POST".to_owned(),
+            format!("/orgs/{org}/apps/{app}/envs/{env}/deploys"),
+            None,
+        ),
+    };
+    Ok((
+        id,
+        AuditIntent {
+            org: org.to_owned(),
+            actor,
+            request_id,
+            method,
+            path,
+            action: String::new(),
+            target,
+            outcome: AuditOutcome::Accepted,
+            status_code: None,
+            reason: None,
+        },
+    ))
 }
 
 #[cfg(test)]

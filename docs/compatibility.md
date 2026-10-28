@@ -23,8 +23,8 @@ major version.
 
 | Format | Version | Compatibility |
 | --- | --- | --- |
-| SQLite database | Schema 10 (`openporch version` prints it) | Migrated forward on start from every earlier schema; a newer schema is refused before anything is written. [Upgrades](operations.md#upgrades-and-the-schema-version) lists the tested pairs |
-| Schema fixtures | 8, 9, 10 in [`crates/server/fixtures/schema`](../crates/server/fixtures/schema) | Every build upgrades each fixture and serves what it recorded |
+| SQLite database | Schema 11 (`openporch version` prints it) | Migrated forward on start from every earlier schema; a newer schema is refused before anything is written. [Upgrades](operations.md#upgrades-and-the-schema-version) lists the tested pairs |
+| Schema fixtures | 8, 9, 10, 11 in [`crates/server/fixtures/schema`](../crates/server/fixtures/schema) | Every build upgrades each fixture and serves what it recorded |
 | Backups | Format `1` (`backup.json`) | `openporch restore` refuses another format, a newer schema, another organization or another state backend |
 | Sealed secrets and cookies | Master key IDs `mk-…` | A server missing a key a record names is not ready and names the key ID |
 | OpenTofu state | Whatever the configured `tofu` writes | openporch reads only outputs; state is upgraded by OpenTofu |
