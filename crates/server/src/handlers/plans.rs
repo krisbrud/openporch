@@ -12,10 +12,11 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::catalog::{BUILTIN_DRIVERS, DriverTarget};
+use openporch_core::model::CloudAccount;
 use openporch_engine::preview::{self, DriverPlan, Entry};
 use openporch_store::{
-    EnvRecord, NewPermit, NewPlan, PermitBinding, PermitRecord, PermitStore, PlanRecord, Store,
-    StoreError,
+    AccountStore, DeploymentRecord, EnvRecord, NewPermit, NewPlan, PermitBinding, PermitRecord,
+    PermitStore, PlanRecord, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -360,18 +361,25 @@ pub(super) async fn preflight(
         }
     }
     let active = state.store.active_resources(org, &env.app, &env.id).await?;
-    // Only the latest attempt's refused driver plans are current.
+    // Only the latest attempt's refused driver plans are current, and each
+    // only while its resource's configuration is the one it was planned for.
     let latest = state
         .store
         .latest_deployment(org, &env.app, &env.id)
-        .await?
-        .map(|d| d.id);
-    let plans: BTreeMap<String, DriverPlan> = state
+        .await?;
+    let requests: Vec<_> = state
         .store
         .approval_requests(org, &env.app, &env.id)
         .await?
         .into_iter()
-        .filter(|r| latest.as_deref() == Some(r.deployment_id.as_str()))
+        .filter(|r| latest.as_ref().map(|d| d.id.as_str()) == Some(r.deployment_id.as_str()))
+        .collect();
+    let planned_for = match &latest {
+        Some(d) if !requests.is_empty() => planned_configs(state, env, d).await?,
+        _ => BTreeMap::new(),
+    };
+    let plans: BTreeMap<String, DriverPlan> = requests
+        .into_iter()
         .map(|r| {
             (
                 r.guresid,
@@ -379,17 +387,57 @@ pub(super) async fn preflight(
                     action: r.action,
                     fingerprint: r.fingerprint,
                     actions: r.actions,
+                    config_digest: planned_for.get(&r.descriptor).cloned(),
                 },
             )
         })
         .collect();
-    preview::preview(&deployment, &active, |id| drivers.facts(id), &plans).map_err(|migrations| {
+    let accounts: BTreeMap<String, CloudAccount> = state
+        .store
+        .accounts(org)
+        .await?
+        .into_iter()
+        .map(|a| (a.account.id.to_string(), a.account))
+        .collect();
+    preview::preview(
+        &deployment,
+        &active,
+        |id| drivers.facts(id),
+        &plans,
+        &accounts,
+    )
+    .map_err(|migrations| {
         ApiError::new(
             StatusCode::CONFLICT,
             code::MIGRATION_REQUIRED,
             migrations.join("; "),
         )
     })
+}
+
+/// The configuration digest of each resource deployment `d` provisioned, read
+/// from its snapshot. Empty when the snapshot cannot be read, which keeps the
+/// driver plans it refused.
+async fn planned_configs(
+    state: &AppState,
+    env: &EnvRecord,
+    d: &DeploymentRecord,
+) -> ApiResult<BTreeMap<String, String>> {
+    let org = state.org();
+    let Some(snapshot) = state
+        .store
+        .deployment_snapshot(org, &env.app, &env.id, &d.id)
+        .await?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let set_id = d.set_id.clone().unwrap_or_default();
+    Ok(
+        deploy::planned(state, &env.app, &env.id, &d.id, set_id, &snapshot, false)
+            .await
+            .map(|planned| preview::config_digests(&planned))
+            .unwrap_or_default(),
+    )
 }
 
 /// What an acceptance checks `presented` permits against: every previewed

@@ -605,6 +605,9 @@ async fn delete_app(
     // What the full command needs: every environment's preview and acks.
     let mut flags = String::new();
     let mut unacknowledged = false;
+    // The generation each environment was previewed at, which the deletion
+    // is accepted only at.
+    let mut generations = serde_json::Map::new();
     for env in &envs {
         let base = format!("{app_base}/envs/{}", segment(env));
         let env_acks: Vec<&Ack> = acks
@@ -635,6 +638,7 @@ async fn delete_app(
             }
             let prefixed: Vec<String> = named.iter().map(|r| format!("{env}:{r}")).collect();
             flags.push_str(&plans::ack_args(&prefixed));
+            generations.insert(env.clone(), json!(p.base_generation));
             prepared.push(p);
             continue;
         }
@@ -647,6 +651,7 @@ async fn delete_app(
             .ok_or("unexpected response from the server: no environment generation")?;
         let body = json!({"kind": "delete_env", "expected_generation": generation});
         let plan = plans::create(&client, &base, &body).await?;
+        generations.insert(env.clone(), json!(generation));
         plans::print(io, &plan, &format!("{id}/{env}"), Some(&permission), None)?;
         let required = plans::required(&plan);
         if !required.is_empty() {
@@ -673,7 +678,8 @@ async fn delete_app(
     for p in prepared {
         permits.extend(plans::issue(&client, p, &preview).await?.permits);
     }
-    let body = json!({"permits": permits, "comment": comment});
+    let body = json!({"permits": permits, "comment": comment,
+                      "expected_generations": generations});
     // The application's deletion takes no idempotency key, and its permits
     // bind on acceptance, so a lost response is not sent again.
     client

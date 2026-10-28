@@ -236,6 +236,9 @@ pub struct AppDeletionRequest {
     pub audit: AuditIntent,
     /// The permits presented for each environment's deletion, by environment.
     pub permits: std::collections::BTreeMap<String, crate::PermitBinding>,
+    /// The generation each environment's deletion was previewed at, by
+    /// environment: a deletion is accepted only at that generation.
+    pub generations: std::collections::BTreeMap<String, i64>,
 }
 
 /// An accepted application deletion.

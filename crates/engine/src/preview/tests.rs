@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use openporch_core::graph::{Node, ResourceGraph};
 use openporch_core::ids::Descriptor;
 use openporch_core::model::ResourceDefinition;
+use openporch_store::secrets::Sealed;
 use serde_json::{Value, json};
 
 use super::*;
@@ -134,6 +135,7 @@ fn new_previewed_and_blind_changes() {
         ],
         facts,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
     .unwrap();
     let e = by_descriptor(&entries);
@@ -158,12 +160,14 @@ fn a_known_driver_plan_shows_as_a_replacement() {
         action: "replace".into(),
         fingerprint: "fp-1".into(),
         actions: vec![("replace".into(), "aws_db_instance.main".into())],
+        config_digest: None,
     };
     let entries = preview(
         &d,
         std::slice::from_ref(&db),
         facts,
         &BTreeMap::from([(db.guresid.clone(), plan.clone())]),
+        &BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(entries[0].action, Change::Replace);
@@ -195,6 +199,7 @@ fn removals_need_permits() {
         ],
         facts,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
     .unwrap();
     let e = by_descriptor(&entries);
@@ -218,6 +223,7 @@ fn removals_need_permits() {
         &[active(WORKLOAD, "openporch/none"), active(BUCKET, "x/y")],
         facts,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(entries.len(), 2);
@@ -234,7 +240,14 @@ fn moving_a_resource_is_refused_as_a_migration() {
     )]);
     let mut db = active(DB, "openporch/template");
     db.driver_account = Some("aws-prod".into());
-    let migrations = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap_err();
+    let migrations = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
     assert!(
         migrations[0].contains("driver `openporch/template`"),
         "{migrations:?}"
@@ -242,7 +255,14 @@ fn moving_a_resource_is_refused_as_a_migration() {
 
     db.driver_type = Some("openporch/opentofu".into());
     db.driver_account = Some("aws-dev".into());
-    let migrations = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap_err();
+    let migrations = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
     assert!(
         migrations[0].contains("cloud account `aws-dev`"),
         "{migrations:?}"
@@ -250,7 +270,14 @@ fn moving_a_resource_is_refused_as_a_migration() {
 
     db.driver_account = Some("aws-prod".into());
     db.backend = Some("local state".into());
-    let migrations = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap_err();
+    let migrations = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
     assert!(
         migrations[0].contains("keeps its state in local state"),
         "{migrations:?}"
@@ -258,7 +285,14 @@ fn moving_a_resource_is_refused_as_a_migration() {
 
     // The same driver, account and backend is an update.
     db.backend = Some("s3://state/openporch".into());
-    let entries = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap();
+    let entries = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
     assert_eq!(entries[0].action, Change::Update);
 
     // An account from a placeholder is checked when the deployment runs.
@@ -267,7 +301,16 @@ fn moving_a_resource_is_refused_as_a_migration() {
         def("pg", "openporch/opentofu", Some("${resources.dns.account}")),
     )]);
     db.driver_account = Some("aws-dev".into());
-    assert!(preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).is_ok());
+    assert!(
+        preview(
+            &d,
+            std::slice::from_ref(&db),
+            facts,
+            &BTreeMap::new(),
+            &BTreeMap::new()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -281,7 +324,14 @@ fn a_failed_first_attempt_and_a_cookie_only_resource() {
     let mut db = active(DB, "openporch/template");
     db.last_deploy_id = None;
     db.status = "failed".into();
-    let entries = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap();
+    let entries = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
     assert_eq!(entries[0].action, Change::Create);
     assert!(!entries[0].known && !entries[0].permit_required);
     assert!(
@@ -296,7 +346,14 @@ fn a_failed_first_attempt_and_a_cookie_only_resource() {
         nonce: Vec::new(),
         ciphertext: Vec::new(),
     });
-    let migrations = preview(&d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap_err();
+    let migrations = preview(
+        &d,
+        std::slice::from_ref(&db),
+        facts,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_err();
     assert!(migrations[0].contains("driver `openporch/template`"));
 }
 
@@ -310,6 +367,7 @@ fn cleanup_and_drivers_without_facts() {
         &d,
         &[active(QUEUE, "test/gone"), bucket],
         |driver| (driver != "test/gone").then(DriverFacts::default),
+        &BTreeMap::new(),
         &BTreeMap::new(),
     )
     .unwrap();
@@ -331,7 +389,14 @@ fn a_digest_follows_the_configuration() {
     )]);
     let db = active(DB, "openporch/opentofu");
     let run = |d: &Deployment| {
-        preview(d, std::slice::from_ref(&db), facts, &BTreeMap::new()).unwrap()[0]
+        preview(
+            d,
+            std::slice::from_ref(&db),
+            facts,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap()[0]
             .digest
             .clone()
     };
@@ -379,12 +444,14 @@ fn refused_driver_plans_keep_their_action() {
                 "fp-1".into()
             },
             actions: Vec::new(),
+            config_digest: None,
         };
         preview(
             &d,
             std::slice::from_ref(db),
             facts,
             &BTreeMap::from([(db.guresid.clone(), plan)]),
+            &BTreeMap::new(),
         )
         .unwrap()
         .remove(0)
@@ -399,4 +466,126 @@ fn refused_driver_plans_keep_their_action() {
     let mut fresh = db.clone();
     fresh.last_deploy_id = None;
     assert_eq!(run("replace", &fresh).action, Change::Replace);
+}
+
+#[test]
+fn a_refused_driver_plan_lapses_when_the_configuration_changes() {
+    let d = deployment(&[(
+        node(DB, "pg", "openporch/opentofu"),
+        def("pg", "openporch/opentofu", None),
+    )]);
+    let db = active(DB, "openporch/opentofu");
+    let run = |d: &Deployment, planned_for: &Deployment| {
+        let plan = DriverPlan {
+            action: "replace".into(),
+            fingerprint: "fp-1".into(),
+            actions: Vec::new(),
+            config_digest: config_digests(planned_for).remove(DB),
+        };
+        preview(
+            d,
+            std::slice::from_ref(&db),
+            facts,
+            &BTreeMap::from([(db.guresid.clone(), plan)]),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .remove(0)
+    };
+    assert_eq!(run(&d, &d).action, Change::Replace);
+    // A new definition version is planned again when the deployment runs.
+    let mut changed = d.clone();
+    for (version, _) in changed.definitions.values_mut() {
+        *version = 2;
+    }
+    let e = run(&changed, &d);
+    assert_eq!(e.action, Change::Update);
+    assert!(!e.permit_required && e.driver_plan.is_none());
+}
+
+#[test]
+fn a_digest_follows_what_the_change_acts_on() {
+    let mut d = deployment(&[
+        (
+            node(QUEUE, "blind", "test/blind"),
+            def("blind", "test/blind", Some("aws-dev")),
+        ),
+        (
+            node(DB, "pg", "openporch/opentofu"),
+            def("pg", "openporch/opentofu", None),
+        ),
+    ]);
+    for n in d.graph.nodes.values_mut() {
+        if n.descriptor.to_string() == QUEUE {
+            n.depends_on.insert(Descriptor::parse(DB).unwrap());
+        }
+    }
+    let mut queue = active(QUEUE, "test/blind");
+    queue.driver_account = Some("aws-dev".into());
+    let db = active(DB, "openporch/opentofu");
+    let account = |role: &str| -> CloudAccount {
+        serde_json::from_value(json!({
+            "id": "aws-dev", "type": "aws-role", "config": {"role_arn": role},
+        }))
+        .unwrap()
+    };
+    let run = |queue: &ActiveResource, db: &ActiveResource, account: CloudAccount| {
+        let e = preview(
+            &d,
+            &[queue.clone(), db.clone()],
+            facts,
+            &BTreeMap::new(),
+            &BTreeMap::from([("aws-dev".to_owned(), account)]),
+        )
+        .unwrap();
+        let e = by_descriptor(&e)[QUEUE].clone();
+        assert_eq!(e.action, Change::Unknown);
+        e.digest
+    };
+    let first = run(&queue, &db, account("arn:aws:iam::1:role/a"));
+    assert_eq!(first, run(&queue, &db, account("arn:aws:iam::1:role/a")));
+    // The cloud account it runs in changes.
+    assert_ne!(first, run(&queue, &db, account("arn:aws:iam::1:role/b")));
+    // A dependency's outputs change, as an observation records them.
+    let mut observed = db.clone();
+    observed.outputs = json!({"host": "db-2.internal"});
+    assert_ne!(
+        first,
+        run(&queue, &observed, account("arn:aws:iam::1:role/a"))
+    );
+    // Its own record changes.
+    let mut recovered = queue.clone();
+    recovered.target = Some("123456789012".into());
+    assert_ne!(
+        first,
+        run(&recovered, &db, account("arn:aws:iam::1:role/a"))
+    );
+    // The driver state a recovery checkpoints changes, even when its inputs
+    // and outputs stay the same.
+    let mut checkpointed = queue.clone();
+    checkpointed.recovery = json!({"etag": "2"});
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
+    );
+    let mut checkpointed = queue.clone();
+    checkpointed.snapshot = json!({"size": "large"});
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
+    );
+    let mut checkpointed = queue.clone();
+    checkpointed.cookie = Some(Sealed {
+        key_id: "k1".into(),
+        nonce: vec![1; 12],
+        ciphertext: vec![2; 16],
+    });
+    assert_ne!(
+        first,
+        run(&checkpointed, &db, account("arn:aws:iam::1:role/a"))
+    );
+    // Its status alone does not.
+    let mut status = queue.clone();
+    status.status = "drifted".into();
+    assert_eq!(first, run(&status, &db, account("arn:aws:iam::1:role/a")));
 }

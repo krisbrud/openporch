@@ -335,6 +335,108 @@ async fn a_refused_driver_plan_shows_in_the_next_preview() {
 }
 
 #[tokio::test]
+async fn a_refused_driver_plan_lapses_when_the_configuration_changes() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", true).await;
+    let db = s.resource(DB).await;
+    let latest = s.get(&format!("{ENV_DEV}/deploys"), &s.admin).await.1["deployments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let planned = vec![("replace".to_owned(), "aws_db_instance.main".to_owned())];
+    StorePermits(s.state.store.clone())
+        .check(PermitRequest {
+            org: "acme",
+            app: "shop",
+            env: "development",
+            descriptor: DB,
+            guresid: db["guresid"].as_str(),
+            deployment: Some(&latest),
+            action: DestructiveAction::Replace,
+            permits: &[],
+            plan: Some("fp-1"),
+            planned: &planned,
+        })
+        .await
+        .unwrap_err();
+    let (_, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(entry(&plan, DB)["action"], "replace", "{plan}");
+
+    // A new definition version is planned again when the deployment runs.
+    let (status, b) = s
+        .call(
+            axum::http::Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(json!({"name": "Postgres v2", "driver_type": "openporch/echo"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let db = entry(&plan, DB);
+    assert_eq!(db["action"], "update", "{plan}");
+    assert_eq!(db["permit_required"], false, "{plan}");
+    assert!(db["driver_plan"].is_null(), "{plan}");
+}
+
+#[tokio::test]
+async fn an_application_deletion_binds_at_the_previewed_generations() {
+    let s = server().await;
+    s.provisioning(Arc::default()).await;
+    s.deploy_web("nginx:1", false).await;
+    let app = "/orgs/acme/apps/shop";
+    let permits = s.app_deletion_permits(app).await;
+    let generation = s.dev_generation().await.as_i64().unwrap();
+    let delete = |body: Value| s.call(axum::http::Method::DELETE, app, Some(&s.admin), Some(body));
+
+    // A generation the environment moved on from, or an environment the
+    // client did not preview, is refused before anything is deleted.
+    let (status, b) = delete(json!({"permits": permits,
+        "expected_generations": {"development": generation - 1}}))
+    .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert!(b["message"].as_str().unwrap().contains("generation"), "{b}");
+    let (status, b) = delete(json!({"permits": permits, "expected_generations": {}})).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    assert_eq!(s.get(app, &s.admin).await.1["state"], "active");
+
+    // The store accepts each deletion only at the generation its preflight
+    // saw.
+    let e = s
+        .state
+        .store
+        .accept_app_deletion(openporch_store::AppDeletionRequest {
+            permits: [("development".to_owned(), Default::default())].into(),
+            generations: [("development".to_owned(), generation - 1)].into(),
+            org: "acme".into(),
+            app: "shop".into(),
+            actor: "bootstrap".into(),
+            comment: String::new(),
+            snapshot: json!({}),
+            audit: openporch_store::AuditIntent::accepted(
+                "acme",
+                "bootstrap",
+                "DELETE",
+                app,
+                "test",
+            ),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, openporch_store::StoreError::StaleGeneration { .. }),
+        "{e}"
+    );
+
+    let (status, b) = delete(json!({"permits": permits,
+        "expected_generations": {"development": generation}}))
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{b}");
+}
+
+#[tokio::test]
 async fn a_driver_that_cannot_preview_needs_an_unknown_impact_permit() {
     let s = server().await;
     s.provisioning(Arc::default()).await;
