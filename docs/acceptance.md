@@ -47,7 +47,7 @@ end.
 |---|---|---|
 | Request for the configured organization | covered | `crates/server/src/tests/mod.rs::single_organization` |
 | Request for an unknown organization | covered | `crates/server/src/tests/mod.rs::single_organization`, `crates/server/src/tests/mod.rs::other_organizations_are_hidden_before_routing` |
-| Unauthenticated request | gap (partial) | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route`, `crates/server/src/tests/mod.rs::router_walk_every_route_declares_a_permission_and_requires_credentials` (partial: the 401 is asserted, but no test shows a credential-less mutation leaves state unchanged) |
+| Unauthenticated request | covered | `crates/server/src/tests/acceptance.rs::requests_without_a_valid_credential_are_not_processed` (every non-public route with no credential, another scheme or an invalid bearer token: `401`, and state and audit log unchanged), `crates/server/src/tests/mod.rs::router_walk_every_route_declares_a_permission_and_requires_credentials` |
 | Forbidden request | covered | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route`, `crates/server/src/tests/acceptance.rs::every_route_refuses_members_without_its_permission` |
 | Validation failure | covered | `crates/server/src/tests/mod.rs::uniform_errors_and_identifiers` |
 | Duplicate ID | covered | `crates/server/src/tests/mod.rs::uniform_errors_and_identifiers` |
@@ -60,7 +60,7 @@ end.
 | Create an application | covered | `crates/server/src/tests/envs.rs::application_starts_with_an_undeployed_development_environment`, `crates/server/src/tests/mod.rs::creator_becomes_owner` |
 | Delete an application with provisioned resources | gap (partial) | `crates/engine/src/planner/tests/teardown.rs::deleting_an_application_deletes_every_environment_then_the_application`, `crates/engine/src/planner/tests/teardown.rs::adopted_and_external_resources_are_released_not_deleted`, `crates/server/src/tests/resources.rs::delete_a_deployed_application` (partial: no test asserts external or retained adopted objects are listed in the deletion result) |
 | Delete a type in use | covered | `crates/server/src/tests/envs.rs::environment_types_in_use_are_kept` |
-| Empty environment | gap (partial) | `crates/server/src/tests/envs.rs::environments_need_developer_and_deployer` (created env is `never_deployed`, no delta) (partial: no test lists a new environment's active resources and deployments to show both are empty) |
+| Empty environment | covered | `crates/server/src/tests/envs.rs::a_new_environment_has_no_deployments_or_resources` |
 | Clone from a deployment | covered | `crates/server/src/tests/envs.rs::clone_an_environment_from_a_deployment` |
 | Successful deletion | covered | `crates/engine/src/planner/tests/teardown.rs::successful_deletion_goes_in_reverse_dependency_order`, `crates/server/src/tests/resources.rs::delete_a_deployed_environment` (no namespace: Kubernetes is group 9) |
 | Deprovision failure | covered | `crates/engine/src/planner/tests/teardown.rs::a_failed_deletion_keeps_the_environment_for_a_retry` |
@@ -81,11 +81,11 @@ end.
 
 | Scenario | Status | Verified by |
 |---|---|---|
-| Actor recorded | gap | No test asserts a definition's `created_by` is the creating service user. Searched `created_by` across `crates/*/src/tests`: only sets, value versions and grants assert it (as `bootstrap`); `DefinitionRecord` serializes `created_by` but no catalog test reads it |
-| Token shown once | gap (partial) | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` (partial: later reads are not checked for the token's ID, description, expiry and creation time) |
+| Actor recorded | covered | `crates/server/src/tests/catalog.rs::a_definition_records_the_service_user_that_created_it` |
+| Token shown once | covered | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` (reads also name the issuing principal, `created_by`, and a revoked token's `revoked_at`; never the token or its hash) |
 | Revoked token | covered | `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable` |
-| Who may create tokens | gap (partial) | `crates/server/src/tests/mod.rs::who_may_create_tokens`, `crates/server/src/tests/mod.rs::manager_delegation_ceiling` (partial: the cited tests do not cover an administrator creating a service user token or the delegation ceiling; see also `crates/server/src/tests/mod.rs::tokens_are_shown_once_and_revocable`, `crates/server/src/tests/mod.rs::service_user_beyond_the_issuers_authority`) |
-| Missing token | gap (partial) | `crates/server/src/tests/mod.rs::missing_bearer_header` (partial: only the 401 on a GET is asserted; no test shows the request is not processed) |
+| Who may create tokens | covered | `crates/server/src/tests/mod.rs::who_may_create_tokens` (member for another user, self, administrator for a service user, manager within and beyond the ceiling), `crates/server/src/tests/mod.rs::manager_delegation_ceiling`, `crates/server/src/tests/mod.rs::service_user_beyond_the_issuers_authority` |
+| Missing token | covered | `crates/server/src/tests/acceptance.rs::requests_without_a_valid_credential_are_not_processed`, `crates/server/src/tests/mod.rs::missing_bearer_header` |
 | Login and expiry | gap (partial) | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`; CLI hint: `crates/cli/src/tests.rs::login_with_a_token_stores_it_owner_only` (asserts "porch login" only when no credential is stored; the 401-to-relogin hint for an expired session is not asserted) |
 | GitHub device login | covered | `crates/server/src/tests/github.rs::device_login_maps_the_immutable_github_id`, `crates/cli/src/tests.rs::device_login_stores_a_session_for_the_github_user` |
 | Unknown identity | covered | `crates/server/src/tests/mod.rs::unknown_identities_need_an_invitation` |
@@ -174,7 +174,7 @@ end.
 | File escapes the run directory | covered | `crates/drivers/src/opentofu/tests.rs::inputs_are_checked_before_anything_runs`, `crates/drivers/src/opentofu/tests.rs::symlinks_cannot_lead_out_of_a_git_module` |
 | Dependency output reveals replacement | gap | No test binds an `unknown`-impact permit and then has the driver plan a replacement. Searched `Unknown`/`unknown` and `Replace` in `crates/store/src/sqlite_permits/tests.rs`, `crates/engine/src/executor/tests.rs`, `crates/server/src/tests/plans.rs`; `a_bound_permit_authorizes_its_deployment_and_retries` covers only a different fingerprint |
 | Generation increments after acceptance | covered | `crates/store/src/sqlite_permits/tests.rs::a_bound_permit_authorizes_its_deployment_and_retries` |
-| External driver redirects credentials | gap | `crates/drivers/src/http.rs` sets `redirect::Policy::none()`, but no test serves a 3xx. Searched `redirect`, `30[1278]`, `Location` in `crates/drivers/src/http_tests.rs` and `crates/drivers/fixtures/http/*.json` (`TestRedirectsAreNotFollowed` covers the Go provider's client, not drivers) |
+| External driver redirects credentials | covered | `crates/drivers/src/http_tests.rs::redirects_are_not_followed_and_credentials_stay_with_the_driver` (301, 302, 303, 307 and 308 to another origin: not followed, nothing reaches that origin, the error redacts echoed secrets and a mutation is uncertain), `crates/engine/src/executor/tests.rs::a_driver_failure_is_redacted` (driver errors are recorded redacted) |
 
 ## deployment-sets-and-deltas
 
@@ -220,7 +220,7 @@ end.
 | Deterministic password | covered | `crates/drivers/src/tests.rs::template_keeps_a_generated_password_in_its_cookie` |
 | Driver error | covered | `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-400-validation.json`), `crates/engine/src/planner/tests.rs::permanent_errors_are_not_retried` |
 | Hung driver | covered | `crates/drivers/src/tests.rs::a_driver_that_does_not_answer_times_out`, `crates/drivers/src/tests.rs::a_timeout_cancels_drivers_that_can`, `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered` |
-| Incompatible cookie upgrade | gap (partial) | Per-call checks only: `crates/drivers/src/opentofu/tests.rs::cookies_are_checked_for_compatibility`, `crates/drivers/src/tests.rs::returned_cookies_are_checked`. No driver-upgrade activation step that rejects with affected GUResIDs; searched `activat`, `cookie_version`, `upgrade` across `crates/` |
+| Incompatible cookie upgrade | covered | `crates/server/src/tests/catalog.rs::a_cookie_version_change_is_refused_while_resources_hold_cookies`, `crates/server/src/tests/catalog.rs::external_drivers_are_replaced` (a registration's `cookie_version` is the version it reads, so any change while active resources hold its cookies is refused with their GUResIDs; registration, cookies and recovery metadata are unchanged). Per-call checks: `crates/drivers/src/opentofu/tests.rs::cookies_are_checked_for_compatibility`, `crates/drivers/src/tests.rs::returned_cookies_are_checked` |
 | Duplicate put | covered | `crates/drivers/src/http_tests.rs::duplicate_put_recovers_the_same_object` |
 | Unobservable timed-out creation | covered | `crates/engine/src/planner/tests/recovery.rs::nothing_found_by_a_driver_that_cannot_recover_waits_for_an_administrator`, `crates/engine/src/planner/tests/recovery.rs::an_unobservable_outcome_waits_for_an_administrator` |
 | Conflict after a lost response | covered | `crates/drivers/src/http_tests.rs::protocol_fixtures` (`put-409-conflict.json`, `delete-409.json`: a 409 to a mutation leaves the outcome uncertain), `crates/drivers/src/http_tests.rs::duplicate_put_recovers_the_same_object`; an uncertain outcome is observed before another mutation: `crates/engine/src/planner/tests.rs::a_timeout_leaves_the_resource_unknown_until_recovered`, `crates/engine/src/planner/tests/recovery.rs::a_crash_after_creation_is_recovered_by_observation`; the cookie a conflict returns is kept for that observation: `crates/drivers/src/http_tests.rs::a_failed_mutation_keeps_the_cookie_it_returned`, `crates/engine/src/executor/tests.rs::an_uncertain_update_keeps_the_new_cookie_for_recovery`, `crates/engine/src/executor/tests.rs::an_uncertain_creation_keeps_its_cookie_and_is_still_a_creation` |
@@ -284,7 +284,7 @@ end.
 | Placeholder escaping | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
 | Secret value changed | covered | `provider/internal/provider/acc_catalog_test.go::TestAccValue` |
 | Service user token | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |
-| Reviewer looks for a deploy resource | gap | Documented only (`provider/internal/provider/provider.go` description, `provider/docs/index.md`); no test asserts the schema has no deployment resource. Searched `provider/internal/**/*_test.go` for `Resources()`, `deploy` |
+| Reviewer looks for a deploy resource | covered | `provider/internal/provider/provider_test.go::TestTheSchemaHasNoDeploymentResource` (no resource, data source, ephemeral resource or action named for deploying; the provider description and `provider/docs/index.md` point to `porch score deploy`) |
 | Accidental application removal from HCL | covered | `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment` (`destroy_acknowledgements`, `ExpectError`) |
 
 ## organization-membership
@@ -326,7 +326,7 @@ end.
 | Org viewer reads secrets | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references` |
 | Developer without deployer | covered | `crates/server/src/tests/deploys.rs::deploying_needs_the_deployer_role`, `crates/server/src/rbac.rs::deployer_gate_names_the_missing_role` |
 | Create an application | covered | `crates/server/src/tests/mod.rs::creator_becomes_owner` |
-| Hidden application | gap (partial) | `crates/server/src/tests/mod.rs::hidden_and_missing_applications_are_404_and_mutations_are_audited` (partial: the cited test exercises a DELETE, not a read; see also `crates/server/src/tests/mod.rs::union_of_roles_and_hidden_applications`) |
+| Hidden application | covered | `crates/server/src/tests/mod.rs::hidden_and_missing_applications_are_404_and_mutations_are_audited`, `crates/server/src/tests/mod.rs::union_of_roles_and_hidden_applications` |
 | Known application, forbidden action | covered | `crates/server/src/tests/mod.rs::authentication_and_authorization_on_every_route` |
 | Grant through the provider | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |
 | Cross-application deployment reference | covered | `crates/server/src/tests/deploys.rs::cross_application_references_are_hidden` |
@@ -387,7 +387,7 @@ end.
 | Inline secret becomes a reference | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references`, `crates/store/src/secrets/tests.rs::inline_values_become_references` |
 | Update creates a version | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references` |
 | Secret output stored as a reference | covered | `crates/engine/src/executor/tests.rs::a_secret_output_is_stored_and_returned_as_a_reference` |
-| Store unreachable | gap (partial) | Only cloud-account credentials naming an unsupported store are tested (`crates/engine/src/cloud/tests.rs::static_keys_come_from_the_secret_reference`). No executor test where a definition/value reference's store read fails and the resource error names store and reference; searched `unreachable`, `could not be read`, `SecretError::Store` in `crates/engine/src/executor/tests.rs`, `crates/engine/src/planner/tests.rs` |
+| Store unreachable | covered | `crates/engine/src/executor/tests.rs::an_unreadable_store_fails_the_resource_naming_store_and_reference` (the built-in store's table is made unreadable; the driver is not called) |
 | Delete a store in use | covered | `crates/server/src/tests/accounts.rs::delete_a_store_in_use`, `crates/server/src/tests/accounts.rs::delete_a_store_used_by_shared_values` |
 | Reference copied between applications | covered | `crates/server/src/tests/secret_use.rs::reference_copied_between_applications` |
 | Production reference in development | covered | `crates/server/src/tests/secret_use.rs::production_reference_in_development` |
@@ -403,7 +403,7 @@ end.
 |---|---|---|
 | Environment override | covered | `crates/server/src/tests/values.rs::environment_override`, `crates/server/src/tests/e2e.rs::a_function_with_a_database_and_a_queue_deploys_and_replays` |
 | Override without base | covered | `crates/server/src/tests/values.rs::override_without_base` |
-| Secret in a composite string | gap (partial) | `crates/engine/src/executor/tests.rs::a_secret_in_a_composite_string_is_rendered_only_for_the_driver` (partial: nothing asserts conversion and the planner keep the unresolved `${values.API_TOKEN}` expression) |
+| Secret in a composite string | covered | `crates/engine/src/planner/tests/workloads.rs::a_secret_in_a_composite_string_stays_an_expression_until_the_executor` (conversion, the accepted graph and the planner's job keep the expression), `crates/engine/src/executor/tests.rs::a_secret_in_a_composite_string_is_rendered_only_for_the_driver` |
 | Deployment pins its version | covered | `crates/server/src/tests/e2e.rs::a_deployment_pins_its_versions_and_replay_refuses_missing_inputs` |
 | Delete environment | covered | `crates/server/src/tests/values.rs::delete_environment` |
 
@@ -416,7 +416,7 @@ end.
 | Unknown field | covered | `crates/core/src/workload/tests.rs::unknown_field_is_named` |
 | Web container | covered | `crates/core/src/workload/tests.rs::web_container_implies_http_trigger` |
 | Zip function | covered | `crates/core/src/workload/tests.rs::deploy_time_artifact_is_required_and_supplied_by_name` |
-| Image function | gap (partial) | `crates/core/src/workload/tests.rs::image_function`, `crates/core/src/workload/tests.rs::deploy_time_image_is_required` (partial: no test shows deploying a function image package requires `--image <name>=<ref>`) |
+| Image function | covered | `crates/core/src/workload/tests.rs::image_function`, `crates/cli/src/tests/deploys.rs::an_image_function_is_deployed_with_its_image_from_the_command_line` (a function's image is named `main`: `--image main=<ref>`), `crates/core/src/workload/tests.rs::deploy_time_image_is_required` |
 | Queue trigger on a dependency | covered | `crates/core/src/workload/tests.rs::queue_trigger_on_a_dependency`, `crates/core/src/graph/tests.rs::queue_trigger_dependency_is_in_the_graph`, `crates/engine/src/planner/tests/workloads.rs::a_lambda_class_workload_gets_its_resolved_document` |
 | Trigger names a missing resource | covered | `crates/core/src/workload/tests.rs::trigger_names_missing_resource` |
 | Unsupported trigger for the target | deferred | `openporch/kubernetes`, group 9 |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 193 covered, 9 manual, 31 deferred, 41 gaps.
+274 scenarios: 206 covered, 9 manual, 31 deferred, 28 gaps.
