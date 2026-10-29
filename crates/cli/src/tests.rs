@@ -27,6 +27,8 @@ mod reference;
 struct DevServer {
     url: String,
     admin: String,
+    /// The server's state, when the test started it here.
+    state: Option<openporch_server::AppState>,
     _data: TempDir,
 }
 
@@ -42,7 +44,7 @@ impl DevServer {
             browser: None,
         });
         let state = openporch_server::start(config, None).await.unwrap();
-        let (router, _) = openporch_server::router(state);
+        let (router, _) = openporch_server::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -59,6 +61,7 @@ impl DevServer {
         Self {
             url: format!("http://{addr}"),
             admin,
+            state: Some(state),
             _data: data,
         }
     }
@@ -491,6 +494,75 @@ async fn device_login_stores_a_session_for_the_github_user() {
     let r = m.porch(&["logout"], "").await;
     assert_eq!(r.code, 0, "{r:?}");
     assert_eq!(client.current_user().await.unwrap_err().status(), Some(401));
+}
+
+/// `Login and expiry` in `authentication`: the session `porch login` stored,
+/// used 25 hours later, is rejected with `401`, and the CLI asks the user to
+/// log in again.
+#[tokio::test]
+async fn an_expired_session_asks_the_user_to_log_in_again() {
+    let github = mock_github().await;
+    let server = DevServer::start(Some(&github)).await;
+    let invitation = server
+        .post(
+            "/orgs/acme/invitations",
+            json!({"provider": "github", "login": "octocat", "role": "member"}),
+        )
+        .await;
+    let code = invitation["code"].as_str().unwrap();
+    let m = Machine::new();
+    let r = m
+        .porch(
+            &[
+                "login",
+                "--url",
+                &server.url,
+                "--org",
+                "acme",
+                "--invitation",
+                code,
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let path = m.dir().join("credentials.toml");
+    let mut creds: Credentials = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let session = creds.servers[&server.url].token.clone();
+    let r = m.porch(&["get", "apps"], "").await;
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // The same session, as the server sees it 25 hours after login: it is
+    // re-signed with its times moved back by 25 hours, which only the server
+    // can do.
+    let signer = server.state.as_ref().unwrap().signer.as_ref().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let claims = signer
+        .verify(&session, i64::try_from(now).unwrap())
+        .unwrap();
+    let hours_25 = 25 * 3_600_000;
+    assert!(signer.verify(&session, claims.iat + hours_25).is_none());
+    let expired = signer.sign(&openporch_server::auth::Claims {
+        iat: claims.iat - hours_25,
+        exp: claims.exp - hours_25,
+        ..claims
+    });
+    creds
+        .servers
+        .get_mut(&server.url)
+        .unwrap()
+        .token
+        .clone_from(&expired);
+    std::fs::write(&path, toml::to_string(&creds).unwrap()).unwrap();
+
+    let r = m.porch(&["get", "apps"], "").await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("AUTH-001"), "{r:?}");
+    assert!(r.err.contains("run `porch login`"), "{r:?}");
+    assert_no_secret(&r, &expired);
 }
 
 #[test]

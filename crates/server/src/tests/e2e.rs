@@ -1362,3 +1362,112 @@ async fn an_application_larger_than_the_server_is_deleted() {
     }
     panic!("the application was not deleted");
 }
+
+/// A web workload that uses the shared DNS name `api-dns`.
+const API: &str = r#"
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata: {name: web}
+containers:
+  web:
+    image: nginx
+    variables:
+      API: "https://${resources.dns.host}/api"
+resources:
+  dns: {type: dns, id: api-dns}
+"#;
+
+/// `resource-graph`'s `Shared DNS per environment`: `shared.api-dns`
+/// deployed to two environments is a separate active resource in each, with
+/// its own identity and outputs, and each environment's workload reads its
+/// own.
+#[tokio::test]
+async fn a_shared_dns_name_is_its_own_resource_in_each_environment() {
+    let s = server().await;
+    s.app("shop").await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "dns",
+            "dns",
+            "openporch/echo",
+            json!({"values": {"host": "api.${context.env.id}.example.com"}}),
+        ),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver,
+                       "driver_inputs": inputs, "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, b) = s
+        .post(
+            &format!("{APP}/envs"),
+            &s.admin,
+            json!({"id": "staging", "name": "Staging", "type": "development"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let module = Workload::parse(API, None)
+        .unwrap()
+        .to_module(&builtin_types())
+        .unwrap()
+        .module;
+    let (st, delta) = s
+        .post(
+            &format!("{APP}/deltas"),
+            &s.admin,
+            json!({"modules": {"add": {"web": module}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let first = s
+        .deploy_to("development", json!({"delta_id": delta["id"]}))
+        .await;
+    s.deploy_to("staging", json!({"set_id": first["set_id"]}))
+        .await;
+
+    const DNS: &str = "dns.default#shared.api-dns";
+    const WEB: &str = "workload.default#modules.web";
+    let dev = s.active("development").await;
+    let staging = s.active("staging").await;
+    for (env, active) in [("development", &dev), ("staging", &staging)] {
+        let dns = &active[DNS];
+        assert_eq!(dns["status"], "provisioned", "{env}: {dns}");
+        assert_eq!(
+            dns["outputs"]["host"],
+            format!("api.{env}.example.com"),
+            "{env}: {dns}"
+        );
+        // The workload of each environment resolved its own environment's name.
+        let web = active[WEB]["outputs"].to_string();
+        assert!(
+            web.contains(&format!("https://api.{env}.example.com/api")),
+            "{env}: {web}"
+        );
+        let other = if env == "staging" {
+            "development"
+        } else {
+            "staging"
+        };
+        assert!(
+            !web.contains(&format!("api.{other}.example.com")),
+            "{env}: {web}"
+        );
+    }
+    assert_ne!(dev[DNS]["guresid"], staging[DNS]["guresid"]);
+    // Two active resources, one per environment.
+    let records: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM active_resources WHERE app_id = 'shop' AND descriptor = ?",
+    )
+    .bind(DNS)
+    .fetch_one(s.state.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(records, 2);
+}
