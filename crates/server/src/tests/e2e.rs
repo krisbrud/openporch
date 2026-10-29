@@ -1471,3 +1471,59 @@ async fn a_shared_dns_name_is_its_own_resource_in_each_environment() {
     .unwrap();
     assert_eq!(records, 2);
 }
+
+/// `${shared.api-dns.host}` resolves to the shared DNS name, whether the set's
+/// `shared` section or a workload dependency with that `id` requests it, when
+/// the DNS name's definition references a route without an ID: the route
+/// inherits the ID `shared.api-dns` but is not the shared resource.
+#[tokio::test]
+async fn a_dependency_inheriting_a_shared_id_is_not_the_shared_resource() {
+    let by_workload = Workload::parse(API, None)
+        .unwrap()
+        .to_module(&builtin_types())
+        .unwrap()
+        .module;
+    let by_set = json!({
+        "modules": {"add": {"web": {"spec": {"containers": {"web": {"image": "nginx",
+            "variables": {"API": "https://${shared.api-dns.host}/api"}}}}}}},
+        "shared": [{"op": "add", "path": "/api-dns", "value": {"type": "dns"}}],
+    });
+    for delta in [by_set, json!({"modules": {"add": {"web": by_workload}}})] {
+        let s = server().await;
+        s.app("shop").await;
+        for (id, ty, driver, inputs) in [
+            ("env", "base-env", "openporch/none", json!({})),
+            ("workloads", "workload", "openporch/none", json!({})),
+            (
+                "dns",
+                "dns",
+                "openporch/echo",
+                json!({"values": {"host": "api-${resources.route.guresid}.example.com"}}),
+            ),
+            ("routes", "route", "openporch/echo", json!({})),
+        ] {
+            let (st, b) = s
+                .post(
+                    "/orgs/acme/resources/defs",
+                    &s.admin,
+                    json!({"id": id, "type": ty, "driver_type": driver,
+                           "driver_inputs": inputs, "criteria": [{}]}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{b}");
+        }
+        let (st, delta) = s.post(&format!("{APP}/deltas"), &s.admin, delta).await;
+        assert_eq!(st, StatusCode::CREATED, "{delta}");
+        s.deploy_to("development", json!({"delta_id": delta["id"]}))
+            .await;
+        let active = s.active("development").await;
+        let route = &active["route.default#shared.api-dns"];
+        let host = format!("api-{}.example.com", route["guresid"].as_str().unwrap());
+        assert_eq!(
+            active["dns.default#shared.api-dns"]["outputs"]["host"],
+            host
+        );
+        let web = active["workload.default#modules.web"]["outputs"].to_string();
+        assert!(web.contains(&format!("https://{host}/api")), "{web}");
+    }
+}

@@ -313,6 +313,32 @@ fn shared_resource_is_one_node() {
     );
 }
 
+/// A workload reading a shared resource of the set's `shared` section
+/// through `${shared.<id>...}` depends on it, so it is resolved after it.
+#[test]
+fn a_workload_depends_on_the_shared_resources_its_spec_reads() {
+    let set: DeploymentSet = serde_json::from_value(json!({
+        "modules": {
+            "web": {"spec": {"containers": {"web": {"image": "nginx",
+                "variables": {"API": "https://${shared.api-dns.host}/api"}}}}},
+            "other": {"spec": {"containers": {"other": {"image": "nginx"}}}},
+        },
+        "shared": {"api-dns": {"type": "dns"}},
+    }))
+    .unwrap();
+    let g = Fixture::new(base_defs()).build(&set).unwrap();
+    assert!(
+        g.nodes[&d("workload.default#modules.web")]
+            .depends_on
+            .contains(&d("dns.default#shared.api-dns"))
+    );
+    assert!(
+        !g.nodes[&d("workload.default#modules.other")]
+            .depends_on
+            .contains(&d("dns.default#shared.api-dns"))
+    );
+}
+
 #[test]
 fn conflicting_shared_table_names_both_paths() {
     let table = |name: &str, key: &str| {

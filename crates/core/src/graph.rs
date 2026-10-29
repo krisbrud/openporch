@@ -222,6 +222,26 @@ pub fn build_graph(input: GraphInput<'_>) -> Result<ResourceGraph, GraphError> {
         let params = Some(shared.params.clone().unwrap_or(Value::Null));
         b.request(&d, &format!("shared.{id}"), params)?;
     }
+    // A workload that reads one of the set's shared resources through
+    // `${shared.<id>...}` depends on it. Placeholders that do not parse are
+    // reported when the workload is resolved.
+    for (wid, module) in &input.set.modules {
+        let w = Descriptor::new(ty("workload"), module.class.clone(), ResId::workload(wid));
+        let spec = Value::Object(module.spec.clone());
+        let found = collect_placeholders(&spec, Dialect::Set, "spec").unwrap_or_default();
+        for (_, _, expr) in found {
+            let Expr::Shared { id, .. } = expr else {
+                continue;
+            };
+            let Some(shared) = input.set.shared.get(&id) else {
+                continue;
+            };
+            if let Ok(res_id) = ResId::shared(&id) {
+                let d = Descriptor::new(shared.ty.clone(), shared.class.clone(), res_id);
+                b.edge(&w, &d);
+            }
+        }
+    }
     while let Some(d) = b.queue.pop_front() {
         b.expand(&d)?;
     }
