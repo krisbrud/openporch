@@ -584,3 +584,314 @@ async fn a_protected_environment_refuses_changes_of_unknown_impact() {
     assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
     assert!(b["message"].as_str().unwrap().contains("protected"), "{b}");
 }
+
+/// `test/planned`: `openporch/echo`, but its plans are what the test says
+/// and it records the permit fingerprint of each `put`.
+#[derive(Debug)]
+struct Planned {
+    echo: openporch_drivers::Echo,
+    info: openporch_drivers::DriverInfo,
+    plan: std::sync::Mutex<openporch_drivers::Plan>,
+    puts: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl openporch_drivers::Driver for Planned {
+    fn info(&self) -> &openporch_drivers::DriverInfo {
+        &self.info
+    }
+
+    fn plan<'a>(
+        &'a self,
+        _req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Plan> {
+        let plan = self.plan.lock().unwrap().clone();
+        Box::pin(async move { Ok(plan) })
+    }
+
+    fn plan_delete<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Plan> {
+        self.echo.plan_delete(req)
+    }
+
+    fn put<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::PutOutcome> {
+        self.puts.lock().unwrap().push(req.permit.clone());
+        self.echo.put(req)
+    }
+
+    fn get<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::Observation> {
+        self.echo.get(req)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        req: &'a openporch_drivers::DriverRequest,
+    ) -> openporch_drivers::DriverFuture<'a, openporch_drivers::DeleteOutcome> {
+        self.echo.delete(req)
+    }
+}
+
+impl Planned {
+    fn set(&self, plan: openporch_drivers::Plan) {
+        *self.plan.lock().unwrap() = plan;
+    }
+
+    fn puts(&self) -> Vec<Option<String>> {
+        self.puts.lock().unwrap().clone()
+    }
+}
+
+/// A plan that replaces the database instance.
+fn replacement(fingerprint: &str) -> openporch_drivers::Plan {
+    openporch_drivers::Plan::Actions {
+        actions: vec![(
+            openporch_drivers::Action::Replace,
+            "aws_db_instance.main".into(),
+        )],
+        fingerprint: fingerprint.into(),
+    }
+}
+
+const DNS: &str = "dns.default#modules.web.externals.db";
+
+/// A started server whose deployments run through the engine, with the
+/// database on `test/planned`. The database's driver input `host` is the
+/// output of a DNS resource its definition references, so the database's
+/// driver can plan only once that DNS resource has finished in the same run.
+/// `web` with its database has been deployed once.
+async fn planned_server() -> (Server, Arc<Planned>) {
+    use openporch_drivers::{Driver as _, DriverRegistry, Echo};
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
+    let echo = Echo::new();
+    let mut info = echo.info().clone();
+    info.id = "test/planned".into();
+    let driver = Arc::new(Planned {
+        echo,
+        info,
+        plan: std::sync::Mutex::new(openporch_drivers::Plan::NoEffects),
+        puts: std::sync::Mutex::default(),
+    });
+    let mut drivers = DriverRegistry::with_builtins();
+    drivers.register(driver.clone() as Arc<_>).unwrap();
+    let state = crate::state::start_with_drivers(
+        config,
+        None,
+        Arc::new(openporch_engine::cloud::AwsSts::new()),
+        Some(Arc::new(drivers)),
+    )
+    .await
+    .unwrap();
+    let s = super::server_from(dir, state);
+    // A record, so definitions may name the driver; it runs in-process.
+    sqlx::query(
+        "INSERT INTO drivers (org_id, id, body, created_at) \
+         VALUES ('acme', 'test/planned', '{}', 0)",
+    )
+    .execute(s.state.store.pool())
+    .await
+    .unwrap();
+    s.app("shop").await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "names",
+            "dns",
+            "openporch/echo",
+            json!({"values": {"host": "db.${context.env.id}.internal"}}),
+        ),
+        (
+            "pg",
+            "postgres",
+            "test/planned",
+            json!({"values": {"host": "${resources.dns.outputs.host}", "name": "shop",
+                              "port": 5432},
+                   "secret_refs": {"username": {"value": "shop"},
+                                   "password": {"value": "change-me"}}}),
+        ),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
+                       "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let first = s.deploy_web("nginx:1", true).await;
+    assert_eq!(first["status"], "succeeded", "{first}");
+    assert_eq!(
+        s.resource(DB).await["outputs"]["host"],
+        "db.development.internal"
+    );
+    (s, driver)
+}
+
+impl Server {
+    /// Redeploys the desired set with `permits` and waits for the outcome.
+    async fn redeploy_with(&self, permits: &[String]) -> Value {
+        let mut body = self.redeploy_body().await;
+        body["expected_generation"] = self.dev_generation().await;
+        body["permits"] = json!(permits);
+        let (status, d) = self
+            .post(&format!("{ENV_DEV}/deploys"), &self.admin, body)
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+        self.finished_at(&format!("{ENV_DEV}/deploys/{}", d["id"].as_str().unwrap()))
+            .await
+    }
+
+    /// Whether permit `id` has been used.
+    async fn permit_used(&self, id: &str) -> bool {
+        let used: Option<i64> = sqlx::query_scalar("SELECT used_at FROM permits WHERE id = ?")
+            .bind(id)
+            .fetch_one(self.state.store.pool())
+            .await
+            .unwrap();
+        used.is_some()
+    }
+}
+
+/// `deployment-safety`: `Database replacement` and `Inputs become resolvable
+/// later`. The preview can only say the database is updated, because its
+/// driver plans once the DNS name it takes as input is provisioned. When the
+/// run's plan replaces the database, the DNS name has already been updated
+/// and stays tracked; the database is not changed, the deployment fails with
+/// `approval_required` naming it, and the plan is recorded against that
+/// deployment. The next preview shows it, and a permit for it authorizes a
+/// new attempt that applies it.
+#[tokio::test]
+async fn a_replacement_found_while_running_needs_a_permit_for_that_plan() {
+    use openporch_store::PermitStore as _;
+    let (s, driver) = planned_server().await;
+    let before = s.resource(DB).await;
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let db = entry(&plan, DB);
+    assert_eq!(db["action"], "update", "{plan}");
+    assert_eq!(db["known"], false, "{plan}");
+    assert_eq!(db["permit_required"], false, "{plan}");
+    // Only the ordinary update is permitted: nothing needs a permit.
+    assert_eq!(
+        s.permits_for(ENV_DEV, s.redeploy_body().await).await,
+        Vec::<String>::new()
+    );
+
+    driver.set(replacement("fp-1"));
+    let puts = driver.puts().len();
+    let failed = s.redeploy_with(&[]).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("approval_required"), "{error}");
+    assert!(error.contains(DB), "{error}");
+    // Apply did not run.
+    assert_eq!(driver.puts().len(), puts);
+    let db = s.resource(DB).await;
+    assert_eq!(db["guresid"], before["guresid"]);
+    assert_eq!(
+        db["usage"]["last_deploy_id"],
+        before["usage"]["last_deploy_id"]
+    );
+    // The dependency that finished first stays tracked with this attempt.
+    let dns = s.resource(DNS).await;
+    assert_eq!(dns["status"], "provisioned", "{dns}");
+    assert_eq!(dns["usage"]["last_deploy_id"], failed["id"], "{dns}");
+    // The deployment's refused plan is recorded with it.
+    let requests = s
+        .state
+        .store
+        .approval_requests("acme", "shop", "development")
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].deployment_id, failed["id"].as_str().unwrap());
+    assert_eq!(requests[0].descriptor, DB);
+    assert_eq!(requests[0].action, "replace");
+    assert_eq!(requests[0].fingerprint, "fp-1");
+    assert_eq!(
+        requests[0].actions,
+        [("replace".to_owned(), "aws_db_instance.main".to_owned())]
+    );
+
+    // The next preview shows the replacement and its plan.
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let db = entry(&plan, DB);
+    assert_eq!(db["action"], "replace", "{plan}");
+    assert_eq!(db["permit_required"], true, "{plan}");
+    assert_eq!(db["driver_plan"]["fingerprint"], "fp-1", "{plan}");
+    assert_eq!(
+        db["driver_plan"]["actions"],
+        json!([["replace", "aws_db_instance.main"]])
+    );
+
+    // Explicitly authorized, the new attempt applies that plan.
+    let permits = s.permits_for(ENV_DEV, s.redeploy_body().await).await;
+    assert_eq!(permits.len(), 1, "{permits:?}");
+    let done = s.redeploy_with(&permits).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(driver.puts().last().unwrap().as_deref(), Some("fp-1"));
+    assert!(s.permit_used(&permits[0]).await);
+}
+
+/// `deployment-safety`: `Dependency output reveals replacement`. An attempt
+/// whose driver could not tell what it would do gets an unknown-impact
+/// permit; when the next attempt's plan, now able to see its input, is a
+/// replacement, that permit is not consumed for it, and the resource waits
+/// for a replacement permit for that plan.
+#[tokio::test]
+async fn an_unknown_impact_permit_does_not_cover_a_replacement() {
+    let (s, driver) = planned_server().await;
+
+    // The driver cannot tell what the change does.
+    driver.set(openporch_drivers::Plan::Unknown);
+    let failed = s.redeploy_with(&[]).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("approval_required"),
+        "{failed}"
+    );
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    assert_eq!(entry(&plan, DB)["action"], "unknown", "{plan}");
+    let unknown = s.permits_for(ENV_DEV, s.redeploy_body().await).await;
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+
+    // With its input now known, the driver plans a replacement.
+    driver.set(replacement("fp-2"));
+    let puts = driver.puts().len();
+    let refused = s.redeploy_with(&unknown).await;
+    assert_eq!(refused["status"], "failed", "{refused}");
+    let error = refused["error"].as_str().unwrap();
+    assert!(error.contains("approval_required"), "{error}");
+    assert_eq!(driver.puts().len(), puts, "the replacement was applied");
+    assert!(
+        !s.permit_used(&unknown[0]).await,
+        "the unknown-impact permit was consumed by a replacement"
+    );
+
+    // It waits for a permit for that replacement.
+    let (status, plan) = s.plan(s.redeploy_body().await).await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let db = entry(&plan, DB);
+    assert_eq!(db["action"], "replace", "{plan}");
+    assert_eq!(db["driver_plan"]["fingerprint"], "fp-2", "{plan}");
+    let replace = s.permits_for(ENV_DEV, s.redeploy_body().await).await;
+    let done = s.redeploy_with(&replace).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert_eq!(driver.puts().last().unwrap().as_deref(), Some("fp-2"));
+}

@@ -365,3 +365,183 @@ async fn backup_and_restore_drill() {
     drop(backups);
     drop(old);
 }
+
+/// Starts the installation in `dir` with the default drivers.
+async fn start_plain(dir: tempfile::TempDir, admin: &str) -> Server {
+    let mut s = super::server_in(dir).await;
+    s.admin = admin.to_owned();
+    s
+}
+
+/// The plaintext of `r`, read through the server's built-in store.
+async fn read_secret(s: &Server, r: &openporch_core::model::SecretRef) -> Option<String> {
+    use openporch_store::secrets::SecretStore as _;
+    let primary = crate::secret_inputs::primary(&s.state).ok()?;
+    primary.read(r).await.ok().map(|v| v.expose().to_owned())
+}
+
+/// Restores `backup` into a new data directory with a key file holding
+/// `keys` (none: no key file), and starts it.
+async fn restore_with(backup: &std::path::Path, keys: &[&str], admin: &str) -> Server {
+    let new = tempfile::tempdir().unwrap();
+    backup::restore(&config(new.path()), backup).await.unwrap();
+    if !keys.is_empty() {
+        super::keys::write_keys(&new.path().join("master.key"), keys);
+    }
+    start_plain(new, admin).await
+}
+
+/// `secret-stores-and-references`: `Restore after key rotation` and `Master
+/// key unavailable`. A backup holds secret versions sealed with a retired key
+/// and with the key that replaced it. Restored with both keys, each version
+/// decrypts with the key it records. Restored without the retired key, or
+/// without any key, readiness fails naming the missing key, no deployment is
+/// accepted, nothing decrypts with the wrong key and no key is generated in
+/// its place.
+#[tokio::test]
+async fn a_restore_after_key_rotation_needs_every_recorded_key() {
+    let s = super::server().await;
+    let admin = s.admin.clone();
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": "openporch/none", "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let secret = |key: &'static str, value: &'static str| {
+        let s = &s;
+        async move {
+            let (st, b) = s
+                .post(
+                    "/orgs/acme/apps/shop/values",
+                    &s.admin,
+                    json!({"key": key, "secret_ref": {"value": value}}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{b}");
+            serde_json::from_value::<openporch_core::model::SecretRef>(b["secret_ref"].clone())
+                .unwrap()
+        }
+    };
+    let old_ref = secret("OLD", "sealed-with-the-old-key").await;
+    let old_key = std::fs::read_to_string(s.dir.path().join("master.key"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let old_id = s.state.keyring.as_ref().unwrap().active_id().to_owned();
+    let dir = stop(s).await;
+
+    // Rotate: a new active key first, the old one retired after it.
+    let new_key = openporch_store::secrets::MasterKey::generate();
+    let new_id = new_key.id().to_owned();
+    let both = [new_key.to_base64().to_string(), old_key.clone()];
+    let both: Vec<&str> = both.iter().map(String::as_str).collect();
+    super::keys::write_keys(&dir.path().join("master.key"), &both);
+    let s = start_plain(dir, &admin).await;
+    assert!(s.state.ready(), "{:?}", s.state.not_ready);
+    let new_ref = {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/apps/shop/values",
+                &s.admin,
+                json!({"key": "NEW", "secret_ref": {"value": "sealed-with-the-new-key"}}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+        serde_json::from_value::<openporch_core::model::SecretRef>(b["secret_ref"].clone()).unwrap()
+    };
+    // A delta to deploy once restored.
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"spec": {"containers": {
+                "web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let dir = stop(s).await;
+
+    // The backup records ciphertext under both keys.
+    let backups = tempfile::tempdir().unwrap();
+    let dest = backups.path().join("rotated");
+    let manifest = backup::backup(&config(dir.path()), &dest).await.unwrap();
+    let mut recorded = manifest.key_ids.clone();
+    recorded.sort();
+    let mut expected = vec![old_id.clone(), new_id.clone()];
+    expected.sort();
+    assert_eq!(recorded, expected, "{manifest:?}");
+    assert!(!dest.join("data/master.key").exists());
+
+    // With both keys, each version decrypts with the key it records.
+    let s = restore_with(&dest, &both, &admin).await;
+    for _ in 0..500 {
+        if s.state.not_ready_reasons().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        s.state.not_ready_reasons().is_empty(),
+        "{:?}",
+        s.state.not_ready_reasons()
+    );
+    assert_eq!(
+        read_secret(&s, &old_ref).await.as_deref(),
+        Some("sealed-with-the-old-key")
+    );
+    assert_eq!(
+        read_secret(&s, &new_ref).await.as_deref(),
+        Some("sealed-with-the-new-key")
+    );
+    drop(stop(s).await);
+
+    // Without the retired key, or with no key at all, the restored server is
+    // not ready, names the missing key and runs no deployment.
+    let new_only = new_key.to_base64().to_string();
+    for (keys, missing) in [
+        (vec![new_only.as_str()], old_id.as_str()),
+        (vec![], new_id.as_str()),
+    ] {
+        let s = restore_with(&dest, &keys, &admin).await;
+        let (st, ready) = s.call(axum::http::Method::GET, "/readyz", None, None).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+        let reasons = ready["reasons"].as_array().unwrap();
+        assert!(
+            reasons.contains(&json!(format!("master_key_missing:{missing}")))
+                || (keys.is_empty()
+                    && reasons
+                        .iter()
+                        .any(|r| r.as_str().unwrap().starts_with("master_key_missing:"))),
+            "{ready}"
+        );
+        // Only key IDs are named, never key material.
+        assert!(!ready.to_string().contains(&old_key), "{ready}");
+        assert!(!ready.to_string().contains(&new_only), "{ready}");
+        let (st, b) = s
+            .post(
+                &format!("{ENV}/deploys"),
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": 0}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        assert_eq!(b["error"], "SRV-002", "{b}");
+        let (st, page) = s.get(&format!("{ENV}/deploys"), &s.admin).await;
+        assert_eq!(st, StatusCode::OK, "{page}");
+        assert_eq!(page["deployments"], json!([]), "{page}");
+        // Nothing decrypts without its own key.
+        assert_eq!(read_secret(&s, &old_ref).await, None);
+        // No key was generated in place of the missing one.
+        let key_file = s.dir.path().join("master.key");
+        let written = std::fs::read_to_string(&key_file).unwrap_or_default();
+        assert_eq!(written.trim(), keys.join("\n"), "{keys:?}");
+        drop(stop(s).await);
+    }
+    drop(dir);
+}

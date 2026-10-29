@@ -221,6 +221,115 @@ async fn custom_types_are_org_prefixed_and_built_ins_are_fixed() {
     assert_eq!(s.get(path, &s.admin).await.0, StatusCode::NOT_FOUND);
 }
 
+/// `Create a custom type`, from the workload side: a workload requests the
+/// created type under `resources`, the request builds into a graph with the
+/// workload depending on it, and the deployment provisions it through a
+/// definition that targets it, its `sdk_key` a secret output.
+#[tokio::test]
+async fn a_workload_requests_a_custom_type_and_it_is_deployed() {
+    let s = server().await;
+    s.app("shop").await;
+    s.created(
+        "/orgs/acme/resources/types",
+        json!({
+            "id": "acme/feature-flags",
+            "use": "direct",
+            "outputs_schema": {"properties": {"secrets": {
+                "type": "object",
+                "properties": {"sdk_key": {"type": "string"}},
+                "required": ["sdk_key"],
+            }}},
+        }),
+    )
+    .await;
+    for (id, ty, driver, inputs) in [
+        ("env", "base-env", "openporch/none", json!({})),
+        ("workloads", "workload", "openporch/none", json!({})),
+        (
+            "flags",
+            "acme/feature-flags",
+            "openporch/echo",
+            json!({"secret_refs": {"sdk_key": {"value": "k-123"}}}),
+        ),
+    ] {
+        s.created(
+            "/orgs/acme/resources/defs",
+            json!({"id": id, "type": ty, "driver_type": driver, "driver_inputs": inputs,
+                   "criteria": [{}]}),
+        )
+        .await;
+    }
+    let score = "apiVersion: openporch.dev/v1\nkind: Workload\nmetadata: {name: web}\n\
+                 containers:\n  web:\n    image: nginx\n\
+                 resources:\n  flags: {type: acme/feature-flags}\n";
+    let delta = s
+        .created(
+            "/orgs/acme/apps/shop/deltas",
+            json!({"workload": score, "env": "development"}),
+        )
+        .await;
+    const FLAGS: &str = "acme/feature-flags.default#modules.web.externals.flags";
+    const WEB: &str = "workload.default#modules.web";
+    let env = "/orgs/acme/apps/shop/envs/development";
+
+    // The preview builds the graph: the flags resource is created from its
+    // definition.
+    let (status, plan) = s
+        .post(
+            &format!("{env}/plans"),
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{plan}");
+    let flags = plan["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["descriptor"] == FLAGS)
+        .unwrap_or_else(|| panic!("{plan}"));
+    assert_eq!(flags["action"], "create", "{plan}");
+    assert_eq!(flags["definition"], "flags", "{plan}");
+
+    let (status, d) = s
+        .post(
+            &format!("{env}/deploys"),
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap();
+    let mut done = Value::Null;
+    for _ in 0..500 {
+        done = s.get(&format!("{env}/deploys/{id}"), &s.admin).await.1;
+        if done["status"] != "in_progress" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(done["status"], "succeeded", "{done}");
+    let (_, graph) = s.get(&format!("{env}/resources/graph"), &s.admin).await;
+    assert!(
+        graph["edges"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"from": WEB, "to": FLAGS})),
+        "{graph}"
+    );
+    let (status, flags) = s
+        .get(
+            &format!("{env}/resources/acme%2Ffeature-flags/modules.web.externals.flags"),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{flags}");
+    assert_eq!(flags["status"], "provisioned", "{flags}");
+    assert_eq!(flags["definition_id"], "flags", "{flags}");
+    assert_eq!(flags["secret_outputs"], json!(["sdk_key"]), "{flags}");
+    assert!(!flags.to_string().contains("k-123"), "{flags}");
+}
+
 #[tokio::test]
 async fn classes_exist_per_type_and_are_kept_while_referenced() {
     let s = server().await;

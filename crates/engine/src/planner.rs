@@ -1794,8 +1794,17 @@ fn scope_for(deployment: &Deployment, node: &Node, done: &BTreeMap<Descriptor, D
         let Some(finished) = done.get(&other.descriptor) else {
             continue;
         };
+        // A shared resource is the one requested as `shared.<id>`: by the
+        // set's `shared` section, or by a workload dependency declared with
+        // that `id`. A dependency of it that only inherited the ID through a
+        // definition's reference is not.
+        let shared_id = other.descriptor.id.as_str().strip_prefix("shared.");
         for r in &other.requests {
-            if let Some(id) = r.path.strip_prefix("shared.") {
+            let requested = r.path.strip_prefix("shared.").or_else(|| {
+                let dependency = r.path.starts_with("modules.") && r.path.contains(".externals.");
+                shared_id.filter(|_| dependency)
+            });
+            if let Some(id) = requested {
                 scope.shared.insert(id.to_owned(), finished.outputs.clone());
             }
             for w in &own {

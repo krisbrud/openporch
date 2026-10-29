@@ -10,7 +10,7 @@ use serde_json::json;
 use super::{Server, assert_error, server, server_in};
 use crate::Config;
 
-fn write_keys(path: &std::path::Path, keys: &[&str]) {
+pub(super) fn write_keys(path: &std::path::Path, keys: &[&str]) {
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;

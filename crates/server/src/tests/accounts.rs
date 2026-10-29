@@ -819,3 +819,127 @@ async fn delete_a_store_used_by_shared_values() {
     let (status, b) = s.delete(&format!("{STORES}/vault"), &s.admin).await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 }
+
+/// A stand-in for `tofu` that appends its arguments and environment to the
+/// file `RECORD`, plans one create, prints the credentials it was given while
+/// applying, and outputs a database.
+const FAKE_TOFU: &str = r#"#!/bin/sh
+{ echo "ARGS $*"; env | sort; } >> "RECORD"
+case "$1" in
+  show) echo '{"resource_changes":[{"address":"aws_db_instance.main","change":{"actions":["create"]}}]}' ;;
+  apply) echo "applying as $AWS_ACCESS_KEY_ID with $AWS_SECRET_ACCESS_KEY and $AWS_SESSION_TOKEN" ;;
+  output) echo '{"host":{"sensitive":false,"value":"db.internal"},"port":{"sensitive":false,"value":5432},"name":{"sensitive":false,"value":"shop"},"username":{"sensitive":true,"value":"shop"},"password":{"sensitive":true,"value":"generated-pw-1"}}' ;;
+esac
+"#;
+
+/// `cloud-accounts`: `OpenTofu driver with a role account`. A `postgres`
+/// definition with `driver_account: aws-prod` runs through the engine's
+/// executor on the OpenTofu driver: the run gets the short-lived credentials
+/// of the assumed role in its environment, and the deployment's log shows
+/// neither the keys nor the session token.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_opentofu_definition_runs_with_the_role_accounts_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = tempfile::tempdir().unwrap();
+    let record = bin.path().join("record.log");
+    let tofu = bin.path().join("tofu");
+    std::fs::write(&tofu, FAKE_TOFU.replace("RECORD", record.to_str().unwrap())).unwrap();
+    std::fs::set_permissions(&tofu, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
+    config.opentofu.tofu = tofu;
+    let state = crate::start_with(config, None, std::sync::Arc::new(FakeSts))
+        .await
+        .unwrap();
+    let s = super::server_from(dir, state);
+    s.ok(
+        Method::POST,
+        ACCOUNTS,
+        json!({"id": "aws-prod", "type": "aws-role",
+               "config": {"role_arn": "arn:aws:iam::1:role/openporch", "external_id": "ext-123"}}),
+    )
+    .await;
+    s.app("shop").await;
+    for def in [
+        json!({"id": "env", "type": "base-env", "driver_type": "openporch/none", "criteria": [{}]}),
+        json!({"id": "workloads", "type": "workload", "driver_type": "openporch/none",
+               "criteria": [{}]}),
+        json!({"id": "pg", "type": "postgres", "driver_type": "openporch/opentofu",
+               "driver_account": "aws-prod", "criteria": [{}],
+               "driver_inputs": {"values": {
+                   "script": "resource \"aws_db_instance\" \"main\" {}",
+                   "credentials_config": {"environment": {
+                       "AWS_ACCESS_KEY_ID": "AccessKeyId",
+                       "AWS_SECRET_ACCESS_KEY": "SecretAccessKey",
+                       "AWS_SESSION_TOKEN": "SessionToken"}}}}}),
+    ] {
+        s.ok(Method::POST, "/orgs/acme/resources/defs", def).await;
+    }
+    let delta = s
+        .ok(
+            Method::POST,
+            "/orgs/acme/apps/shop/deltas",
+            json!({"modules": {"add": {"web": {"externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    let deploys = "/orgs/acme/apps/shop/envs/development/deploys";
+    let d = s
+        .ok(
+            Method::POST,
+            deploys,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+        )
+        .await;
+    let id = d["id"].as_str().unwrap();
+    let mut done = Value::Null;
+    for _ in 0..500 {
+        done = s.get(&format!("{deploys}/{id}"), &s.admin).await.1;
+        if done["status"] != "in_progress" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(done["status"], "succeeded", "{done}");
+
+    // The run had the assumed role's session, and not the server's own
+    // environment.
+    let record = std::fs::read_to_string(&record).unwrap();
+    assert!(record.contains("ARGS apply"), "{record}");
+    for expected in [
+        "AWS_ACCESS_KEY_ID=ASIASESSION",
+        "AWS_SECRET_ACCESS_KEY=session-secret",
+        "AWS_SESSION_TOKEN=session-token",
+    ] {
+        assert!(record.contains(expected), "{expected}: {record}");
+    }
+    assert!(!record.contains("CARGO_"), "{record}");
+
+    let (status, db) = s
+        .get(
+            "/orgs/acme/apps/shop/envs/development/resources/postgres/modules.web.externals.db",
+            &s.admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{db}");
+    assert_eq!(db["driver_account"], "aws-prod", "{db}");
+    assert_eq!(db["outputs"]["host"], "db.internal", "{db}");
+
+    // The log has the run, without keys or tokens.
+    let (status, page) = s.get(&format!("{deploys}/{id}/logs"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let text = page.to_string();
+    assert!(text.contains("applying as"), "{page}");
+    for secret in [
+        "ASIASESSION",
+        "session-secret",
+        "session-token",
+        "generated-pw-1",
+    ] {
+        assert!(!text.contains(secret), "{secret} in {page}");
+    }
+    let (_, d) = s.get(&format!("{deploys}/{id}"), &s.admin).await;
+    assert!(!d.to_string().contains("session-token"), "{d}");
+}

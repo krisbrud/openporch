@@ -463,6 +463,27 @@ async fn requests_for_another_contract_change_nothing() {
 async fn missing_master_key_blocks_readiness_and_mutations() {
     let s = server().await;
     let admin = s.admin.clone();
+    // An application ready to deploy.
+    s.app("shop").await;
+    for (id, ty) in [("env", "base-env"), ("workloads", "workload")] {
+        let (status, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": "openporch/none", "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+    }
+    let (status, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {"spec": {"containers": {
+                "web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delta}");
     let key_id = s.state.keyring.as_ref().unwrap().active_id().to_owned();
     let Server {
         dir, state, router, ..
@@ -482,9 +503,24 @@ async fn missing_master_key_blocks_readiness_and_mutations() {
     // Reads work; mutations are refused.
     assert_eq!(s.get("/orgs/acme/users", &admin).await.0, StatusCode::OK);
     let (status, body) = s
-        .post("/orgs/acme/apps", &admin, json!({"id": "shop"}))
+        .post("/orgs/acme/apps", &admin, json!({"id": "billing"}))
         .await;
     assert_error(status, &body, StatusCode::SERVICE_UNAVAILABLE, "SRV-002");
+    // No deployment is accepted, and none is recorded.
+    let deploys = "/orgs/acme/apps/shop/envs/development/deploys";
+    let (status, body) = s
+        .post(
+            deploys,
+            &admin,
+            json!({"delta_id": delta["id"], "expected_generation": 0}),
+        )
+        .await;
+    assert_error(status, &body, StatusCode::SERVICE_UNAVAILABLE, "SRV-002");
+    let (status, page) = s.get(deploys, &admin).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["deployments"], json!([]), "{page}");
+    let (_, env) = s.get("/orgs/acme/apps/shop/envs/development", &admin).await;
+    assert_eq!(env["generation"], 0, "{env}");
 }
 
 // --- authentication ---------------------------------------------------------------
@@ -1528,6 +1564,84 @@ async fn audit_failure_rejects_the_mutation() {
             .unwrap()
             .role,
         OrgRole::Member
+    );
+}
+
+/// `Expire past retention`: the expiry's own audit record is written in the
+/// transaction that removes the entries, so when that record cannot be
+/// written nothing is removed, and when it is, it is there with the removal.
+#[tokio::test]
+async fn an_expiry_and_its_audit_record_commit_together() {
+    let s = server().await;
+    s.member("dev", "member").await;
+    let pool = s.state.store.pool();
+    sqlx::query("UPDATE audit_log SET at = at - 40 * 86400000")
+        .execute(pool)
+        .await
+        .unwrap();
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    let old = count("SELECT COUNT(*) FROM audit_log").await;
+    assert!(old >= 2);
+    let expire = "/orgs/acme/audit-logs/expire";
+    let (status, b) = s.post(expire, &s.admin, json!({"dry_run": true})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let cutoff = b["before"].clone();
+
+    // Only the expiry's own successful record cannot be written.
+    sqlx::query(
+        "CREATE TRIGGER expiry_unrecorded BEFORE INSERT ON audit_log \
+         WHEN NEW.action = 'audit_log.expire' AND NEW.outcome = 'succeeded' \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
+    assert_error(status, &b, StatusCode::INTERNAL_SERVER_ERROR, "SRV-001");
+    // The deletion was rolled back with its record: every old entry is kept.
+    let kept = count(
+        "SELECT COUNT(*) FROM audit_log WHERE at < strftime('%s','now') * 1000 - 30 * 86400000",
+    )
+    .await;
+    assert_eq!(kept, old);
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'audit_log.expire' \
+             AND outcome = 'succeeded'"
+        )
+        .await,
+        0
+    );
+    sqlx::query("DROP TRIGGER expiry_unrecorded")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // Recorded, the removal commits with its record.
+    let (status, b) = s.post(expire, &s.admin, json!({"before": cutoff})).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["expired"], old, "{b}");
+    let before = b["before"].as_i64().unwrap();
+    let (expired, target): (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(target) FROM audit_log WHERE action = 'audit_log.expire' \
+         AND outcome = 'succeeded'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(expired, 1);
+    assert_eq!(target, format!("{old} entries before {before}"));
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM audit_log WHERE at < strftime('%s','now') * 1000 - 30 * 86400000"
+        )
+        .await,
+        0
     );
 }
 

@@ -31,6 +31,8 @@ pub(super) struct Fake {
     observation: Mutex<Option<Observed>>,
     /// How many lines provisioning writes to the log first.
     chatter: Mutex<usize>,
+    /// When set, each deletion waits for a permit from it.
+    held_deletes: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Executor for Fake {
@@ -83,6 +85,12 @@ impl Executor for Fake {
     }
 
     async fn deprovision(&self, job: DeprovisionJob) -> Result<(), ExecFailure> {
+        let held = self.held_deletes.lock().unwrap().clone();
+        if let Some(gate) = held
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
         let ty = job.job.descriptor.ty.to_string();
         if self.undeletable.lock().unwrap().contains(&ty) {
             return Err(ExecFailure::Permanent(format!(
@@ -1694,4 +1702,352 @@ async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
     let member = s.member("mia", "member").await;
     let (status, _) = s.get("/orgs/acme/diagnostics", &member).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+const WEB: &str = "workload.default#modules.web";
+
+/// `deployments`: `Partial success` and `Reading after partial failure`. The
+/// database's update succeeds and the workload's then fails: the database
+/// keeps its new result, the previous successful deployment stays
+/// identified, the environment reports partial convergence, and the
+/// deployment's graph shows both outcomes.
+#[tokio::test]
+async fn a_database_update_succeeds_and_the_workload_fails() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let good = s.deploy_web("nginx:1", true).await;
+    assert_eq!(good["status"], "succeeded", "{good}");
+    let (_, env) = s.get(ENV_DEV, &s.admin).await;
+    let good_set = env["last_successful_set_id"].clone();
+    assert_eq!(env["convergence"], "converged", "{env}");
+
+    // The database's definition changes, and the workload cannot be updated.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/resources/defs/pg",
+            Some(&s.admin),
+            Some(json!({"name": "Postgres v2", "driver_type": "openporch/echo"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    fake.failing.lock().unwrap().insert("workload".into());
+    let bad = s.deploy_web("nginx:2", true).await;
+    assert_eq!(bad["status"], "failed", "{bad}");
+    assert!(
+        bad["error"]
+            .as_str()
+            .unwrap()
+            .contains("workload is unavailable"),
+        "{bad}"
+    );
+
+    // The database's successful update is kept.
+    let db = s.resource(DB).await;
+    assert_eq!(db["status"], "provisioned", "{db}");
+    assert_eq!(db["definition_version"], 2, "{db}");
+    assert_eq!(db["usage"]["last_deploy_id"], bad["id"], "{db}");
+    assert_eq!(db["outputs"]["host"], "db.internal", "{db}");
+    let web = s.resource(WEB).await;
+    assert_eq!(web["status"], "failed", "{web}");
+
+    // The last success stays identified, and the environment does not claim
+    // the old set is still fully deployed.
+    let (_, env) = s.get(ENV_DEV, &s.admin).await;
+    assert_eq!(env["last_successful_deploy_id"], good["id"], "{env}");
+    assert_eq!(env["last_successful_set_id"], good_set, "{env}");
+    assert_eq!(env["desired_set_id"], bad["set_id"], "{env}");
+    assert_ne!(env["desired_set_id"], good_set, "{env}");
+    assert_eq!(env["latest_deployment"]["id"], bad["id"], "{env}");
+    assert_eq!(env["convergence"], "partial", "{env}");
+
+    // Both branches' recorded outcomes are read back from the failed
+    // deployment.
+    let (status, g) = s.get(&format!("{RESOURCES}/graph"), &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{g}");
+    assert_eq!(g["deployment_id"], bad["id"], "{g}");
+    assert_eq!(g["status"], "failed", "{g}");
+    let node = |descriptor: &str| {
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["descriptor"] == descriptor)
+            .cloned()
+            .unwrap_or_else(|| panic!("{descriptor}: {g}"))
+    };
+    assert_eq!(node(DB)["status"], "provisioned", "{g}");
+    assert!(node(DB)["error"].is_null(), "{g}");
+    assert_eq!(node(WEB)["status"], "failed", "{g}");
+    assert!(
+        node(WEB)["error"]
+            .as_str()
+            .unwrap()
+            .contains("workload is unavailable"),
+        "{g}"
+    );
+}
+
+/// `deployments`: `Recover after a failed deployment`. After a failed
+/// attempt, replaying the last successful deployment uses its recorded set
+/// and snapshot, and is still subject to current permissions and to the
+/// destructive-action policy: it removes a workload the failed attempt
+/// added, which needs a permit.
+#[tokio::test]
+async fn recover_after_a_failed_deployment_by_replaying_the_last_success() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let good = s.deploy_web("nginx:1", false).await;
+    assert_eq!(good["status"], "succeeded", "{good}");
+    let good_id = good["id"].as_str().unwrap().to_owned();
+
+    // The next attempt adds `api` and a database for `web`; the database
+    // fails, after `api` was provisioned.
+    let (status, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"remove": ["web"], "add": {
+                "web": {"externals": {"db": {"type": "postgres"}},
+                        "spec": {"containers": {"web": {"image": "nginx:2"}}}},
+                "api": {"spec": {"containers": {"api": {"image": "api:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delta}");
+    fake.failing.lock().unwrap().insert("postgres".into());
+    let (_, env) = s.get(ENV_DEV, &s.admin).await;
+    let (status, d) = s
+        .post(
+            DEPLOYS,
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": env["generation"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    let bad = s
+        .finished_at(&format!("{DEPLOYS}/{}", d["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(bad["status"], "failed", "{bad}");
+    assert_eq!(
+        s.resource("workload.default#modules.api").await["status"],
+        "provisioned"
+    );
+    fake.failing.lock().unwrap().clear();
+
+    let replay = |token: String, permits: Vec<String>| {
+        let s = &s;
+        async move {
+            let (_, env) = s.get(ENV_DEV, &s.admin).await;
+            s.post(
+                DEPLOYS,
+                &token,
+                json!({"deploy_id": "last-successful", "expected_generation": env["generation"],
+                       "permits": permits}),
+            )
+            .await
+        }
+    };
+    // Current permissions apply: a developer without `deployer` is refused.
+    let dev = s.member("dev", "member").await;
+    s.grant_app("shop", "dev", "developer").await;
+    let (status, b) = replay(dev.clone(), Vec::new()).await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    s.grant_deployer("development", "dev").await;
+
+    // The destructive-action policy applies: removing `api` needs a permit.
+    let (status, b) = replay(dev.clone(), Vec::new()).await;
+    assert_error(status, &b, StatusCode::CONFLICT, "DPL-001");
+    let (_, list) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(list["deployments"].as_array().unwrap().len(), 2, "{list}");
+
+    let permits = s
+        .permits_for(ENV_DEV, json!({"deploy_id": "last-successful"}))
+        .await;
+    assert_eq!(permits.len(), 1, "{permits:?}");
+    let (status, d) = replay(dev, permits).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{d}");
+    assert_eq!(d["set_id"], good["set_id"], "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    let snapshot = s
+        .state
+        .store
+        .deployment_snapshot("acme", "shop", "development", &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot["replayed_from"], good_id.as_str(), "{snapshot}");
+    let good_snapshot = s
+        .state
+        .store
+        .deployment_snapshot("acme", "shop", "development", &good_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot["graph"], good_snapshot["graph"]);
+    let done = s.finished_at(&format!("{DEPLOYS}/{id}")).await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+    assert!(
+        fake.deleted
+            .lock()
+            .unwrap()
+            .contains(&"workload.default#modules.api".to_owned())
+    );
+    let (_, env) = s.get(ENV_DEV, &s.admin).await;
+    assert_eq!(env["last_successful_deploy_id"], id.as_str(), "{env}");
+    assert_eq!(env["convergence"], "converged", "{env}");
+}
+
+/// `deployments`: `Stale or concurrent request`, with an environment
+/// deletion still running: a deployment is refused with `409`, the desired
+/// state does not change and the delta is not frozen.
+#[tokio::test]
+async fn a_deployment_while_the_environment_is_being_deleted_conflicts() {
+    const ENV: &str = "/orgs/acme/apps/shop/envs/pr-42";
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/apps/shop/envs",
+            &s.admin,
+            json!({"id": "pr-42", "type": "development"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let d = s.deploy_web_in("pr-42", "nginx:1", true, false).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *fake.held_deletes.lock().unwrap() = Some(gate.clone());
+    let (_, env) = s.get(ENV, &s.admin).await;
+    let deletion = s.delete_env(ENV, env["generation"].as_i64().unwrap()).await;
+    let deletion_id = deletion["deployment"]["id"].as_str().unwrap().to_owned();
+    let (_, before) = s.get(ENV, &s.admin).await;
+    assert_eq!(
+        before["latest_deployment"]["status"], "in_progress",
+        "{before}"
+    );
+
+    let (status, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"remove": ["web"], "add": {"web": {
+                "spec": {"containers": {"web": {"image": "nginx:2"}}}}}}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delta}");
+    let (status, b) = s
+        .post(
+            &format!("{ENV}/deploys"),
+            &s.admin,
+            json!({"delta_id": delta["id"], "expected_generation": before["generation"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+    // Nothing changed.
+    let (_, after) = s.get(ENV, &s.admin).await;
+    for field in [
+        "generation",
+        "desired_set_id",
+        "last_successful_set_id",
+        "state",
+    ] {
+        assert_eq!(after[field], before[field], "{field}: {after}");
+    }
+    assert_eq!(after["latest_deployment"]["id"], deletion_id.as_str());
+    let (_, unfrozen) = s
+        .get(
+            &format!(
+                "/orgs/acme/apps/shop/deltas/{}",
+                delta["id"].as_str().unwrap()
+            ),
+            &s.admin,
+        )
+        .await;
+    assert_eq!(unfrozen["frozen"], false, "{unfrozen}");
+
+    // The deletion then finishes, and the environment is gone.
+    gate.add_permits(100);
+    let mut gone = false;
+    for _ in 0..500 {
+        if s.get(ENV, &s.admin).await.0 == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the environment was not deleted");
+}
+
+/// `applications-and-environments`: `Delete an application with provisioned
+/// resources`, with an external and an adopted resource: the owned workload
+/// is deleted, and the other two stay and are listed in the deletion result.
+#[tokio::test]
+async fn an_application_deletion_lists_what_it_leaves_in_place() {
+    const APP: &str = "/orgs/acme/apps/shop";
+    const BASE: &str = "base-env.default#base-env";
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    // The base environment is managed elsewhere, and the database was adopted.
+    for (descriptor, ownership) in [(BASE, "external"), (DB, "adopted")] {
+        sqlx::query(
+            "UPDATE active_resources SET ownership = ? WHERE app_id = 'shop' AND descriptor = ?",
+        )
+        .bind(ownership)
+        .bind(descriptor)
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    }
+    let guresid = |descriptor: &'static str| {
+        let s = &s;
+        async move { s.resource(descriptor).await["guresid"].clone() }
+    };
+    let (base, db) = (guresid(BASE).await, guresid(DB).await);
+
+    let permits = s.app_deletion_permits(APP).await;
+    let (status, deletion) = s
+        .call(
+            Method::DELETE,
+            APP,
+            Some(&s.admin),
+            Some(json!({"permits": permits})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{deletion}");
+    let dev = deletion["deletions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["deployment"]["env"] == "development")
+        .cloned()
+        .unwrap_or_else(|| panic!("{deletion}"));
+    let mut retained: Vec<Value> = dev["retained"].as_array().unwrap().clone();
+    retained.sort_by_key(|r| r["descriptor"].as_str().unwrap().to_owned());
+    assert_eq!(
+        retained,
+        [
+            json!({"descriptor": BASE, "guresid": base, "ownership": "external"}),
+            json!({"descriptor": DB, "guresid": db, "ownership": "adopted"}),
+        ],
+        "{deletion}"
+    );
+
+    let mut gone = false;
+    for _ in 0..500 {
+        if s.get(APP, &s.admin).await.0 == StatusCode::NOT_FOUND {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the application was not deleted");
+    let deleted = fake.deleted.lock().unwrap().clone();
+    assert_eq!(deleted, [WEB], "{deleted:?}");
 }

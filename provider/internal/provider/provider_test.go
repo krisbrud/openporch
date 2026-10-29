@@ -2,10 +2,13 @@ package provider
 
 import (
 	"context"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
@@ -151,6 +154,36 @@ func TestPlainHTTPIsRefusedOffLoopback(t *testing.T) {
 	diags := configure(t, map[string]any{"url": "http://porch.example.com", "org_id": "acme", "token": goodToken}, nil)
 	if e := errorText(diags); !strings.Contains(e, "loopback") {
 		t.Fatalf("expected a transport error, got:\n%s", e)
+	}
+}
+
+// TestAnUntrustedCertificateIsRefusedBeforeTheTokenIsSent is the provider half
+// of "Invalid server certificate": a server whose certificate no trusted
+// authority signed fails configuration, and no request, so no token, reaches it.
+func TestAnUntrustedCertificateIsRefusedBeforeTheTokenIsSent(t *testing.T) {
+	var reached atomic.Bool
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Store(true)
+		_, _ = w.Write([]byte(`{"id":"ci","type":"service","name":"CI","role":"administrator"}`))
+	}))
+	// The refused handshakes are expected.
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	if !strings.HasPrefix(srv.URL, "https://") {
+		t.Fatalf("not a TLS server: %s", srv.URL)
+	}
+
+	diags := configure(t, map[string]any{"url": srv.URL, "org_id": "acme", "token": goodToken}, nil)
+	e := errorText(diags)
+	if !strings.Contains(e, "certificate") {
+		t.Fatalf("expected a certificate error, got:\n%s", e)
+	}
+	if strings.Contains(e, goodToken) {
+		t.Fatalf("the error shows the token:\n%s", e)
+	}
+	if reached.Load() {
+		t.Fatal("a request reached the server with an untrusted certificate")
 	}
 }
 
