@@ -896,6 +896,125 @@ async fn identity_binding_is_locked_after_first_login() {
 }
 
 #[tokio::test]
+async fn only_an_administrator_changes_an_identity_binding() {
+    let s = server().await;
+    let (_, code) = s
+        .invite(json!({"email": "alice@example.com", "role": "member"}))
+        .await;
+    let alice = ExternalIdentity {
+        verified_emails: vec!["alice@example.com".into()],
+        ..github("7", "alice")
+    };
+    let old_session = login::login(&s.state, &alice, Some(&code)).await.unwrap();
+    let oidc = ExternalIdentity {
+        provider: "https://id.example.com".into(),
+        subject: "alice-sub".into(),
+        login: None,
+        verified_emails: vec!["alice@example.com".into()],
+        name: "Alice".into(),
+    };
+    assert!(login::login(&s.state, &oidc, None).await.is_err());
+    let path = "/orgs/acme/users/alice/identity";
+    let body = json!({"provider": "https://id.example.com", "subject": "alice-sub"});
+
+    // A manager, who manages members, may not; nor may alice herself.
+    let manager = s.member("mgr", "manager").await;
+    let (status, b) = s
+        .call(Method::PUT, path, Some(&manager), Some(body.clone()))
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    let (status, b) = s
+        .call(Method::PUT, path, Some(&old_session), Some(body.clone()))
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+    // Unknown users and another organization are not found.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/users/nobody/identity",
+            Some(&s.admin),
+            Some(body.clone()),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
+    let (status, _) = s
+        .call(
+            Method::PUT,
+            "/orgs/other/users/alice/identity",
+            Some(&s.admin),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Service users have no identity to bind.
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/users/mgr/identity",
+            Some(&s.admin),
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    assert!(login::login(&s.state, &oidc, None).await.is_err());
+
+    // The administrator rebinds alice: the new provider logs her in, the old
+    // one no longer does, and her old session has ended.
+    let (status, b) = s
+        .call(Method::PUT, path, Some(&s.admin), Some(body.clone()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["identity"], "https://id.example.com:alice-sub", "{b}");
+    assert_eq!(b["role"], "member", "{b}");
+    let (status, _) = s.get("/orgs/acme/current-user", &old_session).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let session = login::login(&s.state, &oidc, None).await.unwrap();
+    let (status, me) = s.get("/orgs/acme/current-user", &session).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], "alice");
+    assert!(login::login(&s.state, &alice, None).await.is_err());
+
+    // An identity bound to another member is not taken from them.
+    let (_, bob_code) = s
+        .invite(json!({"provider": "github", "subject": "8", "role": "member"}))
+        .await;
+    login::login(&s.state, &github("8", "bob"), Some(&bob_code))
+        .await
+        .unwrap();
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            path,
+            Some(&s.admin),
+            Some(json!({"provider": "github", "subject": "8"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{b}");
+
+    // Each change is audited; the refused manager's attempt too.
+    let (_, page) = s
+        .get(
+            "/orgs/acme/audit-logs?path_prefix=/orgs/acme/users/alice/identity",
+            &s.admin,
+        )
+        .await;
+    let entries = page["entries"].as_array().unwrap();
+    let accepted: Vec<_> = entries
+        .iter()
+        .filter(|e| e["outcome"] == "accepted")
+        .collect();
+    assert_eq!(accepted.len(), 1, "{page}");
+    assert_eq!(accepted[0]["action"], "user.identity.update");
+    assert_eq!(accepted[0]["target"], "alice");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["user_id"] == "mgr" && e["outcome"] == "denied"),
+        "{page}"
+    );
+}
+
+#[tokio::test]
 async fn reused_github_login_gains_nothing() {
     let s = server().await;
     let (_, code) = s

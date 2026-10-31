@@ -181,6 +181,43 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetIdentity {
+    provider: String,
+    subject: String,
+}
+
+/// Binds a user to another external identity, such as the same person's account
+/// with another provider. Only administrators may; the user's sessions end.
+pub async fn set_identity(
+    State(state): State<AppState>,
+    ctx: Ctx,
+    Path((_, user)): Path<(String, String)>,
+    JsonBody(body): JsonBody<SetIdentity>,
+) -> ApiResult<Json<Principal>> {
+    let org = state.org();
+    principal_or_404(&state, &user).await?;
+    let provider = body.provider.trim();
+    let subject = body.subject.trim();
+    if provider.is_empty() || subject.is_empty() || provider.len() > 200 || subject.len() > 200 {
+        return Err(ApiError::invalid(
+            "`provider` and `subject` must each be 1 to 200 characters long",
+        ));
+    }
+    let p = state
+        .store
+        .set_identity(
+            org,
+            &user,
+            provider,
+            subject,
+            ctx.audit(org, "user.identity.update", &user),
+        )
+        .await?;
+    Ok(Json(p))
+}
+
 #[derive(Serialize)]
 pub struct CurrentUser {
     #[serde(flatten)]

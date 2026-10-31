@@ -97,6 +97,18 @@ pub trait IdentityStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Binds a user to another external identity, replacing the one bound at
+    /// their first login, and revokes their sessions. Only an administrator may
+    /// do this; an identity bound to another member is refused.
+    fn set_identity(
+        &self,
+        org: &str,
+        id: &str,
+        provider: &str,
+        subject: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Principal>> + Send;
+
     /// A principal's roles at every level.
     fn roles(&self, org: &str, principal: &str) -> impl Future<Output = Result<Roles>> + Send;
 
@@ -519,6 +531,70 @@ impl IdentityStore for SqliteStore {
         audit_in(&mut tx, &audit).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn set_identity(
+        &self,
+        org: &str,
+        id: &str,
+        provider: &str,
+        subject: &str,
+        audit: AuditIntent,
+    ) -> Result<Principal> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let current = require_principal(&mut tx, org, id).await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        if current.kind != "user" {
+            return Err(StoreError::Invalid(
+                "only users have an identity; service users authenticate with tokens".into(),
+            ));
+        }
+        let linked: Option<String> = sqlx::query_scalar(
+            "SELECT principal_id FROM identities WHERE org_id = ? AND provider = ? AND subject = ?",
+        )
+        .bind(org)
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if linked.as_deref().is_some_and(|other| other != id) {
+            return Err(StoreError::Conflict(
+                "this identity already belongs to another member".into(),
+            ));
+        }
+        let now = now_ms();
+        sqlx::query("DELETE FROM identities WHERE org_id = ? AND principal_id = ?")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO identities (org_id, provider, subject, principal_id, login, email, created_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(org)
+        .bind(provider)
+        .bind(subject)
+        .bind(id)
+        .bind(&current.email)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        // Sessions were issued to the old identity.
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) \
+             WHERE org_id = ? AND principal_id = ?",
+        )
+        .bind(now)
+        .bind(org)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        audit_in(&mut tx, &audit).await?;
+        let p = require_principal(&mut tx, org, id).await?;
+        tx.commit().await?;
+        Ok(p)
     }
 
     async fn roles(&self, org: &str, principal: &str) -> Result<Roles> {

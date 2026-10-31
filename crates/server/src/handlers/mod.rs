@@ -80,6 +80,12 @@ pub fn api(state: AppState) -> Api {
             members::remove,
         )
         .route(
+            put(),
+            "/orgs/{org}/users/{user}/identity",
+            Org(OrgPerm::Administer),
+            members::set_identity,
+        )
+        .route(
             get(),
             "/orgs/{org}/current-user",
             Authenticated,

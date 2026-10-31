@@ -1494,6 +1494,73 @@ output "n" { value = tonumber(nonsensitive(var.token)) }
     assert!(!recorded.contains("hunter2-not-a-number"), "{recorded}");
 }
 
+/// The `Apply fails` scenario behind the executor: an apply refused for a
+/// missing IAM permission (printed as the AWS provider prints it, since no
+/// AWS is used) is the resource's error, and the deployment's log is the
+/// whole run.
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_an_access_denied_apply_is_the_resource_error_with_the_run_log() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = openporch_drivers::OpenTofuConfig::new(root.path());
+    if let Ok(tofu) = std::env::var("OPENPORCH_TEST_TOFU") {
+        config.tofu = tofu.into();
+    }
+    let f = Fixture::with_drivers(DriverRegistry::with_builtins().with_opentofu(config)).await;
+    let script = r#"
+variable "token" {
+  type      = string
+  sensitive = true
+}
+resource "terraform_data" "queue" {
+  input = "orders"
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "creating SQS Queue (orders): operation error SQS: CreateQueue, https response error StatusCode: 403, api error AccessDenied: User: arn:aws:sts::123456789012:assumed-role/openporch-deployer/session is not authorized to perform: sqs:createqueue on resource: arn:aws:sqs:us-east-1:123456789012:orders because no identity-based policy allows the sqs:createqueue action" >&2
+      exit 1
+    EOT
+  }
+}
+output "token_length" { value = length(nonsensitive(var.token)) }
+"#;
+    f.secrets
+        .write("defs/pg/token", &SecretValue::new("hunter2-denied-token"))
+        .await
+        .unwrap();
+    let pg = def(
+        "pg",
+        "postgres",
+        "openporch/opentofu",
+        json!({
+            "values": {"script": script},
+            "secret_refs": {"variables": {"token": {"store": "openporch", "ref": "defs/pg/token"}}},
+        }),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    // The apply started, so the outcome is unknown, with the AWS error.
+    let error = match &outcomes[&Descriptor::parse(DB).unwrap()] {
+        Outcome::Unknown(e) | Outcome::Failed(e) => e.clone(),
+        other => panic!("{DB} did not fail: {other:?}"),
+    };
+    let words = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("api error AccessDenied"), "{error}");
+    assert!(
+        words.contains("is not authorized to perform: sqs:createqueue"),
+        "{error}"
+    );
+    let recorded = f.recorded(&deployment).await;
+    for want in [
+        "$ tofu init",
+        "$ tofu plan",
+        "$ tofu apply",
+        "api error AccessDenied",
+    ] {
+        assert!(recorded.contains(want), "{want}: {recorded}");
+    }
+    assert!(!recorded.contains("hunter2-denied-token"), "{recorded}");
+}
+
 #[test]
 fn a_failure_after_the_driver_accepted_a_change_is_uncertain() {
     let transient = || DriverError::Transient {

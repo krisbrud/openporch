@@ -545,3 +545,192 @@ async fn a_restore_after_key_rotation_needs_every_recorded_key() {
     }
     drop(dir);
 }
+
+/// What a [`Ledger`] driver has in its cloud: puts by GUResID, and the
+/// GUResIDs it deleted.
+#[derive(Debug, Default)]
+struct Cloud {
+    objects: BTreeMap<String, u32>,
+    deleted: Vec<String>,
+}
+
+/// `drill/ledger`: `openporch/echo` that keeps what it created in a [`Cloud`]
+/// that outlives every server.
+#[derive(Debug)]
+struct Ledger(Echo, DriverInfo, Arc<Mutex<Cloud>>);
+
+impl Driver for Ledger {
+    fn info(&self) -> &DriverInfo {
+        &self.1
+    }
+
+    fn plan<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
+        self.0.plan(req)
+    }
+
+    fn plan_delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Plan> {
+        self.0.plan_delete(req)
+    }
+
+    fn put<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, PutOutcome> {
+        *self
+            .2
+            .lock()
+            .unwrap()
+            .objects
+            .entry(req.guresid.as_str().to_owned())
+            .or_default() += 1;
+        self.0.put(req)
+    }
+
+    fn get<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, Observation> {
+        let exists = self
+            .2
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key(req.guresid.as_str());
+        Box::pin(async move {
+            if exists {
+                self.0.get(req).await
+            } else {
+                Ok(Observation::Absent { cookie: None })
+            }
+        })
+    }
+
+    fn delete<'a>(&'a self, req: &'a DriverRequest) -> DriverFuture<'a, DeleteOutcome> {
+        let mut cloud = self.2.lock().unwrap();
+        cloud.objects.remove(req.guresid.as_str());
+        cloud.deleted.push(req.guresid.as_str().to_owned());
+        drop(cloud);
+        self.0.delete(req)
+    }
+}
+
+/// `control-plane-operations`: `Uninstall with active resources`, following
+/// the steps in `docs/operations.md#uninstalling` with the backup kept to
+/// resume. Stopping the server and removing its data delete no
+/// infrastructure, and the backup and the master key restore management of
+/// the same resources.
+#[tokio::test]
+async fn uninstalling_keeps_infrastructure_and_a_backup_resumes_management() {
+    const LEDGER: &str = "drill/ledger";
+    let cloud = Arc::new(Mutex::new(Cloud::default()));
+    let start = |dir: tempfile::TempDir| {
+        let cloud = cloud.clone();
+        async move {
+            let mut registry = DriverRegistry::with_builtins();
+            let echo = Echo::new();
+            let mut info = echo.info().clone();
+            info.id = LEDGER.to_owned();
+            registry
+                .register(Arc::new(Ledger(echo, info, cloud)) as Arc<_>)
+                .unwrap();
+            let state = state::start_with_drivers(
+                config(dir.path()),
+                None,
+                Arc::new(openporch_engine::cloud::AwsSts::new()),
+                Some(Arc::new(registry)),
+            )
+            .await
+            .unwrap();
+            server_from(dir, state)
+        }
+    };
+    let s = start(tempfile::tempdir().unwrap()).await;
+    sqlx::query("INSERT INTO drivers (org_id, id, body, created_at) VALUES ('acme', ?, '{}', 0)")
+        .bind(LEDGER)
+        .execute(s.state.store.pool())
+        .await
+        .unwrap();
+    s.app("shop").await;
+    for (id, ty, driver) in [
+        ("env", "base-env", "openporch/none"),
+        ("workloads", "workload", "openporch/none"),
+        ("pg", "postgres", LEDGER),
+    ] {
+        let (st, b) = s
+            .post(
+                "/orgs/acme/resources/defs",
+                &s.admin,
+                json!({"id": id, "type": ty, "driver_type": driver,
+                       "driver_inputs": {"values": {"host": "db.internal", "name": "shop", "port": 5432},
+                           "secret_refs": {"username": {"value": "shop"}, "password": {"value": "change-me"}}},
+                       "criteria": [{}]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, delta) = s
+        .post(
+            "/orgs/acme/apps/shop/deltas",
+            &s.admin,
+            json!({"modules": {"add": {"web": {
+                "externals": {"db": {"type": "postgres"}},
+                "spec": {"containers": {"web": {"image": "web:1"}}}}}}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{delta}");
+    let first = deploy(&s, json!({"delta_id": delta["id"]})).await;
+    assert_eq!(first["status"], "succeeded", "{first}");
+    let before = resources(&s).await;
+    let db = "postgres.default#modules.web.externals.db";
+    let guresid = before[db].0.clone();
+    let objects = |cloud: &Arc<Mutex<Cloud>>| cloud.lock().unwrap().objects.clone();
+    assert_eq!(objects(&cloud), BTreeMap::from([(guresid.clone(), 1)]));
+    let admin = s.admin.clone();
+
+    // 1. Stop managing: the server stops; the database keeps running.
+    let old = stop(s).await;
+    assert_eq!(objects(&cloud), BTreeMap::from([(guresid.clone(), 1)]));
+
+    // To keep the option of resuming, a backup, with the master key kept
+    // apart from it.
+    let backups = tempfile::tempdir().unwrap();
+    let dest = backups.path().join("before-uninstall");
+    backup::backup(&config(old.path()), &dest).await.unwrap();
+    let key = backups.path().join("master.key");
+    std::fs::copy(old.path().join("master.key"), &key).unwrap();
+
+    // 3. Remove the data: the data directory, with the OpenTofu root and the
+    // master key in it. The infrastructure is still there.
+    let old_path = old.path().to_owned();
+    drop(old);
+    assert!(!old_path.exists());
+    assert_eq!(objects(&cloud), BTreeMap::from([(guresid.clone(), 1)]));
+    assert!(cloud.lock().unwrap().deleted.is_empty());
+
+    // Restoring the backup and the key resumes management of the same
+    // resources: they are observed, keep their identities, and the next
+    // deployment converges on the existing database instead of creating one.
+    let new = tempfile::tempdir().unwrap();
+    backup::restore(&config(new.path()), &dest).await.unwrap();
+    std::fs::copy(&key, new.path().join("master.key")).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        new.path().join("master.key"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let mut s = start(new).await;
+    s.admin = admin;
+    for _ in 0..500 {
+        if s.state.not_ready_reasons().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        s.state.not_ready_reasons().is_empty(),
+        "{:?}",
+        s.state.not_ready_reasons()
+    );
+    assert_eq!(resources(&s).await, before);
+    let again = deploy(&s, json!({"deploy_id": first["id"], "replay": "current"})).await;
+    assert_eq!(again["status"], "succeeded", "{again}");
+    let after = resources(&s).await;
+    assert_eq!(after[db].0, guresid);
+    assert_eq!(objects(&cloud), BTreeMap::from([(guresid, 2)]));
+    assert!(cloud.lock().unwrap().deleted.is_empty());
+}

@@ -365,7 +365,10 @@ Authorization: Bearer $ADMIN_TOKEN
 ```
 
 At the first login the identity is bound to the member. Later logins must present
-the same identity, and an email invitation is accepted only for a verified email.
+the same identity, and an email invitation is accepted only for a verified email. Only
+an administrator can change the binding, with
+[`PUT /orgs/{org}/users/{user}/identity`](api.md#members); the member's sessions
+end when it changes.
 
 ## Secret references
 

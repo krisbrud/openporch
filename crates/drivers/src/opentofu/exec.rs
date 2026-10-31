@@ -166,6 +166,27 @@ impl Drop for Running {
     }
 }
 
+/// The file in a run directory naming the process group of the command it
+/// last started, so a later start can tell whether it still runs.
+const GROUP_FILE: &str = ".group";
+
+/// Whether the process group recorded in run directory `dir` still exists.
+/// Without a record nothing was started there, or it cannot be told; a
+/// group the server may not signal still counts as running.
+pub(super) fn group_alive(dir: &Path) -> bool {
+    let Some(group) = std::fs::read_to_string(dir.join(GROUP_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|g| *g > 1)
+    else {
+        return false;
+    };
+    !matches!(
+        killpg(Pid::from_raw(group), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
 /// Reads and discards a command's output until every writer closes it.
 async fn drain(pipes: Option<(ChildStdout, ChildStderr)>) {
     if let Some((mut out, mut err)) = pipes {
@@ -225,6 +246,12 @@ pub(super) async fn run(
         ));
     };
     let group = child.id().and_then(|id| i32::try_from(id).ok());
+    if let Some(group) = group {
+        // Best effort: without it, a crash leaves a directory that the next
+        // start removes at once.
+        let _ =
+            super::files::write_private(&stop.dir.join(GROUP_FILE), group.to_string().as_bytes());
+    }
     let mut running = Running {
         child: Some(child),
         pipes: Some((out, err)),

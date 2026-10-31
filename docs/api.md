@@ -232,6 +232,7 @@ Tokens are revoked through the token routes instead.
 | GET | `/orgs/{org}/users/{user}` | org read |
 | PATCH | `/orgs/{org}/users/{user}` | manage members |
 | DELETE | `/orgs/{org}/users/{user}` | manage members |
+| PUT | `/orgs/{org}/users/{user}/identity` | administer |
 | GET | `/orgs/{org}/invitations` | manage members |
 | POST | `/orgs/{org}/invitations` | manage members |
 
@@ -314,6 +315,29 @@ Authorization: Bearer $ADMIN_TOKEN
 200 OK
 
 {"id": "ci", "name": "CI deployments", "role": "manager"}
+```
+
+A person's first login binds them to that identity, and later logins must present
+it. When the same person needs to log in through another provider, an
+administrator changes the binding with `PUT .../identity`, naming the
+provider and its subject. The member keeps their ID and roles, their sessions
+end, and the old identity no longer logs in. An identity already bound to
+another member is refused with `409`, and service users, which have no identity,
+with `400`. The change is audited as `user.identity.update`.
+
+For example, for a person who joined through an invitation:
+
+```text
+PUT /orgs/acme/users/alice/identity
+Authorization: Bearer $ADMIN_TOKEN
+
+{"provider": "https://id.example.com", "subject": "alice-sub"}
+```
+
+```text
+200 OK
+
+{"id": "alice", "type": "user", "role": "member", "identity": "https://id.example.com:alice-sub"}
 ```
 
 An invitation names a role and either an email address or an external identity. A
