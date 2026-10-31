@@ -395,6 +395,13 @@ lock. Whatever is still running after a grace period, one minute by default, is
 killed, including provider processes. The next call for the resource waits
 until all of them are gone.
 
+A server that crashes or is killed cannot remove its run directories, so the
+secret variable files in them stay on disk, readable only by the server's
+account (directories `0700`, files `0600`, under `<root>/runs`). When the
+server starts again it removes every such directory whose process group has
+exited, and keeps one whose orphaned `tofu` still runs until a later start. It
+logs only how many it removed or kept. Diagnostics never read them.
+
 If another process holds the resource's state lock, plans and applies wait for
 it (30 seconds by default), then fail as a conflict naming the lock ID. A
 conflict means nothing was applied. The driver never breaks a lock. When you are

@@ -11,7 +11,8 @@
 //! than the current branch tip even after a partial apply; the cookie carries
 //! the same record. Secret variables go into an owner-only variables
 //! file, never onto a command line, and every log line and error is redacted
-//! before it leaves the driver.
+//! before it leaves the driver. A run directory a crashed server left behind is
+//! removed when the driver next starts, unless its process group still runs.
 
 mod backend;
 mod exec;
@@ -109,7 +110,10 @@ pub struct OpenTofu {
 }
 
 impl OpenTofu {
+    /// The driver, after removing the run directories that a server which
+    /// stopped without cleaning up left in `config.root` (see [`sweep_runs`]).
     pub fn new(config: Config) -> Self {
+        sweep_runs(&config.root);
         Self {
             info: DriverInfo {
                 id: "openporch/opentofu".into(),
@@ -795,6 +799,42 @@ impl Drop for Run {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// Removes the run directories under `<root>/runs` that a server which
+/// crashed or was killed left behind, with the secret variable files in them.
+/// A directory whose recorded process group still runs is kept: an orphaned
+/// `tofu` may still be writing state, and the next start removes it. Logs only
+/// how many directories it removed or kept, never their contents. Returns the
+/// number removed.
+fn sweep_runs(root: &std::path::Path) -> usize {
+    let Ok(resources) = fs::read_dir(root.join("runs")) else {
+        return 0;
+    };
+    let (mut removed, mut kept) = (0, 0);
+    for resource in resources.flatten() {
+        let Ok(runs) = fs::read_dir(resource.path()) else {
+            continue;
+        };
+        for run in runs.flatten() {
+            let dir = run.path();
+            if exec::group_alive(&dir) {
+                kept += 1;
+            } else if fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 || kept > 0 {
+        tracing::warn!(
+            removed,
+            kept,
+            root = %root.display(),
+            "found OpenTofu run directories left by a server that did not stop cleanly; \
+             removed those whose processes are gone"
+        );
+    }
+    removed
 }
 
 /// How the run's source is chosen.

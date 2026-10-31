@@ -1582,6 +1582,62 @@ async fn metrics_count_work_outcomes_and_storage() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// The `Failure leaves a variables file` scenario at the server: a variables
+/// file that a crashed OpenTofu run left in the installation is removed when
+/// the server starts again, and diagnostics never show it.
+#[tokio::test]
+async fn a_restart_removes_a_crashed_runs_variables_file_and_diagnostics_omit_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir
+        .path()
+        .join("opentofu/runs/0123456789abcdef0123456789abcdef/00000000deadbeef");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(
+        run.join("secrets.tfvars.json"),
+        r#"{"password":"crashed-run-secret-1"}"#,
+    )
+    .unwrap();
+    // The process group it names is gone: a command that already exited.
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    std::fs::write(run.join(".group"), pid.to_string()).unwrap();
+
+    // Another run's orphaned `tofu` still runs, so its directory stays.
+    let orphan_run = run.with_file_name("00000000cafef00d");
+    std::fs::create_dir_all(&orphan_run).unwrap();
+    std::fs::write(
+        orphan_run.join("secrets.tfvars.json"),
+        r#"{"password":"orphaned-run-secret-2"}"#,
+    )
+    .unwrap();
+    let mut orphan = {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    std::fs::write(orphan_run.join(".group"), orphan.id().to_string()).unwrap();
+
+    let s = server_in(dir).await;
+    assert!(!run.exists(), "the run directory was kept");
+    assert!(orphan_run.join("secrets.tfvars.json").exists());
+    let (status, report) = s.get("/orgs/acme/diagnostics", &s.admin).await;
+    orphan.kill().unwrap();
+    orphan.wait().unwrap();
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let report = report.to_string();
+    for leaked in [
+        "crashed-run-secret-1",
+        "orphaned-run-secret-2",
+        "secrets.tfvars",
+    ] {
+        assert!(!report.contains(leaked), "{report}");
+    }
+}
+
 #[tokio::test]
 async fn diagnostics_correlate_a_timed_out_deployment_without_secrets() {
     let s = server().await;

@@ -1110,6 +1110,84 @@ async fn a_timed_out_run_is_interrupted_and_reaped_before_the_next() {
     assert!(events.contains("interrupted"), "{events}");
 }
 
+/// The `Failure leaves a variables file` scenario: the server dies (here, the
+/// call is leaked, so no destructor runs) while `tofu` runs with the secret
+/// variables file on disk.
+#[tokio::test]
+async fn a_variables_file_left_by_a_crash_is_private_and_removed_once_safe() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path().display().to_string();
+    let edit = |s: &str| {
+        s.replacen(
+            "case \"$1\" in\n",
+            &format!(
+                "case \"$1\" in\n  init) if [ -e '{r}/hang' ]; then echo $$ > '{r}/tofu.pid'; \
+                 exec sleep 300; fi ;;\n"
+            ),
+            1,
+        )
+    };
+    let d = fake_driver(root.path(), edit);
+    std::fs::write(root.path().join("hang"), "").unwrap();
+    let req = request(
+        json!({"script": "terraform {}"}),
+        json!({"variables": {"api_token": "hunter2-crash-token"}}),
+    );
+    let mut call = Box::pin(d.put(&req));
+    let pid_file = root.path().join("tofu.pid");
+    tokio::select! {
+        r = &mut call => panic!("the run finished: {r:?}"),
+        () = async {
+            while !pid_file.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        } => {}
+    }
+    // The crash: nothing cleans up, and `tofu` keeps running as an orphan.
+    std::mem::forget(call);
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let runs = root.path().join("runs/0123456789abcdef0123456789abcdef");
+    let run = std::fs::read_dir(&runs)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let secrets = run.join("secrets.tfvars.json");
+    assert!(
+        std::fs::read_to_string(&secrets)
+            .unwrap()
+            .contains("hunter2-crash-token")
+    );
+    // Only the server's account can read it.
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&secrets), 0o600);
+    assert_eq!(mode(&run), 0o700);
+    assert_eq!(mode(&runs), 0o700);
+    assert_eq!(mode(&root.path().join("runs")), 0o700);
+
+    // A restart while the orphan still runs keeps its directory: removing it
+    // under a running `tofu` is not safe.
+    drop(fake_driver(root.path(), edit));
+    assert!(secrets.exists());
+
+    // Once it is gone, the next start removes the directory and its secrets.
+    let group = nix::unistd::Pid::from_raw(pid);
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).unwrap();
+    // This test process is its parent, which a crashed server would not be.
+    let _ = nix::sys::wait::waitpid(group, None);
+    std::fs::remove_file(root.path().join("hang")).unwrap();
+    let d = fake_driver(root.path(), edit);
+    assert!(!run.exists());
+    assert_eq!(std::fs::read_dir(&runs).unwrap().count(), 0);
+    // And the resource runs again.
+    d.put(&req).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_run_that_ignores_interrupts_is_killed_after_the_grace_period() {
     let root = tempfile::tempdir().unwrap();

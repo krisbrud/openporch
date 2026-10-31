@@ -89,7 +89,7 @@ end.
 | Login and expiry | covered | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`, `crates/cli/src/tests.rs::an_expired_session_asks_the_user_to_log_in_again` (the session `porch login` stored, re-signed by the server with its times 25 hours earlier in place of a clock, gets `401` and the CLI says to run `porch login`) |
 | GitHub device login | covered | `crates/server/src/tests/github.rs::device_login_maps_the_immutable_github_id`, `crates/cli/src/tests.rs::device_login_stores_a_session_for_the_github_user` |
 | Unknown identity | covered | `crates/server/src/tests/mod.rs::unknown_identities_need_an_invitation` |
-| Provider is locked after first login | gap (partial) | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1) (partial: no API changes a member's identity binding, so neither an administrator changing it nor others being refused can be shown; that needs a new endpoint) |
+| Provider is locked after first login | covered | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1), `crates/server/src/tests/mod.rs::only_an_administrator_changes_an_identity_binding` (`PUT /orgs/{org}/users/{user}/identity`: a manager and the member get `403`, an unknown user or organization `404`; the administrator's change lets the other provider log in, ends the old identity and sessions, and is audited) |
 | First start | covered | `crates/server/src/tests/mod.rs::first_start_bootstraps_an_administrator`, `crates/server/tests/bootstrap_logs.rs::bootstrap_token_is_not_logged` |
 | Reused GitHub name | covered | `crates/server/src/tests/github.rs::renamed_and_reused_github_logins`, `crates/server/src/tests/mod.rs::reused_github_login_gains_nothing` |
 | Unverified invitation email | covered | `crates/server/src/tests/mod.rs::unverified_invitation_email_is_denied`, `crates/server/src/tests/github.rs::email_invitations_need_a_verified_github_email` |
@@ -391,7 +391,7 @@ end.
 | Delete a store in use | covered | `crates/server/src/tests/accounts.rs::delete_a_store_in_use`, `crates/server/src/tests/accounts.rs::delete_a_store_used_by_shared_values` |
 | Reference copied between applications | covered | `crates/server/src/tests/secret_use.rs::reference_copied_between_applications` |
 | Production reference in development | covered | `crates/server/src/tests/secret_use.rs::production_reference_in_development` |
-| Failure leaves a variables file | gap (partial) | Run directories are private and removed after a run or a reaped timeout (`crates/drivers/src/opentofu/tests.rs::fake_run_passes_credentials_through_files_and_environment_only`, `crates/drivers/src/opentofu/tests.rs::a_timed_out_run_is_interrupted_and_reaped_before_the_next`). No test leaves `secrets.tfvars.json` behind after a server crash and checks owner-only mode, removal on recovery and omission from diagnostics; searched `secrets.tfvars`, `runs/`, `mode()` in `crates/drivers/src/opentofu/tests.rs` |
+| Failure leaves a variables file | covered | `crates/drivers/src/opentofu/tests.rs::a_variables_file_left_by_a_crash_is_private_and_removed_once_safe` (a leaked call leaves `secrets.tfvars.json` behind with `tofu` still running: mode `0600` in `0700` directories, kept by a restart while the orphan runs, removed by the next start once it is gone), `crates/server/src/tests/resources.rs::a_restart_removes_a_crashed_runs_variables_file_and_diagnostics_omit_it` (server start removes it; diagnostics hold neither its contents nor its name) |
 | Master key unavailable | covered | `crates/server/src/tests/restore.rs::a_restore_after_key_rotation_needs_every_recorded_key` (a backup restored without its keys: readiness names the missing key ID and a deployment is refused), `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations` |
 | Store depends on itself | covered | `crates/server/src/tests/accounts.rs::store_depends_on_itself` |
 | Environment secret copied to app values | covered | `crates/server/src/tests/secret_use.rs::environment_secret_copied_to_app_values` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 223 covered, 9 manual, 31 deferred, 11 gaps.
+274 scenarios: 225 covered, 9 manual, 31 deferred, 9 gaps.
