@@ -128,7 +128,8 @@ provisioned.
 module. The tests in each `tests/` directory plan and apply the module against
 the AWS account or emulator the environment points at and destroy what they
 created, except those of `aws-lambda-workload`, which plan against a mocked
-AWS provider. A test in `tests/errors/` must fail instead, with the error
+AWS provider; its `tests/removal` configuration applies a function beside its
+queue and removes it again. A test in `tests/errors/` must fail instead, with the error
 message its `# expect-error:` line names, such as the one refusing an image
 outside ECR. CI runs them against [Floci](https://floci.io):
 

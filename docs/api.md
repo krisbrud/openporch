@@ -325,14 +325,16 @@ end, and the old identity no longer logs in. An identity already bound to
 another member is refused with `409`, and service users, which have no identity,
 with `400`. The change is audited as `user.identity.update`.
 
-```http
+For example, for a person who joined through an invitation:
+
+```text
 PUT /orgs/acme/users/alice/identity
 Authorization: Bearer $ADMIN_TOKEN
 
 {"provider": "https://id.example.com", "subject": "alice-sub"}
 ```
 
-```http-response
+```text
 200 OK
 
 {"id": "alice", "type": "user", "role": "member", "identity": "https://id.example.com:alice-sub"}
