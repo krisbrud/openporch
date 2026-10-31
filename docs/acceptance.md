@@ -151,7 +151,7 @@ end.
 | Database works but key is missing | covered | `crates/server/src/tests/mod.rs::missing_master_key_blocks_readiness_and_mutations` (readiness names the key ID; creating an application and deploying are refused with `503`, and no deployment is recorded) |
 | Restore after total server loss | covered | `crates/server/src/tests/restore.rs::backup_and_restore_drill` |
 | Unsupported downgrade | covered | `crates/server/src/tests/upgrades.rs::an_older_build_refuses_every_newer_fixture_unchanged`, `crates/store/src/sqlite/tests.rs::newer_schema_is_refused_without_changes` |
-| Uninstall with active resources | gap (partial) | `crates/server/src/tests/e2e.rs::stopping_and_restarting_the_server_deletes_nothing`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` (instructions in `docs/operations.md`) (partial: no test performs the uninstall described in docs/operations.md) |
+| Uninstall with active resources | covered | `crates/server/src/tests/restore.rs::uninstalling_keeps_infrastructure_and_a_backup_resumes_management` (the steps in `docs/operations.md#uninstalling` with a backup kept: stopping the server and deleting its data directory delete nothing the driver created; restoring the backup and the master key resumes management with the same GUResIDs, and the next deployment converges on the existing object), `crates/server/src/tests/e2e.rs::stopping_and_restarting_the_server_deletes_nothing`, `crates/server/src/tests/restore.rs::backup_and_restore_drill` |
 | Concurrent environments | covered | `crates/engine/src/planner/tests.rs::concurrency_is_bounded_across_environments`, `crates/server/src/tests/deploys.rs::running_deployments_are_bounded_and_status_stays_available` |
 | Storage exhausted | covered | `crates/engine/src/planner/tests.rs::the_log_stops_at_its_quota_but_keeps_the_outcome`, `crates/engine/src/planner/tests.rs::lost_log_lines_fail_the_deployment`, `crates/server/src/tests/mod.rs::audit_failure_rejects_the_mutation`, `crates/server/src/tests/resources.rs::work_whose_operation_records_cannot_be_stored_is_rejected` (with inserts into `deployments`, then `operations`, failing as on a full disk: the deployment request is refused with `500` and nothing queued, and an accepted deployment hands no resource to a driver and fails) |
 | Benchmark under driver load | manual | `just bench` runs the ignored `crates/server/src/tests/benchmark.rs::reference_capacity_benchmark` (asserts p95 thresholds); not in CI; results in `docs/benchmark.md` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 230 covered, 9 manual, 31 deferred, 4 gaps.
+274 scenarios: 231 covered, 9 manual, 31 deferred, 3 gaps.
