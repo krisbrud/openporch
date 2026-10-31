@@ -33,6 +33,10 @@ pub(super) struct Fake {
     chatter: Mutex<usize>,
     /// When set, each deletion waits for a permit from it.
     held_deletes: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// When set, provisioning a resource of this type waits for a permit.
+    held_provisions: Mutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
+    /// The inputs each job was handed, by descriptor.
+    inputs: Mutex<Vec<(String, Value)>>,
 }
 
 impl Executor for Fake {
@@ -42,6 +46,21 @@ impl Executor for Fake {
             .lock()
             .unwrap()
             .push((job.descriptor.to_string(), job.guresid.to_string()));
+        self.inputs.lock().unwrap().push((
+            job.descriptor.to_string(),
+            serde_json::to_value(&job.inputs).unwrap(),
+        ));
+        let held = self
+            .held_provisions
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(held, _)| *held == ty);
+        if let Some((_, gate)) = held
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
         let chatter = *self.chatter.lock().unwrap();
         if chatter > 0 {
             let log = job.log.redacting();
@@ -1161,6 +1180,189 @@ impl Server {
         }
         panic!("{path} did not finish");
     }
+}
+
+/// The `Storage exhausted` scenario for operation records: a deployment whose
+/// record cannot be stored is rejected, and a resource whose operation record
+/// cannot be stored is never handed to a driver.
+#[tokio::test]
+async fn work_whose_operation_records_cannot_be_stored_is_rejected() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let pool = s.state.store.pool();
+    let full = |table: &str| {
+        format!(
+            "CREATE TRIGGER {table}_full BEFORE INSERT ON {table} \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END"
+        )
+    };
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+
+    // The deployment record cannot be stored: the request is refused, and
+    // nothing is queued or run.
+    sqlx::query(&full("deployments"))
+        .execute(pool)
+        .await
+        .unwrap();
+    let (status, body) = s
+        .try_deploy_web("development", "nginx:1", true, false)
+        .await;
+    assert_error(status, &body, StatusCode::INTERNAL_SERVER_ERROR, "SRV-001");
+    assert!(
+        !body["message"].as_str().unwrap().contains("disk is full"),
+        "{body}"
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM deployments").await, 0);
+    let (_, list) = s.get(DEPLOYS, &s.admin).await;
+    assert_eq!(list.as_array().map_or(0, Vec::len), 0, "{list}");
+    assert!(fake.guresids.lock().unwrap().is_empty());
+
+    // Accepted, but no operation record can be written: no resource reaches a
+    // driver, and the deployment fails rather than reporting success.
+    sqlx::query("DROP TRIGGER deployments_full")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(&full("operations"))
+        .execute(pool)
+        .await
+        .unwrap();
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    assert!(fake.guresids.lock().unwrap().is_empty());
+    assert_eq!(count("SELECT COUNT(*) FROM operations").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM active_resources").await, 0);
+
+    // With storage back, the next deployment runs.
+    sqlx::query("DROP TRIGGER operations_full")
+        .execute(pool)
+        .await
+        .unwrap();
+    let d = s.deploy_web("nginx:1", true).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+}
+
+/// The `Configuration changes during execution` scenario: a definition and a
+/// shared value change while the deployment runs. Its later nodes still use
+/// what was accepted; the next deployment uses the change.
+#[tokio::test]
+async fn edits_during_a_deployment_wait_for_the_next_one() {
+    let s = server().await;
+    let fake = Arc::new(Fake::default());
+    s.provisioning(fake.clone()).await;
+    let defs = "/orgs/acme/resources/defs/workloads";
+    let values = "/orgs/acme/apps/shop/values";
+    let marker = |marker: &str| {
+        json!({"driver_type": "openporch/none",
+               "driver_inputs": {"values": {"marker": marker}}})
+    };
+    let (status, b) = s
+        .call(Method::PUT, defs, Some(&s.admin), Some(marker("accepted")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    s.value(
+        values,
+        json!({"key": "API_HOST", "description": "", "value": "accepted.example"}),
+    )
+    .await;
+    let deploy = || async {
+        let (st, env) = s.get(ENV_DEV, &s.admin).await;
+        assert_eq!(st, StatusCode::OK, "{env}");
+        let remove = if env["desired_set_id"].is_null() {
+            json!([])
+        } else {
+            json!(["web"])
+        };
+        let (st, delta) = s
+            .post(
+                "/orgs/acme/apps/shop/deltas",
+                &s.admin,
+                json!({"modules": {"remove": remove, "add": {"web": {
+                    "externals": {"db": {"type": "postgres"}},
+                    "spec": {"containers": {"web": {"image": "nginx:1"}},
+                             "env": {"API_HOST": "${values.API_HOST}"}}}}}}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{delta}");
+        let (st, d) = s
+            .post(
+                DEPLOYS,
+                &s.admin,
+                json!({"delta_id": delta["id"], "expected_generation": env["generation"]}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+        format!("{DEPLOYS}/{}", d["id"].as_str().unwrap())
+    };
+    // What the workload's job was handed in the deployment run so far.
+    let workload_inputs = || {
+        let inputs = fake.inputs.lock().unwrap();
+        let found: Vec<String> = inputs
+            .iter()
+            .filter(|(d, _)| d.starts_with("workload."))
+            .map(|(_, i)| i.to_string())
+            .collect();
+        found
+    };
+
+    // The database, which the workload waits for, is held mid-deployment.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *fake.held_provisions.lock().unwrap() = Some(("postgres".into(), gate.clone()));
+    let first = deploy().await;
+    for _ in 0..500 {
+        if fake
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| d.starts_with("postgres."))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        workload_inputs().is_empty(),
+        "the workload ran before its database"
+    );
+
+    // Both edits succeed while it runs.
+    let (status, b) = s
+        .call(Method::PUT, defs, Some(&s.admin), Some(marker("edited")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    let (status, b) = s
+        .put(
+            &format!("{values}/API_HOST"),
+            &s.admin,
+            json!({"description": "", "value": "edited.example"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    gate.add_permits(1);
+    let d = s.finished_at(&first).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let ran = workload_inputs();
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert!(ran[0].contains("\"accepted\""), "{}", ran[0]);
+    assert!(ran[0].contains("accepted.example"), "{}", ran[0]);
+    assert!(!ran[0].contains("edited"), "{}", ran[0]);
+
+    // The next deployment uses the edited configuration.
+    *fake.held_provisions.lock().unwrap() = None;
+    let next = deploy().await;
+    let d = s.finished_at(&next).await;
+    assert_eq!(d["status"], "succeeded", "{d}");
+    let ran = workload_inputs();
+    assert_eq!(ran.len(), 2, "{ran:?}");
+    assert!(ran[1].contains("\"edited\""), "{}", ran[1]);
+    assert!(ran[1].contains("edited.example"), "{}", ran[1]);
 }
 
 #[tokio::test]
