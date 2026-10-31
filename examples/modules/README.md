@@ -128,7 +128,9 @@ provisioned.
 module. The tests in each `tests/` directory plan and apply the module against
 the AWS account or emulator the environment points at and destroy what they
 created, except those of `aws-lambda-workload`, which plan against a mocked
-AWS provider. CI runs them against [Floci](https://floci.io):
+AWS provider. A test in `tests/errors/` must fail instead, with the error
+message its `# expect-error:` line names, such as the one refusing an image
+outside ECR. CI runs them against [Floci](https://floci.io):
 
 ```sh
 AWS_ENDPOINT_URL=http://localhost:4566 AWS_ACCESS_KEY_ID=test \
