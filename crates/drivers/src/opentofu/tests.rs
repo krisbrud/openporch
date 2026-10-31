@@ -680,6 +680,62 @@ output "n" { value = tonumber(nonsensitive(var.token)) }
     );
 }
 
+/// A module whose apply fails the way the AWS provider reports a missing IAM
+/// permission, without needing AWS: a provisioner prints the error. The
+/// credentials it ran with are secrets.
+const ACCESS_DENIED_MODULE: &str = r#"
+resource "terraform_data" "queue" {
+  input = "orders"
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "creating SQS Queue (orders): operation error SQS: CreateQueue, https response error StatusCode: 403, RequestID: 6c1b2a3e-0000-4000-8000-000000000000, api error AccessDenied: User: arn:aws:sts::123456789012:assumed-role/openporch-deployer/session is not authorized to perform: sqs:createqueue on resource: arn:aws:sqs:us-east-1:123456789012:orders because no identity-based policy allows the sqs:createqueue action (key $AWS_SECRET_ACCESS_KEY)" >&2
+      exit 1
+    EOT
+  }
+}
+"#;
+
+/// The `Apply fails` scenario.
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_an_access_denied_apply_reports_the_aws_error_redacted() {
+    let root = tempfile::tempdir().unwrap();
+    let d = driver(root.path());
+    let mut req = request(json!({"script": ACCESS_DENIED_MODULE}), json!({}));
+    req.credentials = Some(SecretMap::new(object(json!({
+        "AccessKeyId": "AKIAEXAMPLEDENIED",
+        "SecretAccessKey": "denied-secret-key-1",
+    }))));
+    let lines = capture(&mut req);
+    let message = match d.put(&req).await.unwrap_err() {
+        // The apply started, so what it changed is unknown.
+        DriverError::Uncertain(m) => m,
+        other => panic!("expected uncertain, got {other:?}"),
+    };
+    // The resource error carries the AWS error message, which OpenTofu wraps.
+    let words = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    for want in [
+        "api error AccessDenied",
+        "assumed-role/openporch-deployer/session is not authorized to perform: \
+         sqs:createqueue on resource: arn:aws:sqs:us-east-1:123456789012:orders",
+    ] {
+        assert!(words.contains(want), "{want}: {message}");
+    }
+    assert!(!message.contains("denied-secret-key-1"), "{message}");
+    // The full run log has every command, the error and no credential.
+    let log = lines.lock().unwrap().join("\n");
+    for want in [
+        "$ tofu init",
+        "$ tofu plan",
+        "$ tofu apply",
+        "api error AccessDenied",
+    ] {
+        assert!(log.contains(want), "{want}: {log}");
+    }
+    assert!(log.contains("[REDACTED]"), "{log}");
+    assert!(!log.contains("denied-secret-key-1"), "{log}");
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .args(args)
@@ -756,6 +812,77 @@ async fn opentofu_applies_a_git_module_and_deletes_the_retained_commit() {
     };
     del.permit = Some(fingerprint);
     assert_eq!(d.delete(&del).await.unwrap(), DeleteOutcome::Deleted);
+}
+
+/// A database module's shape without a cloud: `terraform_data` stands for the
+/// instance and `random_password` for its generated password.
+const DATABASE_MODULE: &str = r#"
+terraform {
+  required_providers {
+    random = { source = "hashicorp/random", version = "~> 3.6" }
+  }
+}
+variable "instance_class" { type = string }
+resource "terraform_data" "instance" {
+  input = { class = var.instance_class, engine = "postgres" }
+}
+resource "random_password" "master" {
+  length  = 24
+  special = false
+}
+output "host" { value = "${terraform_data.instance.id}.db.example.internal" }
+output "port" { value = 5432 }
+output "name" { value = "app" }
+output "username" { value = "app_admin" }
+output "password" {
+  value     = random_password.master.result
+  sensitive = true
+}
+output "instance_class" { value = terraform_data.instance.output.class }
+"#;
+
+/// The `Git module with variables` scenario, with a local repository and a
+/// module shaped like the RDS one.
+#[tokio::test]
+#[ignore = "needs OpenTofu and the provider registry"]
+async fn opentofu_a_git_database_module_returns_its_connection_outputs() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join("modules/rds")).unwrap();
+    std::fs::write(repo.join("modules/rds/main.tf"), DATABASE_MODULE).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "database module"]);
+    let d = driver(root.path());
+    let mut req = request(
+        json!({"source": {"url": format!("file://{}", repo.display()), "rev": "main", "path": "modules/rds"},
+               "variables": {"instance_class": "db.t4g.micro"}}),
+        json!({}),
+    );
+    let lines = capture(&mut req);
+    let PutOutcome::Ready { outputs, cookie } = d.put(&req).await.unwrap() else {
+        panic!("not ready");
+    };
+    // The run applied the module with the variable.
+    assert_eq!(outputs.values["instance_class"], "db.t4g.micro");
+    let host = outputs.values["host"].as_str().unwrap();
+    assert!(host.ends_with(".db.example.internal"), "{host}");
+    assert_eq!(outputs.values["port"], 5432);
+    assert_eq!(outputs.values["name"], "app");
+    assert_eq!(outputs.values["username"], "app_admin");
+    // The password is a secret output, never a plain one, and stays out of the log.
+    let password = outputs.secrets.expose()["password"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(password.len(), 24);
+    assert!(!outputs.values.contains_key("password"));
+    let log = lines.lock().unwrap().join("\n");
+    assert!(log.contains("$ tofu apply"), "{log}");
+    assert!(!log.contains(&password), "{log}");
+    let retained: Retained = serde_json::from_str(&cookie.as_ref().unwrap().data).unwrap();
+    assert_eq!(retained.source.as_ref().unwrap().commit.len(), 40);
 }
 
 #[tokio::test]
@@ -1351,6 +1478,89 @@ resource "terraform_data" "slow" {
     d.put(&next).await.unwrap();
     let state = root.path().join("state/0123456789abcdef0123456789abcdef");
     assert!(!state.join(".terraform.tfstate.lock.info").exists());
+}
+
+/// The `Partial apply writes state` scenario: the apply creates `first`, then
+/// fails creating `second`; the retry converges on the state it left.
+#[tokio::test]
+#[ignore = "needs OpenTofu"]
+async fn opentofu_a_retry_after_a_partial_apply_keeps_the_first_object() {
+    let root = tempfile::tempdir().unwrap();
+    let d = driver(root.path());
+    let gate = root.path().join("second-may-be-created");
+    let script = format!(
+        r#"
+resource "terraform_data" "first" {{
+  input = "one"
+}}
+resource "terraform_data" "second" {{
+  input      = "two"
+  depends_on = [terraform_data.first]
+  provisioner "local-exec" {{
+    command = "test -e '{}' || {{ echo 'creating second failed' >&2; exit 1; }}"
+  }}
+}}
+output "first" {{ value = terraform_data.first.id }}
+output "second" {{ value = terraform_data.second.id }}
+"#,
+        gate.display()
+    );
+    let req = || request(json!({"script": script}), json!({}));
+    let state_root = root.path().join("state");
+    let state = state_root.join("0123456789abcdef0123456789abcdef/terraform.tfstate");
+
+    match d.put(&req()).await.unwrap_err() {
+        DriverError::Uncertain(m) => assert!(m.contains("creating second failed"), "{m}"),
+        other => panic!("expected uncertain, got {other:?}"),
+    }
+    // The failed apply wrote state with the first object in it.
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    let id_of = |state: &Value, name: &str| {
+        state["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .map(|r| {
+                r["instances"][0]["attributes"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+    };
+    let first = id_of(&written, "first").expect("first is in the state");
+
+    // The retry plans against that state: `first` is left alone and only the
+    // tainted `second` is created again.
+    std::fs::write(&gate, "").unwrap();
+    let mut retry = req();
+    let Plan::Actions {
+        actions,
+        fingerprint,
+    } = d.plan(&retry).await.unwrap()
+    else {
+        panic!("no actions");
+    };
+    assert_eq!(
+        resources(&actions),
+        [(Action::Replace, "terraform_data.second".to_owned())]
+    );
+    retry.permit = Some(fingerprint);
+    let PutOutcome::Ready { outputs, .. } = d.put(&retry).await.unwrap() else {
+        panic!("not ready");
+    };
+    assert_eq!(outputs.values["first"], first.as_str());
+    assert!(outputs.values["second"].is_string());
+    // One state, at the GUResID's path; no fresh state was allocated.
+    let paths: Vec<_> = std::fs::read_dir(&state_root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(paths, ["0123456789abcdef0123456789abcdef"]);
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(id_of(&after, "first"), Some(first));
+    // Applying again changes nothing.
+    assert_eq!(d.plan(&req()).await.unwrap(), Plan::NoEffects);
 }
 
 #[tokio::test]
