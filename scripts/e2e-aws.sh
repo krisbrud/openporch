@@ -2,9 +2,11 @@
 # The opt-in end-to-end test against a real AWS account; see docs/e2e.md.
 #
 # It applies examples/aws-platform with a fresh name prefix, deploys
-# examples/lambda-order-worker (a zip) and examples/lambda-api (an image) to the
+# examples/lambda-order-worker (a zip), examples/lambda-api (an image function)
+# and examples/lambda-container (a container with the Lambda Web Adapter) to the
 # environment `e2e` of a new application `shop<hex>`, checks what exists in AWS, sends
-# a signed order and waits for it to be stored, calls the API's URL, deploys a
+# a signed order and waits for it to be stored, calls the API's and the
+# container's URLs, deploys a
 # second artifact under the same key, replays the first deployment's snapshot
 # and checks it runs the first artifact again, deletes the environment with a
 # permit for each deletion, checks nothing it owned is left, prints what is kept
@@ -350,23 +352,26 @@ upload() {
   return 1
 }
 
-step "Upload the first worker artifact and push the API image"
+step "Upload the first worker artifact and push the API's and the container's images"
 zip1=$(worker_zip 1)
 version1=$(upload "$zip1") || fail "the artifact bucket did not keep a version of the upload"
 registry="$account.dkr.ecr.$region.amazonaws.com"
 aws ecr create-repository --repository-name "$repository" >/dev/null
 repository_created=1
 docker build -q --platform linux/amd64 --provenance=false -t "$registry/$repository:1" "$repo/examples/lambda-api/app" >/dev/null
+# The container goes to the same repository under a tag of its own.
+docker build -q --platform linux/amd64 --provenance=false -t "$registry/$repository:container-1" "$repo/examples/lambda-container/app" >/dev/null
 # The registry login goes to a Docker config of its own in the working
 # directory, not the user's, so the token goes away with it.
 mkdir -m 700 "$work/docker"
 aws ecr get-login-password | DOCKER_CONFIG="$work/docker" docker login --username AWS --password-stdin "$registry" >/dev/null
 DOCKER_CONFIG="$work/docker" docker push -q "$registry/$repository:1" >/dev/null
+DOCKER_CONFIG="$work/docker" docker push -q "$registry/$repository:container-1" >/dev/null
 rm -rf "$work/docker"
 
 # --- First deployments ----------------------------------------------------------
 
-step "Deploy the order worker and the API with porch workload deploy --wait"
+step "Deploy the order worker, the API and the container with porch workload deploy --wait"
 env_deployed=1
 logged deploy-worker-1 porch workload deploy -f "$repo/examples/lambda-order-worker/workload.yaml" \
   --artifact "main=s3://$bucket/order-worker/e2e.zip" --comment "e2e build 1" --wait --timeout 30m ||
@@ -374,19 +379,26 @@ logged deploy-worker-1 porch workload deploy -f "$repo/examples/lambda-order-wor
 logged deploy-api porch workload deploy -f "$repo/examples/lambda-api/workload.yaml" \
   --image "main=$registry/$repository:1" --comment "e2e api" --wait --timeout 30m ||
   fail "the API did not deploy"
-# The deployment that is replayed later: both workloads, with the first zip.
-# Replaying one without the API would delete it, which needs a permit.
+logged deploy-container porch workload deploy -f "$repo/examples/lambda-container/workload.yaml" \
+  --image "main=$registry/$repository:container-1" --comment "e2e container" --wait --timeout 30m ||
+  fail "the container did not deploy"
+# The deployment that is replayed later: all three workloads, with the first
+# zip. Replaying one without the API or the container would delete it, which
+# needs a permit.
 first_deploy=$(porch get deploys +0 -o json | jq -r .id)
 
 worker=$(active workload/modules.order-worker) || fail "no active order worker"
 api=$(active workload/modules.lambda-api) || fail "no active API"
+container=$(active workload/modules.lambda-container) || fail "no active container"
 table=$(active dynamodb-table/modules.order-worker.externals.orders | jq -r .outputs.name)
 queue_url=$(active sqs/modules.order-worker.externals.inbox | jq -r .outputs.url)
 queue_arn=$(active sqs/modules.order-worker.externals.inbox | jq -r .outputs.arn)
 worker_fn=$(jq -r .outputs.function_name <<<"$worker")
 api_fn=$(jq -r .outputs.function_name <<<"$api")
 url=$(jq -r .outputs.url <<<"$api")
-echo "$worker_fn $api_fn $table $queue_url $url" >"$work/names.txt"
+container_fn=$(jq -r .outputs.function_name <<<"$container")
+container_url=$(jq -r .outputs.url <<<"$container")
+echo "$worker_fn $api_fn $container_fn $table $queue_url $url $container_url" >"$work/names.txt"
 
 step "Check that the functions, table, queue, schedule and event source mapping exist"
 [ "$(aws lambda get-function --function-name "$worker_fn" --query Configuration.State --output text)" = Active ] || fail "the worker is not active"
@@ -406,25 +418,56 @@ schedule=$(aws scheduler get-schedule --name "$(jq -r '.[0]' <<<"$schedules")" -
 [ "$(jq -r '.ScheduleExpression + " " + .ScheduleExpressionTimezone' <<<"$schedule")" = "cron(0 3 * * ? *) Europe/Oslo" ] ||
   fail "the schedule is not as expected: $(jq -c '{ScheduleExpression, ScheduleExpressionTimezone}' <<<"$schedule")"
 
+step "Check that the container is an image function with its args as image config and AWS_LWA_PORT"
+# As examples/lambda-container/workload.yaml declares them: the container's
+# `args` and its service's `targetPort`.
+container_args='["--port", "8080", "--greeting", "Hello from a container on Lambda"]'
+aws lambda get-function-configuration --function-name "$container_fn" --output json >"$work/container-config.json" ||
+  fail "could not read the container's function"
+jq -e '.PackageType == "Image" and .State == "Active"' "$work/container-config.json" >/dev/null ||
+  fail "the container is not an active image function: $(jq -c '{PackageType, State, StateReason}' "$work/container-config.json")"
+# The container has `args` and no `command`, so the image keeps its entry point.
+jq -e --argjson args "$container_args" '.ImageConfigResponse.ImageConfig | .Command == $args and ((.EntryPoint // []) | length == 0)' \
+  "$work/container-config.json" >/dev/null ||
+  fail "the container's image config is not its args: $(jq -c '.ImageConfigResponse' "$work/container-config.json")"
+[ "$(jq -r '.Environment.Variables.AWS_LWA_PORT' "$work/container-config.json")" = 8080 ] ||
+  fail "the container's AWS_LWA_PORT is not its targetPort 8080; it has the variables $(jq -c '.Environment.Variables // {} | keys' "$work/container-config.json")"
+
 step "Send a signed order and see the worker store it"
 send_order e2e-1
 await_order e2e-1 || fail "the order was not stored within 5 minutes"
 
 step "Call the API's URL"
 # A new function URL's permission can take a few seconds to apply.
-# Each answer's request ID, which is the invocation's, goes to api-requests.txt,
-# so that the leak check can wait for exactly these invocations' logs.
+# Each answer's request ID, which is the invocation's, goes to a file,
+# api-requests.txt unless a second argument names another, so that the leak
+# check can wait for exactly these invocations' logs.
+# Usage: get URL [REQUEST_IDS_FILE]
 get() {
   local headers="$work/api-headers.txt"
   rm -f "$headers"
   curl -s --retry 6 --retry-all-errors --retry-delay 5 -f -D "$headers" "$1" || return 1
-  tr -d '\r' <"$headers" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"$work/api-requests.txt"
+  tr -d '\r' <"$headers" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"${2:-$work/api-requests.txt}"
 }
 [ "$(get "$url" | jq -r .message)" = "Hello from openporch" ] || fail "the API did not greet at $url"
 [ "$(get "${url%/}/health" | jq -r .status)" = ok ] || fail "the API's /health did not answer"
 [ "$(curl -s -o /dev/null -D "$work/api-headers.txt" -w '%{http_code}' "${url%/}/nope")" = 404 ] || fail "the API did not answer 404 for an unknown path"
 tr -d '\r' <"$work/api-headers.txt" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"$work/api-requests.txt"
 [ "$(grep -c . "$work/api-requests.txt")" = 3 ] || fail "the API's answers did not all carry a request ID"
+
+step "Call the container's URL and see the server answer with its args"
+# The image's default arguments name port 3000 and another greeting: this
+# answer comes from a server started with the workload's `args`, reached by the
+# Lambda Web Adapter on AWS_LWA_PORT.
+greeting=$(get "$container_url" "$work/container-requests.txt") || fail "the container did not answer at $container_url"
+jq -e '. == {"message": "Hello from a container on Lambda", "port": 8080}' <<<"$greeting" >/dev/null ||
+  fail "the container did not answer with its args at $container_url: $greeting"
+[ "$(get "${container_url%/}/health" "$work/container-requests.txt" | jq -r .status)" = ok ] ||
+  fail "the container's /health did not answer"
+[ "$(curl -s -o /dev/null -D "$work/api-headers.txt" -w '%{http_code}' "${container_url%/}/nope")" = 404 ] ||
+  fail "the container did not answer 404 for an unknown path"
+tr -d '\r' <"$work/api-headers.txt" | awk -F': ' 'tolower($1) == "x-amzn-requestid" { id = $2 } END { print id }' >>"$work/container-requests.txt"
+[ "$(grep -c . "$work/container-requests.txt")" = 3 ] || fail "the container's answers did not all carry a request ID"
 
 # --- Second artifact and replay --------------------------------------------------
 
@@ -449,19 +492,21 @@ send_order e2e-3
 await_order e2e-3 || fail "the replayed build did not store an order"
 
 step "Check that the signing key is in no log, output or function environment"
-# Every deployment's log, the active resources and both functions' environments,
+# Every deployment's log, the active resources and the functions' environments,
 # after the last deployment and before the deletion removes the deployments.
 for id in $(porch get deploys -o json | jq -r '.deployments[].id'); do
   porch logs deploy "$id" >>"$work/deploy.log" 2>&1 || fail "could not read the log of deployment $id"
 done
 porch get active-resources -o json >"$work/active.json"
 aws lambda get-function-configuration --function-name "$api_fn" --query 'Environment.Variables' --output json >"$work/api-env.json"
+aws lambda get-function-configuration --function-name "$container_fn" --query 'Environment.Variables' --output json >"$work/container-env.json"
 aws lambda get-function-configuration --function-name "$worker_fn" --query 'Environment.Variables' --output json >>"$work/worker-env.json"
 # What the functions logged while they ran: the worker read the key at runtime.
 # Lambda logs can take minutes to arrive, so each log is read until it has the
 # REPORT line, the last line, of every invocation the test made: the worker's
 # that stored the three orders, which it logs with their request IDs, and the
-# API's three, whose request IDs came back with the answers. Other invocations,
+# API's and the container's three each, whose request IDs came back with the
+# answers. Other invocations,
 # such as a retry or the nightly schedule, can neither stand in for these nor
 # hold the check up.
 # Usage: runtime_log FUNCTION REQUEST_IDS_FILE, or `-` to take the worker's
@@ -492,8 +537,10 @@ runtime_log() {
 }
 runtime_log "$worker_fn" -
 runtime_log "$api_fn" "$work/api-requests.txt"
-grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/server.log" "$work/deploy.log" \
-  "$work/active.json" "$work"/*.out "$work/$worker_fn.runtime.json" "$work/$api_fn.runtime.json" &&
+runtime_log "$container_fn" "$work/container-requests.txt"
+grep -qF -f <(printf '%s\n' "$key") "$work/worker-env.json" "$work/api-env.json" "$work/container-env.json" \
+  "$work/server.log" "$work/deploy.log" "$work/active.json" "$work"/*.out \
+  "$work/$worker_fn.runtime.json" "$work/$api_fn.runtime.json" "$work/$container_fn.runtime.json" &&
   fail "the signing key reached a function's environment or log, the server log, a deployment log or the active resources"
 
 # --- Deletion ------------------------------------------------------------------
@@ -523,6 +570,7 @@ gone() {
 count() { aws "$@" --output text || fail "could not list: aws $*"; }
 gone ResourceNotFoundException lambda get-function --function-name "$worker_fn" || left+=("function $worker_fn")
 gone ResourceNotFoundException lambda get-function --function-name "$api_fn" || left+=("function $api_fn")
+gone ResourceNotFoundException lambda get-function --function-name "$container_fn" || left+=("function $container_fn")
 gone ResourceNotFoundException dynamodb describe-table --table-name "$table" || left+=("table $table")
 # SQS can answer for a deleted queue for up to a minute.
 queue_gone=
@@ -539,7 +587,7 @@ for name in $(jq -r '.[]' <<<"$schedules"); do
 done
 mappings=$(count lambda list-event-source-mappings --event-source-arn "$queue_arn" --query 'length(EventSourceMappings)')
 [ "$mappings" = 0 ] || left+=("event source mappings of $queue_arn")
-for fn in "$worker_fn" "$api_fn"; do
+for fn in "$worker_fn" "$api_fn" "$container_fn"; do
   [ "$(count logs describe-log-groups --log-group-name-prefix "/aws/lambda/$fn" --query 'length(logGroups)')" = 0 ] ||
     left+=("log group /aws/lambda/$fn")
   [ "$(count ssm get-parameters-by-path --path "/openporch/$fn" --recursive --query 'length(Parameters)')" = 0 ] ||

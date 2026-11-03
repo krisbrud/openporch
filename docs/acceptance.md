@@ -25,8 +25,8 @@ How the tests run:
   2026-10-17 at commit `1134dfc`.
 
 The first release needs every enabled scenario covered or manual, and the
-manual ones run for that release. Until then the open gaps are listed at the
-end.
+manual ones run for that release. The totals at the end count any open gaps;
+none is open.
 
 ## active-resources
 
@@ -103,7 +103,7 @@ end.
 |---|---|---|
 | Zip function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::zip_function`; real function: manual `just e2e-aws` |
 | Image function | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_from_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_function_without_image` |
-| Container workload on Lambda | gap (partial) | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files` (image config overrides, `AWS_LWA_PORT` and the preflight errors, planned against a mocked provider). Real HTTP invocation is of the image function `examples/lambda-api` in `just e2e-aws`, not of a container workload with the adapter. Floci creates and deletes Lambda functions without Docker, but runs their code in containers it starts through a Docker socket, which CI's Floci service does not mount; invoking a container workload there would also need an image with the Lambda Web Adapter built and pushed to Floci's ECR |
+| Container workload on Lambda | manual | `just e2e-aws` steps "Check that the container is an image function with its args as image config and AWS_LWA_PORT" and "Call the container's URL and see the server answer with its args" (`examples/lambda-container`, a plain HTTP server with the Lambda Web Adapter pinned in its `examples/lambda-container/app/Dockerfile`, deployed from `containers:` with class `aws-lambda`; the answer carries the greeting and port from the workload's `args`, which differ from the image's defaults); supporting: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::two_containers`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_files` (image config overrides, `AWS_LWA_PORT` and the preflight errors, planned against a mocked provider), `crates/server/src/tests/e2e.rs::the_example_lambda_workloads_deploy_and_replay` (the example file resolves with its `args`, service port and pinned image), `examples/lambda-container/app/test_server.py`. Not in CI: CI's Floci runs Lambda code in containers it starts through a Docker socket, which its service does not mount |
 | Non-ECR image | covered | `examples/modules/aws-lambda-workload/tests/errors/image_outside_ecr.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/errors/image_in_another_region.tftest.hcl::image_in_another_region` (`examples/modules/test.sh`, in CI's OpenTofu driver job, requires each plan to fail with "Lambda container images must come from ECR in the function's region (eu-north-1)"), `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_outside_ecr`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::image_in_another_region` |
 | Database password | covered | `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::secret_variables_are_references`; `just e2e-aws` checks `SIGNING_KEY_SECRET_REF` in the real function |
 | Function URL | manual | `just e2e-aws` step "Call the API's URL"; config only: `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::container_with_web_adapter_port`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::iam_url`, `examples/modules/aws-lambda-workload/tests/unit.tftest.hcl::inferred_url_is_not_public` |
@@ -434,4 +434,4 @@ end.
 
 ## Totals
 
-274 scenarios: 233 covered, 9 manual, 31 deferred, 1 gaps.
+274 scenarios: 233 covered, 10 manual, 31 deferred, 0 gaps.

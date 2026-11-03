@@ -1,0 +1,32 @@
+# An ordinary HTTP server in a container, run as a Lambda image function behind
+# a public function URL. Deploy it with the image CI pushed to ECR:
+#
+#   porch workload deploy -f workload.yaml \
+#     --image main=<account>.dkr.ecr.<region>.amazonaws.com/lambda-container:<tag> --wait
+#
+# openporch pins the tag to its digest when it accepts the deployment. The
+# function's URL is the workload's `url` output. The image includes the Lambda
+# Web Adapter; see README.md.
+apiVersion: openporch.dev/v1
+kind: Workload
+metadata:
+  name: lambda-container
+  class: aws-lambda
+containers:
+  main:
+    image: .
+    # The function's image config overrides the image's command with these.
+    # The server needs both, and listens on the port the adapter is told.
+    args: ["--port", "8080", "--greeting", "Hello from a container on Lambda"]
+service:
+  ports:
+    http:
+      port: 80
+      # Exported to the adapter as AWS_LWA_PORT.
+      targetPort: 8080
+triggers:
+  web:
+    http:
+      port: http
+      # A public URL must be asked for; `iam` requires signed requests.
+      auth: none
