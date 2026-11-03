@@ -33,6 +33,7 @@ jobs:
         run: |
           python3 -m unittest discover examples/lambda-order-worker/app
           python3 -m unittest discover examples/lambda-api/app
+          python3 -m unittest discover examples/lambda-container/app
 
   deny:
     name: cargo deny

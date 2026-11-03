@@ -8,8 +8,8 @@ for that, and `auth: iam` makes one that needs signed requests.
 
 The image is built from the AWS Lambda Python base image, which includes the
 runtime interface, so it needs no web adapter. For an existing HTTP server in a
-container, see the Lambda Web Adapter in
-[`examples/modules`](../modules/README.md#lambda-workloads).
+container, see [`examples/lambda-container`](../lambda-container), which adds
+the Lambda Web Adapter.
 
 ## Deploy
 

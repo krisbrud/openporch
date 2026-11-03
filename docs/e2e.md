@@ -17,25 +17,34 @@ these steps:
    shared value `ORDER_SIGNING_KEY`. The application has the run's hex, so the
    AWS names (`shop<hex>-e2e-...`) of two runs never collide.
 3. It uploads the order worker's zip to the artifact bucket, and pushes the
-   API's image to a new ECR repository.
-4. It deploys [`examples/lambda-order-worker`](../examples/lambda-order-worker)
-   and [`examples/lambda-api`](../examples/lambda-api) with
+   API's image to a new ECR repository, and the container's image, with the
+   Lambda Web Adapter, to the same repository under the tag `container-1`.
+4. It deploys [`examples/lambda-order-worker`](../examples/lambda-order-worker),
+   [`examples/lambda-api`](../examples/lambda-api) and
+   [`examples/lambda-container`](../examples/lambda-container) with
    `porch workload deploy --wait`.
 5. It checks these in AWS:
-   - both functions;
+   - the three functions;
    - the worker's code hash and its environment: `TABLE`, and
      `SIGNING_KEY_SECRET_REF` without the key itself;
    - the table, the queue, and the queue's enabled event source mapping;
-   - the nightly schedule, `cron(0 3 * * ? *)` in `Europe/Oslo`.
+   - the nightly schedule, `cron(0 3 * * ? *)` in `Europe/Oslo`;
+   - that the container is an active image function whose image config
+     command is the container's `args`, with no entry point override, and
+     whose environment has `AWS_LWA_PORT=8080`, the service's `targetPort`.
 6. It sends a signed order to the queue and waits for the worker to store it.
-7. It calls the API's function URL at `/`, `/health` and an unknown path.
+7. It calls the API's function URL at `/`, `/health` and an unknown path. Then
+   it calls the container's at the same paths, and checks that `/` answers
+   with the greeting and port 8080 from the workload's `args`. The image's own
+   default arguments name port 3000 and another greeting, so the answer shows
+   that the override took effect and that the adapter reached the server.
 8. It uploads a second build of the worker under the same key and deploys it,
    then checks that the function runs the second zip and still stores orders.
-9. It replays the snapshot of the API's deployment, the last one with the first
-   zip, with `porch deploy deploy ID --replay snapshot`. Then it checks that the
+9. It replays the snapshot of the container's deployment, the last one with the
+   first zip, with `porch deploy deploy ID --replay snapshot`. Then it checks that the
    function runs the first zip again: S3 keeps both versions, and the deployment
    pinned the first one. It also checks that orders are still stored.
-   Then it checks that the signing key is in neither function's environment
+   Then it checks that the signing key is in no function's environment
    or CloudWatch log, the server's log, any deployment's log or the active
    resources. It reads each CloudWatch log once it reports every invocation the
    test made, since Lambda logs can arrive minutes late. The deployment
@@ -43,7 +52,8 @@ these steps:
    holding the key left out.
 10. It deletes the environment with `porch delete env`, acknowledging each
     deletion the preview marks for a permit. It waits until the environment is
-    gone, then checks that none of these is left. A resource counts as gone
+    gone, then checks that none of these is left. With the container, the
+    deletion takes 8 permits. A resource counts as gone
     only on its service's not-found error; any other error fails the run:
     - the functions, the table, the queue, the schedule and the event source
       mappings;
@@ -94,13 +104,13 @@ OpenTofu runs.
 ### Cost
 
 Everything in the test is pay-per-use, and it all exists for less than an
-hour. The worker runs three times and the API three times, which is well
+hour. The worker, the API and the container run three times each, which is well
 inside the Lambda free tier. These cost a fraction of a cent:
 
 - DynamoDB on-demand writes and storage;
 - a few SQS requests;
 - S3 storage of two small zips;
-- ECR storage of one image, about 200 MB;
+- ECR storage of two images, a few hundred MB together;
 - log storage.
 
 Nothing is provisioned by the hour. The table is on demand, the functions
@@ -151,13 +161,14 @@ Resources that the state no longer covers can be found by name:
 - SSM parameters are under `/openporch/shop<hex>-e2e-`;
 - the table is `shop<hex>.e2e.modules.order-worker.externals.orders`;
 - policies, queues and buckets start with the run's prefix `ope2e-<hex>`;
-- the ECR repository is `ope2e-<hex>-lambda-api`.
+- the ECR repository is `ope2e-<hex>-lambda-api`; it holds both images.
 
 ## Results
 
 | Date | Commit | Account, region | Result |
 | --- | --- | --- | --- |
 | 2026-10-17 | `1134dfc` | A sandbox account, eu-north-1 | Passed in about 16 minutes. Every step ran, the environment's deletion took 7 permits, and nothing the run created was left in the account. |
+| 2026-11-03 | `daf203a` | A sandbox account, eu-north-1 | Passed in about 13 minutes, with `examples/lambda-container`: the container was an image function with its `args` as image config and `AWS_LWA_PORT=8080`, and its URL answered with the greeting and port from its `args`. The environment's deletion took 8 permits, and nothing the run created was left in the account. |
 
 Add a row for each manual run, with the summary from
 `target/e2e-aws-results.md`.

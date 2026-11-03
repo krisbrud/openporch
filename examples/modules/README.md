@@ -112,6 +112,10 @@ COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt
 ```
 
 Setting `AWS_LWA_PORT` does not by itself make an image run on Lambda.
+[`examples/lambda-container`](../lambda-container) is the reference: a plain
+Python HTTP server with this adapter, whose `args` and `targetPort` the module
+turns into the function's image config and `AWS_LWA_PORT`. `just e2e-aws`
+([e2e](../../docs/e2e.md)) deploys it and calls its URL.
 
 Schedules translate 5-field cron expressions into EventBridge Scheduler's
 `cron(...)`, which numbers days of the week from Sunday = 1 and cannot restrict

@@ -947,8 +947,10 @@ async fn images_in_other_registries_are_pinned_and_checked() {
 
 const ORDER_WORKER: &str = include_str!("../../../../examples/lambda-order-worker/workload.yaml");
 const LAMBDA_API: &str = include_str!("../../../../examples/lambda-api/workload.yaml");
+const LAMBDA_CONTAINER: &str = include_str!("../../../../examples/lambda-container/workload.yaml");
 const WORKER_FN: &str = "workload.aws-lambda#modules.order-worker";
 const API_FN: &str = "workload.aws-lambda#modules.lambda-api";
+const CONTAINER_FN: &str = "workload.aws-lambda#modules.lambda-container";
 const ORDERS: &str = "dynamodb-table.default#modules.order-worker.externals.orders";
 const INBOX: &str = "sqs.default#modules.order-worker.externals.inbox";
 const ORDERS_POLICY: &str = "aws-policy.dynamodb-table#modules.order-worker.externals.orders";
@@ -1039,8 +1041,8 @@ async fn example_platform(s: &Server, queue_url: &str) {
     }
 }
 
-/// 5.7's end-to-end run with the files in `examples/lambda-order-worker` and
-/// `examples/lambda-api`, deployed as CI deploys them, against definitions
+/// 5.7's end-to-end run with the files in `examples/lambda-order-worker`,
+/// `examples/lambda-api` and `examples/lambda-container`, deployed as CI deploys them, against definitions
 /// shaped like `examples/aws-platform`'s with fake drivers.
 #[tokio::test]
 async fn the_example_lambda_workloads_deploy_and_replay() {
@@ -1074,6 +1076,10 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
             LAMBDA_API,
             json!({"images": {"main": format!("{ECR}/lambda-api:1")}}),
         ),
+        (
+            LAMBDA_CONTAINER,
+            json!({"images": {"main": format!("{ECR}/lambda-api:2")}}),
+        ),
     ] {
         let (st, delta) = s
             .post(
@@ -1100,6 +1106,7 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
             ORDERS,
             INBOX,
             API_FN,
+            CONTAINER_FN,
             WORKER_FN,
         ]
     );
@@ -1169,6 +1176,31 @@ async fn the_example_lambda_workloads_deploy_and_replay() {
         format!("{ECR}/lambda-api@sha256:{}", "1".repeat(64))
     );
     assert_eq!(api["triggers"]["web"], json!({"http": {"auth": "none"}}));
+
+    // The container keeps its `args` and service port for the module's image
+    // config and `AWS_LWA_PORT`, and runs the digest its tag pointed at.
+    let container = &resolved[CONTAINER_FN]["spec"];
+    assert_eq!(
+        container["containers"]["main"]["image"],
+        format!("{ECR}/lambda-api@sha256:{}", "2".repeat(64))
+    );
+    assert_eq!(
+        container["containers"]["main"]["args"],
+        json!([
+            "--port",
+            "8080",
+            "--greeting",
+            "Hello from a container on Lambda"
+        ])
+    );
+    assert_eq!(
+        container["service"]["ports"]["http"],
+        json!({"port": 80, "targetPort": 8080})
+    );
+    assert_eq!(
+        container["triggers"]["web"],
+        json!({"http": {"port": "http", "auth": "none"}})
+    );
 
     // Deploying the same set again keeps every resource's identity.
     let again = s.deploy_to("development", json!({"set_id": set_id})).await;

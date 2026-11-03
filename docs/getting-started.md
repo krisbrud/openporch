@@ -469,5 +469,7 @@ versions until the platform is destroyed.
   definitions.
 - [`examples/lambda-api`](../examples/lambda-api): a container-image function
   behind a function URL.
+- [`examples/lambda-container`](../examples/lambda-container): an ordinary
+  HTTP server in a container, run on Lambda with the Lambda Web Adapter.
 - [The provider's reference](../provider/docs/index.md) and the
   [command reference](cli.md).
