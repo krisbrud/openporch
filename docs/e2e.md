@@ -53,8 +53,7 @@ these steps:
 10. It deletes the environment with `porch delete env`, acknowledging each
     deletion the preview marks for a permit. It waits until the environment is
     gone, then checks that none of these is left. With the container, the
-    deletion should take 8 permits, one more than the run recorded below. A
-    resource counts as gone
+    deletion takes 8 permits. A resource counts as gone
     only on its service's not-found error; any other error fails the run:
     - the functions, the table, the queue, the schedule and the event source
       mappings;
@@ -169,6 +168,7 @@ Resources that the state no longer covers can be found by name:
 | Date | Commit | Account, region | Result |
 | --- | --- | --- | --- |
 | 2026-10-17 | `1134dfc` | A sandbox account, eu-north-1 | Passed in about 16 minutes. Every step ran, the environment's deletion took 7 permits, and nothing the run created was left in the account. |
+| 2026-11-03 | `daf203a` | A sandbox account, eu-north-1 | Passed in about 13 minutes, with `examples/lambda-container`: the container was an image function with its `args` as image config and `AWS_LWA_PORT=8080`, and its URL answered with the greeting and port from its `args`. The environment's deletion took 8 permits, and nothing the run created was left in the account. |
 
 Add a row for each manual run, with the summary from
 `target/e2e-aws-results.md`.

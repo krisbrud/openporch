@@ -22,7 +22,7 @@ How the tests run:
   through `provider/scripts/acceptance.sh`.
 - The example modules' tests run in CI through `examples/modules/test.sh`.
 - `just e2e-aws` runs against a real AWS account by hand. It last passed on
-  2026-10-17 at commit `1134dfc`.
+  2026-11-03 at commit `daf203a`.
 
 The first release needs every enabled scenario covered or manual, and the
 manual ones run for that release. The totals at the end count any open gaps;
