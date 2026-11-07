@@ -395,10 +395,11 @@ deploy from GitHub Actions.
 
 ## Clean up
 
-Deleting the application deletes its environments and everything they created.
-The table and the queue hold data, so the deletion needs a permit for each:
-preview it, then run the command the preview prints, with its `--plan` and
-`--ack` arguments:
+Deleting the application deletes its environments and everything they created,
+the table and the queue with their data included. Every resource it deletes
+needs a permit, six for the order worker's environment: preview the deletion,
+then run the command the preview prints, with its `--plan` and one `--ack` for
+each permit:
 
 ```sh
 porch delete app shop --preview
