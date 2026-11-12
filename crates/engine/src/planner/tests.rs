@@ -2402,6 +2402,7 @@ async fn lost_log_lines_fail_the_deployment() {
 }
 
 mod coprovision;
+mod faults;
 mod pins;
 mod recovery;
 mod teardown;
