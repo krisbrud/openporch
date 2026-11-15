@@ -627,8 +627,8 @@ pub trait Sts: Send + Sync {
 
     /// Writes `value` to `secret` (its `version` is ignored) and returns the
     /// new version. With `create`, the secret is created, tagged for `org`,
-    /// and one that already exists is refused rather than written over;
-    /// without it, a version is added to a secret openporch created.
+    /// and `None` means one already exists, which is left as it is; without
+    /// it, a version is added to a secret openporch created.
     fn write_secret<'a>(
         &'a self,
         credentials: &'a AwsCredentials,
@@ -636,7 +636,7 @@ pub trait Sts: Send + Sync {
         value: &'a SecretValue,
         org: &'a str,
         create: bool,
-    ) -> BoxFuture<'a, Result<String, CloudError>> {
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         let _ = (credentials, secret, value, org, create);
         Box::pin(async {
             Err(CloudError::Unavailable(
@@ -807,7 +807,7 @@ impl CredentialResolver {
         value: &SecretValue,
         org: &str,
         create: bool,
-    ) -> Result<String, CloudError> {
+    ) -> Result<Option<String>, CloudError> {
         self.sts
             .write_secret(credentials, secret, value, org, create)
             .await

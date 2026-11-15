@@ -161,7 +161,7 @@ impl Sts for AwsSts {
         value: &'a SecretValue,
         org: &'a str,
         create: bool,
-    ) -> BoxFuture<'a, Result<String, CloudError>> {
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
             self.write_secret_json(credentials, secret, value, org, create)
                 .await
@@ -637,7 +637,7 @@ impl AwsSts {
         value: &SecretValue,
         org: &str,
         create: bool,
-    ) -> Result<String, CloudError> {
+    ) -> Result<Option<String>, CloudError> {
         let tags = serde_json::json!([
             {"Key": "openporch:managed", "Value": "true"},
             {"Key": "openporch:org", "Value": org},
@@ -682,12 +682,7 @@ impl AwsSts {
         if !(200..300).contains(&status) {
             let (code, message) = aws_error(&answer);
             if create && matches!(code, "ResourceExistsException" | "ParameterAlreadyExists") {
-                // Someone else put a secret at this name: it is not written
-                // over, and not openporch's.
-                return Err(CloudError::Rejected(format!(
-                    "{secret} already exists and was not created by openporch, so it is not \
-                     written over"
-                )));
+                return Ok(None);
             }
             return Err(call_error(target, secret, status, code, message));
         }
@@ -695,7 +690,7 @@ impl AwsSts {
             SecretService::SecretsManager => answer["VersionId"].as_str().map(str::to_owned),
             SecretService::Ssm => answer["Version"].as_u64().map(|v| v.to_string()),
         };
-        version.ok_or_else(|| {
+        version.map(Some).ok_or_else(|| {
             CloudError::Rejected(format!("{target} of {secret} returned no version"))
         })
     }

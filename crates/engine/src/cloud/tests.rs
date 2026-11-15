@@ -916,11 +916,11 @@ async fn real_secret_read() {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("writing {service} `{name}`: {e}"));
-            versions.push((version, value));
+            versions.push((version.expect("written"), value));
         }
         assert_ne!(versions[0].0, versions[1].0, "{service} `{name}`");
-        // Creating it again is refused rather than written over.
-        let error = resolver
+        // Creating it again leaves it as it is.
+        let again = resolver
             .write_secret(
                 &credentials,
                 &secret(service, name.clone(), None),
@@ -929,12 +929,8 @@ async fn real_secret_read() {
                 true,
             )
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not created by openporch"),
-            "{service}: {error}"
-        );
+            .unwrap_or_else(|e| panic!("creating {service} `{name}` again: {e}"));
+        assert_eq!(again, None, "{service} `{name}`");
         for (version, value) in &versions {
             let read = resolver
                 .read_secret(&credentials, &secret(service, name.clone(), Some(version)))

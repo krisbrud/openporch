@@ -1685,8 +1685,12 @@ account. openporch writes to an AWS store under `openporch/<org>/<name>`
 `openporch:managed=true` and `openporch:org=<org>`, where `<name>` is the name
 the built-in store would use, such as `defs/<definition>/<key>` or
 `resources/<GUResID>/outputs/<output>`. openporch records each secret it
-creates there; only those belong to the object whose name they carry, like one
-in the built-in store, and only those get new versions. A secret someone else
+creates there, with the store's cloud account and region; only those, while
+the store still points there, belong to the object whose name they carry, like
+one in the built-in store, and only those get new versions. Changing the
+store's `region` or `cloud_account`, or the account's configuration other than
+a new `access_key_id` or `session_duration`, sets them aside until it points
+back. A create whose answer was lost is recognized when it is retried. A secret someone else
 put at such a name needs a grant like any other, and a write to that name is
 refused rather than written over (`422` `CLD-001`).
 

@@ -676,7 +676,7 @@ impl Sts for FakeSts {
         value: &'a SecretValue,
         org: &'a str,
         _create: bool,
-    ) -> BoxFuture<'a, Result<String, CloudError>> {
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
             assert_eq!(c.access_key_id, "AKIAEXAMPLE");
             WRITES.lock().unwrap().push((
@@ -684,7 +684,7 @@ impl Sts for FakeSts {
                 value.expose().to_owned(),
                 org.to_owned(),
             ));
-            Ok("1".to_owned())
+            Ok(Some("1".to_owned()))
         })
     }
 

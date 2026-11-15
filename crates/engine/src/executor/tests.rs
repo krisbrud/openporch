@@ -297,31 +297,21 @@ impl Sts for FakeSts {
         value: &'a SecretValue,
         _org: &'a str,
         create: bool,
-    ) -> BoxFuture<'a, Result<String, CloudError>> {
-        // A name someone else took is refused on creation.
-        let taken = create && secret.name.contains("/taken/");
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         self.objects.lock().unwrap().push((
             Some(credentials.access_key_id.clone()),
-            format!("write {secret}"),
+            format!("{} {secret}", if create { "create" } else { "write" }),
         ));
-        self.written
-            .lock()
-            .unwrap()
-            .insert(secret.name.clone(), value.expose().to_owned());
-        if create {
-            self.objects
-                .lock()
-                .unwrap()
-                .push((None, format!("create {}", secret.name)));
-        }
-        Box::pin(async move {
-            if taken {
-                return Err(CloudError::Rejected(
-                    "the secret already exists and was not created by openporch".into(),
-                ));
-            }
-            Ok(if create { "v1" } else { "v2" }.to_owned())
-        })
+        let mut written = self.written.lock().unwrap();
+        // Creating a secret that exists leaves it as it is.
+        let version = if create && written.contains_key(&secret.name) {
+            None
+        } else {
+            let version = if create { "v1" } else { "v2" };
+            written.insert(secret.name.clone(), value.expose().to_owned());
+            Some(version.to_owned())
+        };
+        Box::pin(async move { Ok(version) })
     }
 
     fn assume_role(
@@ -2214,7 +2204,7 @@ async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_cre
 
     // Once openporch created it, it is the definition's own.
     f.store
-        .record_external_secret(ORG, "sm", name)
+        .record_external_secret(ORG, "sm", name, true)
         .await
         .unwrap();
     let defs = f.define(pg, "openporch/none").await;
@@ -2223,29 +2213,52 @@ async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_cre
     assert_eq!(f.driver.puts()[0].secrets.expose()["master"], "planted");
 }
 
+impl Fixture {
+    /// `sm`, opened as the executor opens a primary store.
+    async fn open_sm(&self) -> ExternalStore {
+        let record = self.store.secret_store(ORG, "sm").await.unwrap().unwrap();
+        let account = self
+            .store
+            .account(ORG, "aws-main")
+            .await
+            .unwrap()
+            .unwrap()
+            .account;
+        let credentials = self
+            .cloud
+            .resolve(
+                &account,
+                self.cloud.generation(),
+                self.secrets.as_ref(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        ExternalStore::new(
+            self.cloud.clone(),
+            credentials,
+            record,
+            ORG,
+            self.store.clone(),
+        )
+    }
+
+    async fn state(&self, name: &str) -> Option<bool> {
+        self.store
+            .external_secret_state(ORG, "sm", name)
+            .await
+            .unwrap()
+    }
+}
+
 /// The first write to a generated name creates the secret; a later one adds a
-/// version. A name someone else took is refused.
+/// version. A name someone else took is refused, and a create whose answer
+/// was lost is recognized when it is retried.
 #[tokio::test]
 async fn external_writes_create_once_and_never_write_over_others() {
     let f = Fixture::new().await;
     f.aws_store(&[]).await;
-    let record = f.store.secret_store(ORG, "sm").await.unwrap().unwrap();
-    let credentials = f
-        .cloud
-        .resolve(
-            &f.store
-                .account(ORG, "aws-main")
-                .await
-                .unwrap()
-                .unwrap()
-                .account,
-            f.cloud.generation(),
-            f.secrets.as_ref(),
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
-    let store = ExternalStore::new(f.cloud.clone(), credentials, record, ORG, f.store.clone());
+    let store = f.open_sm().await;
     let first = store
         .write("defs/pg/x", &SecretValue::new("one"))
         .await
@@ -2259,22 +2272,94 @@ async fn external_writes_create_once_and_never_write_over_others() {
         (first.version.as_deref(), second.version.as_deref()),
         (Some("v1"), Some("v2"))
     );
-    assert!(
-        f.store
-            .external_secret_created(ORG, "sm", "openporch/acme/defs/pg/x")
-            .await
-            .unwrap()
-    );
+    assert_eq!(f.state("openporch/acme/defs/pg/x").await, Some(true));
+
+    // Someone else's secret at a generated name is left as it is.
+    f.sts
+        .written
+        .lock()
+        .unwrap()
+        .insert("openporch/acme/defs/taken/x".into(), "theirs".into());
     let error = store
         .write("defs/taken/x", &SecretValue::new("three"))
         .await
         .unwrap_err()
         .to_string();
     assert!(error.contains("not created by openporch"), "{error}");
-    assert!(
-        !f.store
-            .external_secret_created(ORG, "sm", "openporch/acme/defs/taken/x")
-            .await
-            .unwrap()
+    assert_eq!(
+        f.sts.written.lock().unwrap()["openporch/acme/defs/taken/x"],
+        "theirs"
     );
+    assert_eq!(f.state("openporch/acme/defs/taken/x").await, Some(false));
+
+    // A create that happened, but whose answer or confirmation was lost,
+    // left its pending record: the retry adds a version and confirms it.
+    let lost = "openporch/acme/defs/pg/lost";
+    f.store
+        .record_external_secret(ORG, "sm", lost, false)
+        .await
+        .unwrap();
+    f.sts
+        .written
+        .lock()
+        .unwrap()
+        .insert(lost.into(), "first try".into());
+    let retried = store
+        .write("defs/pg/lost", &SecretValue::new("retry"))
+        .await
+        .unwrap();
+    assert_eq!(retried.version.as_deref(), Some("v2"));
+    assert_eq!(f.sts.written.lock().unwrap()[lost], "retry");
+    assert_eq!(f.state(lost).await, Some(true));
+}
+
+/// What openporch created is bound to where the store pointed: another
+/// region, or an account that now reaches elsewhere, owns none of it.
+#[tokio::test]
+async fn external_ownership_is_bound_to_the_stores_destination() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let name = "openporch/acme/defs/pg/x";
+    f.store
+        .record_external_secret(ORG, "sm", name, true)
+        .await
+        .unwrap();
+    let config = |region: &str| {
+        json!({"region": region, "cloud_account": "aws-main"})
+            .as_object()
+            .unwrap()
+            .clone()
+    };
+    let update = audit("PATCH", "/orgs/acme/secretstores/sm");
+    f.store
+        .update_secret_store(ORG, "sm", &config("us-east-1"), update.clone())
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, None);
+    f.store
+        .update_secret_store(ORG, "sm", &config("eu-west-1"), update)
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, Some(true));
+
+    // A new access key keeps it; another region of the account forgets it.
+    let mut account = f
+        .store
+        .account(ORG, "aws-main")
+        .await
+        .unwrap()
+        .unwrap()
+        .account;
+    let put = audit("PUT", "/orgs/acme/resources/accounts/aws-main");
+    account
+        .config
+        .insert("access_key_id".into(), json!("AKIANEW"));
+    f.store
+        .update_account(ORG, &account, put.clone())
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, Some(true));
+    account.config.insert("region".into(), json!("us-east-2"));
+    f.store.update_account(ORG, &account, put).await.unwrap();
+    assert_eq!(f.state(name).await, None);
 }
