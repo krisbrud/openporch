@@ -8,8 +8,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use openporch_core::ids::AccountId;
 use openporch_core::model::{CloudAccount, CloudAccountType, SecretRef};
-use openporch_engine::cloud::CloudError;
-use openporch_store::secrets::{BUILTIN_STORE, validate_reference};
+use openporch_engine::cloud::{CloudError, ExternalStore};
+use openporch_store::secrets::{BUILTIN_STORE, SecretStore, validate_reference};
 use openporch_store::{AccountRecord, AccountStore, GrantRecord, NewGrant, SecretStoreRecord};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -236,8 +236,12 @@ async fn write_account(
             let audit = ctx.audit(org, "cloud_account.create", &id);
             state.store.create_account(org, &account, audit).await?;
         } else {
+            let verified = verified_aws_account(state, &account, primary.store()).await?;
             let audit = ctx.audit(org, "cloud_account.update", &id);
-            state.store.update_account(org, &account, audit).await?;
+            state
+                .store
+                .update_account(org, &account, verified.as_deref(), audit)
+                .await?;
             state.cloud.forget(&id);
         }
         Ok(())
@@ -247,6 +251,38 @@ async fn write_account(
         secret_inputs::discard(&primary, written).await;
     }
     result
+}
+
+/// The AWS account `account`'s new credentials belong to, when secret stores
+/// read with it: the secrets openporch created through them stay its own only
+/// there. `None` when STS cannot say, which forgets them.
+async fn verified_aws_account(
+    state: &AppState,
+    account: &CloudAccount,
+    builtin: &dyn SecretStore,
+) -> ApiResult<Option<String>> {
+    let read_at = state.cloud.generation();
+    let used = state
+        .store
+        .secret_stores(state.org())
+        .await?
+        .iter()
+        .any(|s| ExternalStore::account_of(s) == Some(account.id.as_str()));
+    if !used {
+        return Ok(None);
+    }
+    Ok(match state.cloud.check(account, read_at, builtin).await {
+        Ok(identity) => Some(identity.account),
+        Err(e) => {
+            tracing::warn!(
+                account = %account.id,
+                error = %e,
+                "the account's new credentials could not be checked, so the secrets openporch \
+                 created through its stores are no longer treated as its own"
+            );
+            None
+        }
+    })
 }
 
 pub async fn create_account(

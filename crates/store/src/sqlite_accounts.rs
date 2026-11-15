@@ -49,6 +49,19 @@ pub struct SecretStoreRecord {
     pub created_at: i64,
 }
 
+/// A secret openporch creates, or created, in an external store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSecretRecord {
+    /// The AWS account, as STS reported it for the store's credentials.
+    pub aws_account: String,
+    /// The region.
+    pub region: String,
+    /// The random ID the create tags the secret with.
+    pub create_id: String,
+    /// Whether the create finished; `false` while it is pending.
+    pub confirmed: bool,
+}
+
 /// A secret-use grant: the scope allowed to use one reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GrantRecord {
@@ -119,10 +132,14 @@ pub trait AccountStore: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Replaces a cloud account's name, configuration and secrets. The type stays.
+    /// When its credentials or configuration change, the secrets openporch
+    /// created through stores that read with it are forgotten, except those in
+    /// `verified`: the AWS account STS reported for the new credentials.
     fn update_account(
         &self,
         org: &str,
         account: &CloudAccount,
+        verified: Option<&str>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -164,25 +181,31 @@ pub trait AccountStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// What openporch recorded about `reference` in external store `store`, in
-    /// the store's current destination: `Some(true)` once it created it,
-    /// `Some(false)` while a create is pending, `None` otherwise.
-    fn external_secret_state(
+    /// What openporch recorded about creating `reference` in external store
+    /// `store`.
+    fn external_secret(
         &self,
         org: &str,
         store: &str,
         reference: &str,
-    ) -> impl Future<Output = Result<Option<bool>>> + Send;
+    ) -> impl Future<Output = Result<Option<ExternalSecretRecord>>> + Send;
 
     /// Records that openporch is about to create `reference` in external store
-    /// `store` (`confirmed` false), or created it (`confirmed` true), in the
-    /// store's current destination.
+    /// `store`, or created it.
     fn record_external_secret(
         &self,
         org: &str,
         store: &str,
         reference: &str,
-        confirmed: bool,
+        record: &ExternalSecretRecord,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Forgets the record of `reference` in external store `store`.
+    fn forget_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Makes `id` the primary store, where new secrets are written. References
@@ -245,39 +268,45 @@ impl std::fmt::Display for Node {
 }
 
 /// Forgets the secrets openporch created through stores that read with
-/// `account` when the account now may reach another AWS account: any change of
-/// its configuration other than a new access key or session length. They may
-/// be someone else's there, so they are neither written over nor used as an
-/// object's own.
+/// `account` when its configuration or credentials change, other than its
+/// session length, unless they are in `verified`, the AWS account the new
+/// credentials belong to. Elsewhere they may be someone else's, so they are
+/// neither written over nor used as an object's own.
 async fn forget_if_repointed(
     tx: &mut SqliteConnection,
     org: &str,
     account: &CloudAccount,
+    verified: Option<&str>,
 ) -> Result<()> {
-    let old: Option<String> =
-        sqlx::query_scalar("SELECT config FROM cloud_accounts WHERE org_id = ? AND id = ?")
-            .bind(org)
-            .bind(account.id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some(old) = old else { return Ok(()) };
+    let old: Option<(String, String)> = sqlx::query_as(
+        "SELECT config, secret_refs FROM cloud_accounts WHERE org_id = ? AND id = ?",
+    )
+    .bind(org)
+    .bind(account.id.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((old, old_refs)) = old else {
+        return Ok(());
+    };
     let mut old: Map<String, Value> = serde_json::from_str(&old)?;
+    let old_refs: BTreeMap<String, SecretRef> = serde_json::from_str(&old_refs)?;
     let mut new = account.config.clone();
-    for key in ["access_key_id", "session_duration"] {
-        old.remove(key);
-        new.remove(key);
-    }
-    if old == new {
+    old.remove("session_duration");
+    new.remove("session_duration");
+    if old == new && old_refs == account.secret_refs {
         return Ok(());
     }
     sqlx::query(
         "DELETE FROM external_secrets WHERE org_id = ? AND store_id IN \
          (SELECT id FROM secret_stores WHERE org_id = ? \
-          AND json_extract(config, '$.cloud_account') = ?)",
+          AND json_extract(config, '$.cloud_account') = ?) \
+         AND (? IS NULL OR aws_account != ?)",
     )
     .bind(org)
     .bind(org)
     .bind(account.id.as_str())
+    .bind(verified)
+    .bind(verified)
     .execute(&mut *tx)
     .await?;
     Ok(())
@@ -631,13 +660,14 @@ impl AccountStore for SqliteStore {
         &self,
         org: &str,
         account: &CloudAccount,
+        verified: Option<&str>,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         check_account_in(&mut tx, org, account, false).await?;
-        forget_if_repointed(&mut tx, org, account).await?;
+        forget_if_repointed(&mut tx, org, account, verified).await?;
         sqlx::query(
             "UPDATE cloud_accounts SET name = ?, config = ?, secret_refs = ? \
              WHERE org_id = ? AND id = ?",
@@ -780,7 +810,19 @@ impl AccountStore for SqliteStore {
                     "the built-in store has no configuration to change".to_owned(),
                 ));
             }
-            Some(_) => {}
+            Some(old) => {
+                // Secrets openporch created elsewhere may be someone else's.
+                let at = |c: &Map<String, Value>| {
+                    (c.get("cloud_account").cloned(), c.get("region").cloned())
+                };
+                if at(&old.config) != at(config) {
+                    sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ?")
+                        .bind(org)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
         check_store_config(&mut tx, org, id, config).await?;
         sqlx::query("UPDATE secret_stores SET config = ? WHERE org_id = ? AND id = ?")
@@ -794,15 +836,30 @@ impl AccountStore for SqliteStore {
         Ok(())
     }
 
-    async fn external_secret_state(
+    async fn external_secret(
         &self,
         org: &str,
         store: &str,
         reference: &str,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<ExternalSecretRecord>> {
         self.check_org(org)?;
-        let mut conn = self.pool().acquire().await?;
-        crate::secret_use::external_state(&mut conn, org, store, reference).await
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT aws_account, region, create_id, confirmed FROM external_secrets \
+             WHERE org_id = ? AND store_id = ? AND ref = ?",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(
+            |(aws_account, region, create_id, confirmed)| ExternalSecretRecord {
+                aws_account,
+                region,
+                create_id,
+                confirmed: confirmed == 1,
+            },
+        ))
     }
 
     async fn record_external_secret(
@@ -810,30 +867,43 @@ impl AccountStore for SqliteStore {
         org: &str,
         store: &str,
         reference: &str,
-        confirmed: bool,
+        record: &ExternalSecretRecord,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
-        let config = store_row(&mut tx, org, store)
+        store_row(&mut tx, org, store)
             .await?
-            .ok_or_else(|| StoreError::NotFound(format!("secret store `{store}`")))?
-            .config;
+            .ok_or_else(|| StoreError::NotFound(format!("secret store `{store}`")))?;
         sqlx::query(
             "INSERT INTO external_secrets \
-             (org_id, store_id, ref, destination, confirmed, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
+             (org_id, store_id, ref, aws_account, region, create_id, confirmed, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (org_id, store_id, ref) DO UPDATE SET \
-             destination = excluded.destination, confirmed = excluded.confirmed",
+             aws_account = excluded.aws_account, region = excluded.region, \
+             create_id = excluded.create_id, confirmed = excluded.confirmed",
         )
         .bind(org)
         .bind(store)
         .bind(reference)
-        .bind(crate::secret_use::destination(&config))
-        .bind(i64::from(confirmed))
+        .bind(&record.aws_account)
+        .bind(&record.region)
+        .bind(&record.create_id)
+        .bind(i64::from(record.confirmed))
         .bind(now_ms())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn forget_external_secret(&self, org: &str, store: &str, reference: &str) -> Result<()> {
+        self.check_org(org)?;
+        sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ? AND ref = ?")
+            .bind(org)
+            .bind(store)
+            .bind(reference)
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 

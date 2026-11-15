@@ -1685,13 +1685,18 @@ account. openporch writes to an AWS store under `openporch/<org>/<name>`
 `openporch:managed=true` and `openporch:org=<org>`, where `<name>` is the name
 the built-in store would use, such as `defs/<definition>/<key>` or
 `resources/<GUResID>/outputs/<output>`. openporch records each secret it
-creates there, with the store's cloud account and region; only those, while
-the store still points there, belong to the object whose name they carry, like
-one in the built-in store, and only those get new versions. Changing the
-store's `region` or `cloud_account`, or the account's configuration other than
-a new `access_key_id` or `session_duration`, sets them aside until it points
-back. A create whose answer was lost is recognized when it is retried. A secret someone else
-put at such a name needs a grant like any other, and a write to that name is
+creates there, with the AWS account STS reports for the store's credentials,
+the region, and a random create ID it tags the secret with
+(`openporch:create-id`). Only those belong to the object whose name they
+carry, like one in the built-in store, and only those get new versions, while
+they still carry their tag in that AWS account and region. Changing the
+store's `region` or `cloud_account` forgets them; so does changing the
+account's configuration or credentials (other than `session_duration`), unless
+STS reports the new credentials in the same AWS account. A store whose account
+reads its own credentials from an external store owns nothing there, since
+those credentials can change outside openporch. A create whose answer was lost
+is recognized by its tag when it is retried. A secret someone else put at such
+a name needs a grant like any other, and a write to that name is
 refused rather than written over (`422` `CLD-001`).
 
 Retention: openporch never deletes from an external store. A version written

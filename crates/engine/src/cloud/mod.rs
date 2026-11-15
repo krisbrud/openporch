@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::oidc::{Claims, Issuer};
 
 pub use aws::AwsSts;
-pub use external::{CreatedSecrets, ExternalStore, external_name, external_secret};
+pub use external::{CREATE_ID_TAG, CreatedSecrets, ExternalStore, external_name, external_secret};
 
 /// Extra validity required beyond an operation's window, for clock skew and the
 /// time the call itself takes.
@@ -626,18 +626,34 @@ pub trait Sts: Send + Sync {
     }
 
     /// Writes `value` to `secret` (its `version` is ignored) and returns the
-    /// new version. With `create`, the secret is created, tagged for `org`,
-    /// and `None` means one already exists, which is left as it is; without
-    /// it, a version is added to a secret openporch created.
+    /// new version. With a `create_id`, the secret is created, tagged for `org`
+    /// and with the ID, and `None` means one already exists, which is left as
+    /// it is; without one, a version is added to a secret openporch created.
     fn write_secret<'a>(
         &'a self,
         credentials: &'a AwsCredentials,
         secret: &'a AwsSecret,
         value: &'a SecretValue,
         org: &'a str,
-        create: bool,
+        create_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
-        let _ = (credentials, secret, value, org, create);
+        let _ = (credentials, secret, value, org, create_id);
+        Box::pin(async {
+            Err(CloudError::Unavailable(
+                "AWS secret stores cannot be reached".into(),
+            ))
+        })
+    }
+
+    /// The value of `secret`'s tag `key`; `None` when the secret or the tag
+    /// does not exist.
+    fn secret_tag<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        let _ = (credentials, secret, key);
         Box::pin(async {
             Err(CloudError::Unavailable(
                 "AWS secret stores cannot be reached".into(),
@@ -806,10 +822,23 @@ impl CredentialResolver {
         secret: &AwsSecret,
         value: &SecretValue,
         org: &str,
-        create: bool,
+        create_id: Option<&str>,
     ) -> Result<Option<String>, CloudError> {
         self.sts
-            .write_secret(credentials, secret, value, org, create)
+            .write_secret(credentials, secret, value, org, create_id)
+            .await
+            .map_err(|e| redacted(e, credentials))
+    }
+
+    /// The value of `secret`'s tag `key`; see [`Sts::secret_tag`].
+    pub async fn secret_tag(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+        key: &str,
+    ) -> Result<Option<String>, CloudError> {
+        self.sts
+            .secret_tag(credentials, secret, key)
             .await
             .map_err(|e| redacted(e, credentials))
     }

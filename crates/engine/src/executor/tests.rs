@@ -287,6 +287,8 @@ struct FakeSts {
     objects: Mutex<Vec<(Option<String>, String)>>,
     /// Secrets written to AWS stores, by name.
     written: Mutex<BTreeMap<String, String>>,
+    /// The create ID tag of secrets in AWS stores, by name.
+    tags: Mutex<BTreeMap<String, String>>,
 }
 
 impl Sts for FakeSts {
@@ -296,22 +298,48 @@ impl Sts for FakeSts {
         secret: &'a crate::cloud::AwsSecret,
         value: &'a SecretValue,
         _org: &'a str,
-        create: bool,
+        create_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         self.objects.lock().unwrap().push((
             Some(credentials.access_key_id.clone()),
-            format!("{} {secret}", if create { "create" } else { "write" }),
+            format!(
+                "{} {secret}",
+                if create_id.is_some() {
+                    "create"
+                } else {
+                    "write"
+                }
+            ),
         ));
         let mut written = self.written.lock().unwrap();
         // Creating a secret that exists leaves it as it is.
-        let version = if create && written.contains_key(&secret.name) {
-            None
-        } else {
-            let version = if create { "v1" } else { "v2" };
-            written.insert(secret.name.clone(), value.expose().to_owned());
-            Some(version.to_owned())
+        let version = match create_id {
+            Some(_) if written.contains_key(&secret.name) => None,
+            Some(id) => {
+                written.insert(secret.name.clone(), value.expose().to_owned());
+                self.tags
+                    .lock()
+                    .unwrap()
+                    .insert(secret.name.clone(), id.to_owned());
+                Some("v1".to_owned())
+            }
+            None => {
+                written.insert(secret.name.clone(), value.expose().to_owned());
+                Some("v2".to_owned())
+            }
         };
         Box::pin(async move { Ok(version) })
+    }
+
+    fn secret_tag<'a>(
+        &'a self,
+        _credentials: &'a AwsCredentials,
+        secret: &'a crate::cloud::AwsSecret,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        assert_eq!(key, crate::cloud::CREATE_ID_TAG);
+        let tag = self.tags.lock().unwrap().get(&secret.name).cloned();
+        Box::pin(async move { Ok(tag) })
     }
 
     fn assume_role(
@@ -526,6 +554,7 @@ impl Fixture {
             account: Mutex::new("111122223333".into()),
             objects: Mutex::new(Vec::new()),
             written: Mutex::new(BTreeMap::new()),
+            tags: Mutex::new(BTreeMap::new()),
         });
         let cloud = Arc::new(CredentialResolver::new(sts.clone()));
         Self {
@@ -2203,10 +2232,7 @@ async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_cre
     assert!(error.contains("no grant covers it"), "{error}");
 
     // Once openporch created it, it is the definition's own.
-    f.store
-        .record_external_secret(ORG, "sm", name, true)
-        .await
-        .unwrap();
+    f.record(name, true, "id").await;
     let defs = f.define(pg, "openporch/none").await;
     let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
     all_provisioned(&outcomes);
@@ -2243,11 +2269,44 @@ impl Fixture {
         )
     }
 
+    /// Whether openporch confirmed (`Some(true)`) or is creating
+    /// (`Some(false)`) `name` in `sm`.
     async fn state(&self, name: &str) -> Option<bool> {
         self.store
-            .external_secret_state(ORG, "sm", name)
+            .external_secret(ORG, "sm", name)
             .await
             .unwrap()
+            .map(|r| r.confirmed)
+    }
+
+    /// Records a create of `name` in `sm`, in the fake STS's account.
+    async fn record(&self, name: &str, confirmed: bool, create_id: &str) {
+        let record = openporch_store::ExternalSecretRecord {
+            aws_account: self.sts.account.lock().unwrap().clone(),
+            region: "eu-west-1".into(),
+            create_id: create_id.into(),
+            confirmed,
+        };
+        self.store
+            .record_external_secret(ORG, "sm", name, &record)
+            .await
+            .unwrap();
+    }
+
+    /// Puts a secret at `name`, as if someone created it with `tag`.
+    fn plant(&self, name: &str, value: &str, tag: Option<&str>) {
+        self.sts
+            .written
+            .lock()
+            .unwrap()
+            .insert(name.into(), value.into());
+        if let Some(tag) = tag {
+            self.sts
+                .tags
+                .lock()
+                .unwrap()
+                .insert(name.into(), tag.into());
+        }
     }
 }
 
@@ -2274,36 +2333,27 @@ async fn external_writes_create_once_and_never_write_over_others() {
     );
     assert_eq!(f.state("openporch/acme/defs/pg/x").await, Some(true));
 
-    // Someone else's secret at a generated name is left as it is.
-    f.sts
-        .written
-        .lock()
-        .unwrap()
-        .insert("openporch/acme/defs/taken/x".into(), "theirs".into());
-    let error = store
-        .write("defs/taken/x", &SecretValue::new("three"))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("not created by openporch"), "{error}");
-    assert_eq!(
-        f.sts.written.lock().unwrap()["openporch/acme/defs/taken/x"],
-        "theirs"
-    );
-    assert_eq!(f.state("openporch/acme/defs/taken/x").await, Some(false));
+    // Someone else's secret at a generated name is left as it is, and the
+    // record of the attempt is dropped, so a retry is refused too.
+    let taken = "openporch/acme/defs/taken/x";
+    f.plant(taken, "theirs", None);
+    for _ in 0..2 {
+        let error = store
+            .write("defs/taken/x", &SecretValue::new("three"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not created by openporch"), "{error}");
+        assert_eq!(f.sts.written.lock().unwrap()[taken], "theirs");
+        assert_eq!(f.state(taken).await, None);
+    }
 
     // A create that happened, but whose answer or confirmation was lost,
-    // left its pending record: the retry adds a version and confirms it.
+    // left its pending record and its tag: the retry adds a version and
+    // confirms it.
     let lost = "openporch/acme/defs/pg/lost";
-    f.store
-        .record_external_secret(ORG, "sm", lost, false)
-        .await
-        .unwrap();
-    f.sts
-        .written
-        .lock()
-        .unwrap()
-        .insert(lost.into(), "first try".into());
+    f.record(lost, false, "lost-id").await;
+    f.plant(lost, "first try", Some("lost-id"));
     let retried = store
         .write("defs/pg/lost", &SecretValue::new("retry"))
         .await
@@ -2311,19 +2361,47 @@ async fn external_writes_create_once_and_never_write_over_others() {
     assert_eq!(retried.version.as_deref(), Some("v2"));
     assert_eq!(f.sts.written.lock().unwrap()[lost], "retry");
     assert_eq!(f.state(lost).await, Some(true));
+
+    // A pending record does not make someone else's secret openporch's: it
+    // carries no create ID, or another one.
+    for (name, tag) in [("pending-a", None), ("pending-b", Some("theirs"))] {
+        let full = format!("openporch/acme/defs/pg/{name}");
+        f.record(&full, false, "mine").await;
+        f.plant(&full, "theirs", tag);
+        let error = store
+            .write(&format!("defs/pg/{name}"), &SecretValue::new("mine"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not created by openporch"), "{error}");
+        assert_eq!(f.sts.written.lock().unwrap()[&full], "theirs");
+        assert_eq!(f.state(&full).await, None);
+    }
+
+    // Nor does a confirmed record once the secret was replaced by one
+    // without its tag.
+    let replaced = "openporch/acme/defs/pg/replaced";
+    f.record(replaced, true, "mine").await;
+    f.plant(replaced, "theirs", Some("other"));
+    let error = store
+        .write("defs/pg/replaced", &SecretValue::new("mine"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not created by openporch"), "{error}");
+    assert_eq!(f.sts.written.lock().unwrap()[replaced], "theirs");
 }
 
-/// What openporch created is bound to where the store pointed: another
-/// region, or an account that now reaches elsewhere, owns none of it.
+/// What openporch created is bound to where it was created: the AWS account
+/// STS reported and the region. Repointing the store, or account credentials
+/// that may reach another AWS account, forget it; a write in another AWS
+/// account treats the name as unknown.
 #[tokio::test]
-async fn external_ownership_is_bound_to_the_stores_destination() {
+async fn external_ownership_is_bound_to_the_aws_account_and_region() {
     let f = Fixture::new().await;
     f.aws_store(&[]).await;
     let name = "openporch/acme/defs/pg/x";
-    f.store
-        .record_external_secret(ORG, "sm", name, true)
-        .await
-        .unwrap();
+    f.record(name, true, "id").await;
     let config = |region: &str| {
         json!({"region": region, "cloud_account": "aws-main"})
             .as_object()
@@ -2331,6 +2409,11 @@ async fn external_ownership_is_bound_to_the_stores_destination() {
             .clone()
     };
     let update = audit("PATCH", "/orgs/acme/secretstores/sm");
+    f.store
+        .update_secret_store(ORG, "sm", &config("eu-west-1"), update.clone())
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, Some(true));
     f.store
         .update_secret_store(ORG, "sm", &config("us-east-1"), update.clone())
         .await
@@ -2340,9 +2423,9 @@ async fn external_ownership_is_bound_to_the_stores_destination() {
         .update_secret_store(ORG, "sm", &config("eu-west-1"), update)
         .await
         .unwrap();
-    assert_eq!(f.state(name).await, Some(true));
+    assert_eq!(f.state(name).await, None);
 
-    // A new access key keeps it; another region of the account forgets it.
+    // New credentials keep it only where STS verified they still reach.
     let mut account = f
         .store
         .account(ORG, "aws-main")
@@ -2351,15 +2434,44 @@ async fn external_ownership_is_bound_to_the_stores_destination() {
         .unwrap()
         .account;
     let put = audit("PUT", "/orgs/acme/resources/accounts/aws-main");
-    account
-        .config
-        .insert("access_key_id".into(), json!("AKIANEW"));
+    let same = f.sts.account.lock().unwrap().clone();
     f.store
-        .update_account(ORG, &account, put.clone())
+        .update_account(ORG, &account, None, put.clone())
+        .await
+        .unwrap();
+    for (key, verified, kept) in [
+        ("AKIANEW", Some(same.as_str()), true),
+        ("AKIANEWER", Some("999999999999"), false),
+        ("AKIANEWEST", None, false),
+    ] {
+        f.record(name, true, "id").await;
+        account.config.insert("access_key_id".into(), json!(key));
+        f.store
+            .update_account(ORG, &account, verified, put.clone())
+            .await
+            .unwrap();
+        assert_eq!(f.state(name).await.is_some(), kept, "{key}");
+    }
+
+    // An unchanged account keeps it without a check.
+    f.record(name, true, "id").await;
+    f.store
+        .update_account(ORG, &account, None, put)
         .await
         .unwrap();
     assert_eq!(f.state(name).await, Some(true));
-    account.config.insert("region".into(), json!("us-east-2"));
-    f.store.update_account(ORG, &account, put).await.unwrap();
-    assert_eq!(f.state(name).await, None);
+
+    // A write whose credentials reach another AWS account does not trust the
+    // record: the secret there is someone else's.
+    f.plant(name, "theirs", Some("id"));
+    *f.sts.account.lock().unwrap() = "444455556666".into();
+    let error = f
+        .open_sm()
+        .await
+        .write("defs/pg/x", &SecretValue::new("mine"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not created by openporch"), "{error}");
+    assert_eq!(f.sts.written.lock().unwrap()[name], "theirs");
 }

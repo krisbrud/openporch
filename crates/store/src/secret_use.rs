@@ -219,16 +219,11 @@ fn collect(refs: &Map<String, Value>, out: &mut Vec<SecretRef>) {
     }
 }
 
-/// Where an external store's secrets live: `<cloud account>/<region>` from its
-/// configuration.
-pub(crate) fn destination(config: &Map<String, Value>) -> String {
-    let get = |k: &str| config.get(k).and_then(Value::as_str).unwrap_or_default();
-    format!("{}/{}", get("cloud_account"), get("region"))
-}
-
 /// Whether `r` is in the built-in store, which only openporch writes, or is a
-/// secret openporch created in an external store, in the store's current
-/// destination.
+/// secret openporch created in an external store, through the store's current
+/// cloud account, while that account's credentials stay in the built-in store.
+/// Rows are forgotten when the store or account is repointed, so a confirmed
+/// row is in the AWS account and region the store reads from.
 pub(crate) async fn created_externally(
     conn: &mut SqliteConnection,
     org: &str,
@@ -237,31 +232,24 @@ pub(crate) async fn created_externally(
     if r.store == BUILTIN_STORE {
         return Ok(true);
     }
-    Ok(external_state(conn, org, &r.store, &r.reference).await? == Some(true))
-}
-
-/// What openporch recorded about `reference` in external store `store`, in
-/// the store's current destination: `Some(true)` once created, `Some(false)`
-/// while a create is pending, `None` when it never created it there.
-pub(crate) async fn external_state(
-    conn: &mut SqliteConnection,
-    org: &str,
-    store: &str,
-    reference: &str,
-) -> Result<Option<bool>> {
-    let row: Option<(String, i64, String)> = sqlx::query_as(
-        "SELECT e.destination, e.confirmed, s.config FROM external_secrets e \
+    let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT e.confirmed, e.region, a.secret_refs FROM external_secrets e \
          JOIN secret_stores s ON s.org_id = e.org_id AND s.id = e.store_id \
-         WHERE e.org_id = ? AND e.store_id = ? AND e.ref = ?",
+         LEFT JOIN cloud_accounts a ON a.org_id = s.org_id \
+          AND a.id = json_extract(s.config, '$.cloud_account') \
+         WHERE e.org_id = ? AND e.store_id = ? AND e.ref = ? \
+          AND e.region = json_extract(s.config, '$.region')",
     )
     .bind(org)
-    .bind(store)
-    .bind(reference)
+    .bind(&r.store)
+    .bind(&r.reference)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((recorded, confirmed, config)) = row else {
-        return Ok(None);
+    let Some((confirmed, _, Some(refs))) = row else {
+        return Ok(false);
     };
-    let config: Map<String, Value> = serde_json::from_str(&config)?;
-    Ok((recorded == destination(&config)).then_some(confirmed == 1))
+    // Credentials read from an external store can change outside openporch,
+    // and with them the AWS account the store reaches.
+    let refs: std::collections::BTreeMap<String, SecretRef> = serde_json::from_str(&refs)?;
+    Ok(confirmed == 1 && refs.values().all(|r| r.store == BUILTIN_STORE))
 }

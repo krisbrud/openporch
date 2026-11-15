@@ -160,12 +160,21 @@ impl Sts for AwsSts {
         secret: &'a AwsSecret,
         value: &'a SecretValue,
         org: &'a str,
-        create: bool,
+        create_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
-            self.write_secret_json(credentials, secret, value, org, create)
+            self.write_secret_json(credentials, secret, value, org, create_id)
                 .await
         })
+    }
+
+    fn secret_tag<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
+        Box::pin(async move { self.secret_tag_json(credentials, secret, key).await })
     }
 
     fn assume_role(
@@ -636,11 +645,13 @@ impl AwsSts {
         secret: &AwsSecret,
         value: &SecretValue,
         org: &str,
-        create: bool,
+        create_id: Option<&str>,
     ) -> Result<Option<String>, CloudError> {
+        let create = create_id.is_some();
         let tags = serde_json::json!([
             {"Key": "openporch:managed", "Value": "true"},
             {"Key": "openporch:org", "Value": org},
+            {"Key": super::CREATE_ID_TAG, "Value": create_id.unwrap_or_default()},
         ]);
         let (service, target, body) = match (secret.service, create) {
             (SecretService::SecretsManager, true) => (
@@ -693,6 +704,49 @@ impl AwsSts {
         version.map(Some).ok_or_else(|| {
             CloudError::Rejected(format!("{target} of {secret} returned no version"))
         })
+    }
+}
+
+impl AwsSts {
+    /// The value of `secret`'s tag `key`; `None` when the secret or the tag
+    /// does not exist.
+    pub(super) async fn secret_tag_json(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+        key: &str,
+    ) -> Result<Option<String>, CloudError> {
+        let (service, target, body, list) = match secret.service {
+            SecretService::SecretsManager => (
+                "secretsmanager",
+                "secretsmanager.DescribeSecret",
+                serde_json::json!({"SecretId": secret.name}),
+                "Tags",
+            ),
+            SecretService::Ssm => (
+                "ssm",
+                "AmazonSSM.ListTagsForResource",
+                serde_json::json!({"ResourceType": "Parameter", "ResourceId": secret.name}),
+                "TagList",
+            ),
+        };
+        let (status, out) = self
+            .json_call(credentials, service, target, &secret.region, &body)
+            .await?;
+        let answer: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+        if !(200..300).contains(&status) {
+            let (code, message) = aws_error(&answer);
+            return match code {
+                "ResourceNotFoundException" | "InvalidResourceId" | "ParameterNotFound" => Ok(None),
+                _ => Err(call_error(target, secret, status, code, message)),
+            };
+        }
+        Ok(answer[list].as_array().and_then(|tags| {
+            tags.iter()
+                .find(|t| t["Key"].as_str() == Some(key))
+                .and_then(|t| t["Value"].as_str())
+                .map(str::to_owned)
+        }))
     }
 }
 

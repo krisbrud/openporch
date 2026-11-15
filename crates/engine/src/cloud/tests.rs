@@ -905,7 +905,11 @@ async fn real_secret_read() {
         ),
     ] {
         let mut versions = Vec::new();
-        for (value, create) in [("first-value", true), ("second-value", false)] {
+        let create_id = format!("test-{}", std::process::id());
+        for (value, create) in [
+            ("first-value", Some(create_id.as_str())),
+            ("second-value", None),
+        ] {
             let version = resolver
                 .write_secret(
                     &credentials,
@@ -926,11 +930,34 @@ async fn real_secret_read() {
                 &secret(service, name.clone(), None),
                 &SecretValue::new("third-value"),
                 "acme",
-                true,
+                Some("another"),
             )
             .await
             .unwrap_or_else(|e| panic!("creating {service} `{name}` again: {e}"));
         assert_eq!(again, None, "{service} `{name}`");
+        // The secret carries the ID of the create that made it.
+        let tag = resolver
+            .secret_tag(
+                &credentials,
+                &secret(service, name.clone(), None),
+                crate::cloud::CREATE_ID_TAG,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("tags of {service} `{name}`: {e}"));
+        assert_eq!(
+            tag.as_deref(),
+            Some(create_id.as_str()),
+            "{service} `{name}`"
+        );
+        let none = resolver
+            .secret_tag(
+                &credentials,
+                &secret(service, format!("{name}-missing"), None),
+                crate::cloud::CREATE_ID_TAG,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("tags of {service} `{name}-missing`: {e}"));
+        assert_eq!(none, None, "{service} `{name}-missing`");
         for (version, value) in &versions {
             let read = resolver
                 .read_secret(&credentials, &secret(service, name.clone(), Some(version)))

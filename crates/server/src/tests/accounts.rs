@@ -675,7 +675,7 @@ impl Sts for FakeSts {
         secret: &'a AwsSecret,
         value: &'a SecretValue,
         org: &'a str,
-        _create: bool,
+        _create_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<String>, CloudError>> {
         Box::pin(async move {
             assert_eq!(c.access_key_id, "AKIAEXAMPLE");

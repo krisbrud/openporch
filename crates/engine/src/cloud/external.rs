@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use openporch_core::model::SecretRef;
 use openporch_store::secrets::{BoxFuture, SecretError, SecretStore, SecretValue};
-use openporch_store::{AccountStore, SecretStoreRecord, StoreError};
+use openporch_store::{AccountStore, ExternalSecretRecord, SecretStoreRecord, StoreError};
 use serde_json::Value;
 
 use super::{AwsCredentials, AwsSecret, CloudError, CredentialResolver, SecretService};
@@ -70,24 +70,34 @@ pub fn external_name(service: SecretService, org: &str, name: &str) -> Result<St
     })
 }
 
+/// The tag a create puts on a secret, holding the random ID of its record.
+pub const CREATE_ID_TAG: &str = "openporch:create-id";
+
 /// The record of which secrets openporch created in external stores.
 pub trait CreatedSecrets: Send + Sync {
-    /// `Some(true)` when openporch created `name` in `store`, `Some(false)`
-    /// while a create of it is pending, `None` otherwise.
+    /// What openporch recorded about creating `name` in `store`.
     fn state<'a>(
         &'a self,
         org: &'a str,
         store: &'a str,
         name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<bool>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Option<ExternalSecretRecord>, StoreError>>;
 
-    /// Records a pending (`confirmed` false) or finished create of `name`.
+    /// Records a pending or finished create of `name`.
     fn record<'a>(
         &'a self,
         org: &'a str,
         store: &'a str,
         name: &'a str,
-        confirmed: bool,
+        record: &'a ExternalSecretRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Forgets the record of `name`.
+    fn forget<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
@@ -97,8 +107,8 @@ impl<S: AccountStore> CreatedSecrets for S {
         org: &'a str,
         store: &'a str,
         name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<bool>, StoreError>> {
-        Box::pin(self.external_secret_state(org, store, name))
+    ) -> BoxFuture<'a, Result<Option<ExternalSecretRecord>, StoreError>> {
+        Box::pin(self.external_secret(org, store, name))
     }
 
     fn record<'a>(
@@ -106,19 +116,38 @@ impl<S: AccountStore> CreatedSecrets for S {
         org: &'a str,
         store: &'a str,
         name: &'a str,
-        confirmed: bool,
+        record: &'a ExternalSecretRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(self.record_external_secret(org, store, name, confirmed))
+        Box::pin(self.record_external_secret(org, store, name, record))
     }
+
+    fn forget<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(self.forget_external_secret(org, store, name))
+    }
+}
+
+/// A fresh random create ID.
+fn create_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// An AWS store, opened with fresh credentials of its cloud account.
 ///
-/// A write records a pending create, creates the secret at its generated name
-/// and confirms the record; only then do later writes add versions to it. A
-/// secret someone else put at that name is refused, never written over. A
-/// create retried while its record is pending, because its answer or the
-/// confirmation was lost, adopts the existing secret as the one it created.
+/// A write records a pending create with a random ID, creates the secret at
+/// its generated name tagged with that ID, and confirms the record; later
+/// writes add versions to it while it still carries the tag, in the AWS
+/// account and region it was created in. A secret someone else put at that
+/// name is refused, never written over. A create retried while its record is
+/// pending, because its answer or the confirmation was lost, recognizes the
+/// secret it created by the tag.
 pub struct ExternalStore {
     cloud: Arc<CredentialResolver>,
     credentials: AwsCredentials,
@@ -191,35 +220,83 @@ impl SecretStore for ExternalStore {
             secret.name = external_name(secret.service, &self.org, name).map_err(refused)?;
             let store = self.record.id.as_str();
             let org = self.org.as_str();
-            let state = self.created.state(org, store, &secret.name).await?;
-            let write = |create| {
+            let cloud = |e| self.failed(e);
+            let aws_account = self
+                .cloud
+                .identity(&self.credentials)
+                .await
+                .map_err(cloud)?
+                .account;
+            let tag = || {
                 self.cloud
-                    .write_secret(&self.credentials, &secret, value, org, create)
+                    .secret_tag(&self.credentials, &secret, CREATE_ID_TAG)
             };
-            let version = match state {
-                Some(true) => write(false).await,
-                None | Some(false) => {
-                    if state.is_none() {
-                        self.created.record(org, store, &secret.name, false).await?;
+            let write = |create_id| {
+                self.cloud
+                    .write_secret(&self.credentials, &secret, value, org, create_id)
+            };
+            // A record elsewhere, or of a secret that no longer carries its
+            // create ID, says nothing about the secret at this name.
+            let mut known = self
+                .created
+                .state(org, store, &secret.name)
+                .await?
+                .filter(|r| r.aws_account == aws_account && r.region == secret.region);
+            if let Some(r) = known.as_ref().filter(|r| r.confirmed)
+                && tag().await.map_err(cloud)?.as_deref() != Some(r.create_id.as_str())
+            {
+                known = None;
+            }
+            let version = match known {
+                Some(r) if r.confirmed => write(None).await.map_err(cloud)?,
+                _ => {
+                    let record = match known {
+                        Some(pending) => pending,
+                        None => {
+                            let pending = ExternalSecretRecord {
+                                aws_account,
+                                region: secret.region.clone(),
+                                create_id: create_id(),
+                                confirmed: false,
+                            };
+                            self.created
+                                .record(org, store, &secret.name, &pending)
+                                .await?;
+                            pending
+                        }
+                    };
+                    let version = match write(Some(&record.create_id)).await.map_err(cloud)? {
+                        Some(version) => Some(version),
+                        // The pending create happened if the secret carries
+                        // its ID; otherwise someone else made it.
+                        None if tag().await.map_err(cloud)?.as_deref()
+                            == Some(record.create_id.as_str()) =>
+                        {
+                            write(None).await.map_err(cloud)?
+                        }
+                        None => {
+                            self.created.forget(org, store, &secret.name).await?;
+                            None
+                        }
+                    };
+                    if version.is_some() {
+                        let confirmed = ExternalSecretRecord {
+                            confirmed: true,
+                            ..record
+                        };
+                        self.created
+                            .record(org, store, &secret.name, &confirmed)
+                            .await?;
                     }
-                    match write(true).await {
-                        Ok(Some(version)) => Ok(Some(version)),
-                        // The pending create may have happened: add a version.
-                        Ok(None) if state == Some(false) => write(false).await,
-                        other => other,
-                    }
+                    version
                 }
             }
-            .map_err(|e| self.failed(e))?
             .ok_or_else(|| {
                 refused(format!(
                     "{secret} already exists and was not created by openporch, so it is not \
                      written over"
                 ))
             })?;
-            if state != Some(true) {
-                self.created.record(org, store, &secret.name, true).await?;
-            }
             Ok(SecretRef {
                 store: self.record.id.clone(),
                 reference: secret.name,
