@@ -26,6 +26,9 @@ in `examples/`. It offers these resources, each importable, and the
 | `openporch_resource_definition` | `DEFINITION` |
 | `openporch_resource_definition_criteria` | `DEFINITION/CRITERION` |
 | `openporch_driver` (external HTTP drivers) | `NAMESPACE/NAME` |
+| `openporch_resource_type` (custom types) | `ORG/NAME` |
+| `openporch_secret_store` (AWS Secrets Manager and SSM) | `STORE` |
+| `openporch_secret_grant` (secret-use grants) | `STORE/GRANT_ID` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
@@ -83,6 +86,21 @@ with the configuration. It writes a secret again only when the configured value
 changes, or when the version on the server is no longer the one it wrote, as
 happens when someone writes the secret outside OpenTofu. An imported secret is
 imported as its reference.
+
+## Secret stores and grants
+
+`openporch_secret_store` registers an AWS Secrets Manager or SSM Parameter
+Store store with the cloud account that reads and writes it. `primary = true`
+makes it the store new secret values are written to; the server opens the
+store with its account first, so the apply fails while AWS refuses the
+account's credentials. `primary = false` never unmarks a store: switch by
+setting `primary = true` on another store. A store that is primary, or that
+anything still references, cannot be deleted.
+
+`openporch_secret_grant` lets an application, one of its environments or the
+whole organization use one reference it did not write. Grants are checked
+right before a deployment reads a secret, so destroying a grant blocks later
+deployments, and replays, that need it.
 
 ## Protecting the state
 

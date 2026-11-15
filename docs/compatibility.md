@@ -66,5 +66,4 @@ Likewise, `openporch_driver` needs a server with
 have, so its changes are refused there; registering and deleting drivers work.
 
 Integrations planned for later milestones are not available in this release:
-Kubernetes and EKS targets, AWS Secrets Manager and SSM secret stores, Postgres,
-remote executors and GitOps delivery.
+Kubernetes and EKS targets, Postgres, remote executors and GitOps delivery.
