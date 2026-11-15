@@ -221,7 +221,8 @@ fn collect(refs: &Map<String, Value>, out: &mut Vec<SecretRef>) {
 
 /// Whether `r` is in the built-in store, which only openporch writes, or is a
 /// secret openporch created in an external store, through the store's current
-/// cloud account, while that account's credentials stay in the built-in store.
+/// cloud account, while that account's credentials are pinned versions in the
+/// built-in store.
 /// Rows are forgotten when the store or account is repointed, so a confirmed
 /// row is in the AWS account and region the store reads from.
 pub(crate) async fn created_externally(
@@ -248,8 +249,12 @@ pub(crate) async fn created_externally(
     let Some((confirmed, _, Some(refs))) = row else {
         return Ok(false);
     };
-    // Credentials read from an external store can change outside openporch,
-    // and with them the AWS account the store reaches.
+    // Credentials whose value can change without the account changing, read
+    // from an external store or an unpinned built-in secret another object may
+    // write, can reach another AWS account.
     let refs: std::collections::BTreeMap<String, SecretRef> = serde_json::from_str(&refs)?;
-    Ok(confirmed == 1 && refs.values().all(|r| r.store == BUILTIN_STORE))
+    Ok(confirmed == 1
+        && refs
+            .values()
+            .all(|r| r.store == BUILTIN_STORE && r.version.is_some()))
 }

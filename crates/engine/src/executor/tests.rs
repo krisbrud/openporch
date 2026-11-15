@@ -943,7 +943,7 @@ impl Fixture {
         let account: CloudAccount = serde_json::from_value(json!({
             "id": "aws-main", "type": "aws",
             "config": {"access_key_id": "AKIATEST", "region": "eu-north-1"},
-            "secret_refs": {"secret_access_key": {"store": "openporch", "ref": "accounts/aws-main/secret_access_key"}},
+            "secret_refs": {"secret_access_key": {"store": "openporch", "ref": "accounts/aws-main/secret_access_key", "version": "1"}},
         }))
         .unwrap();
         self.store
@@ -2252,8 +2252,40 @@ async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_cre
         .to_string();
     assert!(error.contains("no grant covers it"), "{error}");
 
-    // Once openporch created it, it is the definition's own.
+    // Once openporch created it, it is the definition's own, but only while
+    // the account's credentials are pinned: an unpinned key can be replaced,
+    // and with it the AWS account, without the account changing.
     f.record(name, true, "id").await;
+    let mut account = f
+        .store
+        .account(ORG, "aws-main")
+        .await
+        .unwrap()
+        .unwrap()
+        .account;
+    let pinned = account.secret_refs.clone();
+    for r in account.secret_refs.values_mut() {
+        r.version = None;
+    }
+    let put = audit("PUT", "/orgs/acme/resources/accounts/aws-main");
+    let same = f.sts.account.lock().unwrap().clone();
+    f.store
+        .update_account(ORG, &account, Some(&same), put.clone())
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, Some(true));
+    let error = f
+        .store
+        .create_definition(ORG, &pg, audit("POST", "/orgs/acme/resources/defs"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no grant covers it"), "{error}");
+    account.secret_refs = pinned;
+    f.store
+        .update_account(ORG, &account, Some(&same), put)
+        .await
+        .unwrap();
     let defs = f.define(pg, "openporch/none").await;
     let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
     all_provisioned(&outcomes);

@@ -1697,8 +1697,10 @@ they still carry their tag in that AWS account and region. Changing the
 store's `region` or `cloud_account` forgets them; so does changing the
 account's configuration or credentials (other than `session_duration`), unless
 STS reports the new credentials in the same AWS account. A store whose account
-reads its own credentials from an external store owns nothing there, since
-those credentials can change outside openporch. A create whose answer was lost
+reads its credentials from an external store, or from a built-in secret
+without a pinned `version`, owns nothing there, since those credentials can
+change without the account changing. (Credentials given as `{value}` are
+written and pinned for the account.) A create whose answer was lost
 is recognized by its tag when it is retried. A secret someone else put at such
 a name needs a grant like any other, and a write to that name is
 refused rather than written over (`422` `CLD-001`).
