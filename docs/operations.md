@@ -209,7 +209,7 @@ the short-lived tokens it signs instead of holding standing credentials. Turn
 it on with the HTTPS URL at which the cloud provider reaches this server:
 
 ```toml
-public_url = "https://porch.example.com"
+public_url = "https://porch.example.com"   # the root, with no path
 
 [oidc]
 # How long a rotated-out key stays published, in minutes (15 to 43200).

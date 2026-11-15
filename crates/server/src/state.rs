@@ -41,6 +41,9 @@ pub struct Inner {
     pub signer: Option<SessionSigner>,
     /// The OIDC issuer, when `public_url` is set and the keys are available.
     pub issuer: Option<Arc<Issuer>>,
+    /// Held while a key rotation commits and the issuer takes its keys, so
+    /// overlapping rotations cannot leave the issuer with an older set.
+    pub oidc_rotation: tokio::sync::Mutex<()>,
     /// Why the server is not ready; empty when it is.
     pub not_ready: Vec<String>,
     /// The GitHub identity provider, when configured.
@@ -371,6 +374,7 @@ pub(crate) async fn start_with_drivers(
         keyring,
         signer,
         issuer,
+        oidc_rotation: tokio::sync::Mutex::new(()),
         not_ready,
         github,
         cloud: Arc::new(CredentialResolver::new(sts)),

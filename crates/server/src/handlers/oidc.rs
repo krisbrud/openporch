@@ -60,6 +60,7 @@ pub async fn rotate(State(state): State<AppState>, ctx: Ctx) -> ApiResult<Json<R
     let grace_ms = i64::try_from(state.config.oidc.key_grace_minutes)
         .unwrap_or(i64::MAX)
         .saturating_mul(60_000);
+    let _rotating = state.oidc_rotation.lock().await;
     let mut audit = ctx.audit(state.org(), ROTATE_ACTION, "oidc");
     audit.outcome = AuditOutcome::Succeeded;
     let stored = state

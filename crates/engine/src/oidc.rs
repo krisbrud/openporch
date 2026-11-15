@@ -34,8 +34,9 @@ pub enum OidcError {
     /// There is no key to sign with.
     #[error("the OIDC issuer has no active signing key")]
     NoKey,
-    /// A token was asked for with a lifetime above [`MAX_TOKEN_LIFETIME`].
-    #[error("identity tokens live at most {} seconds", MAX_TOKEN_LIFETIME.as_secs())]
+    /// A token was asked for with a lifetime under a second or above
+    /// [`MAX_TOKEN_LIFETIME`].
+    #[error("identity tokens live from 1 to {} seconds", MAX_TOKEN_LIFETIME.as_secs())]
     Lifetime,
     /// Signing failed.
     #[error("signing an identity token failed")]
@@ -246,7 +247,9 @@ impl Issuer {
 
     /// Mints an identity token issued at `now` (milliseconds since the epoch).
     pub fn mint(&self, claims: &Claims, now: i64) -> Result<String, OidcError> {
-        if claims.lifetime > MAX_TOKEN_LIFETIME || claims.lifetime.is_zero() {
+        // `exp` is in whole seconds, so a lifetime under a second would sign
+        // a token that is already expired.
+        if claims.lifetime > MAX_TOKEN_LIFETIME || claims.lifetime.as_secs() == 0 {
             return Err(OidcError::Lifetime);
         }
         let keys = self.keys.read().expect("issuer keys");

@@ -80,7 +80,11 @@ fn tokens_verify_against_the_published_jwks() {
 #[test]
 fn lifetimes_are_bounded() {
     let issuer = Issuer::new(URL, &[stored(0, 1, None)]).unwrap();
-    for lifetime in [MAX_TOKEN_LIFETIME + Duration::from_secs(1), Duration::ZERO] {
+    for lifetime in [
+        MAX_TOKEN_LIFETIME + Duration::from_secs(1),
+        Duration::ZERO,
+        Duration::from_millis(999),
+    ] {
         assert!(matches!(
             issuer.mint(&claims(lifetime), 0),
             Err(OidcError::Lifetime)

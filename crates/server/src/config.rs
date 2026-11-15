@@ -55,8 +55,8 @@ pub struct Config {
     /// Container registries other than ECR.
     #[serde(default)]
     pub images: ImageSettings,
-    /// The HTTPS URL at which cloud providers reach this server, such as
-    /// `https://porch.example.com`. It enables the OIDC issuer at
+    /// The HTTPS URL at which cloud providers reach this server's root, such
+    /// as `https://porch.example.com`, with no path. It enables the OIDC issuer at
     /// `<public_url>/oidc`; without it the issuer is off.
     #[serde(default)]
     pub public_url: Option<String>,
@@ -93,8 +93,8 @@ fn default_oidc_grace_minutes() -> u64 {
     24 * 60
 }
 
-/// Checks `public_url`: an absolute HTTPS URL with no credentials, query or
-/// fragment, returned without a trailing slash.
+/// Checks `public_url`: an absolute HTTPS URL of a host (and port), with no
+/// path, credentials, query or fragment, returned without a trailing slash.
 pub fn check_public_url(url: &str) -> Result<String, ConfigError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ConfigError(format!("`public_url` is not a URL: {e}")))?;
@@ -112,8 +112,15 @@ pub fn check_public_url(url: &str) -> Result<String, ConfigError> {
         || parsed.fragment().is_some()
     {
         return Err(ConfigError(
-            "`public_url` must be a host and optional path, with no credentials, query or \
-             fragment"
+            "`public_url` must be a host, with no credentials, query or fragment".into(),
+        ));
+    }
+    // The issuer is served at `/oidc` from the root, so a path prefix would
+    // advertise URLs the server does not answer.
+    if parsed.path() != "/" {
+        return Err(ConfigError(
+            "`public_url` must not have a path: the issuer is served at `/oidc` from the \
+             server's root"
                 .into(),
         ));
     }
