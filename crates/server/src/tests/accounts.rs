@@ -4,7 +4,9 @@
 use std::time::SystemTime;
 
 use axum::http::{Method, StatusCode};
-use openporch_engine::cloud::{AssumeRole, AwsCredentials, CallerIdentity, CloudError, Sts};
+use openporch_engine::cloud::{
+    AssumeRole, AwsCredentials, AwsSecret, CallerIdentity, CloudError, Sts,
+};
 use openporch_store::secrets::{BoxFuture, SecretValue};
 use serde_json::{Value, json};
 
@@ -653,6 +655,24 @@ async fn account_changes_are_audited() {
 struct FakeSts;
 
 impl Sts for FakeSts {
+    /// `shop/db-user` exists, `down/...` cannot be reached, nothing else exists.
+    fn read_secret<'a>(
+        &'a self,
+        c: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+    ) -> BoxFuture<'a, Result<Option<SecretValue>, CloudError>> {
+        Box::pin(async move {
+            assert_eq!(c.access_key_id, "AKIAEXAMPLE");
+            assert_eq!(c.secret_access_key.expose(), "wJalr-secret");
+            if secret.name.starts_with("down/") {
+                return Err(CloudError::Unavailable(
+                    "secretsmanager.GetSecretValue could not reach the service".into(),
+                ));
+            }
+            Ok((secret.name == "shop/db-user").then(|| SecretValue::new("db-user-plaintext")))
+        })
+    }
+
     fn assume_role(&self, r: AssumeRole) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
         Box::pin(async move {
             if r.role_arn.ends_with("/offline") {
@@ -953,4 +973,67 @@ async fn an_opentofu_definition_runs_with_the_role_accounts_session() {
     }
     let (_, d) = s.get(&format!("{deploys}/{id}"), &s.admin).await;
     assert!(!d.to_string().contains("session-token"), "{d}");
+}
+
+/// The Register an AWS store scenario: the store check reads a test secret with
+/// the store's cloud account and never returns its value.
+#[tokio::test]
+async fn a_store_check_reads_a_test_secret_with_the_stores_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
+    let state = crate::start_with(config, None, std::sync::Arc::new(FakeSts))
+        .await
+        .unwrap();
+    let s = super::server_from(dir, state);
+    s.static_account("aws-prod").await;
+    s.aws_store("prod-sm", "aws-prod").await;
+    let check = format!("{STORES}/prod-sm/check");
+    let b = s
+        .ok(Method::POST, &check, json!({"ref": "shop/db-user"}))
+        .await;
+    assert_eq!(
+        b,
+        json!({"store": "prod-sm", "ref": "shop/db-user", "readable": true,
+               "cloud_account": "aws-prod"})
+    );
+
+    let (status, b) = s
+        .send(
+            Method::POST,
+            &check,
+            json!({"ref": "shop/nope", "version": "v2"}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::UNPROCESSABLE_ENTITY, "CLD-001");
+    assert!(
+        message(&b).contains("`shop/nope` version v2 was not found"),
+        "{b}"
+    );
+    let (status, b) = s
+        .send(Method::POST, &check, json!({"ref": "down/db-user"}))
+        .await;
+    assert_error(status, &b, StatusCode::BAD_GATEWAY, "CLD-002");
+    assert!(message(&b).contains("secret store `prod-sm`"), "{b}");
+    for (path, body, status) in [
+        (
+            check.clone(),
+            json!({"ref": "${context.app.id}"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (check.clone(), json!({}), StatusCode::BAD_REQUEST),
+        (
+            format!("{STORES}/openporch/check"),
+            json!({"ref": "a"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("{STORES}/nope/check"),
+            json!({"ref": "a"}),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (s2, b) = s.send(Method::POST, &path, body).await;
+        assert_eq!(s2, status, "{path}: {b}");
+    }
 }

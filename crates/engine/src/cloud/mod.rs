@@ -189,6 +189,60 @@ impl fmt::Debug for AssumeRoleWithWebIdentity {
     }
 }
 
+/// An AWS service that stores secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretService {
+    /// AWS Secrets Manager: a reference names a secret, and a version is its
+    /// `VersionId`.
+    SecretsManager,
+    /// SSM Parameter Store: a reference names a parameter, and a version is its
+    /// version number.
+    Ssm,
+}
+
+impl SecretService {
+    /// The service of a secret store type, such as `aws-secrets-manager`.
+    pub fn of_store_type(ty: &str) -> Option<Self> {
+        match ty {
+            "aws-secrets-manager" => Some(Self::SecretsManager),
+            "aws-ssm" => Some(Self::Ssm),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SecretService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SecretsManager => "Secrets Manager",
+            Self::Ssm => "SSM Parameter Store",
+        })
+    }
+}
+
+/// A secret to read from an AWS service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsSecret {
+    /// The service.
+    pub service: SecretService,
+    /// The region.
+    pub region: String,
+    /// The secret's or parameter's name or ARN.
+    pub name: String,
+    /// The pinned version; the current one without it.
+    pub version: Option<String>,
+}
+
+impl fmt::Display for AwsSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} `{}` in {}", self.service, self.name, self.region)?;
+        if let Some(v) = &self.version {
+            write!(f, " version {v}")?;
+        }
+        Ok(())
+    }
+}
+
 /// An S3 object version, named as `s3://<bucket>/<key>?versionId=<version>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Version {
@@ -553,6 +607,21 @@ pub trait Sts: Send + Sync {
         let _ = (credentials, image);
         Box::pin(async { Err(CloudError::Unavailable("ECR cannot be reached".into())) })
     }
+
+    /// Reads `secret` with `credentials`; `None` when the secret or its
+    /// version does not exist.
+    fn read_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+    ) -> BoxFuture<'a, Result<Option<SecretValue>, CloudError>> {
+        let _ = (credentials, secret);
+        Box::pin(async {
+            Err(CloudError::Unavailable(
+                "AWS secret stores cannot be reached".into(),
+            ))
+        })
+    }
 }
 
 /// When an account was read, relative to [`CredentialResolver::forget`] calls.
@@ -691,6 +760,19 @@ impl CredentialResolver {
     ) -> Result<bool, CloudError> {
         self.sts
             .image_exists(credentials, image)
+            .await
+            .map_err(|e| redacted(e, credentials))
+    }
+
+    /// Reads `secret` with `credentials`; `None` when the secret or its
+    /// version does not exist.
+    pub async fn read_secret(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+    ) -> Result<Option<SecretValue>, CloudError> {
+        self.sts
+            .read_secret(credentials, secret)
             .await
             .map_err(|e| redacted(e, credentials))
     }

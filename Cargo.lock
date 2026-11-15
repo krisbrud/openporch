@@ -2082,6 +2082,7 @@ dependencies = [
  "aws-sdk-ecr",
  "aws-sdk-s3",
  "aws-sdk-sts",
+ "aws-sigv4",
  "aws-smithy-http-client",
  "axum",
  "base64 0.22.1",
@@ -2102,6 +2103,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]

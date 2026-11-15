@@ -92,6 +92,16 @@ jobs:
             --body worker.zip
           export OPENPORCH_TEST_PLAIN_BUCKET=openporch-plain
           cargo test -p openporch-engine real_artifact_check -- --ignored
+      - name: Secret store read
+        run: |
+          export OPENPORCH_TEST_SECRET_VALUE=floci-secret-value
+          export OPENPORCH_TEST_SM_SECRET=openporch/test-secret
+          export OPENPORCH_TEST_SSM_PARAMETER=/openporch/test-parameter
+          aws secretsmanager create-secret --name "$OPENPORCH_TEST_SM_SECRET" \
+            --secret-string "$OPENPORCH_TEST_SECRET_VALUE"
+          aws ssm put-parameter --name "$OPENPORCH_TEST_SSM_PARAMETER" --type SecureString \
+            --value "$OPENPORCH_TEST_SECRET_VALUE"
+          cargo test -p openporch-engine real_secret_read -- --ignored
 
   opentofu:
     name: OpenTofu driver
