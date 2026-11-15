@@ -2,9 +2,11 @@
 //! obtained immediately before use, cached in memory for no longer than they are
 //! valid, and never stored, logged or returned by the API.
 //!
-//! Milestone 1 resolves AWS accounts: `aws` from an access key whose secret is a
-//! reference, and `aws-role` by assuming a role with an external ID from the host's
-//! own identity. Calls to AWS go through [`Sts`], so tests use a fake.
+//! AWS accounts resolve three ways: `aws` from an access key whose secret is a
+//! reference, `aws-role` by assuming a role with an external ID from the host's
+//! own identity, and `aws-identity` by exchanging an identity token from the
+//! openporch OIDC issuer with `AssumeRoleWithWebIdentity`, so nothing standing
+//! is held at all. Calls to AWS go through [`Sts`], so tests use a fake.
 
 mod aws;
 
@@ -18,6 +20,8 @@ use openporch_core::model::{CloudAccount, CloudAccountType};
 use openporch_store::secrets::{BoxFuture, SecretStore, SecretValue};
 use serde_json::Value;
 
+use crate::oidc::{Claims, Issuer};
+
 pub use aws::AwsSts;
 
 /// Extra validity required beyond an operation's window, for clock skew and the
@@ -29,6 +33,12 @@ pub const CHECK_WINDOW: Duration = Duration::from_secs(60);
 
 /// The role session length when an `aws-role` account sets none.
 pub const DEFAULT_SESSION: Duration = Duration::from_secs(3600);
+
+/// The audience of identity tokens when an `aws-identity` account sets none.
+pub const DEFAULT_AUDIENCE: &str = "sts.amazonaws.com";
+
+/// How long an identity token lives: long enough for one exchange.
+pub const IDENTITY_TOKEN_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 /// The keys a driver receives credentials under, and nothing else.
 pub const DRIVER_CREDENTIAL_KEYS: [&str; 4] =
@@ -151,6 +161,32 @@ pub struct AssumeRole {
     pub duration: Duration,
     /// The region to call STS in.
     pub region: Option<String>,
+}
+
+/// An STS `AssumeRoleWithWebIdentity` request. Prints without its token.
+#[derive(Clone)]
+pub struct AssumeRoleWithWebIdentity {
+    /// The role to assume.
+    pub role_arn: String,
+    /// The identity token from the openporch issuer.
+    pub token: SecretValue,
+    /// The session name, which shows in CloudTrail.
+    pub session_name: String,
+    /// The requested session length.
+    pub duration: Duration,
+    /// The region to call STS in.
+    pub region: Option<String>,
+}
+
+impl fmt::Debug for AssumeRoleWithWebIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssumeRoleWithWebIdentity")
+            .field("role_arn", &self.role_arn)
+            .field("session_name", &self.session_name)
+            .field("duration", &self.duration)
+            .field("region", &self.region)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An S3 object version, named as `s3://<bucket>/<key>?versionId=<version>`.
@@ -454,6 +490,20 @@ pub trait Sts: Send + Sync {
     fn assume_role(&self, request: AssumeRole)
     -> BoxFuture<'_, Result<AwsCredentials, CloudError>>;
 
+    /// Exchanges an identity token for a role session. The call is unsigned:
+    /// the token is the only credential.
+    fn assume_role_with_web_identity(
+        &self,
+        request: AssumeRoleWithWebIdentity,
+    ) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
+        let _ = request;
+        Box::pin(async {
+            Err(CloudError::Unavailable(
+                "STS AssumeRoleWithWebIdentity cannot be reached".into(),
+            ))
+        })
+    }
+
     /// Reports who `credentials` belong to.
     fn caller_identity<'a>(
         &'a self,
@@ -524,6 +574,8 @@ struct Session {
 pub struct CredentialResolver {
     sts: Arc<dyn Sts>,
     clock: Clock,
+    /// The OIDC issuer and the organization, for `aws-identity` accounts.
+    issuer: Option<(Arc<Issuer>, String)>,
     sessions: Mutex<HashMap<String, Session>>,
     /// Counts [`CredentialResolver::forget`] calls, so a session obtained while an
     /// account was being changed or deleted is not cached afterwards.
@@ -547,9 +599,16 @@ impl CredentialResolver {
         Self {
             sts,
             clock,
+            issuer: None,
             sessions: Mutex::new(HashMap::new()),
             forgotten: AtomicU64::new(0),
         }
+    }
+
+    /// Resolves `aws-identity` accounts of `org` with tokens from `issuer`.
+    pub fn with_issuer(mut self, issuer: Arc<Issuer>, org: &str) -> Self {
+        self.issuer = Some((issuer, org.to_owned()));
+        self
     }
 
     /// Credentials for `account` that stay valid for `window`. Secret references are
@@ -565,11 +624,7 @@ impl CredentialResolver {
         match account.ty {
             CloudAccountType::Aws => static_keys(account, secrets).await,
             CloudAccountType::AwsRole => self.role_session(account, read_at, window).await,
-            CloudAccountType::AwsIdentity => Err(CloudError::Invalid(format!(
-                "cloud account `{}` is of type `aws-identity`, which needs the openporch \
-                 OIDC provider that this server does not offer yet",
-                account.id
-            ))),
+            CloudAccountType::AwsIdentity => self.identity_session(account, read_at, window).await,
         }
     }
 
@@ -658,23 +713,108 @@ impl CredentialResolver {
         window: Duration,
     ) -> Result<AwsCredentials, CloudError> {
         let request = role_request(account)?;
-        if window + EXPIRY_MARGIN > request.duration {
-            return Err(CloudError::Expiring(format!(
-                "the operation needs credentials for {}s, but sessions of cloud account `{}` \
-                 last {}s; raise `config.session_duration`",
-                (window + EXPIRY_MARGIN).as_secs(),
-                account.id,
-                request.duration.as_secs()
-            )));
-        }
-        let key = account.id.to_string();
         let fingerprint = format!(
-            "{}\n{}\n{}\n{:?}",
+            "aws-role\n{}\n{}\n{}\n{:?}",
             request.role_arn,
             request.external_id,
             request.duration.as_secs(),
             request.region
         );
+        let (duration, region) = (request.duration, request.region.clone());
+        self.session(
+            account,
+            read_at,
+            window,
+            duration,
+            region,
+            fingerprint,
+            || self.sts.assume_role(request),
+        )
+        .await
+    }
+
+    async fn identity_session(
+        &self,
+        account: &CloudAccount,
+        read_at: Generation,
+        window: Duration,
+    ) -> Result<AwsCredentials, CloudError> {
+        let Some((issuer, org)) = &self.issuer else {
+            return Err(CloudError::Invalid(format!(
+                "cloud account `{}` is of type `aws-identity`, which needs the openporch \
+                 OIDC issuer: set `public_url` to the HTTPS URL AWS reaches this server at",
+                account.id
+            )));
+        };
+        let request = identity_request(account, org)?;
+        let fingerprint = format!(
+            "aws-identity\n{}\n{}\n{}\n{}\n{:?}\n{}",
+            request.role_arn,
+            request.claims.sub,
+            request.claims.aud,
+            request.duration.as_secs(),
+            request.region,
+            issuer.url()
+        );
+        let (duration, region) = (request.duration, request.region.clone());
+        let now = (self.clock)();
+        self.session(
+            account,
+            read_at,
+            window,
+            duration,
+            region,
+            fingerprint,
+            || async {
+                let now_ms = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or_default();
+                let token = issuer
+                    .mint(&request.claims, now_ms)
+                    .map_err(|e| CloudError::Unavailable(e.to_string()))?;
+                self.sts
+                    .assume_role_with_web_identity(AssumeRoleWithWebIdentity {
+                        role_arn: request.role_arn.clone(),
+                        token: SecretValue::new(token),
+                        session_name: request.session_name.clone(),
+                        duration: request.duration,
+                        region: request.region.clone(),
+                    })
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// A session for `account`, reused while it stays valid for `window` and
+    /// its configuration (`fingerprint`) is unchanged, otherwise obtained
+    /// with `fetch`.
+    #[allow(clippy::too_many_arguments)]
+    async fn session<F, Fut>(
+        &self,
+        account: &CloudAccount,
+        read_at: Generation,
+        window: Duration,
+        duration: Duration,
+        region: Option<String>,
+        fingerprint: String,
+        fetch: F,
+    ) -> Result<AwsCredentials, CloudError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<AwsCredentials, CloudError>>,
+    {
+        if window + EXPIRY_MARGIN > duration {
+            return Err(CloudError::Expiring(format!(
+                "the operation needs credentials for {}s, but sessions of cloud account `{}` \
+                 last {}s; raise `config.session_duration`",
+                (window + EXPIRY_MARGIN).as_secs(),
+                account.id,
+                duration.as_secs()
+            )));
+        }
+        let key = account.id.to_string();
         let now = (self.clock)();
         if let Some(s) = self.sessions().get(&key)
             && s.fingerprint == fingerprint
@@ -682,8 +822,8 @@ impl CredentialResolver {
         {
             return Ok(s.credentials.clone());
         }
-        let mut credentials = self.sts.assume_role(request.clone()).await?;
-        credentials.region = request.region;
+        let mut credentials = fetch().await?;
+        credentials.region = region;
         let Some(expires_at) = credentials.expires_at else {
             return Err(CloudError::Unavailable(
                 "STS returned role credentials without an expiry".into(),
@@ -822,26 +962,68 @@ async fn static_keys(
     })
 }
 
-/// The `AssumeRole` request for an `aws-role` account.
-fn role_request(account: &CloudAccount) -> Result<AssumeRole, CloudError> {
-    let duration = match account.config.get("session_duration") {
-        None => DEFAULT_SESSION,
-        Some(v) => Duration::from_secs(v.as_u64().ok_or_else(|| {
+/// The session length an account sets, or [`DEFAULT_SESSION`].
+fn session_duration(account: &CloudAccount) -> Result<Duration, CloudError> {
+    match account.config.get("session_duration") {
+        None => Ok(DEFAULT_SESSION),
+        Some(v) => Ok(Duration::from_secs(v.as_u64().ok_or_else(|| {
             CloudError::Invalid(format!(
                 "cloud account `{}` has a non-numeric `config.session_duration`",
                 account.id
             ))
-        })?),
+        })?)),
+    }
+}
+
+/// The session name of an account's role sessions, which shows in CloudTrail.
+fn session_name(account: &CloudAccount) -> String {
+    // Account IDs only use characters STS allows in session names.
+    format!("openporch-{}", account.id)
+        .chars()
+        .take(64)
+        .collect()
+}
+
+/// The subject of an `aws-identity` account's tokens, which the role's
+/// trust policy names: `<org>/<account-id>`.
+pub fn identity_subject(org: &str, account: &str) -> String {
+    format!("{org}/{account}")
+}
+
+/// What an `aws-identity` account asks STS for.
+struct IdentityRequest {
+    role_arn: String,
+    claims: Claims,
+    session_name: String,
+    duration: Duration,
+    region: Option<String>,
+}
+
+fn identity_request(account: &CloudAccount, org: &str) -> Result<IdentityRequest, CloudError> {
+    let audience = match account.config.get("audience") {
+        None => DEFAULT_AUDIENCE.to_owned(),
+        Some(_) => config_str(account, "audience")?.to_owned(),
     };
+    Ok(IdentityRequest {
+        role_arn: config_str(account, "role_arn")?.to_owned(),
+        claims: Claims {
+            sub: identity_subject(org, account.id.as_str()),
+            aud: audience,
+            lifetime: IDENTITY_TOKEN_LIFETIME,
+        },
+        session_name: session_name(account),
+        duration: session_duration(account)?,
+        region: region(account),
+    })
+}
+
+/// The `AssumeRole` request for an `aws-role` account.
+fn role_request(account: &CloudAccount) -> Result<AssumeRole, CloudError> {
     Ok(AssumeRole {
         role_arn: config_str(account, "role_arn")?.to_owned(),
         external_id: config_str(account, "external_id")?.to_owned(),
-        // Account IDs only use characters STS allows in session names.
-        session_name: format!("openporch-{}", account.id)
-            .chars()
-            .take(64)
-            .collect(),
-        duration,
+        session_name: session_name(account),
+        duration: session_duration(account)?,
         region: region(account),
     })
 }

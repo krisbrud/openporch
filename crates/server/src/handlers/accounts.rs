@@ -78,11 +78,25 @@ fn shape(ty: CloudAccountType) -> ApiResult<Shape> {
             optional: &["session_duration", "region"],
             secrets: &[],
         }),
-        CloudAccountType::AwsIdentity => Err(ApiError::invalid(
-            "cloud account type `aws-identity` needs the openporch OIDC provider, which this \
-             server does not offer yet; use `aws` or `aws-role`",
-        )),
+        CloudAccountType::AwsIdentity => Ok(Shape {
+            required: &["role_arn"],
+            optional: &["audience", "session_duration", "region"],
+            secrets: &[],
+        }),
     }
+}
+
+/// Refuses an `aws-identity` account on a server whose issuer AWS cannot
+/// reach.
+fn check_reachable(state: &AppState, ty: CloudAccountType) -> ApiResult<()> {
+    if ty == CloudAccountType::AwsIdentity && state.config.public_url.is_none() {
+        return Err(ApiError::invalid(
+            "cloud account type `aws-identity` needs the openporch OIDC issuer, which AWS must \
+             reach over HTTPS: set `public_url` in the server configuration to this server's \
+             public HTTPS URL",
+        ));
+    }
+    Ok(())
 }
 
 /// Checks an account body against its type and plans its secrets. Error messages
@@ -117,12 +131,20 @@ fn plan_account(
             }
         }
     }
-    for key in ["region", "role_arn", "external_id"] {
+    for key in ["region", "role_arn", "external_id", "audience"] {
         if body.config.get(key).is_some_and(|v| !v.is_string()) {
             return Err(ApiError::invalid(format!(
                 "`config.{key}` must be a string"
             )));
         }
+    }
+    if body
+        .config
+        .get("audience")
+        .and_then(Value::as_str)
+        .is_some_and(|a| a.trim().is_empty())
+    {
+        return Err(ApiError::invalid("`config.audience` must not be empty"));
     }
     if let Some(arn) = body.config.get("role_arn").and_then(Value::as_str)
         && !arn.starts_with("arn:")
@@ -235,6 +257,7 @@ pub async fn create_account(
         .id
         .take()
         .ok_or_else(|| ApiError::invalid("`id` is required"))?;
+    check_reachable(&state, body.ty)?;
     let (account, planned) = plan_account(&id, body)?;
     state
         .store
@@ -259,6 +282,7 @@ pub async fn update_account(
         return Err(ApiError::invalid("`id` cannot be changed"));
     }
     account_or_404(&state, &id).await?;
+    check_reachable(&state, body.ty)?;
     let (account, planned) = plan_account(&id, body)?;
     state
         .store
@@ -269,7 +293,8 @@ pub async fn update_account(
 }
 
 /// Obtains credentials for the account and asks AWS STS who they belong to. Errors
-/// carry the STS failure message, never credentials.
+/// carry the STS failure message, never credentials. For an `aws-identity`
+/// account, the answer and any failure carry the setup guidance.
 pub async fn check_account(
     State(state): State<AppState>,
     Path((_, id)): Path<(String, String)>,
@@ -278,6 +303,9 @@ pub async fn check_account(
     // session out of the cache.
     let read_at = state.cloud.generation();
     let account = account_or_404(&state, &id).await?.account;
+    let setup = (account.ty == CloudAccountType::AwsIdentity)
+        .then(|| super::oidc::aws_identity_setup(&state, account.id.as_str(), Some(&account)))
+        .transpose()?;
     let primary = secret_inputs::primary(&state)?;
     let identity = state
         .cloud
@@ -291,12 +319,25 @@ pub async fn check_account(
             CloudError::Unavailable(m) | CloudError::Throttled { message: m, .. } => {
                 ApiError::new(StatusCode::BAD_GATEWAY, code::CLOUD_UNAVAILABLE, m)
             }
+        })
+        .map_err(|mut e| {
+            if setup.is_some() {
+                e.message.push_str(&format!(
+                    "; `porch cloud-accounts setup aws-identity {id}` prints the identity \
+                     provider and trust policy the role needs"
+                ));
+            }
+            e
         })?;
-    Ok(Json(json!({
+    let mut answer = json!({
         "arn": identity.arn,
         "account": identity.account,
         "user_id": identity.user_id,
-    })))
+    });
+    if let Some(setup) = setup {
+        answer["setup"] = setup;
+    }
+    Ok(Json(answer))
 }
 
 pub async fn delete_account(

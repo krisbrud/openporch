@@ -365,6 +365,10 @@ pub(crate) async fn start_with_drivers(
         finish_bootstrap_file(&config)?;
     }
 
+    let cloud = match &issuer {
+        Some(issuer) => CredentialResolver::new(sts).with_issuer(issuer.clone(), &config.org),
+        None => CredentialResolver::new(sts),
+    };
     let runners = crate::deploy::Runners::new(config.limits.running_deployments);
     let login_limit = RateLimiter::new(config.rate_limits.login_per_minute);
     let token_limit = RateLimiter::new(config.rate_limits.tokens_per_minute);
@@ -377,7 +381,7 @@ pub(crate) async fn start_with_drivers(
         oidc_rotation: tokio::sync::Mutex::new(()),
         not_ready,
         github,
-        cloud: Arc::new(CredentialResolver::new(sts)),
+        cloud: Arc::new(cloud),
         browser_logins: Default::default(),
         login_limit,
         token_limit,

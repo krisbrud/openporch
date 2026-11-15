@@ -81,6 +81,9 @@ pub enum Command {
     /// Manages secret stores.
     #[command(subcommand)]
     Secretstores(members::SecretStores),
+    /// Checks cloud accounts and prints how to set them up.
+    #[command(subcommand)]
+    CloudAccounts(members::CloudAccounts),
     /// Queries the audit log, newest first.
     AuditLogs(members::AuditLogs),
     /// Removes the audit entries older than the server's retention period.
@@ -265,6 +268,7 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
         Command::Apps(cmd) => members::apps(&session, cmd, io).await,
         Command::EnvTypes(cmd) => members::env_types(&session, cmd, io).await,
         Command::Secretstores(cmd) => members::secret_stores(&session, cmd, io).await,
+        Command::CloudAccounts(cmd) => members::cloud_accounts(&session, cmd, io).await,
         Command::AuditLogs(args) => members::audit_logs(&session, args, io).await,
         Command::ExpireAuditLogs(args) => members::expire_audit_logs(&session, args, io).await,
         Command::Workload(cmd) => deploys::workload(&session, cmd, io).await,

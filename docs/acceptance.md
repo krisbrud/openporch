@@ -248,10 +248,10 @@ none is open.
 |---|---|---|
 | Discovery | covered | `crates/server/src/tests/oidc.rs::discovery_and_jwks_are_public_and_validate_issued_tokens`, `crates/engine/src/oidc/tests.rs::discovery_names_the_issuer_jwks_and_rs256` |
 | Key rotation | covered | `crates/server/src/tests/oidc.rs::rotation_signs_with_the_new_key_and_keeps_the_old_one_published_for_its_grace` (the end of the grace period is simulated by moving it into the past), `crates/engine/src/oidc/tests.rs::rotation_signs_with_the_new_key_and_publishes_both_until_the_grace_ends` |
-| Role assumption without standing credentials | deferred | Group 11 |
-| Trust scoped to another account | deferred | Group 11 |
-| Print trust policy | deferred | Group 11 |
-| No public URL | deferred | Group 11; `aws-identity` is reported unavailable by `crates/server/src/tests/accounts.rs::unavailable_account_types_name_the_missing_capability` |
+| Role assumption without standing credentials | covered | `crates/server/src/tests/oidc.rs::role_assumption_without_standing_credentials` (an STS fake that verifies the token against the served JWKS and the role's subject condition), `crates/engine/src/cloud/tests.rs::identity_accounts_exchange_issuer_tokens_for_role_sessions`; against real AWS only by the opt-in `real_identity_account_check` |
+| Trust scoped to another account | covered | `crates/server/src/tests/oidc.rs::trust_scoped_to_another_account` (STS fake); against real AWS only by the opt-in `real_identity_account_check` |
+| Print trust policy | covered | `crates/cli/src/tests.rs::setup_prints_an_aws_identity_trust_policy`, `crates/server/src/tests/oidc.rs::setup_prints_the_trust_policy_scoped_to_the_account` |
+| No public URL | covered | `crates/server/src/tests/accounts.rs::identity_accounts_need_a_public_url` |
 
 ## opentofu-driver
 
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 235 covered, 10 manual, 29 deferred, 0 gaps.
+274 scenarios: 239 covered, 10 manual, 25 deferred, 0 gaps.

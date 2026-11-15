@@ -2447,6 +2447,7 @@ Authorization: Bearer $ADMIN_TOKEN
 | GET | `/oidc/.well-known/openid-configuration` | public |
 | GET | `/oidc/jwks` | public |
 | POST | `/orgs/{org}/oidc/keys/rotate` | org administer |
+| GET | `/orgs/{org}/oidc/aws-identity/{account}` | org read |
 
 With `public_url` set, openporch is an OpenID Connect issuer at
 `<public_url>/oidc`, so that a cloud provider can trust short-lived tokens it
@@ -2474,6 +2475,12 @@ rotated out:
 
 Key IDs are RFC 7638 thumbprints of the public keys. Identity tokens are never
 returned through the API.
+
+`GET /orgs/{org}/oidc/aws-identity/{account}` returns how to set up AWS for an
+`aws-identity` account, which need not exist yet: the identity provider URL
+and ARN, the audience, the subject `<org>/<account>`, a note on thumbprints,
+the command that creates the provider and the role's trust policy. See
+[cloud-accounts.md](cloud-accounts.md#setting-up-an-identity-account).
 
 ## Audit log
 

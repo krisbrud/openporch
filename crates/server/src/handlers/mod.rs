@@ -57,6 +57,12 @@ pub fn api(state: AppState) -> Api {
             Org(OrgPerm::Administer),
             oidc::rotate,
         )
+        .route(
+            get(),
+            "/orgs/{org}/oidc/aws-identity/{account}",
+            Org(OrgPerm::ReadMembers),
+            oidc::aws_identity,
+        )
         // Login.
         .route(post(), "/auth/github/device", Public, login::start)
         .route(post(), "/auth/github/token", Public, login::poll)

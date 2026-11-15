@@ -21,6 +21,7 @@ Commands:
   apps               Manages application users
   env-types          Manages environment type deployers
   secretstores       Manages secret stores
+  cloud-accounts     Checks cloud accounts and prints how to set them up
   audit-logs         Queries the audit log, newest first
   expire-audit-logs  Removes the audit entries older than the server's retention period
   workload           Deploys or previews workload documents
@@ -1562,6 +1563,144 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## `porch cloud-accounts`
+
+```text
+Checks cloud accounts and prints how to set them up
+
+Usage: porch cloud-accounts [OPTIONS] <COMMAND>
+
+Commands:
+  check  Obtains credentials for an account and prints who AWS says they belong to. An `aws-identity` account's answer includes its setup
+  setup  Prints how to set up a cloud provider to trust openporch for an account
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --url <URL>
+          The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
+
+      --org <ORG>
+          The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
+
+      --app <APP>
+          The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
+      --config <FILE>
+          The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it
+
+  -h, --help
+          Print help
+```
+
+## `porch cloud-accounts check`
+
+```text
+Obtains credentials for an account and prints who AWS says they belong to. An `aws-identity` account's answer includes its setup
+
+Usage: porch cloud-accounts check [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The account ID
+
+Options:
+  -o, --output <OUTPUT>
+          The output format
+
+          Possible values:
+          - table: Aligned columns
+          - json:  JSON
+          - yaml:  YAML
+          
+          [default: table]
+
+      --url <URL>
+          The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
+
+      --org <ORG>
+          The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
+
+      --app <APP>
+          The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
+      --config <FILE>
+          The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+## `porch cloud-accounts setup`
+
+```text
+Prints how to set up a cloud provider to trust openporch for an account
+
+Usage: porch cloud-accounts setup [OPTIONS] <COMMAND>
+
+Commands:
+  aws-identity  Prints the IAM OIDC identity provider to create for the server's issuer and the trust policy that lets an `aws-identity` account assume its role, scoped to the account's subject `<org>/<id>`. The account need not exist yet; once it does, its role ARN fills in the AWS account
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --url <URL>
+          The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
+
+      --org <ORG>
+          The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
+
+      --app <APP>
+          The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
+      --config <FILE>
+          The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it
+
+  -h, --help
+          Print help
+```
+
+## `porch cloud-accounts setup aws-identity`
+
+```text
+Prints the IAM OIDC identity provider to create for the server's issuer and the trust policy that lets an `aws-identity` account assume its role, scoped to the account's subject `<org>/<id>`. The account need not exist yet; once it does, its role ARN fills in the AWS account
+
+Usage: porch cloud-accounts setup aws-identity [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The account ID
+
+Options:
+      --json
+          Print the whole setup as JSON instead
+
+      --url <URL>
+          The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
+
+      --org <ORG>
+          The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
+
+      --app <APP>
+          The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+      --env <ENV>
+          The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file
+
+      --config <FILE>
+          The config file. Defaults to `OPENPORCH_CONFIG`, then `~/.config/openporch/config.toml`; the credentials file sits next to it
+
+  -h, --help
+          Print help
 ```
 
 ## `porch audit-logs`

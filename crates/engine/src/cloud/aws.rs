@@ -13,8 +13,8 @@ use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
 use super::{
-    AssumeRole, AwsCredentials, CallerIdentity, CloudError, EcrDigest, EcrImage, Latest, S3Object,
-    S3Version, Sts,
+    AssumeRole, AssumeRoleWithWebIdentity, AwsCredentials, CallerIdentity, CloudError, EcrDigest,
+    EcrImage, Latest, S3Object, S3Version, Sts,
 };
 
 /// The region STS is called in when neither the account nor the host names one.
@@ -158,6 +158,38 @@ impl Sts for AwsSts {
                 .map_err(|e| sdk_error("AssumeRole", e))?;
             let c = out.credentials().ok_or_else(|| {
                 CloudError::Unavailable("STS AssumeRole returned no credentials".into())
+            })?;
+            Ok(AwsCredentials {
+                access_key_id: c.access_key_id().to_owned(),
+                secret_access_key: SecretValue::new(c.secret_access_key()),
+                session_token: Some(SecretValue::new(c.session_token())),
+                region: request.region,
+                expires_at: SystemTime::try_from(*c.expiration()).ok(),
+            })
+        })
+    }
+
+    fn assume_role_with_web_identity(
+        &self,
+        request: AssumeRoleWithWebIdentity,
+    ) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
+        Box::pin(async move {
+            // The operation is unsigned, so the host needs no identity of its own.
+            let client = self.client(request.region.as_deref(), None).await;
+            let seconds = i32::try_from(request.duration.as_secs()).unwrap_or(i32::MAX);
+            let out = client
+                .assume_role_with_web_identity()
+                .role_arn(&request.role_arn)
+                .web_identity_token(request.token.expose())
+                .role_session_name(&request.session_name)
+                .duration_seconds(seconds)
+                .send()
+                .await
+                .map_err(|e| sdk_error("AssumeRoleWithWebIdentity", e))?;
+            let c = out.credentials().ok_or_else(|| {
+                CloudError::Unavailable(
+                    "STS AssumeRoleWithWebIdentity returned no credentials".into(),
+                )
             })?;
             Ok(AwsCredentials {
                 access_key_id: c.access_key_id().to_owned(),

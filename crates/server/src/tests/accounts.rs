@@ -211,17 +211,28 @@ async fn create_a_role_account() {
 }
 
 #[tokio::test]
-async fn unavailable_account_types_name_the_missing_capability() {
+async fn identity_accounts_need_a_public_url() {
     let s = server().await;
     let (status, b) = s
         .send(
             Method::POST,
             ACCOUNTS,
-            json!({"id": "aws-oidc", "type": "aws-identity", "config": {}}),
+            json!({"id": "aws-oidc", "type": "aws-identity",
+                   "config": {"role_arn": "arn:aws:iam::111122223333:role/openporch"}}),
         )
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
-    assert!(message(&b).contains("OIDC provider"), "{b}");
+    assert!(message(&b).contains("public_url"), "{b}");
+    assert!(message(&b).contains("HTTPS"), "{b}");
+    let (status, _) = s
+        .call(
+            Method::GET,
+            &format!("{ACCOUNTS}/aws-oidc"),
+            Some(&s.admin),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
