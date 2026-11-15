@@ -484,6 +484,7 @@ pub async fn create_store(
         config: body.config,
         primary: false,
         created_at: 0,
+        generation: 0,
     };
     state
         .store

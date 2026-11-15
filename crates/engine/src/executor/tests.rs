@@ -2020,6 +2020,7 @@ impl Fixture {
                 .clone(),
             primary: false,
             created_at: 0,
+            generation: 0,
         };
         self.store
             .create_secret_store(ORG, &store, audit("POST", "/orgs/acme/secretstores"))
@@ -2147,6 +2148,7 @@ fn external_references_name_a_secret_in_the_stores_region() {
             .clone(),
         primary: false,
         created_at: 0,
+        generation: 0,
     };
     let r = |name: &str, version: Option<&str>| SecretRef {
         store: "s".into(),
@@ -2359,6 +2361,16 @@ impl Fixture {
             .map(|r| r.confirmed)
     }
 
+    /// The current generation of `sm`.
+    async fn generation(&self) -> i64 {
+        self.store
+            .secret_store(ORG, "sm")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation
+    }
+
     /// Records a create of `name` in `sm`, in the fake STS's account.
     async fn record(&self, name: &str, confirmed: bool, create_id: &str) {
         let record = openporch_store::ExternalSecretRecord {
@@ -2375,7 +2387,14 @@ impl Fixture {
             .map(|r| r.create_id);
         assert!(
             self.store
-                .record_external_secret(ORG, "sm", name, &record, prior.as_deref())
+                .record_external_secret(
+                    ORG,
+                    "sm",
+                    name,
+                    &record,
+                    prior.as_deref(),
+                    self.generation().await
+                )
                 .await
                 .unwrap()
         );
@@ -2514,22 +2533,22 @@ async fn concurrent_writers_never_replace_each_others_records() {
     };
     let s = &f.store;
     assert!(
-        s.record_external_secret(ORG, "sm", name, &record("a", false), None)
+        s.record_external_secret(ORG, "sm", name, &record("a", false), None, 0)
             .await
             .unwrap()
     );
     assert!(
-        !s.record_external_secret(ORG, "sm", name, &record("b", false), None)
+        !s.record_external_secret(ORG, "sm", name, &record("b", false), None, 0)
             .await
             .unwrap()
     );
     assert!(
-        s.record_external_secret(ORG, "sm", name, &record("a", true), Some("a"))
+        s.record_external_secret(ORG, "sm", name, &record("a", true), Some("a"), 0)
             .await
             .unwrap()
     );
     assert!(
-        !s.record_external_secret(ORG, "sm", name, &record("b", true), Some("b"))
+        !s.record_external_secret(ORG, "sm", name, &record("b", true), Some("b"), 0)
             .await
             .unwrap()
     );
@@ -2542,6 +2561,32 @@ async fn concurrent_writers_never_replace_each_others_records() {
         .await
         .unwrap();
     assert_eq!(f.state(name).await, None);
+
+    // A write that opened the store before it was repointed records nothing.
+    let store = f.open_sm().await;
+    let config = json!({"region": "us-east-1", "cloud_account": "aws-main"});
+    f.store
+        .update_secret_store(
+            ORG,
+            "sm",
+            config.as_object().unwrap(),
+            audit("PATCH", "/orgs/acme/secretstores/sm"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !s.record_external_secret(ORG, "sm", name, &record("c", false), None, 0)
+            .await
+            .unwrap()
+    );
+    let error = store
+        .write("defs/pg/x", &SecretValue::new("stale"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed during the write"), "{error}");
+    assert_eq!(f.state(name).await, None);
+    assert!(!f.sts.written.lock().unwrap().contains_key(name));
 }
 
 /// What openporch created is bound to where it was created: the AWS account

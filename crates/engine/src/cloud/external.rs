@@ -84,7 +84,8 @@ pub trait CreatedSecrets: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<ExternalSecretRecord>, StoreError>>;
 
     /// Records a pending or finished create of `name` if its record still has
-    /// create ID `expected` (`None`: there is none); `false` when it changed.
+    /// create ID `expected` (`None`: there is none) and the store is still at
+    /// `generation`; `false` when either changed.
     fn record<'a>(
         &'a self,
         org: &'a str,
@@ -92,6 +93,7 @@ pub trait CreatedSecrets: Send + Sync {
         name: &'a str,
         record: &'a ExternalSecretRecord,
         expected: Option<&'a str>,
+        generation: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Forgets the record of `name` if it still has `create_id`.
@@ -121,8 +123,9 @@ impl<S: AccountStore> CreatedSecrets for S {
         name: &'a str,
         record: &'a ExternalSecretRecord,
         expected: Option<&'a str>,
+        generation: i64,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(self.record_external_secret(org, store, name, record, expected))
+        Box::pin(self.record_external_secret(org, store, name, record, expected, generation))
     }
 
     fn forget<'a>(
@@ -234,6 +237,7 @@ impl SecretStore for ExternalStore {
             let org = self.org.as_str();
             let cloud = |e| self.failed(e);
             let aws_account = self.aws_account.clone();
+            let generation = self.record.generation;
             let tag = || {
                 self.cloud
                     .secret_tag(&self.credentials, &secret, CREATE_ID_TAG)
@@ -248,10 +252,11 @@ impl SecretStore for ExternalStore {
             let prior = recorded.as_ref().map(|r| r.create_id.clone());
             let mut known =
                 recorded.filter(|r| r.aws_account == aws_account && r.region == secret.region);
-            // Another writer replaced the record since it was read.
+            // Another writer replaced the record since it was read, or the
+            // store was repointed since it was opened.
             let raced = || SecretError::Unavailable {
                 store: self.record.id.clone(),
-                reason: format!("another write of {secret} changed its record; try again"),
+                reason: format!("{secret} or its store changed during the write; try again"),
             };
             if let Some(r) = known.as_ref().filter(|r| r.confirmed)
                 && tag().await.map_err(cloud)?.as_deref() != Some(r.create_id.as_str())
@@ -272,7 +277,14 @@ impl SecretStore for ExternalStore {
                             };
                             if !self
                                 .created
-                                .record(org, store, &secret.name, &pending, prior.as_deref())
+                                .record(
+                                    org,
+                                    store,
+                                    &secret.name,
+                                    &pending,
+                                    prior.as_deref(),
+                                    generation,
+                                )
                                 .await?
                             {
                                 return Err(raced());
@@ -304,7 +316,7 @@ impl SecretStore for ExternalStore {
                         };
                         if !self
                             .created
-                            .record(org, store, &secret.name, &confirmed, Some(&id))
+                            .record(org, store, &secret.name, &confirmed, Some(&id), generation)
                             .await?
                         {
                             return Err(raced());

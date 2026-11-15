@@ -16,3 +16,9 @@ CREATE TABLE external_secrets (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (org_id, store_id, ref)
 );
+
+-- Raised whenever a store may now reach another AWS account or region: its
+-- `cloud_account` or `region` changes, or that account's credentials do. A
+-- write records a create only while the generation it opened the store at is
+-- current, so a write racing a repointing never records a stale destination.
+ALTER TABLE secret_stores ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;

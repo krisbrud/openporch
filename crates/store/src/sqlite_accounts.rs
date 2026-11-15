@@ -47,6 +47,9 @@ pub struct SecretStoreRecord {
     pub primary: bool,
     /// Creation time.
     pub created_at: i64,
+    /// Raised whenever the store may reach another AWS account or region.
+    #[serde(skip)]
+    pub generation: i64,
 }
 
 /// A secret openporch creates, or created, in an external store.
@@ -192,8 +195,9 @@ pub trait AccountStore: Send + Sync {
 
     /// Records that openporch is about to create `reference` in external store
     /// `store`, or created it, if the record still has create ID `expected`
-    /// (`None`: there is none). Returns whether it did, so concurrent writers
-    /// never replace each other's records.
+    /// (`None`: there is none) and the store is still at `generation`. Returns
+    /// whether it did, so concurrent writers never replace each other's
+    /// records, and a write racing a repointing records nothing.
     fn record_external_secret(
         &self,
         org: &str,
@@ -201,6 +205,7 @@ pub trait AccountStore: Send + Sync {
         reference: &str,
         record: &ExternalSecretRecord,
         expected: Option<&str>,
+        generation: i64,
     ) -> impl Future<Output = Result<bool>> + Send;
 
     /// Forgets the record of `reference` in external store `store` if it still
@@ -313,6 +318,14 @@ async fn forget_if_repointed(
     .bind(account.id.as_str())
     .bind(verified)
     .bind(verified)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE secret_stores SET generation = generation + 1 WHERE org_id = ? \
+         AND json_extract(config, '$.cloud_account') = ?",
+    )
+    .bind(org)
+    .bind(account.id.as_str())
     .execute(&mut *tx)
     .await?;
     Ok(())
@@ -476,8 +489,8 @@ async fn store_row(
     org: &str,
     id: &str,
 ) -> Result<Option<SecretStoreRecord>> {
-    let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, type, config, is_primary, created_at FROM secret_stores \
+    let row: Option<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, type, config, is_primary, created_at, generation FROM secret_stores \
          WHERE org_id = ? AND id = ?",
     )
     .bind(org)
@@ -488,7 +501,7 @@ async fn store_row(
 }
 
 fn store_from_row(
-    (id, ty, config, primary, created_at): (String, String, String, i64, i64),
+    (id, ty, config, primary, created_at, generation): (String, String, String, i64, i64, i64),
 ) -> Result<SecretStoreRecord> {
     Ok(SecretStoreRecord {
         id,
@@ -496,6 +509,7 @@ fn store_from_row(
         config: serde_json::from_str(&config)?,
         primary: primary != 0,
         created_at,
+        generation,
     })
 }
 
@@ -750,8 +764,8 @@ impl AccountStore for SqliteStore {
 
     async fn secret_stores(&self, org: &str) -> Result<Vec<SecretStoreRecord>> {
         self.check_org(org)?;
-        let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
-            "SELECT id, type, config, is_primary, created_at FROM secret_stores \
+        let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT id, type, config, is_primary, created_at, generation FROM secret_stores \
              WHERE org_id = ? ORDER BY id",
         )
         .bind(org)
@@ -827,6 +841,14 @@ impl AccountStore for SqliteStore {
                         .bind(id)
                         .execute(&mut *tx)
                         .await?;
+                    sqlx::query(
+                        "UPDATE secret_stores SET generation = generation + 1 \
+                         WHERE org_id = ? AND id = ?",
+                    )
+                    .bind(org)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
         }
@@ -875,12 +897,16 @@ impl AccountStore for SqliteStore {
         reference: &str,
         record: &ExternalSecretRecord,
         expected: Option<&str>,
+        generation: i64,
     ) -> Result<bool> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
-        store_row(&mut tx, org, store)
+        let current = store_row(&mut tx, org, store)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("secret store `{store}`")))?;
+        if current.generation != generation {
+            return Ok(false);
+        }
         let done = sqlx::query(
             "INSERT INTO external_secrets \
              (org_id, store_id, ref, aws_account, region, create_id, confirmed, created_at) \
@@ -903,7 +929,6 @@ impl AccountStore for SqliteStore {
         .await?
         .rows_affected()
             == 1;
-        // With no record expected, an insert that met one changed nothing.
         tx.commit().await?;
         Ok(done)
     }
