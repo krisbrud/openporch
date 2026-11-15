@@ -463,6 +463,10 @@ impl AwsSts {
         let host = self.host().await;
         let url = match host.endpoint_url() {
             Some(endpoint) => format!("{}/", endpoint.trim_end_matches('/')),
+            // The China partition has its own domain.
+            None if region.starts_with("cn-") => {
+                format!("https://{service}.{region}.amazonaws.com.cn/")
+            }
             None => format!("https://{service}.{region}.amazonaws.com/"),
         };
         let body = serde_json::to_vec(body).map_err(|e| CloudError::Invalid(e.to_string()))?;
