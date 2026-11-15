@@ -221,7 +221,8 @@ document at `/oidc/.well-known/openid-configuration` and its keys at
 `/oidc/jwks`. Both are served without credentials, and must be reachable from
 the internet for AWS to fetch them. `public_url` must use `https`, even behind
 a TLS-terminating proxy, because cloud providers only trust an issuer served
-over HTTPS.
+over HTTPS, and must be the root of a host on port 443 with no path, because
+AWS IAM identity provider URLs take no port.
 
 On the first start with `public_url` set the server generates an RS256
 signing key and stores it in the database sealed with the master key, as it

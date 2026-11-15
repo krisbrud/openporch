@@ -93,8 +93,9 @@ fn default_oidc_grace_minutes() -> u64 {
     24 * 60
 }
 
-/// Checks `public_url`: an absolute HTTPS URL of a host (and port), with no
-/// path, credentials, query or fragment, returned without a trailing slash.
+/// Checks `public_url`: an absolute HTTPS URL of a host on port 443, with no
+/// port, path, credentials, query or fragment, returned without a trailing
+/// slash.
 pub fn check_public_url(url: &str) -> Result<String, ConfigError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ConfigError(format!("`public_url` is not a URL: {e}")))?;
@@ -113,6 +114,15 @@ pub fn check_public_url(url: &str) -> Result<String, ConfigError> {
     {
         return Err(ConfigError(
             "`public_url` must be a host, with no credentials, query or fragment".into(),
+        ));
+    }
+    // IAM's identity provider URLs take no port, so the issuer must be on 443
+    // (which `Url` leaves out of the string).
+    if parsed.port().is_some() {
+        return Err(ConfigError(
+            "`public_url` must not name a port: AWS IAM identity providers only take an \
+             issuer on the default HTTPS port 443"
+                .into(),
         ));
     }
     // The issuer is served at `/oidc` from the root, so a path prefix would

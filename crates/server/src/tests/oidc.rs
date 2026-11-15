@@ -234,6 +234,7 @@ async fn the_public_url_must_be_https_and_the_grace_at_least_a_token_lifetime() 
         ("https://porch.example.com/#x", "fragment"),
         ("porch.example.com", "not a URL"),
         ("https://porch.example.com/openporch", "path"),
+        ("https://porch.example.com:8443", "port"),
     ] {
         let mut config = issuer_config(&dir);
         config.public_url = Some(url.into());
@@ -241,11 +242,12 @@ async fn the_public_url_must_be_https_and_the_grace_at_least_a_token_lifetime() 
         assert!(e.contains(expected), "{url}: {e}");
     }
     let mut config = issuer_config(&dir);
-    config.public_url = Some("https://porch.example.com:8443/".into());
+    // The default port is the same URL.
+    config.public_url = Some("https://porch.example.com:443/".into());
     config.validate().unwrap();
     assert_eq!(
         config.oidc_issuer().as_deref(),
-        Some("https://porch.example.com:8443/oidc")
+        Some("https://porch.example.com/oidc")
     );
     for minutes in [14, 30 * 24 * 60 + 1] {
         let mut config = issuer_config(&dir);
