@@ -1707,6 +1707,16 @@ is recognized by its tag when it is retried. A secret someone else put at such
 a name needs a grant like any other, and a write to that name is
 refused rather than written over (`422` `CLD-001`).
 
+Version limits: AWS keeps a bounded number of versions per secret (SSM
+Parameter Store keeps the latest 100 parameter versions; Secrets Manager
+removes deprecated versions beyond about 100). References openporch writes
+pin the version just written, and active resources, values and definitions
+always hold the newest one, so eviction only reaches references kept by older
+deployments: replaying such a deployment fails before any driver call with
+the secret version not found, and a new deployment writes a fresh
+version. Use the built-in store, which keeps every version, where old
+deployments must stay replayable after many rewrites of the same secret.
+
 Retention: openporch never deletes from an external store. A version written
 for a change that is then rejected stays in place (the built-in store discards
 it), and secrets of deleted objects stay until an administrator removes them,
