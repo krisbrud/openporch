@@ -389,6 +389,15 @@ fn check_store_config(config: &Map<String, Value>) -> ApiResult<()> {
             )));
         }
     }
+    let region = config.get("region").and_then(Value::as_str);
+    if region.is_some_and(|r| {
+        !r.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }) {
+        return Err(ApiError::invalid(
+            "`config.region` must be an AWS region such as `eu-north-1`",
+        ));
+    }
     for key in ["region", "cloud_account"] {
         match config.get(key).and_then(Value::as_str) {
             Some(v) if !v.trim().is_empty() => {}
@@ -492,6 +501,105 @@ pub async fn update_store(
             .await?;
     }
     Ok(Json(store_or_404(&state, &id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreCheck {
+    /// The test secret to read.
+    #[serde(rename = "ref")]
+    reference: String,
+    version: Option<String>,
+}
+
+/// Reads a test secret from an external store with the store's cloud account,
+/// so an administrator learns whether references to it will resolve. The value
+/// is never returned.
+pub async fn check_store(
+    State(state): State<AppState>,
+    Path((_, id)): Path<(String, String)>,
+    JsonBody(body): JsonBody<StoreCheck>,
+) -> ApiResult<Json<Value>> {
+    let store = store_or_404(&state, &id).await?;
+    if store.ty == BUILTIN_STORE {
+        return Err(ApiError::invalid(
+            "the built-in store is read with the master key and needs no check",
+        ));
+    }
+    let r = SecretRef {
+        store: id.clone(),
+        reference: body.reference,
+        version: body.version,
+    };
+    validate_reference(&r).map_err(|e| ApiError::invalid(e.to_string()))?;
+    let secret =
+        openporch_engine::executor::external_secret(&store, &r).map_err(ApiError::invalid)?;
+    let account_id = store
+        .config
+        .get("cloud_account")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let read_at = state.cloud.generation();
+    let account = account_or_404(&state, &account_id).await?.account;
+    let primary = secret_inputs::primary(&state)?;
+    let credentials = state
+        .cloud
+        .resolve(
+            &account,
+            read_at,
+            &primary,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| cloud_error(e, &format!("cloud account `{account_id}`")))?;
+    let found = state
+        .cloud
+        .read_secret(&credentials, &secret)
+        .await
+        .map_err(|e| cloud_error(e, &format!("secret store `{id}`")))?;
+    let Some(_value) = found else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code::CLOUD_REJECTED,
+            format!(
+                "secret `{}`{} was not found in store `{id}` ({secret})",
+                r.reference,
+                r.version
+                    .as_ref()
+                    .map(|v| format!(" version {v}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    };
+    let mut answer = json!({
+        "store": id,
+        "ref": r.reference,
+        "readable": true,
+        "cloud_account": account_id,
+    });
+    if let Some(v) = r.version {
+        answer["version"] = v.into();
+    }
+    Ok(Json(answer))
+}
+
+fn cloud_error(e: CloudError, what: &str) -> ApiError {
+    match e {
+        CloudError::Invalid(m) | CloudError::Expiring(m) => {
+            ApiError::invalid(format!("{what}: {m}"))
+        }
+        CloudError::Rejected(m) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code::CLOUD_REJECTED,
+            format!("{what}: {m}"),
+        ),
+        CloudError::Unavailable(m) | CloudError::Throttled { message: m, .. } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            code::CLOUD_UNAVAILABLE,
+            format!("{what}: {m}"),
+        ),
+    }
 }
 
 pub async fn delete_store(

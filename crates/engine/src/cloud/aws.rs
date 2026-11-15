@@ -13,8 +13,8 @@ use openporch_store::secrets::{BoxFuture, SecretValue};
 use tokio::sync::OnceCell;
 
 use super::{
-    AssumeRole, AssumeRoleWithWebIdentity, AwsCredentials, CallerIdentity, CloudError, EcrDigest,
-    EcrImage, Latest, S3Object, S3Version, Sts,
+    AssumeRole, AssumeRoleWithWebIdentity, AwsCredentials, AwsSecret, CallerIdentity, CloudError,
+    EcrDigest, EcrImage, Latest, S3Object, S3Version, SecretService, Sts,
 };
 
 /// The region STS is called in when neither the account nor the host names one.
@@ -27,7 +27,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 pub struct AwsSts {
     host: OnceCell<SdkConfig>,
+    /// Calls the JSON APIs of Secrets Manager and SSM, which are signed here.
+    http: std::sync::OnceLock<reqwest::Client>,
 }
+
+/// The largest secret response read: Secrets Manager holds up to 64 KiB, and
+/// the JSON around it and its encoding add some.
+const MAX_SECRET_RESPONSE: usize = 256 * 1024;
 
 impl AwsSts {
     /// An STS client that loads the host identity on first use.
@@ -140,6 +146,14 @@ where
 }
 
 impl Sts for AwsSts {
+    fn read_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+    ) -> BoxFuture<'a, Result<Option<SecretValue>, CloudError>> {
+        Box::pin(async move { self.read_secret_json(credentials, secret).await })
+    }
+
     fn assume_role(
         &self,
         request: AssumeRole,
@@ -430,4 +444,189 @@ impl AwsSts {
             "S3 HeadObject on `{name}` was redirected more than once"
         )))
     }
+}
+
+impl AwsSts {
+    /// A JSON 1.1 call to `service` (`secretsmanager` or `ssm`) in `region`,
+    /// signed with SigV4. A host endpoint, as for an emulator, is used for both.
+    async fn json_call(
+        &self,
+        credentials: &AwsCredentials,
+        service: &str,
+        target: &str,
+        region: &str,
+        body: &serde_json::Value,
+    ) -> Result<(u16, zeroize::Zeroizing<Vec<u8>>), CloudError> {
+        use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
+        use aws_sigv4::sign::v4;
+
+        let host = self.host().await;
+        let url = match host.endpoint_url() {
+            Some(endpoint) => format!("{}/", endpoint.trim_end_matches('/')),
+            // The China partition has its own domain.
+            None if region.starts_with("cn-") => {
+                format!("https://{service}.{region}.amazonaws.com.cn/")
+            }
+            None => format!("https://{service}.{region}.amazonaws.com/"),
+        };
+        let body = serde_json::to_vec(body).map_err(|e| CloudError::Invalid(e.to_string()))?;
+        let headers = [
+            ("content-type", "application/x-amz-json-1.1"),
+            ("x-amz-target", target),
+        ];
+        let identity = provider(credentials).into();
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name(service)
+            .time(SystemTime::now())
+            .settings(SigningSettings::default())
+            .build()
+            .map_err(|e| CloudError::Invalid(format!("signing a {target} request: {e}")))?
+            .into();
+        let signable = SignableRequest::new(
+            "POST",
+            &url,
+            headers.iter().copied(),
+            SignableBody::Bytes(&body),
+        )
+        .map_err(|e| CloudError::Invalid(format!("signing a {target} request: {e}")))?;
+        let (instructions, _) = sign(signable, &params)
+            .map_err(|e| CloudError::Invalid(format!("signing a {target} request: {e}")))?
+            .into_parts();
+        let client = self.http.get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::builder()
+                .timeout(CALL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default()
+        });
+        let mut req = client.post(&url).body(body);
+        for (name, value) in headers.iter().copied().chain(instructions.headers()) {
+            req = req.header(name, value);
+        }
+        let mut res = req
+            .send()
+            .await
+            .map_err(|e| CloudError::Unavailable(format!("{target} could not reach {url}: {e}")))?;
+        let status = res.status().as_u16();
+        // The response may hold a secret, so even a partial one is zeroed.
+        let mut out = zeroize::Zeroizing::new(Vec::new());
+        while let Some(chunk) = res
+            .chunk()
+            .await
+            .map_err(|e| CloudError::Unavailable(format!("{target} failed: {e}")))?
+        {
+            if out.len() + chunk.len() > MAX_SECRET_RESPONSE {
+                return Err(CloudError::Rejected(format!(
+                    "{target} answered with more than {MAX_SECRET_RESPONSE} bytes"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok((status, out))
+    }
+
+    async fn read_secret_json(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+    ) -> Result<Option<SecretValue>, CloudError> {
+        let (service, target, body) = match secret.service {
+            SecretService::SecretsManager => {
+                let mut body = serde_json::json!({ "SecretId": secret.name });
+                if let Some(v) = &secret.version {
+                    body["VersionId"] = v.clone().into();
+                }
+                ("secretsmanager", "secretsmanager.GetSecretValue", body)
+            }
+            SecretService::Ssm => {
+                let name = match &secret.version {
+                    Some(v) => format!("{}:{v}", secret.name),
+                    None => secret.name.clone(),
+                };
+                (
+                    "ssm",
+                    "AmazonSSM.GetParameter",
+                    serde_json::json!({ "Name": name, "WithDecryption": true }),
+                )
+            }
+        };
+        let (status, out) = self
+            .json_call(credentials, service, target, &secret.region, &body)
+            .await?;
+        if !(200..300).contains(&status) {
+            // An error response holds no secret.
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+            let code = value["__type"]
+                .as_str()
+                .map(|t| t.rsplit('#').next().unwrap_or(t))
+                .unwrap_or("Unknown");
+            let message = value["message"]
+                .as_str()
+                .or_else(|| value["Message"].as_str())
+                .unwrap_or("no message");
+            return match code {
+                "ResourceNotFoundException" | "ParameterNotFound" | "ParameterVersionNotFound" => {
+                    Ok(None)
+                }
+                "ThrottlingException" | "ThrottledException" => Err(CloudError::Throttled {
+                    message: format!("{target} of {secret} was throttled: {message}"),
+                    retry_after: None,
+                }),
+                "InternalServiceError" | "InternalServerError" | "InternalFailure" => Err(
+                    CloudError::Unavailable(format!("{target} of {secret} failed: {code}")),
+                ),
+                _ if status >= 500 => Err(CloudError::Unavailable(format!(
+                    "{target} of {secret} failed with status {status}"
+                ))),
+                _ => Err(CloudError::Rejected(format!(
+                    "{target} of {secret} failed: {code}: {message}"
+                ))),
+            };
+        }
+        // The value is parsed straight into a `SecretValue`, which is zeroed on
+        // drop, so no other copy of it is left behind.
+        let no_value = || CloudError::Rejected(format!("{target} of {secret} returned no value"));
+        let text = match secret.service {
+            SecretService::SecretsManager => {
+                let answer: SecretsManagerValue =
+                    serde_json::from_slice(&out).map_err(|_| no_value())?;
+                if answer.secret_binary.is_some() && answer.secret_string.is_none() {
+                    return Err(CloudError::Rejected(format!(
+                        "{secret} holds a binary secret; only text secrets can be read"
+                    )));
+                }
+                answer.secret_string
+            }
+            SecretService::Ssm => serde_json::from_slice::<SsmParameterValue>(&out)
+                .map_err(|_| no_value())?
+                .parameter
+                .and_then(|p| p.value),
+        };
+        text.map(Some).ok_or_else(no_value)
+    }
+}
+
+/// A `GetSecretValue` answer, as far as it is read.
+#[derive(serde::Deserialize)]
+struct SecretsManagerValue {
+    #[serde(rename = "SecretString")]
+    secret_string: Option<SecretValue>,
+    #[serde(rename = "SecretBinary")]
+    secret_binary: Option<serde::de::IgnoredAny>,
+}
+
+/// A `GetParameter` answer, as far as it is read.
+#[derive(serde::Deserialize)]
+struct SsmParameterValue {
+    #[serde(rename = "Parameter")]
+    parameter: Option<SsmParameter>,
+}
+
+#[derive(serde::Deserialize)]
+struct SsmParameter {
+    #[serde(rename = "Value")]
+    value: Option<SecretValue>,
 }

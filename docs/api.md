@@ -29,9 +29,8 @@ group. The examples run in order against a fresh dev server in
   server that does not serve it refuses the request with `400` `API-008`
   before doing anything. `porch` and the OpenTofu provider send it, and refuse
   a server whose responses name another contract.
-- **Work in progress.** External secret store adapters are not implemented
-  yet; where a route registers something the server cannot use yet, its
-  section says so.
+- **Work in progress.** External secret stores can be read but not yet
+  written, so they cannot become primary; the secret stores section says so.
 
 ### Errors
 
@@ -1665,15 +1664,26 @@ Authorization: Bearer $ADMIN_TOKEN
 | POST | `/orgs/{org}/secretstores` | administer |
 | GET | `/orgs/{org}/secretstores/{store}` | org read |
 | PATCH | `/orgs/{org}/secretstores/{store}` | administer |
+| POST | `/orgs/{org}/secretstores/{store}/check` | administer |
 | DELETE | `/orgs/{org}/secretstores/{store}` | administer |
 | GET | `/orgs/{org}/secretstores/{store}/grants` | org read all |
 | POST | `/orgs/{org}/secretstores/{store}/grants` | administer |
 | DELETE | `/orgs/{org}/secretstores/{store}/grants/{grant}` | administer |
 
 The built-in store `openporch` is the primary store, where `{value}` secrets are
-written. External stores such as `aws-secrets-manager` can be registered with the
-cloud account that reads them, but their adapters are not implemented yet, so
-references to them do not resolve. A store that
+written. External stores of type `aws-secrets-manager` (a reference names a
+secret, a version is its `VersionId`) and `aws-ssm` (a reference names a
+parameter, a version is its number; SecureString parameters are decrypted) are
+registered with a `region` and the `cloud_account` that reads them. The
+executor reads their references with fresh credentials of that account right
+before the driver call; the account's own secrets must be in the built-in
+store, so resolution never depends on the store it opens. They cannot be
+primary yet, since this server does not write to them. `check` reads a test
+secret with the store's account and answers without its value: `422` `CLD-001`
+when AWS refuses the read or the secret does not exist, `502` `CLD-002` when
+AWS cannot be reached; for example `{"ref": "shop/stripe-key"}` answers
+`{"store": "vault", "ref": "shop/stripe-key", "readable": true, "cloud_account": "aws-dev"}`.
+A store that
 definitions, accounts, drivers, grants or shared values still reference cannot be
 deleted. Grants are described in [security.md](security.md#secret-use-grants).
 

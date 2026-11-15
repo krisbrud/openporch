@@ -27,6 +27,7 @@ openporch-client = { path = "crates/client" }
 aes-gcm = "0.10"
 aws-config = { version = "1.12", default-features = false, features = ["rt-tokio", "behavior-version-latest", "sso"] }
 aws-credential-types = "1"
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-sdk-sts = { version = "1.119", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.152", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }

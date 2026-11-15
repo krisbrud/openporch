@@ -714,6 +714,12 @@ pub fn api(state: AppState) -> Api {
             accounts::update_store,
         )
         .route(
+            post(),
+            "/orgs/{org}/secretstores/{store}/check",
+            Org(OrgPerm::Administer),
+            accounts::check_store,
+        )
+        .route(
             delete(),
             "/orgs/{org}/secretstores/{store}",
             Org(OrgPerm::Administer),

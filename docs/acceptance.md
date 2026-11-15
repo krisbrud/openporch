@@ -379,15 +379,15 @@ none is open.
 
 | Scenario | Status | Verified by |
 |---|---|---|
-| Register an AWS store | deferred | Store check needs the AWS adapter (task 13.2); registration itself: `crates/server/src/tests/accounts.rs::register_an_aws_store` |
+| Register an AWS store | covered | `crates/server/src/tests/accounts.rs::register_an_aws_store` (registration, granted references), `crates/server/src/tests/accounts.rs::a_store_check_reads_a_test_secret_with_the_stores_account` (fake AWS); the signed Secrets Manager and SSM reads run against Floci in CI: `crates/engine/src/cloud/tests.rs::real_secret_read` |
 | Change primary | deferred | Task 13.2 (explicitly moved there by task 3.9) |
 | Pinned version | covered | `crates/store/src/secrets/tests.rs::versions_are_kept_and_pinned` |
 | Placeholder in a reference | covered | `crates/server/src/secret_inputs.rs::placeholder_in_reference_is_rejected` |
-| Definition with references from two stores | deferred | Reading `my-sm` needs the external adapter (13.2); creating such a definition: `crates/server/src/tests/accounts.rs::register_an_aws_store` |
+| Definition with references from two stores | covered | `crates/engine/src/executor/tests.rs::a_definition_reads_secrets_from_two_stores` (one reference in `openporch`, one in a Secrets Manager store read with its cloud account; both reach the driver, neither the log) |
 | Inline secret becomes a reference | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references`, `crates/store/src/secrets/tests.rs::inline_values_become_references` |
 | Update creates a version | covered | `crates/server/src/tests/catalog.rs::definition_secrets_are_stored_as_references` |
 | Secret output stored as a reference | covered | `crates/engine/src/executor/tests.rs::a_secret_output_is_stored_and_returned_as_a_reference` |
-| Store unreachable | covered | `crates/engine/src/executor/tests.rs::an_unreadable_store_fails_the_resource_naming_store_and_reference` (the built-in store's table is made unreadable; the driver is not called) |
+| Store unreachable | covered | `crates/engine/src/executor/tests.rs::an_unreadable_store_fails_the_resource_naming_store_and_reference` (the built-in store's table is made unreadable; the driver is not called), `crates/engine/src/executor/tests.rs::an_unreachable_aws_store_fails_the_resource_naming_store_and_reference` |
 | Delete a store in use | covered | `crates/server/src/tests/accounts.rs::delete_a_store_in_use`, `crates/server/src/tests/accounts.rs::delete_a_store_used_by_shared_values` |
 | Reference copied between applications | covered | `crates/server/src/tests/secret_use.rs::reference_copied_between_applications` |
 | Production reference in development | covered | `crates/server/src/tests/secret_use.rs::production_reference_in_development` |
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 240 covered, 10 manual, 24 deferred, 0 gaps.
+274 scenarios: 242 covered, 10 manual, 22 deferred, 0 gaps.

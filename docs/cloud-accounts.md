@@ -219,3 +219,36 @@ The data directory keeps the issuer's key between runs. Point the tunnel at the
 listen address and create the identity provider and role from the setup the test
 prints, for account `aws-prod` in organization `acme`, before the check runs;
 the test waits up to ten minutes for the role to trust it.
+
+## Accounts that read secret stores
+
+An `aws-secrets-manager` or `aws-ssm` secret store names the cloud account its
+references are read with. That account needs, on the secrets it will read:
+
+- Secrets Manager: `secretsmanager:GetSecretValue`.
+- SSM Parameter Store: `ssm:GetParameter`.
+- Both: `kms:Decrypt` on the key that encrypts them, unless it is the AWS
+  managed key.
+
+A store's account must keep its own secrets in the built-in store, so reading
+a store never needs that same store. `POST /orgs/{org}/secretstores/{store}/check`
+with `{"ref": "<test secret>"}` reads a test secret with the account and
+reports whether it could, never the value.
+
+### The real secret store check
+
+`real_secret_read` reads a Secrets Manager secret and an SSM SecureString
+parameter (current and pinned version 1) with the host's static keys, and
+checks that missing names read as not found. CI runs it against Floci in the
+`account check against Floci` job. Against a real account, create both with the
+same value and run:
+
+```sh
+OPENPORCH_TEST_SECRET_VALUE=some-test-value \
+OPENPORCH_TEST_SM_SECRET=openporch/test-secret \
+OPENPORCH_TEST_SSM_PARAMETER=/openporch/test-parameter \
+  cargo test -p openporch-engine real_secret_read -- --ignored
+```
+
+It needs `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optionally
+`AWS_SESSION_TOKEN`, and `AWS_REGION` in the environment.

@@ -830,3 +830,66 @@ async fn identity_accounts_need_the_issuer() {
         Err(CloudError::Invalid(m)) if m.contains("public_url")
     ));
 }
+
+/// Reads a Secrets Manager secret and an SSM parameter through the hand-signed
+/// JSON calls, with the host's static keys. CI runs it against Floci: the job
+/// creates secret `OPENPORCH_TEST_SM_SECRET` and SecureString parameter
+/// `OPENPORCH_TEST_SSM_PARAMETER`, both holding `OPENPORCH_TEST_SECRET_VALUE`.
+#[tokio::test]
+#[ignore = "needs Secrets Manager and SSM"]
+async fn real_secret_read() {
+    use crate::cloud::{AwsSecret, SecretService};
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+    let credentials = AwsCredentials {
+        access_key_id: var("AWS_ACCESS_KEY_ID"),
+        secret_access_key: SecretValue::new(var("AWS_SECRET_ACCESS_KEY")),
+        session_token: std::env::var("AWS_SESSION_TOKEN")
+            .ok()
+            .map(SecretValue::new),
+        region: Some(var("AWS_REGION")),
+        expires_at: None,
+    };
+    let resolver = CredentialResolver::new(Arc::new(AwsSts::new()));
+    let expected = var("OPENPORCH_TEST_SECRET_VALUE");
+    let secret = |service, name: String, version: Option<&str>| AwsSecret {
+        service,
+        region: var("AWS_REGION"),
+        name,
+        version: version.map(str::to_owned),
+    };
+    for (service, name, version) in [
+        (
+            SecretService::SecretsManager,
+            var("OPENPORCH_TEST_SM_SECRET"),
+            None,
+        ),
+        (
+            SecretService::Ssm,
+            var("OPENPORCH_TEST_SSM_PARAMETER"),
+            None,
+        ),
+        (
+            SecretService::Ssm,
+            var("OPENPORCH_TEST_SSM_PARAMETER"),
+            Some("1"),
+        ),
+    ] {
+        let read = resolver
+            .read_secret(&credentials, &secret(service, name.clone(), version))
+            .await
+            .unwrap_or_else(|e| panic!("{service} `{name}`: {e}"));
+        assert_eq!(
+            read.expect("found").expose(),
+            expected,
+            "{service} `{name}`"
+        );
+        let missing = resolver
+            .read_secret(
+                &credentials,
+                &secret(service, format!("{name}-missing"), None),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{service} `{name}-missing`: {e}"));
+        assert!(missing.is_none(), "{service} `{name}-missing`");
+    }
+}

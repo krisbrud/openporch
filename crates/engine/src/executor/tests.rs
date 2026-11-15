@@ -42,6 +42,8 @@ const MASTER: &str = "master-plaintext-31";
 const TOKEN: &str = "token-plaintext-59";
 const ACCOUNT_KEY: &str = "account-key-plaintext-73";
 const PASSWORD: &str = "password-plaintext-47";
+/// The plaintext of `prod/db-password` in the AWS store.
+const EXTERNAL: &str = "external-plaintext-89";
 
 const WEB: &str = r#"
 apiVersion: openporch.dev/v1
@@ -350,6 +352,26 @@ impl Sts for FakeSts {
         let digest = (image.repository == "web" && image.tag == "1")
             .then(|| format!("sha256:{}", "ab".repeat(32)));
         Box::pin(async move { Ok(digest) })
+    }
+    /// Secrets Manager holds `prod/db-password`; reading `down/...` fails as an
+    /// unreachable service, and nothing else exists.
+    fn read_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a crate::cloud::AwsSecret,
+    ) -> BoxFuture<'a, Result<Option<SecretValue>, CloudError>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .push((Some(credentials.access_key_id.clone()), secret.to_string()));
+        let found = if secret.name.starts_with("down/") {
+            Err(CloudError::Unavailable(
+                "secretsmanager.GetSecretValue could not reach the service".into(),
+            ))
+        } else {
+            Ok((secret.name == "prod/db-password").then(|| SecretValue::new(EXTERNAL)))
+        };
+        Box::pin(async move { found })
     }
     /// Every digest exists except one of zeros.
     fn image_exists<'a>(
@@ -1917,4 +1939,163 @@ async fn an_observation_keeps_only_a_cookie_the_driver_can_read() {
         other => panic!("{other:?}"),
     }
     assert!(observed.cookie.is_none());
+}
+
+impl Fixture {
+    /// Registers `sm`, a Secrets Manager store read with `aws-main`, and grants
+    /// the organization each of `refs` in it.
+    async fn aws_store(&self, refs: &[&str]) {
+        self.account().await;
+        let store = openporch_store::SecretStoreRecord {
+            id: "sm".into(),
+            ty: "aws-secrets-manager".into(),
+            config: json!({"region": "eu-west-1", "cloud_account": "aws-main"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            primary: false,
+            created_at: 0,
+        };
+        self.store
+            .create_secret_store(ORG, &store, audit("POST", "/orgs/acme/secretstores"))
+            .await
+            .unwrap();
+        for r in refs {
+            self.store
+                .create_grant(
+                    ORG,
+                    &NewGrant {
+                        store: "sm".into(),
+                        reference: (*r).into(),
+                        app_id: None,
+                        env_id: None,
+                        org_wide: true,
+                    },
+                    audit("POST", "/orgs/acme/secretstores/sm/grants"),
+                )
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// The Definition with references from two stores scenario: one secret from
+/// the built-in store and one from Secrets Manager, read with the store's
+/// cloud account, both reach the driver and neither reaches the log.
+#[tokio::test]
+async fn a_definition_reads_secrets_from_two_stores() {
+    let f = Fixture::new().await;
+    f.aws_store(&["prod/db-password"]).await;
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {
+            "master": {"store": "openporch", "ref": "defs/pg/master"},
+            "external": {"store": "sm", "ref": "prod/db-password"},
+        }}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let secrets = f.driver.puts()[0].secrets.expose().clone();
+    assert_eq!(secrets["master"], MASTER);
+    assert_eq!(secrets["external"], EXTERNAL);
+    assert!(
+        f.sts.objects.lock().unwrap().contains(&(
+            Some("AKIATEST".into()),
+            "Secrets Manager `prod/db-password` in eu-west-1".into()
+        )),
+        "{:?}",
+        f.sts.objects.lock().unwrap()
+    );
+    let recorded = f.recorded(&deployment).await;
+    for plaintext in [MASTER, EXTERNAL, ACCOUNT_KEY] {
+        assert!(!recorded.contains(plaintext), "{plaintext}: {recorded}");
+    }
+}
+
+#[tokio::test]
+async fn an_external_secret_needs_a_grant_and_must_exist() {
+    let f = Fixture::new().await;
+    f.aws_store(&["prod/missing"]).await;
+    let with = |r: &str| {
+        def(
+            "pg",
+            "postgres",
+            "test/fake",
+            json!({"secret_refs": {"external": {"store": "sm", "ref": r}}}),
+        )
+    };
+    let defs = f.define(with("prod/missing"), "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, DB);
+    assert!(
+        error.contains("secret `prod/missing` not found in store `sm`"),
+        "{error}"
+    );
+    assert!(f.driver.puts().is_empty(), "the driver was called");
+
+    // Without a grant the store is never asked.
+    sqlx::query("DELETE FROM secret_grants WHERE store_id = 'sm'")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    f.sts.objects.lock().unwrap().clear();
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, DB);
+    assert!(error.contains("no grant"), "{error}");
+    assert!(f.sts.objects.lock().unwrap().is_empty());
+}
+
+/// The Store unreachable scenario for an AWS store: the error names the store
+/// and the reference, and the driver is not called.
+#[tokio::test]
+async fn an_unreachable_aws_store_fails_the_resource_naming_store_and_reference() {
+    let f = Fixture::new().await;
+    f.aws_store(&["down/db-password"]).await;
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"external": {"store": "sm", "ref": "down/db-password"}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let error = failed(&outcomes, DB);
+    assert!(
+        error.contains("secret `down/db-password` in store `sm` could not be read"),
+        "{error}"
+    );
+    assert!(f.driver.puts().is_empty(), "the driver was called");
+    assert!(!f.recorded(&deployment).await.contains(ACCOUNT_KEY));
+}
+
+#[test]
+fn external_references_name_a_secret_in_the_stores_region() {
+    let store = |ty: &str, region: &str| openporch_store::SecretStoreRecord {
+        id: "s".into(),
+        ty: ty.into(),
+        config: json!({"region": region, "cloud_account": "a"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        primary: false,
+        created_at: 0,
+    };
+    let r = |name: &str, version: Option<&str>| SecretRef {
+        store: "s".into(),
+        reference: name.into(),
+        version: version.map(str::to_owned),
+    };
+    let ssm = external_secret(&store("aws-ssm", "eu-north-1"), &r("/app/db", Some("3"))).unwrap();
+    assert_eq!(ssm.service, SecretService::Ssm);
+    assert_eq!(ssm.region, "eu-north-1");
+    assert_eq!(ssm.version.as_deref(), Some("3"));
+    let e = external_secret(&store("aws-ssm", "eu-north-1"), &r("/app/db", Some("x"))).unwrap_err();
+    assert!(e.contains("are numbers"), "{e}");
+    let e = external_secret(&store("aws-ssm", "evil.example/"), &r("a", None)).unwrap_err();
+    assert!(e.contains("config.region"), "{e}");
+    let e = external_secret(&store("vault", "eu-north-1"), &r("a", None)).unwrap_err();
+    assert!(e.contains("cannot be read"), "{e}");
 }
