@@ -55,6 +55,69 @@ pub struct Config {
     /// Container registries other than ECR.
     #[serde(default)]
     pub images: ImageSettings,
+    /// The HTTPS URL at which cloud providers reach this server, such as
+    /// `https://porch.example.com`. It enables the OIDC issuer at
+    /// `<public_url>/oidc`; without it the issuer is off.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// The OIDC issuer.
+    #[serde(default)]
+    pub oidc: OidcSettings,
+}
+
+/// The shortest grace period of a rotated OIDC key: the longest token
+/// lifetime, so every token it signed has expired before it is unpublished.
+const MIN_OIDC_GRACE_MINUTES: u64 = 15;
+/// The longest grace period: thirty days.
+const MAX_OIDC_GRACE_MINUTES: u64 = 30 * 24 * 60;
+
+/// The OIDC issuer's key rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcSettings {
+    /// How long a rotated-out signing key stays in the JWKS, in minutes.
+    /// Cloud providers cache the JWKS, so the default is a day.
+    #[serde(default = "default_oidc_grace_minutes")]
+    pub key_grace_minutes: u64,
+}
+
+impl Default for OidcSettings {
+    fn default() -> Self {
+        Self {
+            key_grace_minutes: default_oidc_grace_minutes(),
+        }
+    }
+}
+
+fn default_oidc_grace_minutes() -> u64 {
+    24 * 60
+}
+
+/// Checks `public_url`: an absolute HTTPS URL with no credentials, query or
+/// fragment, returned without a trailing slash.
+pub fn check_public_url(url: &str) -> Result<String, ConfigError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ConfigError(format!("`public_url` is not a URL: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(ConfigError(
+            "`public_url` must use https: cloud providers only trust an OIDC issuer served \
+             over HTTPS"
+                .into(),
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError(
+            "`public_url` must be a host and optional path, with no credentials, query or \
+             fragment"
+                .into(),
+        ));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 /// How images in registries other than ECR are pinned and checked.
@@ -431,7 +494,15 @@ impl Config {
             limits: WorkLimits::default(),
             audit: AuditSettings::default(),
             images: ImageSettings::default(),
+            public_url: None,
+            oidc: OidcSettings::default(),
         }
+    }
+
+    /// The issuer URL, `<public_url>/oidc`, when the issuer is enabled.
+    pub fn oidc_issuer(&self) -> Option<String> {
+        let url = check_public_url(self.public_url.as_deref()?).ok()?;
+        Some(format!("{url}{}", openporch_engine::oidc::ISSUER_PATH))
     }
 
     /// Loads `path` (if given), then applies `OPENPORCH_ORG`, `OPENPORCH_DATA_DIR` and
@@ -518,6 +589,16 @@ impl Config {
                     )));
                 }
             }
+        }
+        if let Some(url) = &self.public_url {
+            check_public_url(url)?;
+        }
+        if !(MIN_OIDC_GRACE_MINUTES..=MAX_OIDC_GRACE_MINUTES).contains(&self.oidc.key_grace_minutes)
+        {
+            return Err(ConfigError(format!(
+                "`oidc.key_grace_minutes` must be between {MIN_OIDC_GRACE_MINUTES} and \
+                 {MAX_OIDC_GRACE_MINUTES}"
+            )));
         }
         if !self.listen.ip().is_loopback() && !self.tls_terminated_by_proxy {
             return Err(ConfigError(format!(

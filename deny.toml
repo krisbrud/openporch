@@ -21,6 +21,10 @@ ignore = [
     # unsafe-libyaml, under serde_yaml_ng, is unmaintained. No vulnerability
     # is reported; revisit when moving to a maintained YAML parser.
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, no known vulnerability" },
+    # The Marvin attack: the `rsa` crate's private-key operations are not
+    # constant time. openporch only generates OIDC keys with it; every
+    # signature is made by `ring` (crates/engine/src/oidc.rs).
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used for key generation only; ring signs" },
 ]
 
 [licenses]

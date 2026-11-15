@@ -35,7 +35,7 @@ pub use deploy::{
 pub use error::StoreError;
 pub use identity::{
     AppRole, AuditFilter, ExternalIdentity, Invitation, NewInvitation, NewPrincipal, OrgRole,
-    Principal, Roles, TokenInfo, covers,
+    Principal, Roles, SigningKey, TokenInfo, covers,
 };
 pub use ownership::Ownership;
 pub use secret_use::{SecretOwner, SecretUseStore};

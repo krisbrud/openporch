@@ -202,6 +202,36 @@ private_registries = ["registry.internal:5000"]
 insecure_registries = ["localhost:5000"]
 ```
 
+## OIDC issuer
+
+openporch can act as an OpenID Connect issuer, so a cloud account can trust
+the short-lived tokens it signs instead of holding standing credentials. Turn
+it on with the HTTPS URL at which the cloud provider reaches this server:
+
+```toml
+public_url = "https://porch.example.com"
+
+[oidc]
+# How long a rotated-out key stays published, in minutes (15 to 43200).
+key_grace_minutes = 1440
+```
+
+The issuer is then `https://porch.example.com/oidc`, with its discovery
+document at `/oidc/.well-known/openid-configuration` and its keys at
+`/oidc/jwks`. Both are served without credentials, and must be reachable from
+the internet for AWS to fetch them. `public_url` must use `https`, even behind
+a TLS-terminating proxy, because cloud providers only trust an issuer served
+over HTTPS.
+
+On the first start with `public_url` set the server generates an RS256
+signing key and stores it in the database sealed with the master key, as it
+does the session key; a backup carries it. An administrator rotates it with
+`POST /orgs/{org}/oidc/keys/rotate`: new tokens are signed with the new key at
+once, and the old one stays in the JWKS for `key_grace_minutes`, so tokens it
+signed keep validating while cloud providers refresh their cached copy. It is
+deleted at the next rotation after that. Tokens live at most 15 minutes, so
+the grace period is at least that long.
+
 ## Stopping the server
 
 On `SIGTERM` or Ctrl-C the server:

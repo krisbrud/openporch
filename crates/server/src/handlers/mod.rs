@@ -13,6 +13,7 @@ pub use health::CONTRACT_VERSION;
 mod login;
 mod members;
 mod metrics;
+mod oidc;
 mod plans;
 mod resources;
 mod sets;
@@ -42,6 +43,20 @@ pub fn api(state: AppState) -> Api {
         .route(get(), "/readyz", Public, health::readyz)
         .route(get(), "/healthz", Public, health::readyz)
         .route(get(), "/version", Public, health::version)
+        // The OIDC issuer.
+        .route(
+            get(),
+            "/oidc/.well-known/openid-configuration",
+            Public,
+            oidc::discovery,
+        )
+        .route(get(), "/oidc/jwks", Public, oidc::jwks)
+        .route(
+            post(),
+            "/orgs/{org}/oidc/keys/rotate",
+            Org(OrgPerm::Administer),
+            oidc::rotate,
+        )
         // Login.
         .route(post(), "/auth/github/device", Public, login::start)
         .route(post(), "/auth/github/token", Public, login::poll)

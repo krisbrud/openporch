@@ -2440,6 +2440,41 @@ Authorization: Bearer $ADMIN_TOKEN
 {"tombstones": []}
 ```
 
+## OIDC issuer
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/oidc/.well-known/openid-configuration` | public |
+| GET | `/oidc/jwks` | public |
+| POST | `/orgs/{org}/oidc/keys/rotate` | org administer |
+
+With `public_url` set, openporch is an OpenID Connect issuer at
+`<public_url>/oidc`, so that a cloud provider can trust short-lived tokens it
+signs instead of openporch holding standing credentials. The discovery
+document names the issuer, the JWKS URL and `RS256`. The JWKS lists only
+public keys: the key new tokens are signed with and, after a rotation, the key
+it replaced until its grace period (`[oidc] key_grace_minutes`, a day by
+default) ends. Without `public_url` the three routes return `404`. See
+[Operating openporch](operations.md#oidc-issuer).
+
+A rotation generates a new RS256 key, signs every later token with it and is
+recorded in the audit log as `oidc.key.rotate`. The answer names the signing
+key and every published key, newest first, with `retires_at` on the ones being
+rotated out:
+
+```json
+{
+  "signing_kid": "Xa3…",
+  "keys": [
+    {"kid": "Xa3…", "created_at": 1763218800000},
+    {"kid": "q7Z…", "created_at": 1760540400000, "retires_at": 1763305200000}
+  ]
+}
+```
+
+Key IDs are RFC 7638 thumbprints of the public keys. Identity tokens are never
+returned through the API.
+
 ## Audit log
 
 | Method | Path | Permission |

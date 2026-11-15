@@ -30,7 +30,7 @@ pub struct RouteSpec {
 }
 
 /// The only routes that may be served without credentials.
-pub const PUBLIC_ROUTES: [(Method, &str); 9] = [
+pub const PUBLIC_ROUTES: [(Method, &str); 11] = [
     (Method::GET, "/livez"),
     (Method::GET, "/readyz"),
     (Method::GET, "/healthz"),
@@ -40,6 +40,8 @@ pub const PUBLIC_ROUTES: [(Method, &str); 9] = [
     (Method::GET, "/auth/github/authorize"),
     (Method::GET, "/auth/github/callback"),
     (Method::POST, "/auth/github/session"),
+    (Method::GET, "/oidc/.well-known/openid-configuration"),
+    (Method::GET, "/oidc/jwks"),
 ];
 
 /// Builds the router. Routes can only be added together with their permission, so
