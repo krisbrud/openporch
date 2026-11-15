@@ -24,6 +24,8 @@ use crate::rate_limit::ClientAddr;
 use crate::state::AppState;
 
 const TOKEN_PATH: &str = "/auth/github/token";
+/// The provider ID of browser logins through GitHub.
+const GITHUB: &str = "github";
 
 fn github(state: &AppState) -> ApiResult<Arc<dyn IdentityProvider>> {
     state
@@ -72,7 +74,7 @@ struct Pending {
     interval: u64,
 }
 
-fn login_failed(message: &str) -> ApiError {
+pub(crate) fn login_failed(message: &str) -> ApiError {
     ApiError::new(StatusCode::UNAUTHORIZED, code::UNAUTHENTICATED, message)
 }
 
@@ -137,7 +139,7 @@ fn login_cookie(config: &GithubBrowserConfig, value: &str, max_age: i64) -> Head
     HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -149,7 +151,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 /// A `302` to `location` that is never cached, with `cookie` set.
-fn redirect(location: &str, cookie: HeaderValue) -> ApiResult<Response> {
+pub(crate) fn redirect(location: &str, cookie: HeaderValue) -> ApiResult<Response> {
     let location = HeaderValue::from_str(location)
         .map_err(|_| ApiError::internal("a redirect address is not a valid header"))?;
     Ok((
@@ -161,6 +163,21 @@ fn redirect(location: &str, cookie: HeaderValue) -> ApiResult<Response> {
         ],
     )
         .into_response())
+}
+
+/// The page a login returns to: `requested`, which must be one of `urls`, or the
+/// only one of them.
+pub(crate) fn pick_return_to(requested: Option<&str>, urls: &[String]) -> ApiResult<String> {
+    match (requested, urls) {
+        (None, [only]) => Ok(only.clone()),
+        (None, _) => Err(ApiError::invalid(
+            "`return_to` is required: name one of the server's return URLs",
+        )),
+        (Some(url), urls) if urls.iter().any(|u| u == url) => Ok(url.to_owned()),
+        (Some(_), _) => Err(ApiError::invalid(
+            "`return_to` is not one of the server's return URLs",
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -180,23 +197,10 @@ pub async fn authorize(
     state.login_limit.check(&addr)?;
     let config = browser_config(&state)?;
     let provider = github(&state)?;
-    let return_to = match (&query.return_to, config.return_urls.as_slice()) {
-        (None, [only]) => only.clone(),
-        (None, _) => {
-            return Err(ApiError::invalid(
-                "`return_to` is required: name one of the server's return URLs",
-            ));
-        }
-        (Some(url), urls) if urls.iter().any(|u| u == url) => url.clone(),
-        (Some(_), _) => {
-            return Err(ApiError::invalid(
-                "`return_to` is not one of the server's return URLs",
-            ));
-        }
-    };
+    let return_to = pick_return_to(query.return_to.as_deref(), &config.return_urls)?;
     let started = state
         .browser_logins
-        .start(&return_to, openporch_store::now_ms())
+        .start(GITHUB, &return_to, None, openporch_store::now_ms())
         .ok_or_else(|| ApiError::rate_limited(60))?;
     let url = provider
         .authorize_url(&started.state, &config.callback_url)
@@ -218,7 +222,7 @@ pub struct Callback {
 }
 
 /// Where a login returns to, with one query parameter added.
-fn returning(return_to: &str, key: &str, value: &str) -> ApiResult<String> {
+pub(crate) fn returning(return_to: &str, key: &str, value: &str) -> ApiResult<String> {
     let mut url = Url::parse(return_to).map_err(ApiError::internal)?;
     url.query_pairs_mut().append_pair(key, value);
     Ok(url.into())
@@ -241,6 +245,7 @@ pub async fn callback(
     let return_to = state
         .browser_logins
         .callback(
+            GITHUB,
             query.state.as_deref().unwrap_or_default(),
             cookie_value(&headers, LOGIN_COOKIE),
             now,
@@ -254,7 +259,8 @@ pub async fn callback(
                     "this login was started in another browser; sign in again"
                 }
             })
-        })?;
+        })?
+        .return_to;
     let clear = login_cookie(config, "", 0);
     let fail = |reason: &str| redirect(&returning(&return_to, "error", reason)?, clear.clone());
     if let Some(error) = query.error.as_deref() {
@@ -277,7 +283,7 @@ pub async fn callback(
     };
     // The exchange window starts once GitHub has answered.
     let now = openporch_store::now_ms();
-    let Some(login_code) = state.browser_logins.complete(identity, now) else {
+    let Some(login_code) = state.browser_logins.complete(GITHUB, identity, now) else {
         return fail("unavailable");
     };
     redirect(&returning(&return_to, "login_code", &login_code)?, clear)
@@ -302,7 +308,7 @@ pub async fn exchange(
     browser_config(&state)?;
     let identity = state
         .browser_logins
-        .exchange(&body.login_code, openporch_store::now_ms())
+        .exchange(GITHUB, &body.login_code, openporch_store::now_ms())
         .ok_or_else(|| {
             login_failed("the login code is unknown, expired or already used; sign in again")
         })?;

@@ -35,6 +35,7 @@ mod github;
 mod keys;
 mod limits;
 mod oidc;
+mod oidc_login;
 mod plans;
 mod resources;
 mod restore;

@@ -89,13 +89,13 @@ none is open.
 | Login and expiry | covered | `crates/server/src/tests/mod.rs::sessions_expire_after_24_hours`, `crates/cli/src/tests.rs::an_expired_session_asks_the_user_to_log_in_again` (the session `porch login` stored, re-signed by the server with its times 25 hours earlier in place of a clock, gets `401` and the CLI says to run `porch login`) |
 | GitHub device login | covered | `crates/server/src/tests/github.rs::device_login_maps_the_immutable_github_id`, `crates/cli/src/tests.rs::device_login_stores_a_session_for_the_github_user` |
 | Unknown identity | covered | `crates/server/src/tests/mod.rs::unknown_identities_need_an_invitation` |
-| Provider is locked after first login | covered | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity; generic OIDC login itself is task 13.1), `crates/server/src/tests/mod.rs::only_an_administrator_changes_an_identity_binding` (`PUT /orgs/{org}/users/{user}/identity`: a manager and the member get `403`, an unknown user or organization `404`; the administrator's change lets the other provider log in, ends the old identity and sessions, and is audited) |
+| Provider is locked after first login | covered | `crates/server/src/tests/mod.rs::identity_binding_is_locked_after_first_login` (login layer with an OIDC-shaped identity), `crates/server/src/tests/oidc_login.rs::a_member_who_signed_in_with_github_cannot_sign_in_through_oidc_by_email` (through the OIDC browser login against a local test issuer), `crates/server/src/tests/mod.rs::only_an_administrator_changes_an_identity_binding` (`PUT /orgs/{org}/users/{user}/identity`: a manager and the member get `403`, an unknown user or organization `404`; the administrator's change lets the other provider log in, ends the old identity and sessions, and is audited) |
 | First start | covered | `crates/server/src/tests/mod.rs::first_start_bootstraps_an_administrator`, `crates/server/tests/bootstrap_logs.rs::bootstrap_token_is_not_logged` |
 | Reused GitHub name | covered | `crates/server/src/tests/github.rs::renamed_and_reused_github_logins`, `crates/server/src/tests/mod.rs::reused_github_login_gains_nothing` |
-| Unverified invitation email | covered | `crates/server/src/tests/mod.rs::unverified_invitation_email_is_denied`, `crates/server/src/tests/github.rs::email_invitations_need_a_verified_github_email` |
+| Unverified invitation email | covered | `crates/server/src/tests/mod.rs::unverified_invitation_email_is_denied`, `crates/server/src/tests/github.rs::email_invitations_need_a_verified_github_email`, `crates/server/src/tests/oidc_login.rs::unverified_emails_do_not_accept_email_invitations` |
 | Removed user with a valid signature | covered | `crates/server/src/tests/mod.rs::sessions_check_membership_and_revocation_on_every_request` |
 | Invalid server certificate | covered | CLI: `crates/client/src/tests.rs::untrusted_certificate_is_rejected_before_the_token_is_sent`; provider: `provider/internal/provider/provider_test.go::TestAnUntrustedCertificateIsRefusedBeforeTheTokenIsSent` (a TLS server with an untrusted certificate fails configuration and receives no request) |
-| Wrong audience or replayed transaction | deferred | Generic OIDC login, task 13.1 |
+| Wrong audience or replayed transaction | covered | `crates/server/src/tests/oidc_login.rs::id_tokens_failing_a_check_create_no_session` (another audience, another `azp`, issuer, expiry, nonce, `none`/HS256, unpublished key, tampered claims, a PKCE mismatch, a callback naming another `iss`; against a local test issuer), `crates/server/src/tests/oidc_login.rs::oidc_login_maps_issuer_and_subject_and_accepts_verified_email_invitations` (a used `state` and `login_code` are refused), `crates/server/src/tests/oidc_login.rs::forged_callbacks_unknown_providers_and_return_urls_are_refused` |
 
 ## aws-lambda-workloads
 
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 239 covered, 10 manual, 25 deferred, 0 gaps.
+274 scenarios: 240 covered, 10 manual, 24 deferred, 0 gaps.

@@ -44,18 +44,22 @@ async fn sqlx_ping(state: &AppState) -> Result<(), openporch_store::StoreError> 
 
 pub async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Each configured provider with the login flows it offers.
-    let providers: Vec<serde_json::Value> = state
-        .config
-        .github
-        .iter()
-        .map(|g| {
-            let mut flows = vec!["device"];
-            if g.browser.is_some() {
-                flows.push("browser");
-            }
-            json!({"id": "github", "flows": flows})
-        })
-        .collect();
+    let providers: Vec<serde_json::Value> =
+        state
+            .config
+            .github
+            .iter()
+            .map(|g| {
+                let mut flows = vec!["device"];
+                if g.browser.is_some() {
+                    flows.push("browser");
+                }
+                json!({"id": "github", "flows": flows})
+            })
+            .chain(state.config.oidc_login.iter().map(
+                |o| json!({"id": o.id, "type": "oidc", "issuer": o.issuer, "flows": ["browser"]}),
+            ))
+            .collect();
     Json(json!({
         "version": crate::VERSION,
         "contract": CONTRACT_VERSION,

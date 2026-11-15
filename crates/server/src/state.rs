@@ -48,6 +48,8 @@ pub struct Inner {
     pub not_ready: Vec<String>,
     /// The GitHub identity provider, when configured.
     pub github: Option<Arc<dyn IdentityProvider>>,
+    /// The OpenID Connect login providers, by ID.
+    pub oidc_logins: std::collections::HashMap<String, Arc<crate::oidc_login::OidcLogin>>,
     /// Resolves cloud accounts into credentials.
     pub cloud: Arc<CredentialResolver>,
     /// Browser logins in progress.
@@ -305,6 +307,12 @@ pub(crate) async fn start_with_drivers(
         }
         None => None,
     };
+    let oidc_logins = config
+        .oidc_login
+        .iter()
+        .map(|c| crate::oidc_login::OidcLogin::new(c).map(|p| (c.id.clone(), Arc::new(p))))
+        .collect::<Result<_, _>>()
+        .map_err(StartupError::Io)?;
     let ownership = Ownership::acquire(&config.data_dir)?;
     let store = SqliteStore::open(ownership, &config.org).await?;
     let keyring = load_keyring(&config, &store, env_key).await?.map(Arc::new);
@@ -381,6 +389,7 @@ pub(crate) async fn start_with_drivers(
         oidc_rotation: tokio::sync::Mutex::new(()),
         not_ready,
         github,
+        oidc_logins,
         cloud: Arc::new(cloud),
         browser_logins: Default::default(),
         login_limit,

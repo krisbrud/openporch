@@ -103,6 +103,62 @@ token stays on the server, which drops it once it has read who signed in.
 Invitations work as with the device flow: the exchange takes the
 `invitation_code` on a first login.
 
+### OpenID Connect sign-in
+
+Any OpenID Connect provider that supports the authorization-code flow, such as
+Google, Microsoft Entra ID, Okta, Keycloak or Dex, can sign members in through a
+browser. Register openporch as a web application client with the redirect URI
+`https://<server>/auth/oidc/<id>/callback`, where `<id>` is the name you give the
+provider in openporch, write its client secret to a file only the server's user
+can read, and add the provider:
+
+```toml
+[[oidc_login]]
+id = "corp"
+issuer = "https://id.example.com"
+client_id = "openporch"
+client_secret_file = "/etc/openporch/corp-client-secret"
+callback_url = "https://porch.example.com/auth/oidc/corp/callback"
+return_urls = ["https://portal.example.com/login/done"]
+# The defaults:
+# scopes = ["openid", "email", "profile"]
+# algorithms = ["RS256"]
+```
+
+`issuer` must match the `issuer` of the provider's discovery document
+(`<issuer>/.well-known/openid-configuration`) exactly. A public client, which has
+no secret, leaves `client_secret_file` out; PKCE then protects the code on its
+own. Several providers can be configured, each with its own `id`.
+
+The login runs like GitHub's browser login, with the same `state`, cookie,
+return URLs and one-time `login_code`, and adds the checks OpenID Connect asks
+for:
+
+- Every login sends a PKCE `S256` challenge, and the server alone holds the
+  verifier, which it sends with the code. A code that leaks from the browser is
+  useless without it.
+- Every login sends a fresh `nonce`, and the ID token must carry it. An ID token
+  from another login is refused.
+- The ID token must be signed with one of the configured `algorithms`, by a key
+  the provider publishes at its `jwks_uri`; `none` and HMAC algorithms are never
+  accepted. Its `iss` must be the issuer and its `aud` must include the client ID;
+  when it names other audiences too, or names an `azp`, `azp` must be the client
+  ID. It must not have expired, and its `iat` and `nbf` must not be in the
+  future, allowing for 60 seconds of clock skew.
+- A callback that names another `iss` (RFC 9207) is refused before the code is
+  used.
+- The keys are cached for an hour. A token naming a key the cache lacks makes the
+  server fetch them again, at most once a minute, so it follows the provider's key
+  rotations.
+
+The identity is `<issuer>:<sub>`, since `sub` is the only claim a provider keeps
+stable. An invitation by email is accepted only when the provider marks that
+address verified with `email_verified`, and an email that already belongs to a
+member linked to another identity stays bound to it: only an administrator can
+change a member's identity, with `PUT /orgs/{org}/users/{user}/identity`. The
+provider's access and ID tokens stay on the server and are dropped once it has
+read who signed in.
+
 ## Roles
 
 | Scope | Role | Grants |

@@ -63,6 +63,124 @@ pub struct Config {
     /// The OIDC issuer.
     #[serde(default)]
     pub oidc: OidcSettings,
+    /// OpenID Connect identity providers people sign in with, each under its own
+    /// `id`.
+    #[serde(default)]
+    pub oidc_login: Vec<OidcLoginConfig>,
+}
+
+/// An OpenID Connect identity provider for browser login: the authorization-code
+/// flow with PKCE. Identities are `<issuer>:<sub>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcLoginConfig {
+    /// The provider's ID in this server's routes, such as `corp`.
+    pub id: String,
+    /// The issuer, exactly as its discovery document and ID tokens name it.
+    pub issuer: String,
+    /// The OAuth client ID registered with the provider.
+    pub client_id: String,
+    /// A file holding the client secret, readable only by the server's user. Left
+    /// out for a public client, which PKCE alone protects.
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+    /// This server's `/auth/oidc/<id>/callback` URL, as registered with the
+    /// provider.
+    pub callback_url: String,
+    /// The pages a finished login may return the browser to.
+    pub return_urls: Vec<String>,
+    /// The scopes requested; they must include `openid`.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// The ID token signing algorithms accepted.
+    #[serde(default = "default_oidc_algorithms")]
+    pub algorithms: Vec<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    ["openid", "email", "profile"].map(String::from).to_vec()
+}
+
+fn default_oidc_algorithms() -> Vec<String> {
+    vec!["RS256".into()]
+}
+
+/// The path of an OpenID Connect provider's browser login callback.
+pub fn oidc_callback_path(id: &str) -> String {
+    format!("/auth/oidc/{id}/callback")
+}
+
+impl OidcLoginConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let id = &self.id;
+        if id == "github" || !openporch_core::ids::is_valid_object_id(id) {
+            return Err(ConfigError(format!(
+                "`oidc_login.id` `{id}` must be a lowercase ID other than `github`"
+            )));
+        }
+        let name = |field: &str| format!("oidc_login.{id}.{field}");
+        let issuer =
+            crate::identity::check_url(&name("issuer"), &self.issuer).map_err(ConfigError)?;
+        if issuer.query().is_some() {
+            return Err(ConfigError(format!(
+                "`{}` must not have a query",
+                name("issuer")
+            )));
+        }
+        if self.client_id.trim().is_empty() {
+            return Err(ConfigError(format!("`{}` is empty", name("client_id"))));
+        }
+        let callback = crate::identity::check_url(&name("callback_url"), &self.callback_url)
+            .map_err(ConfigError)?;
+        let path = oidc_callback_path(id);
+        if callback.path() != path || callback.query().is_some() {
+            return Err(ConfigError(format!(
+                "`{}` must be this server's `{path}`, with no query",
+                name("callback_url")
+            )));
+        }
+        if self.return_urls.is_empty() {
+            return Err(ConfigError(format!(
+                "`{}` needs at least one page to return to",
+                name("return_urls")
+            )));
+        }
+        for url in &self.return_urls {
+            crate::identity::check_url(&name("return_urls"), url).map_err(ConfigError)?;
+        }
+        if !self.scopes.iter().any(|s| s == "openid") {
+            return Err(ConfigError(format!(
+                "`{}` must include `openid`",
+                name("scopes")
+            )));
+        }
+        if let Some(scope) = self.scopes.iter().find(|s| {
+            s.is_empty()
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+        }) {
+            return Err(ConfigError(format!(
+                "`{}` has an invalid scope `{scope}`",
+                name("scopes")
+            )));
+        }
+        if self.algorithms.is_empty() {
+            return Err(ConfigError(format!("`{}` is empty", name("algorithms"))));
+        }
+        if let Some(alg) = self
+            .algorithms
+            .iter()
+            .find(|a| !crate::oidc_login::ALGORITHMS.contains(&a.as_str()))
+        {
+            return Err(ConfigError(format!(
+                "`{}` names `{alg}`; supported are {}",
+                name("algorithms"),
+                crate::oidc_login::ALGORITHMS.join(", ")
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The shortest grace period of a rotated OIDC key: the longest token
@@ -513,6 +631,7 @@ impl Config {
             images: ImageSettings::default(),
             public_url: None,
             oidc: OidcSettings::default(),
+            oidc_login: Vec::new(),
         }
     }
 
@@ -635,6 +754,16 @@ impl Config {
                 .map_err(ConfigError)?;
             if let Some(browser) = &github.browser {
                 browser.validate()?;
+            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for provider in &self.oidc_login {
+            provider.validate()?;
+            if !ids.insert(&provider.id) {
+                return Err(ConfigError(format!(
+                    "`oidc_login.id` `{}` is used twice",
+                    provider.id
+                )));
             }
         }
         if let StateSettings::S3 {

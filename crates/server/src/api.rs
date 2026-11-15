@@ -30,7 +30,7 @@ pub struct RouteSpec {
 }
 
 /// The only routes that may be served without credentials.
-pub const PUBLIC_ROUTES: [(Method, &str); 11] = [
+pub const PUBLIC_ROUTES: [(Method, &str); 14] = [
     (Method::GET, "/livez"),
     (Method::GET, "/readyz"),
     (Method::GET, "/healthz"),
@@ -40,6 +40,9 @@ pub const PUBLIC_ROUTES: [(Method, &str); 11] = [
     (Method::GET, "/auth/github/authorize"),
     (Method::GET, "/auth/github/callback"),
     (Method::POST, "/auth/github/session"),
+    (Method::GET, "/auth/oidc/{provider}/authorize"),
+    (Method::GET, "/auth/oidc/{provider}/callback"),
+    (Method::POST, "/auth/oidc/{provider}/session"),
     (Method::GET, "/oidc/.well-known/openid-configuration"),
     (Method::GET, "/oidc/jwks"),
 ];
