@@ -73,14 +73,17 @@ Options:
       --url <URL>
           The server URL. Defaults to `OPENPORCH_URL`, then `url` in the config file
 
-      --invitation <CODE>
-          The invitation code, on a first GitHub login
-
       --org <ORG>
           The organization. Defaults to `OPENPORCH_ORG`, then `org` in the config file
 
+      --provider <ID>
+          Sign in through the browser with this OpenID Connect provider of the server, instead of with GitHub
+
       --app <APP>
           The application. Defaults to `OPENPORCH_APP`, then `app` in the config file
+
+      --invitation <CODE>
+          The invitation code, on a first login
 
       --env <ENV>
           The environment. Defaults to `OPENPORCH_ENV`, then `env` in the config file

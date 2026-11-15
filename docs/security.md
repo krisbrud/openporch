@@ -120,6 +120,8 @@ client_id = "openporch"
 client_secret_file = "/etc/openporch/corp-client-secret"
 callback_url = "https://porch.example.com/auth/oidc/corp/callback"
 return_urls = ["https://portal.example.com/login/done"]
+# Lets `porch login --provider corp` sign in, as below.
+loopback_return = true
 # The defaults:
 # scopes = ["openid", "email", "profile"]
 # algorithms = ["RS256"]
@@ -129,6 +131,15 @@ return_urls = ["https://portal.example.com/login/done"]
 (`<issuer>/.well-known/openid-configuration`) exactly. A public client, which has
 no secret, leaves `client_secret_file` out; PKCE then protects the code on its
 own. Several providers can be configured, each with its own `id`.
+
+With `loopback_return = true`, `porch login --provider corp` signs in from a
+terminal: it listens on a random port of `127.0.0.1`, prints the address to open
+in a browser on the same computer, and receives the login there (RFC 8252). The
+server then also returns a login to `http://127.0.0.1:<port>/<path>` or
+`http://[::1]:<port>/<path>`, which only the browser's own machine can receive;
+`porch` listens on a path with a random part, so a page that guesses the port
+cannot hand it someone else's login. A provider used only from the terminal
+needs no `return_urls`.
 
 The login runs like GitHub's browser login, with the same `state`, cookie,
 return URLs and one-time `login_code`, and adds the checks OpenID Connect asks

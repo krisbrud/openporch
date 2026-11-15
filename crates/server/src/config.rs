@@ -89,6 +89,11 @@ pub struct OidcLoginConfig {
     pub callback_url: String,
     /// The pages a finished login may return the browser to.
     pub return_urls: Vec<String>,
+    /// Also return a finished login to any port of the loopback address, as
+    /// `porch login --provider` listens on one (RFC 8252). Only the browser's
+    /// own machine can receive a login code there.
+    #[serde(default)]
+    pub loopback_return: bool,
     /// The scopes requested; they must include `openid`.
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
@@ -139,9 +144,9 @@ impl OidcLoginConfig {
                 name("callback_url")
             )));
         }
-        if self.return_urls.is_empty() {
+        if self.return_urls.is_empty() && !self.loopback_return {
             return Err(ConfigError(format!(
-                "`{}` needs at least one page to return to",
+                "`{}` needs at least one page to return to, or `loopback_return = true`",
                 name("return_urls")
             )));
         }

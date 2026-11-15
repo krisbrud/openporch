@@ -212,7 +212,9 @@ where `{provider}` is its `id`. The provider is sent a PKCE `S256` challenge and
 hands out a `login_code`; an ID token that fails a check returns the browser with
 `error=login_failed`. Each provider is listed in `/version` as
 `{"id": "corp", "type": "oidc", "issuer": "https://id.example.com", "flows": ["browser"]}`,
-and an `id` that no provider has gets `404`. The member's identity is
+and an `id` that no provider has gets `404`. A provider with `loopback_return`
+also accepts a `return_to` of `http://127.0.0.1:<port>/<path>` or
+`http://[::1]:<port>/<path>`, as `porch login --provider` listens on. The member's identity is
 `<issuer>:<sub>`, which is also how an invitation names one:
 `{"role": "member", "provider": "https://id.example.com", "subject": "248289761001"}`.
 

@@ -28,6 +28,7 @@ toml.workspace = true
 axum.workspace = true
 openporch-engine = { path = "../engine" }
 openporch-server = { path = "../server" }
+reqwest.workspace = true
 
 [lints]
 workspace = true
