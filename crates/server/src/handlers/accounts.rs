@@ -522,20 +522,27 @@ pub async fn update_store(
             "mark another store primary instead of unmarking the primary store",
         ));
     }
+    let promote = body.primary == Some(true) && !store.primary;
     if let Some(config) = &body.config {
         check_store_config(config)?;
+    }
+    if promote && store.ty != BUILTIN_STORE {
+        // The store must open with its account, as it will be configured,
+        // before anything changes or secrets are sent to it.
+        let mut proposed = store.clone();
+        if let Some(config) = &body.config {
+            proposed.config = config.clone();
+        }
+        let builtin = secret_inputs::builtin(&state)?;
+        secret_inputs::open_external(&state, &builtin, proposed).await?;
+    }
+    if let Some(config) = &body.config {
         state
             .store
             .update_secret_store(org, &id, config, ctx.audit(org, "secret_store.update", &id))
             .await?;
     }
-    if body.primary == Some(true) && !store.primary {
-        // The store must open with its account before secrets are sent to it.
-        if store.ty != BUILTIN_STORE {
-            let builtin = secret_inputs::builtin(&state)?;
-            secret_inputs::open_external(&state, &builtin, store_or_404(&state, &id).await?)
-                .await?;
-        }
+    if promote {
         state
             .store
             .set_primary_secret_store(org, &id, ctx.audit(org, "secret_store.primary", &id))

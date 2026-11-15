@@ -1066,6 +1066,26 @@ async fn change_primary() {
     let s = super::server_from(dir, state);
     s.static_account("aws-prod").await;
     s.aws_store("prod-sm", "aws-prod").await;
+    // A promotion whose new configuration cannot open changes nothing.
+    s.ok(
+        Method::POST,
+        ACCOUNTS,
+        json!({"id": "aws-offline", "type": "aws-role",
+               "config": {"role_arn": "arn:aws:iam::1:role/offline", "external_id": "ext-123"}}),
+    )
+    .await;
+    let (status, b) = s
+        .send(
+            Method::PATCH,
+            &format!("{STORES}/prod-sm"),
+            json!({"primary": true,
+                   "config": {"region": "eu-north-1", "cloud_account": "aws-offline"}}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_GATEWAY, "CLD-002");
+    let (_, b) = s.get(&format!("{STORES}/prod-sm"), &s.admin).await;
+    assert_eq!(b["config"]["cloud_account"], "aws-prod");
+    assert_eq!(b["primary"], false);
     let def = |id: &str| {
         json!({"id": id, "type": "postgres", "driver_type": "openporch/echo",
                "driver_inputs": {"secrets": {"password": format!("{id}-plaintext")}},
