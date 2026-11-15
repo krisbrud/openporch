@@ -11,15 +11,19 @@ resource "openporch_environment_type" "production" {
   description = "Production environments"
 }
 
+# With `aws-identity` the account holds no secret and no external ID: the
+# server needs `public_url`, and the role trusts the subject `<org>/aws`.
 resource "openporch_cloud_account" "aws" {
   id   = "aws"
   name = "AWS"
-  type = "aws-role"
-  config = {
-    role_arn    = aws_iam_role.openporch.arn
-    external_id = var.external_id
-    region      = var.aws_region
-  }
+  type = var.credentials
+  config = merge(
+    {
+      role_arn = aws_iam_role.openporch.arn
+      region   = var.aws_region
+    },
+    { for k, v in { external_id = var.external_id } : k => v if !local.identity },
+  )
   depends_on = [aws_iam_role_policy.openporch]
 }
 

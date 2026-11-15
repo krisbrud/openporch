@@ -9,13 +9,15 @@ It creates, with the [openporch provider](../../provider) and the AWS provider:
 
 - In AWS:
   - the role openporch assumes, `<prefix>-platform`, which only
-    `trusted_principal_arn` may assume, with the external ID;
+    `trusted_principal_arn` may assume, with the external ID, or, with
+    [`aws-identity`](#without-any-aws-credential-aws-identity), only tokens
+    from openporch's issuer for the cloud account `aws`;
   - `<prefix>-boundary`, the permissions boundary of every role openporch
     creates;
   - the versioned artifact bucket `<prefix>-artifacts-<account>`.
 - In openporch:
   - the `production` environment type (`development` always exists);
-  - the `aws-role` cloud account `aws`;
+  - the cloud account `aws`, of type `aws-role` or `aws-identity`;
   - the resource classes it uses;
   - these resource definitions, which use the modules in
     [`examples/modules`](../modules) from `modules_source` at `modules_rev`:
@@ -82,9 +84,42 @@ given access to data, but neither openporch nor a function it creates can
 change roles or policies it did not create, including its own role and the
 boundary.
 
+## Without any AWS credential: `aws-identity`
+
+By default openporch assumes the platform's role from its host's own identity
+with an external ID (`credentials = "aws-role"`), which works for a server on a
+laptop or anywhere AWS cannot reach. When AWS can reach the server over HTTPS,
+the platform can instead trust openporch's own OIDC issuer, so neither
+openporch nor its host holds any AWS credential:
+
+```sh
+tofu apply \
+  -var credentials=aws-identity \
+  -var oidc_issuer_url=https://porch.example.com/oidc \
+  -var org="$OPENPORCH_ORG"
+```
+
+This needs `public_url = "https://porch.example.com"` in the server's
+configuration (see [Operating openporch](../../docs/operations.md#oidc-issuer)).
+It creates the IAM OIDC identity provider for the issuer (set
+`create_oidc_provider = false` if the AWS account already has one), and gives
+the role a trust policy that accepts only tokens with the subject `<org>/aws`,
+the cloud account this configuration creates, and audience
+`sts.amazonaws.com`. The cloud account `aws` is then of type `aws-identity`,
+with no external ID and no secret. `trusted_principal_arn` and `external_id`
+are not used. Check it the same way; `porch cloud-accounts setup aws-identity
+aws` prints the trust policy the role carries. [Security](../../docs/security.md#keyless-aws-access)
+explains the trust.
+
+Choose before the first apply. A cloud account's type cannot change in place,
+and the server refuses to delete an account that definitions or active
+resources name, so switching an existing platform means deleting its
+environments and destroying it first.
+
 `examples/aws-platform/test.sh` applies the configuration against a dev server,
 checks what the server holds, plans again to see that nothing changes, and
-destroys it. CI runs it against [Floci](https://floci.io), an
+destroys it, then does the same for the `aws-identity` variant, without
+exchanging a token. CI runs it against [Floci](https://floci.io), an
 AWS emulator.
 
 ## Function artifacts

@@ -4,19 +4,55 @@ variable "aws_region" {
   description = "The region functions, tables, queues and buckets are created in."
 }
 
+variable "credentials" {
+  type        = string
+  default     = "aws-role"
+  description = "How openporch reaches AWS. `aws-role`: the server's own identity (`trusted_principal_arn`) assumes the platform's role with `external_id`. `aws-identity`: openporch presents a token from its own OIDC issuer (`oidc_issuer_url`), so neither openporch nor its host holds any AWS credential."
+
+  validation {
+    condition     = contains(["aws-role", "aws-identity"], var.credentials)
+    error_message = "Use `aws-role` or `aws-identity`."
+  }
+}
+
 variable "trusted_principal_arn" {
   type        = string
-  description = "The identity the openporch server runs as, such as its instance or task role, which may assume the platform's role."
+  default     = null
+  description = "With `aws-role`: the identity the openporch server runs as, such as its instance or task role, which may assume the platform's role."
 }
 
 variable "external_id" {
   type        = string
-  description = "The external ID openporch presents when it assumes the role; a long random value."
+  default     = null
+  description = "With `aws-role`: the external ID openporch presents when it assumes the role; a long random value."
 
   validation {
-    condition     = length(var.external_id) >= 16
+    condition     = var.external_id == null || try(length(var.external_id) >= 16, false)
     error_message = "Use an external ID of at least 16 characters."
   }
+}
+
+variable "oidc_issuer_url" {
+  type        = string
+  default     = null
+  description = "With `aws-identity`: the openporch issuer, `<public_url>/oidc`, such as `https://porch.example.com/oidc`."
+
+  validation {
+    condition     = var.oidc_issuer_url == null || can(regex("^https://[^/?#]+/oidc$", var.oidc_issuer_url))
+    error_message = "The issuer is `https://<host>/oidc`: the server's `public_url` followed by `/oidc`."
+  }
+}
+
+variable "org" {
+  type        = string
+  default     = null
+  description = "With `aws-identity`: the openporch organization, the first half of the subject `<org>/aws` the role trusts."
+}
+
+variable "create_oidc_provider" {
+  type        = bool
+  default     = true
+  description = "With `aws-identity`: create the IAM OIDC identity provider for the issuer. Set false when the AWS account already has one for it, such as from another platform."
 }
 
 variable "name_prefix" {
