@@ -188,6 +188,38 @@ pub enum SecretStores {
     },
 }
 
+/// `porch cloud-accounts`.
+#[derive(Debug, Subcommand)]
+pub enum CloudAccounts {
+    /// Obtains credentials for an account and prints who AWS says they belong
+    /// to. An `aws-identity` account's answer includes its setup.
+    Check {
+        /// The account ID.
+        id: String,
+        #[command(flatten)]
+        output: OutputArg,
+    },
+    /// Prints how to set up a cloud provider to trust openporch for an account.
+    #[command(subcommand)]
+    Setup(AccountSetup),
+}
+
+/// `porch cloud-accounts setup`.
+#[derive(Debug, Subcommand)]
+pub enum AccountSetup {
+    /// Prints the IAM OIDC identity provider to create for the server's
+    /// issuer and the trust policy that lets an `aws-identity` account assume
+    /// its role, scoped to the account's subject `<org>/<id>`. The account
+    /// need not exist yet; once it does, its role ARN fills in the AWS account.
+    AwsIdentity {
+        /// The account ID.
+        id: String,
+        /// Print the whole setup as JSON instead.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `porch audit-logs`.
 #[derive(Debug, Args)]
 pub struct AuditLogs {
@@ -529,6 +561,64 @@ pub(crate) async fn env_types(
             say(
                 io,
                 &format!("{user} may no longer deploy to {env_type} environments."),
+            )
+        }
+    }
+}
+
+/// `porch cloud-accounts`.
+pub(crate) async fn cloud_accounts(
+    session: &Session,
+    cmd: CloudAccounts,
+    io: &mut Io<'_>,
+) -> Result<(), String> {
+    let client = session.client()?;
+    match cmd {
+        CloudAccounts::Check { id, output } => {
+            let path = format!(
+                "{}/resources/accounts/{}/check",
+                org(session)?,
+                segment(&id)
+            );
+            let identity = client
+                .request(Method::POST, &path, Some(&json!({})))
+                .await
+                .map_err(api)?;
+            output::print(
+                io.out,
+                output.output,
+                &identity,
+                &[
+                    ("ARN", "arn"),
+                    ("ACCOUNT", "account"),
+                    ("USER ID", "user_id"),
+                ],
+            )
+        }
+        CloudAccounts::Setup(AccountSetup::AwsIdentity { id, json }) => {
+            let path = format!("{}/oidc/aws-identity/{}", org(session)?, segment(&id));
+            let setup = client
+                .request(Method::GET, &path, None)
+                .await
+                .map_err(api)?;
+            let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+            if json {
+                return say(io, &pretty(&setup));
+            }
+            let field = |k: &str| setup[k].as_str().unwrap_or_default().to_owned();
+            say(
+                io,
+                &format!(
+                    "Identity provider URL: {}\nAudience:              {}\nSubject:               \
+                     {}\n\nThumbprint: {}\n\nCreate the identity provider once per AWS \
+                     account:\n\n  {}\n\nTrust policy for the role in `config.role_arn`:\n\n{}",
+                    field("provider_url"),
+                    field("audience"),
+                    field("subject"),
+                    field("thumbprint"),
+                    field("create_provider"),
+                    pretty(&setup["trust_policy"]),
+                ),
             )
         }
     }

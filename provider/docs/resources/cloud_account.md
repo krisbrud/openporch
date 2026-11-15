@@ -43,11 +43,11 @@ resource "openporch_cloud_account" "aws_dev" {
 ### Required
 
 - `id` (String) The account ID. Changing it replaces the account.
-- `type` (String) The account type: `aws` (a static key pair) or `aws-role` (a role openporch assumes). Changing it replaces the account.
+- `type` (String) The account type: `aws` (a static key pair), `aws-role` (a role openporch assumes) or `aws-identity` (a role openporch assumes with a token from its own OIDC issuer, which needs `public_url` on the server). Changing it replaces the account.
 
 ### Optional
 
-- `config` (Dynamic) The non-secret configuration, an object: `access_key_id` and `region` for `aws`; `role_arn`, `external_id`, `session_duration` (seconds) and `region` for `aws-role`.
+- `config` (Dynamic) The non-secret configuration, an object: `access_key_id` and `region` for `aws`; `role_arn`, `external_id`, `session_duration` (seconds) and `region` for `aws-role`; `role_arn`, `audience`, `session_duration` and `region` for `aws-identity`.
 - `name` (String) The display name, 1 to 100 characters without surrounding spaces. Defaults to the ID when the object is created.
 - `secret_refs` (Attributes Map) Secret configuration as references to secrets already in a store. A key cannot be in both `secrets` and `secret_refs`. (see [below for nested schema](#nestedatt--secret_refs))
 - `secrets` (Map of String, Sensitive) Secret configuration, such as `secret_access_key` for `aws`, written to the built-in store. Changing an entry writes a new version. The server never returns the values; `written_secret_refs` records the versions written, and a version changed outside OpenTofu plans a write of the entry again.

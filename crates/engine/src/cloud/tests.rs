@@ -22,6 +22,11 @@ struct FakeSts {
     echo_secret: bool,
     /// Runs while the next AssumeRole call is in flight.
     during_assume: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The issuer a web identity role trusts, and the subject its condition
+    /// names.
+    trusts: Mutex<Option<(Arc<Issuer>, String)>>,
+    /// The verified claims of each web identity exchange.
+    web_identity: Mutex<Vec<Value>>,
 }
 
 impl FakeSts {
@@ -34,6 +39,8 @@ impl FakeSts {
             issued: AtomicU64::new(0),
             echo_secret: false,
             during_assume: Mutex::new(None),
+            trusts: Mutex::new(None),
+            web_identity: Mutex::new(Vec::new()),
         }
     }
 
@@ -72,6 +79,43 @@ impl Sts for FakeSts {
                 session_token: Some(SecretValue::new(format!("session-token-{n}"))),
                 region: None,
                 expires_at: Some(*self.now.lock().unwrap() + lifetime),
+            })
+        })
+    }
+
+    fn assume_role_with_web_identity(
+        &self,
+        request: AssumeRoleWithWebIdentity,
+    ) -> BoxFuture<'_, Result<AwsCredentials, CloudError>> {
+        Box::pin(async move {
+            let (issuer, subject) = self.trusts.lock().unwrap().clone().expect("a trust");
+            let now = self
+                .now
+                .lock()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            // As STS does: the token verifies against the issuer's JWKS, and
+            // the role's conditions name its subject and audience.
+            let claims =
+                crate::oidc::verify(request.token.expose(), &issuer.jwks(now), issuer.url(), now)
+                    .map_err(|e| CloudError::Rejected(format!("InvalidIdentityToken: {e}")))?;
+            if claims["sub"] != subject.as_str() || claims["aud"] != DEFAULT_AUDIENCE {
+                return Err(CloudError::Rejected(
+                    "STS AssumeRoleWithWebIdentity failed: AccessDenied: Not authorized to \
+                     perform sts:AssumeRoleWithWebIdentity"
+                        .into(),
+                ));
+            }
+            self.web_identity.lock().unwrap().push(claims);
+            let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(AwsCredentials {
+                access_key_id: format!("ASIAWEB{n}"),
+                secret_access_key: SecretValue::new(format!("web-secret-{n}")),
+                session_token: Some(SecretValue::new(format!("web-token-{n}"))),
+                region: None,
+                expires_at: Some(*self.now.lock().unwrap() + request.duration),
             })
         })
     }
@@ -691,4 +735,98 @@ fn ecr_images_named_by_tag_are_recognized() {
     assert!(!pinned_image("nginx:1"));
     assert!(!pinned_image("nginx@sha256:abc"));
     assert!(pinned_image(&format!("nginx@sha256:{}", "AB".repeat(32))));
+}
+
+fn issuer() -> Arc<Issuer> {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    let pkcs8 = KEY.get_or_init(|| crate::oidc::generate_key().unwrap());
+    Arc::new(
+        Issuer::new(
+            "https://porch.example.com",
+            &[crate::oidc::StoredKey {
+                pkcs8: pkcs8.clone(),
+                created_at: 1,
+                retires_at: None,
+            }],
+        )
+        .unwrap(),
+    )
+}
+
+fn identity_account(id: &str, config: Value) -> CloudAccount {
+    account(id, CloudAccountType::AwsIdentity, config)
+}
+
+#[tokio::test]
+async fn identity_accounts_exchange_issuer_tokens_for_role_sessions() {
+    let issuer = issuer();
+    let mut f = fixture();
+    *f.sts.trusts.lock().unwrap() = Some((issuer.clone(), "acme/aws-prod".into()));
+    f.resolver = f.resolver.with_issuer(issuer.clone(), "acme");
+    let prod = identity_account(
+        "aws-prod",
+        json!({"role_arn": "arn:aws:iam::111122223333:role/openporch", "region": "eu-west-1"}),
+    );
+    let c = f.resolve(&prod, MINUTE).await.unwrap();
+    assert_eq!(c.access_key_id, "ASIAWEB1");
+    assert_eq!(c.region.as_deref(), Some("eu-west-1"));
+    let claims = f.sts.web_identity.lock().unwrap().clone();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["sub"], "acme/aws-prod");
+    assert_eq!(claims[0]["aud"], "sts.amazonaws.com");
+    assert_eq!(claims[0]["iss"], "https://porch.example.com/oidc");
+    let lifetime = claims[0]["exp"].as_i64().unwrap() - claims[0]["iat"].as_i64().unwrap();
+    assert!(lifetime <= 15 * 60, "{lifetime}");
+    // The session is reused while it stays valid; no new token is minted.
+    assert_eq!(
+        f.resolve(&prod, MINUTE).await.unwrap().access_key_id,
+        "ASIAWEB1"
+    );
+    assert_eq!(f.sts.web_identity.lock().unwrap().len(), 1);
+    // And replaced once it would expire within the window.
+    f.advance(DEFAULT_SESSION - MINUTE);
+    assert_eq!(
+        f.resolve(&prod, MINUTE).await.unwrap().access_key_id,
+        "ASIAWEB2"
+    );
+
+    // A role trusting another account's subject refuses this one's token,
+    // and the check reports what STS said.
+    let dev = identity_account(
+        "aws-dev",
+        json!({"role_arn": "arn:aws:iam::111122223333:role/openporch"}),
+    );
+    let err = f
+        .resolver
+        .check(&dev, f.resolver.generation(), &secrets())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CloudError::Rejected(m) if m.contains("AssumeRoleWithWebIdentity")),
+        "{err}"
+    );
+    // A different audience is minted when the account sets one.
+    let custom = identity_account(
+        "aws-prod",
+        json!({"role_arn": "arn:aws:iam::111122223333:role/other", "audience": "openporch"}),
+    );
+    f.resolver.forget("aws-prod");
+    assert!(matches!(
+        f.resolve(&custom, MINUTE).await,
+        Err(CloudError::Rejected(_))
+    ));
+}
+
+#[tokio::test]
+async fn identity_accounts_need_the_issuer() {
+    let f = fixture();
+    let prod = identity_account(
+        "aws-prod",
+        json!({"role_arn": "arn:aws:iam::111122223333:role/openporch"}),
+    );
+    assert!(matches!(
+        f.resolve(&prod, MINUTE).await,
+        Err(CloudError::Invalid(m)) if m.contains("public_url")
+    ));
 }

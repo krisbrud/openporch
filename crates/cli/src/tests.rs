@@ -34,15 +34,23 @@ struct DevServer {
 
 impl DevServer {
     async fn start(github: Option<&str>) -> Self {
+        Self::start_with(|config| {
+            config.github = github.map(|base| openporch_server::config::GithubConfig {
+                client_id: "Iv1.cli-test".into(),
+                api_url: base.to_owned(),
+                web_url: base.to_owned(),
+                browser: None,
+            });
+        })
+        .await
+    }
+
+    /// A dev server whose configuration `configure` changes.
+    async fn start_with(configure: impl FnOnce(&mut openporch_server::Config)) -> Self {
         let data = tempfile::tempdir().unwrap();
         let mut config = openporch_server::Config::new("acme", data.path());
         config.images.pin_other_registries = false;
-        config.github = github.map(|base| openporch_server::config::GithubConfig {
-            client_id: "Iv1.cli-test".into(),
-            api_url: base.to_owned(),
-            web_url: base.to_owned(),
-            browser: None,
-        });
+        configure(&mut config);
         let state = openporch_server::start(config, None).await.unwrap();
         let (router, _) = openporch_server::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -636,4 +644,61 @@ async fn credentials_are_not_written_where_others_can_write() {
     assert_no_secret(&r, &server.admin);
     assert!(!shared.join("credentials.toml").exists());
     assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn setup_prints_an_aws_identity_trust_policy() {
+    let server = DevServer::start_with(|config| {
+        config.public_url = Some("https://porch.example.com".into());
+    })
+    .await;
+    let mut m = Machine::new();
+    m.set("OPENPORCH_URL", &server.url)
+        .set("OPENPORCH_ORG", "acme")
+        .set("OPENPORCH_TOKEN", &server.admin);
+    let r = m
+        .porch(&["cloud-accounts", "setup", "aws-identity", "aws-prod"], "")
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out
+            .contains("Identity provider URL: https://porch.example.com/oidc"),
+        "{r:?}"
+    );
+    assert!(
+        r.out.contains("Subject:               acme/aws-prod"),
+        "{r:?}"
+    );
+    assert!(
+        r.out.contains(
+            "aws iam create-open-id-connect-provider --url https://porch.example.com/oidc"
+        ),
+        "{r:?}"
+    );
+    // The trust policy is JSON after its heading.
+    let policy: Value = serde_json::from_str(&r.out[r.out.find("\n{").unwrap()..]).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Condition"]["StringEquals"]["porch.example.com/oidc:sub"],
+        "acme/aws-prod"
+    );
+    assert_eq!(
+        policy["Statement"][0]["Action"],
+        "sts:AssumeRoleWithWebIdentity"
+    );
+    let r = m
+        .porch(
+            &[
+                "cloud-accounts",
+                "setup",
+                "aws-identity",
+                "aws-prod",
+                "--json",
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let setup: Value = serde_json::from_str(&r.out).unwrap();
+    assert_eq!(setup["issuer"], "https://porch.example.com/oidc");
+    assert_eq!(setup["subject"], "acme/aws-prod");
 }

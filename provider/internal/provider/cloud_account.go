@@ -57,11 +57,13 @@ func (r *cloudAccount) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				MarkdownDescription: "The account ID. Changing it replaces the account."},
 			"name": nameAttribute(),
 			"type": schema.StringAttribute{Required: true, PlanModifiers: replace,
-				MarkdownDescription: "The account type: `aws` (a static key pair) or `aws-role` (a role " +
-					"openporch assumes). Changing it replaces the account."},
+				MarkdownDescription: "The account type: `aws` (a static key pair), `aws-role` (a role " +
+					"openporch assumes) or `aws-identity` (a role openporch assumes with a token from its " +
+					"own OIDC issuer, which needs `public_url` on the server). Changing it replaces the account."},
 			"config": schema.DynamicAttribute{Optional: true,
 				MarkdownDescription: "The non-secret configuration, an object: `access_key_id` and `region` " +
-					"for `aws`; `role_arn`, `external_id`, `session_duration` (seconds) and `region` for `aws-role`."},
+					"for `aws`; `role_arn`, `external_id`, `session_duration` (seconds) and `region` for `aws-role`; " +
+					"`role_arn`, `audience`, `session_duration` and `region` for `aws-identity`."},
 			"secrets": schema.MapAttribute{ElementType: types.StringType, Optional: true, Sensitive: true,
 				MarkdownDescription: "Secret configuration, such as `secret_access_key` for `aws`, written to " +
 					"the built-in store. Changing an entry writes a new version. The server never returns " +
