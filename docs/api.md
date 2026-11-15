@@ -1693,7 +1693,9 @@ creates there, with the AWS account STS reports for the store's credentials,
 the region, and a random create ID it tags the secret with
 (`openporch:create-id`). Only those belong to the object whose name they
 carry, like one in the built-in store, and only those get new versions, while
-they still carry their tag in that AWS account and region. Changing the
+they still carry their tag in that AWS account and region. Each read of one
+checks the tag too: a secret someone replaced is forgotten and the read
+refused, so using it needs a grant. Changing the
 store's `region` or `cloud_account` forgets them; so does changing the
 account's configuration or credentials (other than `session_duration`), unless
 STS reports the new credentials in the same AWS account. A store whose account

@@ -28,8 +28,8 @@ use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 use crate::cloud::{
-    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, EcrDigest, EcrImage,
-    ExternalStore, Latest, S3Object, S3Version, external_secret, pinned_image,
+    AwsCredentials, AwsSecret, CHECK_WINDOW, CREATE_ID_TAG, CloudError, CredentialResolver,
+    EcrDigest, EcrImage, ExternalStore, Latest, S3Object, S3Version, external_secret, pinned_image,
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
@@ -489,6 +489,8 @@ where
                     ),
                 )
             })?;
+        self.check_still_created(c, r, &credentials, &secret)
+            .await?;
         let read = self.cloud.read_secret(&credentials, &secret).await;
         match read {
             Ok(Some(value)) => Ok(value),
@@ -508,6 +510,47 @@ where
                 ),
             )),
         }
+    }
+
+    /// A secret openporch created in an external store is its owner's own
+    /// only while it still carries its create ID: one someone replaced is not,
+    /// so its record is forgotten and the read refused, and a retry needs a
+    /// grant like any other.
+    async fn check_still_created(
+        &self,
+        c: &JobContext,
+        r: &SecretRef,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+    ) -> Result<(), ExecFailure> {
+        let org = c.org.as_str();
+        let record = self
+            .store
+            .external_secret(org, &r.store, &r.reference)
+            .await
+            .map_err(|e| store_failure(e, "the record of external secrets could not be read"))?;
+        let Some(record) = record.filter(|r| r.confirmed) else {
+            return Ok(());
+        };
+        let tag = self
+            .cloud
+            .secret_tag(credentials, secret, CREATE_ID_TAG)
+            .await
+            .map_err(cloud_failure)?;
+        if tag.as_deref() == Some(record.create_id.as_str()) {
+            return Ok(());
+        }
+        self.store
+            .forget_external_secret(org, &r.store, &r.reference, &record.create_id)
+            .await
+            .map_err(|e| store_failure(e, "the record of external secrets could not be changed"))?;
+        Err(ExecFailure::Retryable {
+            error: format!(
+                "{secret} was replaced outside openporch, so it is no longer treated as \
+                 openporch's; using it now needs a grant"
+            ),
+            retry_after: None,
+        })
     }
 
     /// The primary store, where secret outputs are written: the built-in

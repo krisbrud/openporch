@@ -227,6 +227,8 @@ references are read with. That account needs, on the secrets it will read:
 
 - Secrets Manager: `secretsmanager:GetSecretValue`.
 - SSM Parameter Store: `ssm:GetParameter`.
+- For secrets openporch created there, also `secretsmanager:DescribeSecret` or
+  `ssm:ListTagsForResource`, to check their `openporch:create-id` tag.
 - Both: `kms:Decrypt` on the key that encrypts them, unless it is the AWS
   managed key.
 

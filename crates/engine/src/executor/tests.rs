@@ -2286,10 +2286,35 @@ async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_cre
         .update_account(ORG, &account, Some(&same), put)
         .await
         .unwrap();
+    f.plant(name, "created", Some("id"));
     let defs = f.define(pg, "openporch/none").await;
     let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
     all_provisioned(&outcomes);
-    assert_eq!(f.driver.puts()[0].secrets.expose()["master"], "planted");
+    assert_eq!(f.driver.puts()[0].secrets.expose()["master"], "created");
+}
+
+/// A secret openporch created but someone then replaced, without its create
+/// ID, is not read as its owner's own: the record is forgotten and the read
+/// refused before the driver gets it.
+#[tokio::test]
+async fn a_replaced_external_secret_is_not_read_as_its_owners() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let name = "openporch/acme/defs/pg/master";
+    f.record(name, true, "id").await;
+    f.plant(name, "replacement", Some("someone-else"));
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "sm", "ref": name}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let failure = format!("{outcomes:?}");
+    assert!(failure.contains("replaced outside openporch"), "{failure}");
+    assert!(f.driver.puts().is_empty());
+    assert_eq!(f.state(name).await, None);
 }
 
 impl Fixture {
