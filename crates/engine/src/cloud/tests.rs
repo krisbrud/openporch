@@ -905,19 +905,36 @@ async fn real_secret_read() {
         ),
     ] {
         let mut versions = Vec::new();
-        for value in ["first-value", "second-value"] {
+        for (value, create) in [("first-value", true), ("second-value", false)] {
             let version = resolver
                 .write_secret(
                     &credentials,
                     &secret(service, name.clone(), None),
                     &SecretValue::new(value),
                     "acme",
+                    create,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("writing {service} `{name}`: {e}"));
             versions.push((version, value));
         }
         assert_ne!(versions[0].0, versions[1].0, "{service} `{name}`");
+        // Creating it again is refused rather than written over.
+        let error = resolver
+            .write_secret(
+                &credentials,
+                &secret(service, name.clone(), None),
+                &SecretValue::new("third-value"),
+                "acme",
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not created by openporch"),
+            "{service}: {error}"
+        );
         for (version, value) in &versions {
             let read = resolver
                 .read_secret(&credentials, &secret(service, name.clone(), Some(version)))

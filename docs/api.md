@@ -1684,8 +1684,11 @@ account. openporch writes to an AWS store under `openporch/<org>/<name>`
 (Secrets Manager) or `/openporch/<org>/<name>` (SSM, as SecureString), tagged
 `openporch:managed=true` and `openporch:org=<org>`, where `<name>` is the name
 the built-in store would use, such as `defs/<definition>/<key>` or
-`resources/<GUResID>/outputs/<output>`. Such a secret belongs to the object
-whose name it carries, like one in the built-in store.
+`resources/<GUResID>/outputs/<output>`. openporch records each secret it
+creates there; only those belong to the object whose name they carry, like one
+in the built-in store, and only those get new versions. A secret someone else
+put at such a name needs a grant like any other, and a write to that name is
+refused rather than written over (`422` `CLD-001`).
 
 Retention: openporch never deletes from an external store. A version written
 for a change that is then rejected stays in place (the built-in store discards

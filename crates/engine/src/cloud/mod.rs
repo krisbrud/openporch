@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::oidc::{Claims, Issuer};
 
 pub use aws::AwsSts;
-pub use external::{ExternalStore, external_name, external_secret};
+pub use external::{CreatedSecrets, ExternalStore, external_name, external_secret};
 
 /// Extra validity required beyond an operation's window, for clock skew and the
 /// time the call itself takes.
@@ -625,17 +625,19 @@ pub trait Sts: Send + Sync {
         })
     }
 
-    /// Writes `value` as a new version of `secret` (its `version` is
-    /// ignored), creating it tagged for `org` when it does not exist. Returns
-    /// the new version.
+    /// Writes `value` to `secret` (its `version` is ignored) and returns the
+    /// new version. With `create`, the secret is created, tagged for `org`,
+    /// and one that already exists is refused rather than written over;
+    /// without it, a version is added to a secret openporch created.
     fn write_secret<'a>(
         &'a self,
         credentials: &'a AwsCredentials,
         secret: &'a AwsSecret,
         value: &'a SecretValue,
         org: &'a str,
+        create: bool,
     ) -> BoxFuture<'a, Result<String, CloudError>> {
-        let _ = (credentials, secret, value, org);
+        let _ = (credentials, secret, value, org, create);
         Box::pin(async {
             Err(CloudError::Unavailable(
                 "AWS secret stores cannot be reached".into(),
@@ -804,9 +806,10 @@ impl CredentialResolver {
         secret: &AwsSecret,
         value: &SecretValue,
         org: &str,
+        create: bool,
     ) -> Result<String, CloudError> {
         self.sts
-            .write_secret(credentials, secret, value, org)
+            .write_secret(credentials, secret, value, org, create)
             .await
             .map_err(|e| redacted(e, credentials))
     }

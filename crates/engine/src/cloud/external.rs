@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use openporch_core::model::SecretRef;
-use openporch_store::SecretStoreRecord;
 use openporch_store::secrets::{BoxFuture, SecretError, SecretStore, SecretValue};
+use openporch_store::{AccountStore, SecretStoreRecord, StoreError};
 use serde_json::Value;
 
 use super::{AwsCredentials, AwsSecret, CloudError, CredentialResolver, SecretService};
@@ -61,7 +61,7 @@ pub fn external_name(service: SecretService, org: &str, name: &str) -> Result<St
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.');
     if name.is_empty() || !name.chars().all(allowed) || name.contains("//") {
         return Err(format!(
-            "secret `{name}` cannot be written to an AWS store: names use letters, digits,              `/`, `_`, `-` and `.`"
+            "secret `{name}` cannot be written to an AWS store: names use letters, digits, `/`, `_`, `-` and `.`"
         ));
     }
     Ok(match service {
@@ -70,12 +70,56 @@ pub fn external_name(service: SecretService, org: &str, name: &str) -> Result<St
     })
 }
 
+/// The record of which secrets openporch created in external stores.
+pub trait CreatedSecrets: Send + Sync {
+    /// Whether openporch created `name` in `store`.
+    fn created<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Records that openporch created `name` in `store`.
+    fn record<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+impl<S: AccountStore> CreatedSecrets for S {
+    fn created<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(self.external_secret_created(org, store, name))
+    }
+
+    fn record<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(self.record_external_secret(org, store, name))
+    }
+}
+
 /// An AWS store, opened with fresh credentials of its cloud account.
+///
+/// A write creates the secret at its generated name and records that
+/// openporch created it; only then do later writes add versions to it. A
+/// secret someone else put at that name is refused, never written over.
 pub struct ExternalStore {
     cloud: Arc<CredentialResolver>,
     credentials: AwsCredentials,
     record: SecretStoreRecord,
     org: String,
+    created: Arc<dyn CreatedSecrets>,
 }
 
 impl ExternalStore {
@@ -85,12 +129,14 @@ impl ExternalStore {
         credentials: AwsCredentials,
         record: SecretStoreRecord,
         org: impl Into<String>,
+        created: Arc<dyn CreatedSecrets>,
     ) -> Self {
         Self {
             cloud,
             credentials,
             record,
             org: org.into(),
+            created,
         }
     }
 
@@ -138,11 +184,16 @@ impl SecretStore for ExternalStore {
             )
             .map_err(refused)?;
             secret.name = external_name(secret.service, &self.org, name).map_err(refused)?;
+            let store = self.record.id.as_str();
+            let create = !self.created.created(&self.org, store, &secret.name).await?;
             let version = self
                 .cloud
-                .write_secret(&self.credentials, &secret, value, &self.org)
+                .write_secret(&self.credentials, &secret, value, &self.org, create)
                 .await
                 .map_err(|e| self.failed(e))?;
+            if create {
+                self.created.record(&self.org, store, &secret.name).await?;
+            }
             Ok(SecretRef {
                 store: self.record.id.clone(),
                 reference: secret.name,

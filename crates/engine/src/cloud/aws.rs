@@ -160,9 +160,10 @@ impl Sts for AwsSts {
         secret: &'a AwsSecret,
         value: &'a SecretValue,
         org: &'a str,
+        create: bool,
     ) -> BoxFuture<'a, Result<String, CloudError>> {
         Box::pin(async move {
-            self.write_secret_json(credentials, secret, value, org)
+            self.write_secret_json(credentials, secret, value, org, create)
                 .await
         })
     }
@@ -635,82 +636,68 @@ impl AwsSts {
         secret: &AwsSecret,
         value: &SecretValue,
         org: &str,
+        create: bool,
     ) -> Result<String, CloudError> {
         let tags = serde_json::json!([
             {"Key": "openporch:managed", "Value": "true"},
             {"Key": "openporch:org", "Value": org},
         ]);
-        let (service, attempts) = match secret.service {
-            SecretService::SecretsManager => (
+        let (service, target, body) = match (secret.service, create) {
+            (SecretService::SecretsManager, true) => (
                 "secretsmanager",
-                [
-                    (
-                        "secretsmanager.PutSecretValue",
-                        serde_json::json!({"SecretId": secret.name, "SecretString": value.expose()}),
-                        "ResourceNotFoundException",
-                    ),
-                    (
-                        "secretsmanager.CreateSecret",
-                        serde_json::json!({
-                            "Name": secret.name,
-                            "SecretString": value.expose(),
-                            "Description": "Written by openporch",
-                            "Tags": tags,
-                        }),
-                        "ResourceExistsException",
-                    ),
-                ],
+                "secretsmanager.CreateSecret",
+                serde_json::json!({
+                    "Name": secret.name,
+                    "SecretString": value.expose(),
+                    "Description": "Written by openporch",
+                    "Tags": tags,
+                }),
             ),
-            // A new parameter takes tags, an existing one is overwritten.
-            SecretService::Ssm => (
+            (SecretService::SecretsManager, false) => (
+                "secretsmanager",
+                "secretsmanager.PutSecretValue",
+                serde_json::json!({"SecretId": secret.name, "SecretString": value.expose()}),
+            ),
+            (SecretService::Ssm, true) => (
                 "ssm",
-                [
-                    (
-                        "AmazonSSM.PutParameter",
-                        serde_json::json!({
-                            "Name": secret.name, "Value": value.expose(),
-                            "Type": "SecureString", "Tags": tags,
-                        }),
-                        "ParameterAlreadyExists",
-                    ),
-                    (
-                        "AmazonSSM.PutParameter",
-                        serde_json::json!({
-                            "Name": secret.name, "Value": value.expose(),
-                            "Type": "SecureString", "Overwrite": true,
-                        }),
-                        "",
-                    ),
-                ],
+                "AmazonSSM.PutParameter",
+                serde_json::json!({
+                    "Name": secret.name, "Value": value.expose(),
+                    "Type": "SecureString", "Tags": tags,
+                }),
+            ),
+            (SecretService::Ssm, false) => (
+                "ssm",
+                "AmazonSSM.PutParameter",
+                serde_json::json!({
+                    "Name": secret.name, "Value": value.expose(),
+                    "Type": "SecureString", "Overwrite": true,
+                }),
             ),
         };
-        // Each attempt falls through to the next on its expected error; a
-        // secret created between the two attempts is written by a final retry
-        // of the first.
-        let mut last = None;
-        for (target, body, next_on) in attempts.iter().chain(attempts.first()) {
-            let (status, out) = self
-                .json_call(credentials, service, target, &secret.region, body)
-                .await?;
-            let answer: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
-            if (200..300).contains(&status) {
-                let version = match secret.service {
-                    SecretService::SecretsManager => {
-                        answer["VersionId"].as_str().map(str::to_owned)
-                    }
-                    SecretService::Ssm => answer["Version"].as_u64().map(|v| v.to_string()),
-                };
-                return version.ok_or_else(|| {
-                    CloudError::Rejected(format!("{target} of {secret} returned no version"))
-                });
-            }
+        let (status, out) = self
+            .json_call(credentials, service, target, &secret.region, &body)
+            .await?;
+        let answer: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+        if !(200..300).contains(&status) {
             let (code, message) = aws_error(&answer);
-            if code != *next_on || next_on.is_empty() {
-                return Err(call_error(target, secret, status, code, message));
+            if create && matches!(code, "ResourceExistsException" | "ParameterAlreadyExists") {
+                // Someone else put a secret at this name: it is not written
+                // over, and not openporch's.
+                return Err(CloudError::Rejected(format!(
+                    "{secret} already exists and was not created by openporch, so it is not \
+                     written over"
+                )));
             }
-            last = Some(format!("{target} of {secret} failed: {code}"));
+            return Err(call_error(target, secret, status, code, message));
         }
-        Err(CloudError::Unavailable(last.unwrap_or_default()))
+        let version = match secret.service {
+            SecretService::SecretsManager => answer["VersionId"].as_str().map(str::to_owned),
+            SecretService::Ssm => answer["Version"].as_u64().map(|v| v.to_string()),
+        };
+        version.ok_or_else(|| {
+            CloudError::Rejected(format!("{target} of {secret} returned no version"))
+        })
     }
 }
 

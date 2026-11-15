@@ -296,7 +296,10 @@ impl Sts for FakeSts {
         secret: &'a crate::cloud::AwsSecret,
         value: &'a SecretValue,
         _org: &'a str,
+        create: bool,
     ) -> BoxFuture<'a, Result<String, CloudError>> {
+        // A name someone else took is refused on creation.
+        let taken = create && secret.name.contains("/taken/");
         self.objects.lock().unwrap().push((
             Some(credentials.access_key_id.clone()),
             format!("write {secret}"),
@@ -305,7 +308,20 @@ impl Sts for FakeSts {
             .lock()
             .unwrap()
             .insert(secret.name.clone(), value.expose().to_owned());
-        Box::pin(async { Ok("v1".to_owned()) })
+        if create {
+            self.objects
+                .lock()
+                .unwrap()
+                .push((None, format!("create {}", secret.name)));
+        }
+        Box::pin(async move {
+            if taken {
+                return Err(CloudError::Rejected(
+                    "the secret already exists and was not created by openporch".into(),
+                ));
+            }
+            Ok(if create { "v1" } else { "v2" }.to_owned())
+        })
     }
 
     fn assume_role(
@@ -2167,4 +2183,98 @@ async fn secret_outputs_go_to_an_external_primary_store() {
     for plaintext in [PASSWORD, ACCOUNT_KEY] {
         assert!(!recorded.contains(plaintext), "{plaintext}: {recorded}");
     }
+}
+
+/// A definition's own name in an external store is its own only once
+/// openporch created the secret there: a secret someone else put at that name
+/// still needs a grant.
+#[tokio::test]
+async fn an_external_secret_at_an_owners_name_needs_a_grant_unless_openporch_created_it() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let name = "openporch/acme/defs/pg/master";
+    f.sts
+        .written
+        .lock()
+        .unwrap()
+        .insert(name.into(), "planted".into());
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "sm", "ref": name}}}),
+    );
+    let error = f
+        .store
+        .create_definition(ORG, &pg, audit("POST", "/orgs/acme/resources/defs"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no grant covers it"), "{error}");
+
+    // Once openporch created it, it is the definition's own.
+    f.store
+        .record_external_secret(ORG, "sm", name)
+        .await
+        .unwrap();
+    let defs = f.define(pg, "openporch/none").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    assert_eq!(f.driver.puts()[0].secrets.expose()["master"], "planted");
+}
+
+/// The first write to a generated name creates the secret; a later one adds a
+/// version. A name someone else took is refused.
+#[tokio::test]
+async fn external_writes_create_once_and_never_write_over_others() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let record = f.store.secret_store(ORG, "sm").await.unwrap().unwrap();
+    let credentials = f
+        .cloud
+        .resolve(
+            &f.store
+                .account(ORG, "aws-main")
+                .await
+                .unwrap()
+                .unwrap()
+                .account,
+            f.cloud.generation(),
+            f.secrets.as_ref(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let store = ExternalStore::new(f.cloud.clone(), credentials, record, ORG, f.store.clone());
+    let first = store
+        .write("defs/pg/x", &SecretValue::new("one"))
+        .await
+        .unwrap();
+    let second = store
+        .write("defs/pg/x", &SecretValue::new("two"))
+        .await
+        .unwrap();
+    assert_eq!(first.reference, "openporch/acme/defs/pg/x");
+    assert_eq!(
+        (first.version.as_deref(), second.version.as_deref()),
+        (Some("v1"), Some("v2"))
+    );
+    assert!(
+        f.store
+            .external_secret_created(ORG, "sm", "openporch/acme/defs/pg/x")
+            .await
+            .unwrap()
+    );
+    let error = store
+        .write("defs/taken/x", &SecretValue::new("three"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not created by openporch"), "{error}");
+    assert!(
+        !f.store
+            .external_secret_created(ORG, "sm", "openporch/acme/defs/taken/x")
+            .await
+            .unwrap()
+    );
 }

@@ -207,7 +207,9 @@ pub(crate) async fn check_secret_use(
         if env.is_some() {
             prefixes.push(value_secret_prefix(app, env));
         }
-        if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+        if prefixes.iter().any(|p| name.starts_with(p.as_str()))
+            && crate::secret_use::created_externally(conn, org, r).await?
+        {
             return Ok(());
         }
     }

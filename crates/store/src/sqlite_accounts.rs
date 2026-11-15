@@ -164,6 +164,24 @@ pub trait AccountStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Whether openporch created `reference` in external store `store`.
+    fn external_secret_created(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Records that openporch created `reference` in external store `store`, so
+    /// it belongs to the object its name names and later writes may add
+    /// versions to it.
+    fn record_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Makes `id` the primary store, where new secrets are written. References
     /// to the previous primary store are unchanged.
     fn set_primary_secret_store(
@@ -733,6 +751,37 @@ impl AccountStore for SqliteStore {
         Ok(())
     }
 
+    async fn external_secret_created(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+    ) -> Result<bool> {
+        self.check_org(org)?;
+        let mut conn = self.pool().acquire().await?;
+        let r = SecretRef {
+            store: store.to_owned(),
+            reference: reference.to_owned(),
+            version: None,
+        };
+        crate::secret_use::created_externally(&mut conn, org, &r).await
+    }
+
+    async fn record_external_secret(&self, org: &str, store: &str, reference: &str) -> Result<()> {
+        self.check_org(org)?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO external_secrets (org_id, store_id, ref, created_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .bind(now_ms())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     async fn set_primary_secret_store(
         &self,
         org: &str,
@@ -837,6 +886,12 @@ impl AccountStore for SqliteStore {
             )));
         }
         sqlx::query("DELETE FROM secret_stores WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // A store registered later under the same ID owns none of these.
+        sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ?")
             .bind(org)
             .bind(id)
             .execute(&mut *tx)

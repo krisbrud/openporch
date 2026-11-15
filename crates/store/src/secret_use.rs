@@ -9,7 +9,7 @@ use openporch_core::model::SecretRef;
 use serde_json::{Map, Value};
 use sqlx::SqliteConnection;
 
-use crate::secrets::written_name;
+use crate::secrets::{BUILTIN_STORE, written_name};
 use crate::sqlite::SqliteStore;
 use crate::sqlite_catalog::check_ref_stores;
 use crate::sqlite_values::check_secret_use;
@@ -53,12 +53,21 @@ impl SecretOwner<'_> {
         }
     }
 
-    /// Whether `r` is a secret openporch wrote for this object, in any store.
-    fn owns(self, org: &str, r: &SecretRef) -> bool {
+    /// Whether `r` carries this object's own name.
+    fn named_for(self, org: &str, r: &SecretRef) -> bool {
         written_name(org, r).is_some_and(|name| {
             self.own_prefix()
                 .is_some_and(|p| name.starts_with(p.as_str()))
         })
+    }
+
+    /// Whether `r` is a secret openporch wrote for this object: its own name,
+    /// and, in an external store, one openporch created there.
+    async fn owns(self, conn: &mut SqliteConnection, org: &str, r: &SecretRef) -> Result<bool> {
+        if !self.named_for(org, r) {
+            return Ok(false);
+        }
+        created_externally(conn, org, r).await
     }
 }
 
@@ -129,7 +138,7 @@ pub(crate) async fn check_use(
     let mut refs = Map::new();
     refs.insert("ref".into(), serde_json::to_value(r)?);
     check_ref_stores(conn, org, &refs).await?;
-    if owner.owns(org, r) {
+    if owner.owns(conn, org, r).await? {
         return Ok(());
     }
     let granted: Option<i64> = sqlx::query_scalar(
@@ -168,7 +177,7 @@ pub(crate) async fn check_assigned(
     let mut found = Vec::new();
     collect(refs, &mut found);
     for r in found {
-        if owner.owns(org, &r) {
+        if owner.owns(conn, org, &r).await? {
             continue;
         }
         let granted: Option<i64> = sqlx::query_scalar(
@@ -208,4 +217,25 @@ fn collect(refs: &Map<String, Value>, out: &mut Vec<SecretRef>) {
             _ => collect(m, out),
         }
     }
+}
+
+/// Whether `r` is in the built-in store, which only openporch writes, or is a
+/// secret openporch created in an external store.
+pub(crate) async fn created_externally(
+    conn: &mut SqliteConnection,
+    org: &str,
+    r: &SecretRef,
+) -> Result<bool> {
+    if r.store == BUILTIN_STORE {
+        return Ok(true);
+    }
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM external_secrets WHERE org_id = ? AND store_id = ? AND ref = ?",
+    )
+    .bind(org)
+    .bind(&r.store)
+    .bind(&r.reference)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(found.is_some())
 }

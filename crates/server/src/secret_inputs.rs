@@ -12,6 +12,7 @@ use openporch_core::placeholder::{Dialect, Expr, Part, Template};
 use openporch_store::secrets::{
     BuiltinSecretStore, SecretError, SecretInput, SecretStore, SecretValue, validate_reference,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -108,6 +109,7 @@ pub async fn open_external(
         credentials,
         record,
         state.org(),
+        Arc::new(state.store.clone()),
     ))
 }
 
