@@ -104,13 +104,20 @@ pub async fn open_external(
                 &format!("secret store `{id}` could not use cloud account `{account_id}`"),
             )
         })?;
-    Ok(ExternalStore::new(
+    ExternalStore::open(
         state.cloud.clone(),
         credentials,
         record,
         state.org(),
         Arc::new(state.store.clone()),
-    ))
+    )
+    .await
+    .map_err(|e| {
+        cloud_error(
+            e,
+            &format!("secret store `{id}` could not use cloud account `{account_id}`"),
+        )
+    })
 }
 
 /// The API error for a failed cloud call about `what`.

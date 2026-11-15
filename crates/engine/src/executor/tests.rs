@@ -355,6 +355,11 @@ impl Sts for FakeSts {
     ) -> BoxFuture<'a, Result<CallerIdentity, CloudError>> {
         let account = self.account.lock().unwrap().clone();
         Box::pin(async move {
+            if account == "revoked" {
+                return Err(CloudError::Rejected(
+                    "STS GetCallerIdentity failed: InvalidClientTokenId".into(),
+                ));
+            }
             Ok(CallerIdentity {
                 arn: format!("arn:aws:iam::{account}:user/openporch"),
                 account,
@@ -2276,13 +2281,15 @@ impl Fixture {
             )
             .await
             .unwrap();
-        ExternalStore::new(
+        ExternalStore::open(
             self.cloud.clone(),
             credentials,
             record,
             ORG,
             self.store.clone(),
         )
+        .await
+        .unwrap()
     }
 
     /// Whether openporch confirmed (`Some(true)`) or is creating
@@ -2303,10 +2310,18 @@ impl Fixture {
             create_id: create_id.into(),
             confirmed,
         };
-        self.store
-            .record_external_secret(ORG, "sm", name, &record)
+        let prior = self
+            .store
+            .external_secret(ORG, "sm", name)
             .await
-            .unwrap();
+            .unwrap()
+            .map(|r| r.create_id);
+        assert!(
+            self.store
+                .record_external_secret(ORG, "sm", name, &record, prior.as_deref())
+                .await
+                .unwrap()
+        );
     }
 
     /// Puts a secret at `name`, as if someone created it with `tag`.
@@ -2406,6 +2421,70 @@ async fn external_writes_create_once_and_never_write_over_others() {
         .to_string();
     assert!(error.contains("not created by openporch"), "{error}");
     assert_eq!(f.sts.written.lock().unwrap()[replaced], "theirs");
+}
+
+/// Static keys AWS refuses fail the deployment before the driver changes
+/// anything, not when its secret outputs are stored.
+#[tokio::test]
+async fn a_primary_store_with_refused_credentials_fails_before_the_driver() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    f.store
+        .set_primary_secret_store(ORG, "sm", audit("PATCH", "/orgs/acme/secretstores/sm"))
+        .await
+        .unwrap();
+    *f.sts.account.lock().unwrap() = "revoked".into();
+    let defs = f.define(plain_pg(), "test/fake").await;
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let failure = format!("{outcomes:?}");
+    assert!(failure.contains("InvalidClientTokenId"), "{failure}");
+    assert!(f.driver.puts().is_empty());
+}
+
+/// Records change only for the writer that read them: a writer that saw no
+/// record cannot replace another's claim, and one whose create lost cannot
+/// forget the winner's record.
+#[tokio::test]
+async fn concurrent_writers_never_replace_each_others_records() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let name = "openporch/acme/defs/pg/x";
+    let record = |id: &str, confirmed| openporch_store::ExternalSecretRecord {
+        aws_account: "111122223333".into(),
+        region: "eu-west-1".into(),
+        create_id: id.into(),
+        confirmed,
+    };
+    let s = &f.store;
+    assert!(
+        s.record_external_secret(ORG, "sm", name, &record("a", false), None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.record_external_secret(ORG, "sm", name, &record("b", false), None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        s.record_external_secret(ORG, "sm", name, &record("a", true), Some("a"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.record_external_secret(ORG, "sm", name, &record("b", true), Some("b"))
+            .await
+            .unwrap()
+    );
+    s.forget_external_secret(ORG, "sm", name, "b")
+        .await
+        .unwrap();
+    let kept = s.external_secret(ORG, "sm", name).await.unwrap().unwrap();
+    assert_eq!((kept.create_id.as_str(), kept.confirmed), ("a", true));
+    s.forget_external_secret(ORG, "sm", name, "a")
+        .await
+        .unwrap();
+    assert_eq!(f.state(name).await, None);
 }
 
 /// What openporch created is bound to where it was created: the AWS account

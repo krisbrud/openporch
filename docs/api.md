@@ -1682,7 +1682,8 @@ External stores of type `aws-secrets-manager` (a reference names a secret, a
 version is its `VersionId`) and `aws-ssm` (a reference names a parameter, a
 version is its number; SecureString parameters are decrypted) are registered
 with a `region` and the `cloud_account` that reads and writes them, with fresh
-credentials right before each use. Marking one primary first opens it with that
+credentials right before each use, which STS must accept before a deployment
+changes anything. Marking one primary first opens it with that
 account. openporch writes to an AWS store under `openporch/<org>/<name>`
 (Secrets Manager) or `/openporch/<org>/<name>` (SSM, as SecureString), tagged
 `openporch:managed=true` and `openporch:org=<org>`, where `<name>` is the name

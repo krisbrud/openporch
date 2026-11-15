@@ -545,13 +545,21 @@ where
                     &format!("primary secret store `{id}` could not use cloud account `{account}`"),
                 )
             })?;
-        Ok(Arc::new(ExternalStore::new(
+        let opened = ExternalStore::open(
             self.cloud.clone(),
             credentials,
             primary,
             c.org.as_str(),
             self.store.clone(),
-        )))
+        )
+        .await
+        .map_err(|e| {
+            prefixed(
+                cloud_failure(e),
+                &format!("primary secret store `{id}` could not use cloud account `{account}`"),
+            )
+        })?;
+        Ok(Arc::new(opened))
     }
 
     /// Fresh credentials for the job's cloud account and what they resolve to,

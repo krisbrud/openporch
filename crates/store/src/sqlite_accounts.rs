@@ -191,21 +191,26 @@ pub trait AccountStore: Send + Sync {
     ) -> impl Future<Output = Result<Option<ExternalSecretRecord>>> + Send;
 
     /// Records that openporch is about to create `reference` in external store
-    /// `store`, or created it.
+    /// `store`, or created it, if the record still has create ID `expected`
+    /// (`None`: there is none). Returns whether it did, so concurrent writers
+    /// never replace each other's records.
     fn record_external_secret(
         &self,
         org: &str,
         store: &str,
         reference: &str,
         record: &ExternalSecretRecord,
-    ) -> impl Future<Output = Result<()>> + Send;
+        expected: Option<&str>,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
-    /// Forgets the record of `reference` in external store `store`.
+    /// Forgets the record of `reference` in external store `store` if it still
+    /// has create ID `create_id`.
     fn forget_external_secret(
         &self,
         org: &str,
         store: &str,
         reference: &str,
+        create_id: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Makes `id` the primary store, where new secrets are written. References
@@ -869,19 +874,21 @@ impl AccountStore for SqliteStore {
         store: &str,
         reference: &str,
         record: &ExternalSecretRecord,
-    ) -> Result<()> {
+        expected: Option<&str>,
+    ) -> Result<bool> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         store_row(&mut tx, org, store)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("secret store `{store}`")))?;
-        sqlx::query(
+        let done = sqlx::query(
             "INSERT INTO external_secrets \
              (org_id, store_id, ref, aws_account, region, create_id, confirmed, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (org_id, store_id, ref) DO UPDATE SET \
              aws_account = excluded.aws_account, region = excluded.region, \
-             create_id = excluded.create_id, confirmed = excluded.confirmed",
+             create_id = excluded.create_id, confirmed = excluded.confirmed \
+             WHERE external_secrets.create_id = ?",
         )
         .bind(org)
         .bind(store)
@@ -891,20 +898,34 @@ impl AccountStore for SqliteStore {
         .bind(&record.create_id)
         .bind(i64::from(record.confirmed))
         .bind(now_ms())
+        .bind(expected)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected()
+            == 1;
+        // With no record expected, an insert that met one changed nothing.
         tx.commit().await?;
-        Ok(())
+        Ok(done)
     }
 
-    async fn forget_external_secret(&self, org: &str, store: &str, reference: &str) -> Result<()> {
+    async fn forget_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+        create_id: &str,
+    ) -> Result<()> {
         self.check_org(org)?;
-        sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ? AND ref = ?")
-            .bind(org)
-            .bind(store)
-            .bind(reference)
-            .execute(self.pool())
-            .await?;
+        sqlx::query(
+            "DELETE FROM external_secrets \
+             WHERE org_id = ? AND store_id = ? AND ref = ? AND create_id = ?",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .bind(create_id)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
