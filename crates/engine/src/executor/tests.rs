@@ -2627,6 +2627,33 @@ async fn concurrent_writers_never_replace_each_others_records() {
     assert!(error.contains("changed during the write"), "{error}");
     assert_eq!(f.state(name).await, None);
     assert!(!f.sts.written.lock().unwrap().contains_key(name));
+
+    // A write to a secret openporch owns returns no reference when the store
+    // was repointed while the value was written: the row that survived the
+    // read below is checked again against the generation the write opened.
+    let config = json!({"region": "eu-west-1", "cloud_account": "aws-main"});
+    f.store
+        .update_secret_store(
+            ORG,
+            "sm",
+            config.as_object().unwrap(),
+            audit("PATCH", "/orgs/acme/secretstores/sm"),
+        )
+        .await
+        .unwrap();
+    f.record(name, true, "owned").await;
+    f.plant(name, "old", Some("owned"));
+    let store = f.open_sm().await;
+    sqlx::query("UPDATE secret_stores SET generation = generation + 1")
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+    let error = store
+        .write("defs/pg/x", &SecretValue::new("late"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("changed during the write"), "{error}");
 }
 
 /// What openporch created is bound to where it was created: the AWS account

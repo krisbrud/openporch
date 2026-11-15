@@ -264,7 +264,20 @@ impl SecretStore for ExternalStore {
                 known = None;
             }
             let version = match known {
-                Some(r) if r.confirmed => write(None).await.map_err(cloud)?,
+                Some(r) if r.confirmed => {
+                    let version = write(None).await.map_err(cloud)?;
+                    // Re-confirm against the handle's generation: if the store
+                    // was repointed meanwhile, the value went to the old
+                    // destination and no reference may be returned for it.
+                    if !self
+                        .created
+                        .record(org, store, &secret.name, &r, Some(&r.create_id), generation)
+                        .await?
+                    {
+                        return Err(raced());
+                    }
+                    version
+                }
                 _ => {
                     let record = match known {
                         Some(pending) => pending,
