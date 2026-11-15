@@ -456,7 +456,7 @@ impl AwsSts {
         target: &str,
         region: &str,
         body: &serde_json::Value,
-    ) -> Result<(u16, Vec<u8>), CloudError> {
+    ) -> Result<(u16, zeroize::Zeroizing<Vec<u8>>), CloudError> {
         use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
         use aws_sigv4::sign::v4;
 
@@ -507,7 +507,8 @@ impl AwsSts {
             .await
             .map_err(|e| CloudError::Unavailable(format!("{target} could not reach {url}: {e}")))?;
         let status = res.status().as_u16();
-        let mut out = Vec::new();
+        // The response may hold a secret, so even a partial one is zeroed.
+        let mut out = zeroize::Zeroizing::new(Vec::new());
         while let Some(chunk) = res
             .chunk()
             .await
@@ -551,8 +552,6 @@ impl AwsSts {
         let (status, out) = self
             .json_call(credentials, service, target, &secret.region, &body)
             .await?;
-        // The raw response holds the value, so it is zeroed once read.
-        let out = zeroize::Zeroizing::new(out);
         if !(200..300).contains(&status) {
             // An error response holds no secret.
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
