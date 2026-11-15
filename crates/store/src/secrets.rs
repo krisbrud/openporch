@@ -439,7 +439,7 @@ impl BuiltinSecretStore {
             version: None,
         };
         validate_reference(&reference)?;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = crate::sqlite::begin_immediate(&self.pool).await?;
         let latest: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(version) FROM secret_versions WHERE org_id = ? AND ref = ?",
         )

@@ -163,6 +163,8 @@ struct Fake {
     deletions: Mutex<BTreeMap<String, Behavior>>,
     /// Every deletion job, in the order they started.
     deleted: Mutex<Vec<DeprovisionJob>>,
+    /// The objects that existed as each deletion job started.
+    deleted_while: Mutex<Vec<BTreeMap<String, String>>>,
     /// The cloud objects that exist: descriptor by GUResID.
     objects: Mutex<BTreeMap<String, String>>,
     /// Every object created, as descriptor and GUResID, in order.
@@ -479,6 +481,8 @@ impl Executor for Fake {
             .cloned()
             .unwrap_or(Behavior::Succeed);
         let guresid = job.job.guresid.to_string();
+        let existing = self.objects.lock().unwrap().clone();
+        self.deleted_while.lock().unwrap().push(existing);
         self.deleted.lock().unwrap().push(job);
         match behavior {
             Behavior::Succeed => {
@@ -2402,6 +2406,7 @@ async fn lost_log_lines_fail_the_deployment() {
 }
 
 mod coprovision;
+mod fault_matrix;
 mod faults;
 mod pins;
 mod recovery;
