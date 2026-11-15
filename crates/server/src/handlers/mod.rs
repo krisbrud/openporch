@@ -14,6 +14,7 @@ mod login;
 mod members;
 mod metrics;
 mod oidc;
+mod oidc_login;
 mod plans;
 mod resources;
 mod sets;
@@ -69,6 +70,24 @@ pub fn api(state: AppState) -> Api {
         .route(get(), "/auth/github/authorize", Public, login::authorize)
         .route(get(), "/auth/github/callback", Public, login::callback)
         .route(post(), "/auth/github/session", Public, login::exchange)
+        .route(
+            get(),
+            "/auth/oidc/{provider}/authorize",
+            Public,
+            oidc_login::authorize,
+        )
+        .route(
+            get(),
+            "/auth/oidc/{provider}/callback",
+            Public,
+            oidc_login::callback,
+        )
+        .route(
+            post(),
+            "/auth/oidc/{provider}/session",
+            Public,
+            oidc_login::exchange,
+        )
         // Members.
         .route(
             get(),

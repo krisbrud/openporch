@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use openporch_store::ExternalIdentity;
+use zeroize::Zeroizing;
 
 use crate::auth;
 
@@ -20,19 +21,41 @@ pub const COMPLETED_TTL_MS: i64 = 2 * 60 * 1000;
 /// The most logins of each kind held at once; more are refused until some expire.
 const CAPACITY: usize = 10_000;
 
+/// What an OpenID Connect login keeps until its callback: the `nonce` the ID token
+/// must carry and the PKCE code verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSecrets {
+    /// The nonce sent with the authorization request.
+    pub nonce: Zeroizing<String>,
+    /// The PKCE code verifier, sent with the code exchange.
+    pub verifier: Zeroizing<String>,
+}
+
 /// A started login.
 #[derive(Debug)]
 struct Pending {
+    provider: String,
     binding_hash: String,
     return_to: String,
+    secrets: Option<LoginSecrets>,
     expires_at: i64,
 }
 
 /// A finished login, waiting to be exchanged.
 #[derive(Debug)]
 struct Completed {
+    provider: String,
     identity: ExternalIdentity,
     expires_at: i64,
+}
+
+/// A login whose callback arrived from the browser that started it.
+#[derive(Debug)]
+pub struct Resumed {
+    /// Where the browser returns to.
+    pub return_to: String,
+    /// The login's secrets, for an OpenID Connect login.
+    pub secrets: Option<LoginSecrets>,
 }
 
 /// A started login: the `state` for the provider, the `binding` for the cookie.
@@ -65,9 +88,15 @@ fn prune<T>(map: &mut HashMap<String, T>, now: i64, expires: impl Fn(&T) -> i64)
 }
 
 impl BrowserLogins {
-    /// Starts a login that returns to `return_to`. `None` when too many are in
-    /// progress.
-    pub fn start(&self, return_to: &str, now: i64) -> Option<Started> {
+    /// Starts a login through `provider` that returns to `return_to`, keeping
+    /// `secrets` for its callback. `None` when too many are in progress.
+    pub fn start(
+        &self,
+        provider: &str,
+        return_to: &str,
+        secrets: Option<LoginSecrets>,
+        now: i64,
+    ) -> Option<Started> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut pending, now, |p| p.expires_at);
         if pending.len() >= CAPACITY {
@@ -80,8 +109,10 @@ impl BrowserLogins {
         pending.insert(
             auth::hash_token(&started.state),
             Pending {
+                provider: provider.to_owned(),
                 binding_hash: auth::hash_token(&started.binding),
                 return_to: return_to.to_owned(),
+                secrets,
                 expires_at: now + PENDING_TTL_MS,
             },
         );
@@ -89,29 +120,34 @@ impl BrowserLogins {
     }
 
     /// Ends the login `state` names, which `binding` from the browser's cookie must
-    /// have started, and returns where it returns to. A state is accepted once, even
-    /// when the binding is wrong, so a guessed or replayed callback cannot be retried.
+    /// have started through `provider`, and resumes it. A state is accepted once,
+    /// even when the binding or provider is wrong, so a guessed or replayed callback
+    /// cannot be retried.
     pub fn callback(
         &self,
+        provider: &str,
         state: &str,
         binding: Option<&str>,
         now: i64,
-    ) -> Result<String, CallbackError> {
+    ) -> Result<Resumed, CallbackError> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let login = pending
             .remove(&auth::hash_token(state))
-            .filter(|p| p.expires_at > now)
+            .filter(|p| p.expires_at > now && p.provider == provider)
             .ok_or(CallbackError::UnknownState)?;
         let presented = binding.map(auth::hash_token).unwrap_or_default();
         if !constant_time_eq(presented.as_bytes(), login.binding_hash.as_bytes()) {
             return Err(CallbackError::WrongBrowser);
         }
-        Ok(login.return_to)
+        Ok(Resumed {
+            return_to: login.return_to,
+            secrets: login.secrets,
+        })
     }
 
-    /// Holds a verified identity under a new one-time login code. `None` when too
-    /// many finished logins wait.
-    pub fn complete(&self, identity: ExternalIdentity, now: i64) -> Option<String> {
+    /// Holds an identity `provider` verified under a new one-time login code. `None`
+    /// when too many finished logins wait.
+    pub fn complete(&self, provider: &str, identity: ExternalIdentity, now: i64) -> Option<String> {
         let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut completed, now, |c| c.expires_at);
         if completed.len() >= CAPACITY {
@@ -121,6 +157,7 @@ impl BrowserLogins {
         completed.insert(
             auth::hash_token(&code),
             Completed {
+                provider: provider.to_owned(),
                 identity,
                 expires_at: now + COMPLETED_TTL_MS,
             },
@@ -128,12 +165,12 @@ impl BrowserLogins {
         Some(code)
     }
 
-    /// Takes the identity a login code holds, once.
-    pub fn exchange(&self, login_code: &str, now: i64) -> Option<ExternalIdentity> {
+    /// Takes the identity a login code from `provider` holds, once.
+    pub fn exchange(&self, provider: &str, login_code: &str, now: i64) -> Option<ExternalIdentity> {
         let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         completed
             .remove(&auth::hash_token(login_code))
-            .filter(|c| c.expires_at > now)
+            .filter(|c| c.expires_at > now && c.provider == provider)
             .map(|c| c.identity)
     }
 }
@@ -159,47 +196,109 @@ mod tests {
     #[test]
     fn a_state_is_used_once_by_the_browser_that_started_it() {
         let logins = BrowserLogins::default();
-        let a = logins.start("https://portal.example/done", 0).unwrap();
+        let a = logins
+            .start("github", "https://portal.example/done", None, 0)
+            .unwrap();
         assert_eq!(
-            logins.callback(&a.state, Some(&a.binding), 1),
+            logins
+                .callback("github", &a.state, Some(&a.binding), 1)
+                .map(|r| r.return_to),
             Ok("https://portal.example/done".into())
         );
         assert_eq!(
-            logins.callback(&a.state, Some(&a.binding), 2),
-            Err(CallbackError::UnknownState)
+            logins
+                .callback("github", &a.state, Some(&a.binding), 2)
+                .err(),
+            Some(CallbackError::UnknownState)
         );
 
         // Another browser's cookie, or none, is refused, and the state is spent.
-        let b = logins.start("https://portal.example/done", 0).unwrap();
-        let c = logins.start("https://portal.example/done", 0).unwrap();
+        let b = logins
+            .start("github", "https://portal.example/done", None, 0)
+            .unwrap();
+        let c = logins
+            .start("github", "https://portal.example/done", None, 0)
+            .unwrap();
         assert_eq!(
-            logins.callback(&b.state, Some(&c.binding), 1),
-            Err(CallbackError::WrongBrowser)
+            logins
+                .callback("github", &b.state, Some(&c.binding), 1)
+                .err(),
+            Some(CallbackError::WrongBrowser)
         );
         assert_eq!(
-            logins.callback(&b.state, Some(&b.binding), 1),
-            Err(CallbackError::UnknownState)
+            logins
+                .callback("github", &b.state, Some(&b.binding), 1)
+                .err(),
+            Some(CallbackError::UnknownState)
         );
         assert_eq!(
-            logins.callback(&c.state, None, 1),
-            Err(CallbackError::WrongBrowser)
+            logins.callback("github", &c.state, None, 1).err(),
+            Some(CallbackError::WrongBrowser)
         );
+    }
+
+    #[test]
+    fn a_login_resumes_only_through_the_provider_that_started_it() {
+        let logins = BrowserLogins::default();
+        let secrets = LoginSecrets {
+            nonce: Zeroizing::new("n".into()),
+            verifier: Zeroizing::new("v".into()),
+        };
+        let a = logins
+            .start(
+                "corp",
+                "https://portal.example/done",
+                Some(secrets.clone()),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            logins
+                .callback("github", &a.state, Some(&a.binding), 1)
+                .err(),
+            Some(CallbackError::UnknownState)
+        );
+        // The state was spent by the wrong callback.
+        assert_eq!(
+            logins.callback("corp", &a.state, Some(&a.binding), 1).err(),
+            Some(CallbackError::UnknownState)
+        );
+        let b = logins
+            .start(
+                "corp",
+                "https://portal.example/done",
+                Some(secrets.clone()),
+                0,
+            )
+            .unwrap();
+        let resumed = logins
+            .callback("corp", &b.state, Some(&b.binding), 1)
+            .unwrap();
+        assert_eq!(resumed.secrets, Some(secrets));
+
+        let code = logins.complete("corp", identity(), 0).unwrap();
+        assert!(logins.exchange("github", &code, 1).is_none());
+        assert!(logins.exchange("corp", &code, 1).is_none(), "spent");
     }
 
     #[test]
     fn logins_expire() {
         let logins = BrowserLogins::default();
-        let a = logins.start("https://portal.example/done", 0).unwrap();
+        let a = logins
+            .start("github", "https://portal.example/done", None, 0)
+            .unwrap();
         assert_eq!(
-            logins.callback(&a.state, Some(&a.binding), PENDING_TTL_MS),
-            Err(CallbackError::UnknownState)
+            logins
+                .callback("github", &a.state, Some(&a.binding), PENDING_TTL_MS)
+                .err(),
+            Some(CallbackError::UnknownState)
         );
-        let code = logins.complete(identity(), 0).unwrap();
-        assert!(logins.exchange(&code, COMPLETED_TTL_MS).is_none());
-        let code = logins.complete(identity(), 0).unwrap();
-        assert_eq!(logins.exchange(&code, 1), Some(identity()));
+        let code = logins.complete("github", identity(), 0).unwrap();
+        assert!(logins.exchange("github", &code, COMPLETED_TTL_MS).is_none());
+        let code = logins.complete("github", identity(), 0).unwrap();
+        assert_eq!(logins.exchange("github", &code, 1), Some(identity()));
         assert!(
-            logins.exchange(&code, 2).is_none(),
+            logins.exchange("github", &code, 2).is_none(),
             "a login code is used once"
         );
     }

@@ -181,28 +181,35 @@ impl std::fmt::Debug for Github {
 
 /// Reads the client secret from a file that only its owner may read.
 fn read_client_secret(path: &std::path::Path) -> Result<Zeroizing<String>, String> {
+    read_secret_file(path, "the GitHub client secret")
+}
+
+/// Reads `what` from a file that only its owner may read.
+pub(crate) fn read_secret_file(
+    path: &std::path::Path,
+    what: &str,
+) -> Result<Zeroizing<String>, String> {
     let name = path.display();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(path)
-            .map_err(|e| format!("reading the GitHub client secret {name}: {e}"))?
+            .map_err(|e| format!("reading {what} {name}: {e}"))?
             .permissions()
             .mode();
         if mode & 0o077 != 0 {
             return Err(format!(
-                "the GitHub client secret {name} may be read by others; \
+                "{what} {name} may be read by others; \
                  make it readable by the server's user only (chmod 600)"
             ));
         }
     }
     let text = Zeroizing::new(
-        std::fs::read_to_string(path)
-            .map_err(|e| format!("reading the GitHub client secret {name}: {e}"))?,
+        std::fs::read_to_string(path).map_err(|e| format!("reading {what} {name}: {e}"))?,
     );
     let secret = text.trim();
     if secret.is_empty() {
-        return Err(format!("the GitHub client secret {name} is empty"));
+        return Err(format!("{what} {name} is empty"));
     }
     Ok(Zeroizing::new(secret.to_owned()))
 }

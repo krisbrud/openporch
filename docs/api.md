@@ -155,6 +155,9 @@ GET /version
 | GET | `/auth/github/authorize` | public |
 | GET | `/auth/github/callback` | public |
 | POST | `/auth/github/session` | public |
+| GET | `/auth/oidc/{provider}/authorize` | public |
+| GET | `/auth/oidc/{provider}/callback` | public |
+| POST | `/auth/oidc/{provider}/session` | public |
 | GET | `/orgs/{org}/current-user` | authenticated |
 | DELETE | `/orgs/{org}/sessions/current` | authenticated |
 
@@ -200,6 +203,18 @@ available when the server configures `[github.browser]` (see
 Logins in progress are kept in memory, so a restart abandons them. Without
 `[github.browser]` the three routes return `404`. `/version` lists each provider
 with its flows, such as `{"id": "github", "flows": ["device", "browser"]}`.
+
+An OpenID Connect provider configured under `[[oidc_login]]` (see
+[OpenID Connect sign-in](security.md#openid-connect-sign-in)) signs people in the
+same way through `/auth/oidc/{provider}/authorize`, `/callback` and `/session`,
+where `{provider}` is its `id`. The provider is sent a PKCE `S256` challenge and a
+`nonce` along with the `state`, and the callback checks the ID token before it
+hands out a `login_code`; an ID token that fails a check returns the browser with
+`error=login_failed`. Each provider is listed in `/version` as
+`{"id": "corp", "type": "oidc", "issuer": "https://id.example.com", "flows": ["browser"]}`,
+and an `id` that no provider has gets `404`. The member's identity is
+`<issuer>:<sub>`, which is also how an invitation names one:
+`{"role": "member", "provider": "https://id.example.com", "subject": "248289761001"}`.
 
 `current-user` shows who a token belongs to and their effective roles:
 
