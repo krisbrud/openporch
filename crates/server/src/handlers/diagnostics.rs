@@ -78,6 +78,11 @@ fn sanitized(config: &Config) -> Value {
         "audit": {
             "retention_days": config.audit.retention_days,
         },
+        "public_url": config.public_url,
+        "oidc": {
+            "issuer": config.oidc_issuer(),
+            "key_grace_minutes": config.oidc.key_grace_minutes,
+        },
         "opentofu": {
             "root_configured": config.opentofu.root.is_some(),
             "state": state,

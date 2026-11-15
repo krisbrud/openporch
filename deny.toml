@@ -21,6 +21,18 @@ ignore = [
     # unsafe-libyaml, under serde_yaml_ng, is unmaintained. No vulnerability
     # is reported; revisit when moving to a maintained YAML parser.
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, no known vulnerability" },
+    # The Marvin attack: the `rsa` crate's private-key operations are not
+    # constant time. openporch only generates OIDC keys with it; every
+    # signature is made by `ring` (crates/engine/src/oidc.rs).
+    # SQLite before 3.54 can return uninitialized memory when it opens a
+    # database together with a crafted `-wal` file. No sqlx release accepts
+    # the fixed libsqlite3-sys (0.39; sqlx-sqlite 0.9 allows <0.38). openporch
+    # only opens the database in its own data directory, which anyone able to
+    # write already controls the installation; backups are a single file
+    # made with `VACUUM INTO`, and restore never brings a `-wal` along.
+    # Revisit when sqlx allows libsqlite3-sys 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "only the server's own data directory is opened; no sqlx release takes the fix yet" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used for key generation only; ring signs" },
 ]
 
 [licenses]

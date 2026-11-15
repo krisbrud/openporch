@@ -22,6 +22,7 @@ use crate::rate_limit::RateLimiter;
 use openporch_engine::cloud::{AwsSts, CredentialResolver, Sts};
 
 use crate::identity::{Github, IdentityProvider};
+use openporch_engine::oidc::{Issuer, StoredKey};
 
 /// State shared by every request.
 #[derive(Clone, Debug)]
@@ -38,6 +39,11 @@ pub struct Inner {
     pub keyring: Option<Arc<Keyring>>,
     /// The session signer, when the keys are available.
     pub signer: Option<SessionSigner>,
+    /// The OIDC issuer, when `public_url` is set and the keys are available.
+    pub issuer: Option<Arc<Issuer>>,
+    /// Held while a key rotation commits and the issuer takes its keys, so
+    /// overlapping rotations cannot leave the issuer with an older set.
+    pub oidc_rotation: tokio::sync::Mutex<()>,
     /// Why the server is not ready; empty when it is.
     pub not_ready: Vec<String>,
     /// The GitHub identity provider, when configured.
@@ -321,6 +327,10 @@ pub(crate) async fn start_with_drivers(
         (Some(k), true) => Some(session_signer(&store, k).await?),
         _ => None,
     };
+    let issuer = match (&keyring, &signer, config.public_url.as_deref()) {
+        (Some(k), Some(_), Some(url)) => Some(Arc::new(oidc_issuer(&store, k, url).await?)),
+        _ => None,
+    };
 
     let report = store.recover_interrupted().await?;
     for _ in &report.failed_deployments {
@@ -363,6 +373,8 @@ pub(crate) async fn start_with_drivers(
         store,
         keyring,
         signer,
+        issuer,
+        oidc_rotation: tokio::sync::Mutex::new(()),
         not_ready,
         github,
         cloud: Arc::new(CredentialResolver::new(sts)),
@@ -626,6 +638,60 @@ async fn session_signer(
         .try_into()
         .map_err(|_| StartupError::Io("the session signing key is malformed".into()))?;
     Ok(SessionSigner::from_seed(&seed))
+}
+
+/// The associated data that binds a sealed OIDC key to its purpose.
+pub const OIDC_KEY_AAD: &[u8] = b"openporch-signing-key:oidc:RS256";
+/// The `purpose` of OIDC keys in the key table.
+pub const OIDC_KEY_PURPOSE: &str = "oidc";
+
+/// Generates an OIDC signing key and seals it.
+pub async fn new_oidc_key(keyring: &Keyring) -> Result<Sealed, openporch_engine::oidc::OidcError> {
+    let pkcs8 = tokio::task::spawn_blocking(openporch_engine::oidc::generate_key)
+        .await
+        .map_err(|e| openporch_engine::oidc::OidcError::Generate(e.to_string()))??;
+    let pkcs8 = zeroize::Zeroizing::new(pkcs8);
+    Ok(keyring.seal(OIDC_KEY_AAD, &pkcs8))
+}
+
+/// Opens the published OIDC keys.
+pub fn open_oidc_keys(
+    keyring: &Keyring,
+    keys: &[openporch_store::SigningKey],
+) -> Result<Vec<StoredKey>, StartupError> {
+    keys.iter()
+        .map(|key| {
+            let pkcs8 = keyring.open(OIDC_KEY_AAD, &key.sealed)?.ok_or_else(|| {
+                StartupError::Io("an OIDC signing key could not be decrypted".into())
+            })?;
+            Ok(StoredKey {
+                pkcs8: pkcs8.to_vec(),
+                created_at: key.created_at,
+                retires_at: key.retires_at,
+            })
+        })
+        .collect()
+}
+
+/// Loads the OIDC issuer, generating its first key if it has none.
+async fn oidc_issuer(
+    store: &SqliteStore,
+    keyring: &Keyring,
+    public_url: &str,
+) -> Result<Issuer, StartupError> {
+    let mut keys = store.signing_keys(OIDC_KEY_PURPOSE).await?;
+    if !keys.iter().any(|k| k.retires_at.is_none()) {
+        let generated = new_oidc_key(keyring)
+            .await
+            .map_err(|e| StartupError::Io(e.to_string()))?;
+        store
+            .signing_key(OIDC_KEY_PURPOSE, "RS256", generated)
+            .await?;
+        keys = store.signing_keys(OIDC_KEY_PURPOSE).await?;
+    }
+    let url =
+        crate::config::check_public_url(public_url).map_err(|e| StartupError::Io(e.to_string()))?;
+    Issuer::new(&url, &open_oidc_keys(keyring, &keys)?).map_err(|e| StartupError::Io(e.to_string()))
 }
 
 fn pending_bootstrap_path(config: &Config) -> std::path::PathBuf {

@@ -157,6 +157,17 @@ pub struct Roles {
     pub deployer: BTreeSet<String>,
 }
 
+/// A stored signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningKey {
+    /// The private key, sealed with the master key.
+    pub sealed: crate::secrets::Sealed,
+    /// When it was created, in milliseconds since the epoch.
+    pub created_at: i64,
+    /// When it stops being published, once it has been rotated out.
+    pub retires_at: Option<i64>,
+}
+
 /// An invitation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Invitation {

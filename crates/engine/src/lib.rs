@@ -3,6 +3,7 @@
 pub mod cloud;
 pub mod executor;
 pub mod metrics;
+pub mod oidc;
 pub mod planner;
 pub mod preview;
 pub mod registry;

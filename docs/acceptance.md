@@ -246,8 +246,8 @@ none is open.
 
 | Scenario | Status | Verified by |
 |---|---|---|
-| Discovery | deferred | Group 11 |
-| Key rotation | deferred | Group 11 |
+| Discovery | covered | `crates/server/src/tests/oidc.rs::discovery_and_jwks_are_public_and_validate_issued_tokens`, `crates/engine/src/oidc/tests.rs::discovery_names_the_issuer_jwks_and_rs256` |
+| Key rotation | covered | `crates/server/src/tests/oidc.rs::rotation_signs_with_the_new_key_and_keeps_the_old_one_published_for_its_grace` (the end of the grace period is simulated by moving it into the past), `crates/engine/src/oidc/tests.rs::rotation_signs_with_the_new_key_and_publishes_both_until_the_grace_ends` |
 | Role assumption without standing credentials | deferred | Group 11 |
 | Trust scoped to another account | deferred | Group 11 |
 | Print trust policy | deferred | Group 11 |
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 233 covered, 10 manual, 31 deferred, 0 gaps.
+274 scenarios: 235 covered, 10 manual, 29 deferred, 0 gaps.

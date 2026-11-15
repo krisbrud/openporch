@@ -34,6 +34,7 @@ mod envs;
 mod github;
 mod keys;
 mod limits;
+mod oidc;
 mod plans;
 mod resources;
 mod restore;

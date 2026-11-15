@@ -186,6 +186,23 @@ pub trait IdentityStore: Send + Sync {
         generated: Sealed,
     ) -> impl Future<Output = Result<Sealed>> + Send;
 
+    /// The signing keys for `purpose` that are still published: the active
+    /// ones and those rotated out whose grace period has not ended.
+    fn signing_keys(&self, purpose: &str) -> impl Future<Output = Result<Vec<SigningKey>>> + Send;
+
+    /// Rotates the keys for `purpose`: every active key retires `grace_ms`
+    /// from now, keys whose grace period has ended are removed and
+    /// `generated` becomes the active key, with `audit` recorded in the same
+    /// transaction. Returns the keys still published.
+    fn rotate_signing_key(
+        &self,
+        purpose: &str,
+        algorithm: &str,
+        generated: Sealed,
+        grace_ms: i64,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<Vec<SigningKey>>> + Send;
+
     /// Creates an invitation.
     fn create_invitation(
         &self,
@@ -869,6 +886,52 @@ impl IdentityStore for SqliteStore {
         Ok(sealed)
     }
 
+    async fn signing_keys(&self, purpose: &str) -> Result<Vec<SigningKey>> {
+        let mut conn = self.pool().acquire().await?;
+        published_keys(&mut conn, purpose, now_ms()).await
+    }
+
+    async fn rotate_signing_key(
+        &self,
+        purpose: &str,
+        algorithm: &str,
+        generated: Sealed,
+        grace_ms: i64,
+        audit: AuditIntent,
+    ) -> Result<Vec<SigningKey>> {
+        let now = now_ms();
+        let mut tx = self.begin().await?;
+        sqlx::query("DELETE FROM signing_keys WHERE purpose = ? AND retired_at <= ?")
+            .bind(purpose)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE signing_keys SET retired_at = ? WHERE purpose = ? AND retired_at IS NULL",
+        )
+        .bind(now.saturating_add(grace_ms))
+        .bind(purpose)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO signing_keys (id, purpose, algorithm, key_id, nonce, ciphertext, \
+             created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(crate::random_hex(16))
+        .bind(purpose)
+        .bind(algorithm)
+        .bind(&generated.key_id)
+        .bind(&generated.nonce)
+        .bind(&generated.ciphertext)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        audit_in(&mut tx, &audit).await?;
+        let keys = published_keys(&mut tx, purpose, now).await?;
+        tx.commit().await?;
+        Ok(keys)
+    }
+
     async fn create_invitation(
         &self,
         org: &str,
@@ -1311,4 +1374,35 @@ impl IdentityStore for SqliteStore {
         .fetch_all(self.pool())
         .await?)
     }
+}
+
+async fn published_keys(
+    conn: &mut sqlx::SqliteConnection,
+    purpose: &str,
+    now: i64,
+) -> Result<Vec<SigningKey>> {
+    type Row = (String, Vec<u8>, Vec<u8>, i64, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT key_id, nonce, ciphertext, created_at, retired_at FROM signing_keys \
+         WHERE purpose = ? AND (retired_at IS NULL OR retired_at > ?) \
+         ORDER BY created_at DESC, id",
+    )
+    .bind(purpose)
+    .bind(now)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(key_id, nonce, ciphertext, created_at, retires_at)| SigningKey {
+                sealed: Sealed {
+                    key_id,
+                    nonce,
+                    ciphertext,
+                },
+                created_at,
+                retires_at,
+            },
+        )
+        .collect())
 }
