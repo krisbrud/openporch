@@ -25,6 +25,20 @@ use crate::StoreError;
 /// The ID of the built-in store.
 pub const BUILTIN_STORE: &str = "openporch";
 
+/// The name openporch wrote `r` under, relative to the organization: the
+/// reference itself in the built-in store, and in an external store the part
+/// after `openporch/<org>/` (Secrets Manager) or `/openporch/<org>/` (SSM).
+/// `None` for an external secret openporch did not name.
+pub fn written_name<'a>(org: &str, r: &'a SecretRef) -> Option<&'a str> {
+    if r.store == BUILTIN_STORE {
+        return Some(&r.reference);
+    }
+    let rest = r.reference.strip_prefix('/').unwrap_or(&r.reference);
+    rest.strip_prefix("openporch/")?
+        .strip_prefix(org)?
+        .strip_prefix('/')
+}
+
 /// A boxed future, so that secret stores can be used as trait objects.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -114,6 +128,22 @@ pub enum SecretError {
     /// A master key could not be loaded.
     #[error("invalid master key: {0}")]
     InvalidKey(String),
+    /// An external store could not be reached.
+    #[error("secret store `{store}` could not be reached: {reason}")]
+    Unavailable {
+        /// Store ID.
+        store: String,
+        /// What failed.
+        reason: String,
+    },
+    /// An external store refused the call.
+    #[error("secret store `{store}` refused the call: {reason}")]
+    Refused {
+        /// Store ID.
+        store: String,
+        /// Why.
+        reason: String,
+    },
     /// The store's database failed.
     #[error(transparent)]
     Store(#[from] StoreError),

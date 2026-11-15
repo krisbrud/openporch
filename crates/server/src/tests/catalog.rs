@@ -552,7 +552,7 @@ async fn definition_secrets_are_stored_as_references() {
 
     // The value really is in the built-in store.
     use openporch_store::secrets::SecretStore as _;
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let r =
         serde_json::from_value(read["driver_inputs"]["secret_refs"]["password"].clone()).unwrap();
     assert_eq!(primary.read(&r).await.unwrap().expose(), "hunter2");
@@ -1085,7 +1085,7 @@ async fn external_drivers_are_replaced() {
     assert_ne!(second["version"], first["version"], "{b}");
     let (_, got) = s.get(path, &member).await;
     assert_eq!(got, b);
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let token: openporch_core::model::SecretRef = serde_json::from_value(second.clone()).unwrap();
     assert_eq!(
         primary.read(&token).await.unwrap().expose(),
@@ -1488,13 +1488,14 @@ async fn malformed_secret_bodies_are_not_echoed() {
 async fn secrets_of_rejected_changes_are_discarded() {
     use openporch_store::secrets::{SecretStore as _, SecretValue};
     let s = server().await;
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let r = primary
         .write("defs/x/password", &SecretValue::new("hunter2"))
         .await
         .unwrap();
+    let primary = crate::secret_inputs::Primary::Builtin(primary);
     crate::secret_inputs::discard(&primary, vec![r.clone()]).await;
-    assert!(primary.read(&r).await.is_err());
+    assert!(primary.store().read(&r).await.is_err());
 }
 
 #[tokio::test]

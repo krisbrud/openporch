@@ -9,7 +9,7 @@ use openporch_core::model::SecretRef;
 use serde_json::{Map, Value};
 use sqlx::SqliteConnection;
 
-use crate::secrets::BUILTIN_STORE;
+use crate::secrets::written_name;
 use crate::sqlite::SqliteStore;
 use crate::sqlite_catalog::check_ref_stores;
 use crate::sqlite_values::check_secret_use;
@@ -31,8 +31,8 @@ pub enum SecretOwner<'a> {
 }
 
 impl SecretOwner<'_> {
-    /// The prefix under which the object's own `{value}` secrets are written in the
-    /// built-in store.
+    /// The prefix under which the object's own `{value}` secrets are written,
+    /// relative to the organization's namespace in a store.
     fn own_prefix(self) -> Option<String> {
         match self {
             Self::Values => None,
@@ -53,11 +53,12 @@ impl SecretOwner<'_> {
         }
     }
 
-    fn owns(self, r: &SecretRef) -> bool {
-        r.store == BUILTIN_STORE
-            && self
-                .own_prefix()
-                .is_some_and(|p| r.reference.starts_with(p.as_str()))
+    /// Whether `r` is a secret openporch wrote for this object, in any store.
+    fn owns(self, org: &str, r: &SecretRef) -> bool {
+        written_name(org, r).is_some_and(|name| {
+            self.own_prefix()
+                .is_some_and(|p| name.starts_with(p.as_str()))
+        })
     }
 }
 
@@ -128,7 +129,7 @@ pub(crate) async fn check_use(
     let mut refs = Map::new();
     refs.insert("ref".into(), serde_json::to_value(r)?);
     check_ref_stores(conn, org, &refs).await?;
-    if owner.owns(r) {
+    if owner.owns(org, r) {
         return Ok(());
     }
     let granted: Option<i64> = sqlx::query_scalar(
@@ -167,7 +168,7 @@ pub(crate) async fn check_assigned(
     let mut found = Vec::new();
     collect(refs, &mut found);
     for r in found {
-        if owner.owns(&r) {
+        if owner.owns(org, &r) {
             continue;
         }
         let granted: Option<i64> = sqlx::query_scalar(

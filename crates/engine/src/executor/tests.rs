@@ -27,6 +27,7 @@ use crate::cloud::{
     AssumeRole, AwsCredentials, CallerIdentity, EcrDigest, EcrImage, Latest, S3Object, S3Version,
     Sts,
 };
+use crate::cloud::{SecretService, external_secret};
 use crate::planner::{
     Deployment, JobInputs, JobLog, Limits, NoPermits, Observed, Outcome, Planner,
 };
@@ -284,9 +285,29 @@ struct FakeSts {
     /// The objects checked, with the access key they were checked with. A
     /// version named `gone` does not exist.
     objects: Mutex<Vec<(Option<String>, String)>>,
+    /// Secrets written to AWS stores, by name.
+    written: Mutex<BTreeMap<String, String>>,
 }
 
 impl Sts for FakeSts {
+    fn write_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a crate::cloud::AwsSecret,
+        value: &'a SecretValue,
+        _org: &'a str,
+    ) -> BoxFuture<'a, Result<String, CloudError>> {
+        self.objects.lock().unwrap().push((
+            Some(credentials.access_key_id.clone()),
+            format!("write {secret}"),
+        ));
+        self.written
+            .lock()
+            .unwrap()
+            .insert(secret.name.clone(), value.expose().to_owned());
+        Box::pin(async { Ok("v1".to_owned()) })
+    }
+
     fn assume_role(
         &self,
         _request: AssumeRole,
@@ -364,7 +385,10 @@ impl Sts for FakeSts {
             .lock()
             .unwrap()
             .push((Some(credentials.access_key_id.clone()), secret.to_string()));
-        let found = if secret.name.starts_with("down/") {
+        let written = self.written.lock().unwrap().get(&secret.name).cloned();
+        let found = if let Some(value) = written {
+            Ok(Some(SecretValue::new(value)))
+        } else if secret.name.starts_with("down/") {
             Err(CloudError::Unavailable(
                 "secretsmanager.GetSecretValue could not reach the service".into(),
             ))
@@ -495,6 +519,7 @@ impl Fixture {
         let sts = Arc::new(FakeSts {
             account: Mutex::new("111122223333".into()),
             objects: Mutex::new(Vec::new()),
+            written: Mutex::new(BTreeMap::new()),
         });
         let cloud = Arc::new(CredentialResolver::new(sts.clone()));
         Self {
@@ -2098,4 +2123,48 @@ fn external_references_name_a_secret_in_the_stores_region() {
     assert!(e.contains("config.region"), "{e}");
     let e = external_secret(&store("vault", "eu-north-1"), &r("a", None)).unwrap_err();
     assert!(e.contains("cannot be read"), "{e}");
+}
+
+/// With an AWS store primary, a driver's secret output is written there under
+/// the resource's own name, and the workload that uses it reads it back.
+#[tokio::test]
+async fn secret_outputs_go_to_an_external_primary_store() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    f.store
+        .set_primary_secret_store(ORG, "sm", audit("PATCH", "/orgs/acme/secretstores/sm"))
+        .await
+        .unwrap();
+    let defs = f.define(plain_pg(), "test/fake").await;
+    let (deployment, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    all_provisioned(&outcomes);
+    let db = f.active(DB).await;
+    let password = &db.secret_outputs["password"];
+    assert_eq!(password.store, "sm");
+    assert_eq!(
+        password.reference,
+        format!("openporch/acme/resources/{}/outputs/password", db.guresid)
+    );
+    assert_eq!(password.version.as_deref(), Some("v1"));
+    assert_eq!(
+        f.sts
+            .written
+            .lock()
+            .unwrap()
+            .get(&password.reference)
+            .map(String::as_str),
+        Some(PASSWORD)
+    );
+    // The workload got the password from the store, as its own resource's
+    // output, without a grant.
+    let puts = f.driver.puts();
+    let workload = puts.iter().find(|r| r.resource_type == "workload").unwrap();
+    assert_eq!(
+        workload.resource_secrets.expose()["spec"]["containers"]["web"]["variables"]["DB_PASSWORD"],
+        PASSWORD
+    );
+    let recorded = f.recorded(&deployment).await;
+    for plaintext in [PASSWORD, ACCOUNT_KEY] {
+        assert!(!recorded.contains(plaintext), "{plaintext}: {recorded}");
+    }
 }

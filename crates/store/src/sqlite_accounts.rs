@@ -164,6 +164,15 @@ pub trait AccountStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Makes `id` the primary store, where new secrets are written. References
+    /// to the previous primary store are unchanged.
+    fn set_primary_secret_store(
+        &self,
+        org: &str,
+        id: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Deletes a store nothing references: not the built-in or primary store, and
     /// not one named by definitions, accounts, drivers or grants.
     fn delete_secret_store(
@@ -715,6 +724,32 @@ impl AccountStore for SqliteStore {
         check_store_config(&mut tx, org, id, config).await?;
         sqlx::query("UPDATE secret_stores SET config = ? WHERE org_id = ? AND id = ?")
             .bind(serde_json::to_string(config)?)
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_primary_secret_store(
+        &self,
+        org: &str,
+        id: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        if store_row(&mut tx, org, id).await?.is_none() {
+            return Err(StoreError::NotFound(format!("secret store `{id}`")));
+        }
+        sqlx::query("UPDATE secret_stores SET is_primary = 0 WHERE org_id = ? AND is_primary = 1")
+            .bind(org)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE secret_stores SET is_primary = 1 WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)
             .execute(&mut *tx)

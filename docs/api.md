@@ -29,8 +29,6 @@ group. The examples run in order against a fresh dev server in
   server that does not serve it refuses the request with `400` `API-008`
   before doing anything. `porch` and the OpenTofu provider send it, and refuse
   a server whose responses name another contract.
-- **Work in progress.** External secret stores can be read but not yet
-  written, so they cannot become primary; the secret stores section says so.
 
 ### Errors
 
@@ -1670,18 +1668,34 @@ Authorization: Bearer $ADMIN_TOKEN
 | POST | `/orgs/{org}/secretstores/{store}/grants` | administer |
 | DELETE | `/orgs/{org}/secretstores/{store}/grants/{grant}` | administer |
 
-The built-in store `openporch` is the primary store, where `{value}` secrets are
-written. External stores of type `aws-secrets-manager` (a reference names a
-secret, a version is its `VersionId`) and `aws-ssm` (a reference names a
-parameter, a version is its number; SecureString parameters are decrypted) are
-registered with a `region` and the `cloud_account` that reads them. The
-executor reads their references with fresh credentials of that account right
-before the driver call; the account's own secrets must be in the built-in
-store, so resolution never depends on the store it opens. They cannot be
-primary yet, since this server does not write to them. `check` reads a test
-secret with the store's account and answers without its value: `422` `CLD-001`
-when AWS refuses the read or the secret does not exist, `502` `CLD-002` when
-AWS cannot be reached; for example `{"ref": "shop/stripe-key"}` answers
+The primary store is where `{value}` secrets and drivers' secret outputs are
+written; the built-in store `openporch` is primary until another store is
+marked with `PATCH {"primary": true}`. Existing references keep naming the
+store they were written to, and a store stays primary until another one is
+marked. Cloud account secrets are always written to the built-in store, so
+opening an external store never depends on an external store.
+
+External stores of type `aws-secrets-manager` (a reference names a secret, a
+version is its `VersionId`) and `aws-ssm` (a reference names a parameter, a
+version is its number; SecureString parameters are decrypted) are registered
+with a `region` and the `cloud_account` that reads and writes them, with fresh
+credentials right before each use. Marking one primary first opens it with that
+account. openporch writes to an AWS store under `openporch/<org>/<name>`
+(Secrets Manager) or `/openporch/<org>/<name>` (SSM, as SecureString), tagged
+`openporch:managed=true` and `openporch:org=<org>`, where `<name>` is the name
+the built-in store would use, such as `defs/<definition>/<key>` or
+`resources/<GUResID>/outputs/<output>`. Such a secret belongs to the object
+whose name it carries, like one in the built-in store.
+
+Retention: openporch never deletes from an external store. A version written
+for a change that is then rejected stays in place (the built-in store discards
+it), and secrets of deleted objects stay until an administrator removes them,
+for example by the `openporch:managed` tag. Secrets openporch did not write are
+only ever read.
+
+`check` reads a test secret with the store's account and answers without its
+value: `422` `CLD-001` when AWS refuses the read or the secret does not exist,
+`502` `CLD-002` when AWS cannot be reached; for example `{"ref": "shop/stripe-key"}` answers
 `{"store": "vault", "ref": "shop/stripe-key", "readable": true, "cloud_account": "aws-dev"}`.
 A store that
 definitions, accounts, drivers, grants or shared values still reference cannot be

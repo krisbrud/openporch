@@ -220,12 +220,15 @@ async fn write_account(
     create: bool,
 ) -> ApiResult<()> {
     let org = state.org();
-    let primary = secret_inputs::primary(state)?;
+    // Account secrets stay in the built-in store, which needs no account.
+    let primary = secret_inputs::Primary::Builtin(secret_inputs::builtin(state)?);
     let mut written = Vec::new();
     let result: ApiResult<()> = async {
         for (key, secret) in planned {
             let name = format!("accounts/{}/{key}", account.id);
-            let r = secret.materialize(&primary, &name, &mut written).await?;
+            let r = secret
+                .materialize(primary.store(), &name, &mut written)
+                .await?;
             account.secret_refs.insert(key, r);
         }
         let id = account.id.to_string();
@@ -306,7 +309,7 @@ pub async fn check_account(
     let setup = (account.ty == CloudAccountType::AwsIdentity)
         .then(|| super::oidc::aws_identity_setup(&state, account.id.as_str(), Some(&account)))
         .transpose()?;
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::builtin(&state)?;
     let identity = state
         .cloud
         .check(&account, read_at, &primary)
@@ -356,8 +359,7 @@ pub async fn delete_account(
 
 // Secret stores ------------------------------------------------------------------
 
-/// Store types that can be registered. Their adapters arrive in milestone 2, so
-/// they cannot be primary yet.
+/// Store types that can be registered besides the built-in one.
 const EXTERNAL_STORE_TYPES: &[&str] = &["aws-secrets-manager", "aws-ssm"];
 
 async fn store_or_404(state: &AppState, id: &str) -> ApiResult<SecretStoreRecord> {
@@ -468,8 +470,8 @@ pub struct StorePatch {
     primary: Option<bool>,
 }
 
-/// Changes a store's configuration, or marks it primary. Only the built-in store
-/// can be primary until the external adapters can write secrets.
+/// Changes a store's configuration, or marks it primary. New secrets go to the
+/// primary store from then on; existing references keep naming their store.
 pub async fn update_store(
     State(state): State<AppState>,
     ctx: Ctx,
@@ -478,26 +480,28 @@ pub async fn update_store(
 ) -> ApiResult<Json<SecretStoreRecord>> {
     let org = state.org();
     let store = store_or_404(&state, &id).await?;
-    match body.primary {
-        Some(true) if !store.primary => {
-            return Err(ApiError::invalid(format!(
-                "secret store `{id}` cannot become primary: this server cannot write \
-                 secrets to `{}` stores yet",
-                store.ty
-            )));
-        }
-        Some(false) if store.primary => {
-            return Err(ApiError::invalid(
-                "mark another store primary instead of unmarking the primary store",
-            ));
-        }
-        _ => {}
+    if body.primary == Some(false) && store.primary {
+        return Err(ApiError::invalid(
+            "mark another store primary instead of unmarking the primary store",
+        ));
     }
     if let Some(config) = &body.config {
         check_store_config(config)?;
         state
             .store
             .update_secret_store(org, &id, config, ctx.audit(org, "secret_store.update", &id))
+            .await?;
+    }
+    if body.primary == Some(true) && !store.primary {
+        // The store must open with its account before secrets are sent to it.
+        if store.ty != BUILTIN_STORE {
+            let builtin = secret_inputs::builtin(&state)?;
+            secret_inputs::open_external(&state, &builtin, store_or_404(&state, &id).await?)
+                .await?;
+        }
+        state
+            .store
+            .set_primary_secret_store(org, &id, ctx.audit(org, "secret_store.primary", &id))
             .await?;
     }
     Ok(Json(store_or_404(&state, &id).await?))
@@ -532,8 +536,7 @@ pub async fn check_store(
         version: body.version,
     };
     validate_reference(&r).map_err(|e| ApiError::invalid(e.to_string()))?;
-    let secret =
-        openporch_engine::executor::external_secret(&store, &r).map_err(ApiError::invalid)?;
+    let secret = openporch_engine::cloud::external_secret(&store, &r).map_err(ApiError::invalid)?;
     let account_id = store
         .config
         .get("cloud_account")
@@ -542,7 +545,7 @@ pub async fn check_store(
         .to_owned();
     let read_at = state.cloud.generation();
     let account = account_or_404(&state, &account_id).await?.account;
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::builtin(&state)?;
     let credentials = state
         .cloud
         .resolve(
@@ -552,12 +555,12 @@ pub async fn check_store(
             std::time::Duration::from_secs(60),
         )
         .await
-        .map_err(|e| cloud_error(e, &format!("cloud account `{account_id}`")))?;
+        .map_err(|e| secret_inputs::cloud_error(e, &format!("cloud account `{account_id}`")))?;
     let found = state
         .cloud
         .read_secret(&credentials, &secret)
         .await
-        .map_err(|e| cloud_error(e, &format!("secret store `{id}`")))?;
+        .map_err(|e| secret_inputs::cloud_error(e, &format!("secret store `{id}`")))?;
     let Some(_value) = found else {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -582,24 +585,6 @@ pub async fn check_store(
         answer["version"] = v.into();
     }
     Ok(Json(answer))
-}
-
-fn cloud_error(e: CloudError, what: &str) -> ApiError {
-    match e {
-        CloudError::Invalid(m) | CloudError::Expiring(m) => {
-            ApiError::invalid(format!("{what}: {m}"))
-        }
-        CloudError::Rejected(m) => ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            code::CLOUD_REJECTED,
-            format!("{what}: {m}"),
-        ),
-        CloudError::Unavailable(m) | CloudError::Throttled { message: m, .. } => ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            code::CLOUD_UNAVAILABLE,
-            format!("{what}: {m}"),
-        ),
-    }
 }
 
 pub async fn delete_store(

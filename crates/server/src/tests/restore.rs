@@ -376,7 +376,7 @@ async fn start_plain(dir: tempfile::TempDir, admin: &str) -> Server {
 /// The plaintext of `r`, read through the server's built-in store.
 async fn read_secret(s: &Server, r: &openporch_core::model::SecretRef) -> Option<String> {
     use openporch_store::secrets::SecretStore as _;
-    let primary = crate::secret_inputs::primary(&s.state).ok()?;
+    let primary = crate::secret_inputs::builtin(&s.state).ok()?;
     primary.read(r).await.ok().map(|v| v.expose().to_owned())
 }
 

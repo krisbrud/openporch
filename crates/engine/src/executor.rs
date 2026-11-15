@@ -28,8 +28,8 @@ use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 use crate::cloud::{
-    AwsCredentials, AwsSecret, CHECK_WINDOW, CloudError, CredentialResolver, EcrDigest, EcrImage,
-    Latest, S3Object, S3Version, SecretService, pinned_image,
+    AwsCredentials, CHECK_WINDOW, CloudError, CredentialResolver, EcrDigest, EcrImage,
+    ExternalStore, Latest, S3Object, S3Version, external_secret, pinned_image,
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
@@ -510,6 +510,49 @@ where
         }
     }
 
+    /// The primary store, where secret outputs are written: the built-in
+    /// store, or an AWS store opened with fresh credentials of its account.
+    async fn primary_store(
+        &self,
+        c: &JobContext,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn SecretStore>, ExecFailure> {
+        let stores = self
+            .store
+            .secret_stores(c.org.as_str())
+            .await
+            .map_err(|e| store_failure(e, "the secret stores could not be read"))?;
+        let Some(primary) = stores
+            .into_iter()
+            .find(|s| s.primary && s.id != self.secrets.id())
+        else {
+            return Ok(self.secrets.clone());
+        };
+        let id = primary.id.clone();
+        let account = ExternalStore::account_of(&primary)
+            .and_then(|a| AccountId::new(a).ok())
+            .ok_or_else(|| {
+                ExecFailure::Permanent(format!(
+                    "primary secret store `{id}` names no valid `cloud_account`"
+                ))
+            })?;
+        let credentials = self
+            .account_credentials(c, &account, SECRET_READ_WINDOW, log)
+            .await
+            .map_err(|f| {
+                prefixed(
+                    f,
+                    &format!("primary secret store `{id}` could not use cloud account `{account}`"),
+                )
+            })?;
+        Ok(Arc::new(ExternalStore::new(
+            self.cloud.clone(),
+            credentials,
+            primary,
+            c.org.as_str(),
+        )))
+    }
+
     /// Fresh credentials for the job's cloud account and what they resolve to,
     /// refusing an account that now resolves to another target than the one
     /// the resource was provisioned in.
@@ -726,6 +769,9 @@ where
             }
             Plan::Unknown => {}
         }
+        // A primary store that cannot be opened fails the job before the
+        // driver changes anything, rather than after.
+        self.primary_store(&job.context, log).await?;
         let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
         let target = match self.refresh(job, &mut req, timeout, log).await? {
             Some(refreshed) => Some(refreshed),
@@ -805,10 +851,15 @@ where
             secret_texts(value, &mut texts);
         }
         log.secret(texts);
+        let primary = if secrets.is_empty() {
+            None
+        } else {
+            Some(self.primary_store(&job.context, log).await?)
+        };
         for (key, value) in secrets {
             let name = format!("resources/{}/outputs/{key}", job.guresid);
-            let reference = self
-                .secrets
+            let Some(primary) = &primary else { break };
+            let reference = primary
                 .write(&name, &SecretValue::new(secret_text(value)))
                 .await
                 .map_err(|e| {
@@ -1598,53 +1649,6 @@ fn store_failure(e: StoreError, what: &str) -> ExecFailure {
 
 /// How long credentials used to read an external secret must stay valid.
 const SECRET_READ_WINDOW: Duration = Duration::from_secs(60);
-
-/// The AWS secret that `r` names in `store`.
-pub fn external_secret(
-    store: &openporch_store::SecretStoreRecord,
-    r: &SecretRef,
-) -> Result<AwsSecret, String> {
-    let service = SecretService::of_store_type(&store.ty).ok_or_else(|| {
-        format!(
-            "secret store `{}` has type `{}`, which cannot be read",
-            store.id, store.ty
-        )
-    })?;
-    let region = store
-        .config
-        .get("region")
-        .and_then(Value::as_str)
-        .filter(|r| {
-            !r.is_empty()
-                && r.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        .ok_or_else(|| format!("secret store `{}` has no valid `config.region`", store.id))?;
-    if r.reference.is_empty() {
-        return Err(format!(
-            "a reference into secret store `{}` names no secret",
-            store.id
-        ));
-    }
-    if service == SecretService::Ssm
-        && r.version
-            .as_deref()
-            .is_some_and(|v| v.parse::<u64>().is_err())
-    {
-        return Err(format!(
-            "secret `{}` in store `{}` pins version `{}`, but SSM parameter versions are numbers",
-            r.reference,
-            store.id,
-            r.version.as_deref().unwrap_or_default()
-        ));
-    }
-    Ok(AwsSecret {
-        service,
-        region: region.to_owned(),
-        name: r.reference.clone(),
-        version: r.version.clone(),
-    })
-}
 
 fn secret_failure(e: SecretError) -> ExecFailure {
     match e {

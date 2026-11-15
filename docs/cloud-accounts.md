@@ -230,6 +230,14 @@ references are read with. That account needs, on the secrets it will read:
 - Both: `kms:Decrypt` on the key that encrypts them, unless it is the AWS
   managed key.
 
+A primary store's account also writes, under `openporch/<org>/*` (Secrets
+Manager) or `/openporch/<org>/*` (SSM):
+
+- Secrets Manager: `secretsmanager:CreateSecret`, `secretsmanager:PutSecretValue`
+  and `secretsmanager:TagResource`.
+- SSM Parameter Store: `ssm:PutParameter` and `ssm:AddTagsToResource`.
+- Both: `kms:GenerateDataKey` and `kms:Encrypt` on a customer managed key.
+
 A store's account must keep its own secrets in the built-in store, so reading
 a store never needs that same store. `POST /orgs/{org}/secretstores/{store}/check`
 with `{"ref": "<test secret>"}` reads a test secret with the account and
@@ -238,8 +246,10 @@ reports whether it could, never the value.
 ### The real secret store check
 
 `real_secret_read` reads a Secrets Manager secret and an SSM SecureString
-parameter (current and pinned version 1) with the host's static keys, and
-checks that missing names read as not found. CI runs it against Floci in the
+parameter (current and pinned version 1) with the host's static keys, checks
+that missing names read as not found, then writes two versions of
+`<name>-written` in each service and reads each version back. It leaves the
+written secrets behind. CI runs it against Floci in the
 `account check against Floci` job. Against a real account, create both with the
 same value and run:
 

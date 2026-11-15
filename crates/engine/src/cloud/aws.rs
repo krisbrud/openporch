@@ -154,6 +154,19 @@ impl Sts for AwsSts {
         Box::pin(async move { self.read_secret_json(credentials, secret).await })
     }
 
+    fn write_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+        value: &'a SecretValue,
+        org: &'a str,
+    ) -> BoxFuture<'a, Result<String, CloudError>> {
+        Box::pin(async move {
+            self.write_secret_json(credentials, secret, value, org)
+                .await
+        })
+    }
+
     fn assume_role(
         &self,
         request: AssumeRole,
@@ -559,31 +572,12 @@ impl AwsSts {
         if !(200..300).contains(&status) {
             // An error response holds no secret.
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
-            let code = value["__type"]
-                .as_str()
-                .map(|t| t.rsplit('#').next().unwrap_or(t))
-                .unwrap_or("Unknown");
-            let message = value["message"]
-                .as_str()
-                .or_else(|| value["Message"].as_str())
-                .unwrap_or("no message");
+            let (code, message) = aws_error(&value);
             return match code {
                 "ResourceNotFoundException" | "ParameterNotFound" | "ParameterVersionNotFound" => {
                     Ok(None)
                 }
-                "ThrottlingException" | "ThrottledException" => Err(CloudError::Throttled {
-                    message: format!("{target} of {secret} was throttled: {message}"),
-                    retry_after: None,
-                }),
-                "InternalServiceError" | "InternalServerError" | "InternalFailure" => Err(
-                    CloudError::Unavailable(format!("{target} of {secret} failed: {code}")),
-                ),
-                _ if status >= 500 => Err(CloudError::Unavailable(format!(
-                    "{target} of {secret} failed with status {status}"
-                ))),
-                _ => Err(CloudError::Rejected(format!(
-                    "{target} of {secret} failed: {code}: {message}"
-                ))),
+                _ => Err(call_error(target, secret, status, code, message)),
             };
         }
         // The value is parsed straight into a `SecretValue`, which is zeroed on
@@ -629,4 +623,128 @@ struct SsmParameterValue {
 struct SsmParameter {
     #[serde(rename = "Value")]
     value: Option<SecretValue>,
+}
+
+impl AwsSts {
+    /// Writes `value` as a new version of `secret`, creating it, tagged as
+    /// written by openporch for `org`, when it does not exist. Returns the new
+    /// version.
+    pub(super) async fn write_secret_json(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+        value: &SecretValue,
+        org: &str,
+    ) -> Result<String, CloudError> {
+        let tags = serde_json::json!([
+            {"Key": "openporch:managed", "Value": "true"},
+            {"Key": "openporch:org", "Value": org},
+        ]);
+        let (service, attempts) = match secret.service {
+            SecretService::SecretsManager => (
+                "secretsmanager",
+                [
+                    (
+                        "secretsmanager.PutSecretValue",
+                        serde_json::json!({"SecretId": secret.name, "SecretString": value.expose()}),
+                        "ResourceNotFoundException",
+                    ),
+                    (
+                        "secretsmanager.CreateSecret",
+                        serde_json::json!({
+                            "Name": secret.name,
+                            "SecretString": value.expose(),
+                            "Description": "Written by openporch",
+                            "Tags": tags,
+                        }),
+                        "ResourceExistsException",
+                    ),
+                ],
+            ),
+            // A new parameter takes tags, an existing one is overwritten.
+            SecretService::Ssm => (
+                "ssm",
+                [
+                    (
+                        "AmazonSSM.PutParameter",
+                        serde_json::json!({
+                            "Name": secret.name, "Value": value.expose(),
+                            "Type": "SecureString", "Tags": tags,
+                        }),
+                        "ParameterAlreadyExists",
+                    ),
+                    (
+                        "AmazonSSM.PutParameter",
+                        serde_json::json!({
+                            "Name": secret.name, "Value": value.expose(),
+                            "Type": "SecureString", "Overwrite": true,
+                        }),
+                        "",
+                    ),
+                ],
+            ),
+        };
+        // Each attempt falls through to the next on its expected error; a
+        // secret created between the two attempts is written by a final retry
+        // of the first.
+        let mut last = None;
+        for (target, body, next_on) in attempts.iter().chain(attempts.first()) {
+            let (status, out) = self
+                .json_call(credentials, service, target, &secret.region, body)
+                .await?;
+            let answer: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+            if (200..300).contains(&status) {
+                let version = match secret.service {
+                    SecretService::SecretsManager => {
+                        answer["VersionId"].as_str().map(str::to_owned)
+                    }
+                    SecretService::Ssm => answer["Version"].as_u64().map(|v| v.to_string()),
+                };
+                return version.ok_or_else(|| {
+                    CloudError::Rejected(format!("{target} of {secret} returned no version"))
+                });
+            }
+            let (code, message) = aws_error(&answer);
+            if code != *next_on || next_on.is_empty() {
+                return Err(call_error(target, secret, status, code, message));
+            }
+            last = Some(format!("{target} of {secret} failed: {code}"));
+        }
+        Err(CloudError::Unavailable(last.unwrap_or_default()))
+    }
+}
+
+/// The error code and message of a JSON 1.1 error response.
+fn aws_error(value: &serde_json::Value) -> (&str, &str) {
+    let code = value["__type"]
+        .as_str()
+        .map(|t| t.rsplit('#').next().unwrap_or(t))
+        .unwrap_or("Unknown");
+    let message = value["message"]
+        .as_str()
+        .or_else(|| value["Message"].as_str())
+        .unwrap_or("no message");
+    (code, message)
+}
+
+fn call_error(
+    target: &str,
+    secret: &AwsSecret,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> CloudError {
+    match code {
+        "ThrottlingException" | "ThrottledException" => CloudError::Throttled {
+            message: format!("{target} of {secret} was throttled: {message}"),
+            retry_after: None,
+        },
+        "InternalServiceError" | "InternalServerError" | "InternalFailure" => {
+            CloudError::Unavailable(format!("{target} of {secret} failed: {code}"))
+        }
+        _ if status >= 500 => {
+            CloudError::Unavailable(format!("{target} of {secret} failed with status {status}"))
+        }
+        _ => CloudError::Rejected(format!("{target} of {secret} failed: {code}: {message}")),
+    }
 }

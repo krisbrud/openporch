@@ -83,7 +83,7 @@ async fn create_a_static_account() {
 
     // The value is in the primary store.
     use openporch_store::secrets::SecretStore as _;
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let r = serde_json::from_value(read["secret_refs"]["secret_access_key"].clone()).unwrap();
     assert_eq!(primary.read(&r).await.unwrap().expose(), "wJalr-secret");
 
@@ -394,15 +394,7 @@ async fn register_an_aws_store() {
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 
-    // External stores cannot become primary until their adapters exist.
-    let (status, b) = s
-        .send(
-            Method::PATCH,
-            &format!("{STORES}/prod-sm"),
-            json!({"primary": true}),
-        )
-        .await;
-    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    // Marking an external store primary is `change_primary`.
     let (status, b) = s
         .send(
             Method::PATCH,
@@ -650,6 +642,9 @@ async fn account_changes_are_audited() {
     assert!(!text.contains("wJalr-secret"), "{text}");
 }
 
+/// The writes [`FakeSts`] received: the secret, its value and the org.
+static WRITES: std::sync::Mutex<Vec<(String, String, String)>> = std::sync::Mutex::new(Vec::new());
+
 /// STS for the account check: role sessions need external ID `ext-123`, and role
 /// `arn:aws:iam::1:role/offline` cannot be reached.
 struct FakeSts;
@@ -670,6 +665,25 @@ impl Sts for FakeSts {
                 ));
             }
             Ok((secret.name == "shop/db-user").then(|| SecretValue::new("db-user-plaintext")))
+        })
+    }
+
+    /// Records each write and answers version `1`.
+    fn write_secret<'a>(
+        &'a self,
+        c: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+        value: &'a SecretValue,
+        org: &'a str,
+    ) -> BoxFuture<'a, Result<String, CloudError>> {
+        Box::pin(async move {
+            assert_eq!(c.access_key_id, "AKIAEXAMPLE");
+            WRITES.lock().unwrap().push((
+                secret.to_string(),
+                value.expose().to_owned(),
+                org.to_owned(),
+            ));
+            Ok("1".to_owned())
         })
     }
 
@@ -1036,4 +1050,101 @@ async fn a_store_check_reads_a_test_secret_with_the_stores_account() {
         let (s2, b) = s.send(Method::POST, &path, body).await;
         assert_eq!(s2, status, "{path}: {b}");
     }
+}
+
+/// The Change primary scenario: once `prod-sm` is primary, new secrets written
+/// through the orchestrator go to it, and existing references are unchanged.
+#[tokio::test]
+async fn change_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = crate::Config::new("acme", dir.path());
+    config.images.pin_other_registries = false;
+    let state = crate::start_with(config, None, std::sync::Arc::new(FakeSts))
+        .await
+        .unwrap();
+    let s = super::server_from(dir, state);
+    s.static_account("aws-prod").await;
+    s.aws_store("prod-sm", "aws-prod").await;
+    let def = |id: &str| {
+        json!({"id": id, "type": "postgres", "driver_type": "openporch/echo",
+               "driver_inputs": {"secrets": {"password": format!("{id}-plaintext")}},
+               "criteria": [{}]})
+    };
+    let before = s
+        .ok(Method::POST, "/orgs/acme/resources/defs", def("before"))
+        .await;
+    assert_eq!(
+        before["driver_inputs"]["secret_refs"]["password"]["store"],
+        "openporch"
+    );
+
+    let b = s
+        .ok(
+            Method::PATCH,
+            &format!("{STORES}/prod-sm"),
+            json!({"primary": true}),
+        )
+        .await;
+    assert_eq!(b["primary"], true);
+    let (_, b) = s.get(&format!("{STORES}/openporch"), &s.admin).await;
+    assert_eq!(b["primary"], false);
+
+    let after = s
+        .ok(Method::POST, "/orgs/acme/resources/defs", def("after"))
+        .await;
+    assert_eq!(
+        after["driver_inputs"]["secret_refs"]["password"],
+        json!({"store": "prod-sm", "ref": "openporch/acme/defs/after/password", "version": "1"})
+    );
+    assert!(!after.to_string().contains("after-plaintext"), "{after}");
+    assert!(
+        WRITES.lock().unwrap().contains(&(
+            "Secrets Manager `openporch/acme/defs/after/password` in eu-north-1".to_owned(),
+            "after-plaintext".to_owned(),
+            "acme".to_owned(),
+        )),
+        "{:?}",
+        WRITES.lock().unwrap()
+    );
+    // Existing references keep naming the built-in store.
+    let (_, read) = s.get("/orgs/acme/resources/defs/before", &s.admin).await;
+    assert_eq!(read["driver_inputs"], before["driver_inputs"]);
+    // Cloud account secrets stay in the built-in store, so opening a store
+    // never depends on one.
+    let account = s.static_account("aws-dev").await;
+    assert_eq!(
+        account["secret_refs"]["secret_access_key"]["store"],
+        "openporch"
+    );
+
+    let (status, b) = s
+        .send(
+            Method::PATCH,
+            &format!("{STORES}/prod-sm"),
+            json!({"primary": false}),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let (status, b) = s
+        .send(Method::DELETE, &format!("{STORES}/prod-sm"), Value::Null)
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    s.ok(
+        Method::PATCH,
+        &format!("{STORES}/openporch"),
+        json!({"primary": true}),
+    )
+    .await;
+    let (_, b) = s.get(&format!("{STORES}/prod-sm"), &s.admin).await;
+    assert_eq!(b["primary"], false);
+    let (_, audit) = s
+        .get(
+            "/orgs/acme/audit-logs?path_prefix=/orgs/acme/secretstores",
+            &s.admin,
+        )
+        .await;
+    assert!(
+        audit.to_string().contains("secret_store.primary"),
+        "{audit}"
+    );
 }

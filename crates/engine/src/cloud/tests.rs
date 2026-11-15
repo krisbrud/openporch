@@ -831,8 +831,8 @@ async fn identity_accounts_need_the_issuer() {
     ));
 }
 
-/// Reads a Secrets Manager secret and an SSM parameter through the hand-signed
-/// JSON calls, with the host's static keys. CI runs it against Floci: the job
+/// Reads and writes Secrets Manager secrets and SSM parameters through the
+/// hand-signed JSON calls, with the host's static keys. CI runs it against Floci: the job
 /// creates secret `OPENPORCH_TEST_SM_SECRET` and SecureString parameter
 /// `OPENPORCH_TEST_SSM_PARAMETER`, both holding `OPENPORCH_TEST_SECRET_VALUE`.
 #[tokio::test]
@@ -891,5 +891,39 @@ async fn real_secret_read() {
             .await
             .unwrap_or_else(|e| panic!("{service} `{name}-missing`: {e}"));
         assert!(missing.is_none(), "{service} `{name}-missing`");
+    }
+
+    // Writing creates a secret, then adds versions; each version reads back.
+    for (service, name) in [
+        (
+            SecretService::SecretsManager,
+            format!("{}-written", var("OPENPORCH_TEST_SM_SECRET")),
+        ),
+        (
+            SecretService::Ssm,
+            format!("{}-written", var("OPENPORCH_TEST_SSM_PARAMETER")),
+        ),
+    ] {
+        let mut versions = Vec::new();
+        for value in ["first-value", "second-value"] {
+            let version = resolver
+                .write_secret(
+                    &credentials,
+                    &secret(service, name.clone(), None),
+                    &SecretValue::new(value),
+                    "acme",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("writing {service} `{name}`: {e}"));
+            versions.push((version, value));
+        }
+        assert_ne!(versions[0].0, versions[1].0, "{service} `{name}`");
+        for (version, value) in &versions {
+            let read = resolver
+                .read_secret(&credentials, &secret(service, name.clone(), Some(version)))
+                .await
+                .unwrap_or_else(|e| panic!("{service} `{name}` version {version}: {e}"));
+            assert_eq!(read.expect("found").expose(), *value, "{service} `{name}`");
+        }
     }
 }

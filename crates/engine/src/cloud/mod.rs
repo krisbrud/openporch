@@ -9,6 +9,7 @@
 //! is held at all. Calls to AWS go through [`Sts`], so tests use a fake.
 
 mod aws;
+mod external;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -23,6 +24,7 @@ use serde_json::Value;
 use crate::oidc::{Claims, Issuer};
 
 pub use aws::AwsSts;
+pub use external::{ExternalStore, external_name, external_secret};
 
 /// Extra validity required beyond an operation's window, for clock skew and the
 /// time the call itself takes.
@@ -622,6 +624,24 @@ pub trait Sts: Send + Sync {
             ))
         })
     }
+
+    /// Writes `value` as a new version of `secret` (its `version` is
+    /// ignored), creating it tagged for `org` when it does not exist. Returns
+    /// the new version.
+    fn write_secret<'a>(
+        &'a self,
+        credentials: &'a AwsCredentials,
+        secret: &'a AwsSecret,
+        value: &'a SecretValue,
+        org: &'a str,
+    ) -> BoxFuture<'a, Result<String, CloudError>> {
+        let _ = (credentials, secret, value, org);
+        Box::pin(async {
+            Err(CloudError::Unavailable(
+                "AWS secret stores cannot be reached".into(),
+            ))
+        })
+    }
 }
 
 /// When an account was read, relative to [`CredentialResolver::forget`] calls.
@@ -773,6 +793,20 @@ impl CredentialResolver {
     ) -> Result<Option<SecretValue>, CloudError> {
         self.sts
             .read_secret(credentials, secret)
+            .await
+            .map_err(|e| redacted(e, credentials))
+    }
+
+    /// Writes `value` as a new version of `secret`; see [`Sts::write_secret`].
+    pub async fn write_secret(
+        &self,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+        value: &SecretValue,
+        org: &str,
+    ) -> Result<String, CloudError> {
+        self.sts
+            .write_secret(credentials, secret, value, org)
             .await
             .map_err(|e| redacted(e, credentials))
     }
