@@ -553,8 +553,9 @@ impl AwsSts {
             .await?;
         // The raw response holds the value, so it is zeroed once read.
         let out = zeroize::Zeroizing::new(out);
-        let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
         if !(200..300).contains(&status) {
+            // An error response holds no secret.
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
             let code = value["__type"]
                 .as_str()
                 .map(|t| t.rsplit('#').next().unwrap_or(t))
@@ -582,20 +583,47 @@ impl AwsSts {
                 ))),
             };
         }
+        // The value is parsed straight into a `SecretValue`, which is zeroed on
+        // drop, so no other copy of it is left behind.
+        let no_value = || CloudError::Rejected(format!("{target} of {secret} returned no value"));
         let text = match secret.service {
             SecretService::SecretsManager => {
-                if value.get("SecretBinary").is_some() && value.get("SecretString").is_none() {
+                let answer: SecretsManagerValue =
+                    serde_json::from_slice(&out).map_err(|_| no_value())?;
+                if answer.secret_binary.is_some() && answer.secret_string.is_none() {
                     return Err(CloudError::Rejected(format!(
                         "{secret} holds a binary secret; only text secrets can be read"
                     )));
                 }
-                value["SecretString"].as_str()
+                answer.secret_string
             }
-            SecretService::Ssm => value["Parameter"]["Value"].as_str(),
+            SecretService::Ssm => serde_json::from_slice::<SsmParameterValue>(&out)
+                .map_err(|_| no_value())?
+                .parameter
+                .and_then(|p| p.value),
         };
-        let text = text.ok_or_else(|| {
-            CloudError::Rejected(format!("{target} of {secret} returned no value"))
-        })?;
-        Ok(Some(SecretValue::new(text.to_owned())))
+        text.map(Some).ok_or_else(no_value)
     }
+}
+
+/// A `GetSecretValue` answer, as far as it is read.
+#[derive(serde::Deserialize)]
+struct SecretsManagerValue {
+    #[serde(rename = "SecretString")]
+    secret_string: Option<SecretValue>,
+    #[serde(rename = "SecretBinary")]
+    secret_binary: Option<serde::de::IgnoredAny>,
+}
+
+/// A `GetParameter` answer, as far as it is read.
+#[derive(serde::Deserialize)]
+struct SsmParameterValue {
+    #[serde(rename = "Parameter")]
+    parameter: Option<SsmParameter>,
+}
+
+#[derive(serde::Deserialize)]
+struct SsmParameter {
+    #[serde(rename = "Value")]
+    value: Option<SecretValue>,
 }
