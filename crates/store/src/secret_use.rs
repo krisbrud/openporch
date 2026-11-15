@@ -9,7 +9,7 @@ use openporch_core::model::SecretRef;
 use serde_json::{Map, Value};
 use sqlx::SqliteConnection;
 
-use crate::secrets::BUILTIN_STORE;
+use crate::secrets::{BUILTIN_STORE, written_name};
 use crate::sqlite::SqliteStore;
 use crate::sqlite_catalog::check_ref_stores;
 use crate::sqlite_values::check_secret_use;
@@ -31,8 +31,8 @@ pub enum SecretOwner<'a> {
 }
 
 impl SecretOwner<'_> {
-    /// The prefix under which the object's own `{value}` secrets are written in the
-    /// built-in store.
+    /// The prefix under which the object's own `{value}` secrets are written,
+    /// relative to the organization's namespace in a store.
     fn own_prefix(self) -> Option<String> {
         match self {
             Self::Values => None,
@@ -53,11 +53,21 @@ impl SecretOwner<'_> {
         }
     }
 
-    fn owns(self, r: &SecretRef) -> bool {
-        r.store == BUILTIN_STORE
-            && self
-                .own_prefix()
-                .is_some_and(|p| r.reference.starts_with(p.as_str()))
+    /// Whether `r` carries this object's own name.
+    fn named_for(self, org: &str, r: &SecretRef) -> bool {
+        written_name(org, r).is_some_and(|name| {
+            self.own_prefix()
+                .is_some_and(|p| name.starts_with(p.as_str()))
+        })
+    }
+
+    /// Whether `r` is a secret openporch wrote for this object: its own name,
+    /// and, in an external store, one openporch created there.
+    async fn owns(self, conn: &mut SqliteConnection, org: &str, r: &SecretRef) -> Result<bool> {
+        if !self.named_for(org, r) {
+            return Ok(false);
+        }
+        created_externally(conn, org, r).await
     }
 }
 
@@ -128,7 +138,7 @@ pub(crate) async fn check_use(
     let mut refs = Map::new();
     refs.insert("ref".into(), serde_json::to_value(r)?);
     check_ref_stores(conn, org, &refs).await?;
-    if owner.owns(r) {
+    if owner.owns(conn, org, r).await? {
         return Ok(());
     }
     let granted: Option<i64> = sqlx::query_scalar(
@@ -167,7 +177,7 @@ pub(crate) async fn check_assigned(
     let mut found = Vec::new();
     collect(refs, &mut found);
     for r in found {
-        if owner.owns(&r) {
+        if owner.owns(conn, org, &r).await? {
             continue;
         }
         let granted: Option<i64> = sqlx::query_scalar(
@@ -207,4 +217,44 @@ fn collect(refs: &Map<String, Value>, out: &mut Vec<SecretRef>) {
             _ => collect(m, out),
         }
     }
+}
+
+/// Whether `r` is in the built-in store, which only openporch writes, or is a
+/// secret openporch created in an external store, through the store's current
+/// cloud account, while that account's credentials are pinned versions in the
+/// built-in store.
+/// Rows are forgotten when the store or account is repointed, so a confirmed
+/// row is in the AWS account and region the store reads from.
+pub(crate) async fn created_externally(
+    conn: &mut SqliteConnection,
+    org: &str,
+    r: &SecretRef,
+) -> Result<bool> {
+    if r.store == BUILTIN_STORE {
+        return Ok(true);
+    }
+    let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT e.confirmed, e.region, a.secret_refs FROM external_secrets e \
+         JOIN secret_stores s ON s.org_id = e.org_id AND s.id = e.store_id \
+         LEFT JOIN cloud_accounts a ON a.org_id = s.org_id \
+          AND a.id = json_extract(s.config, '$.cloud_account') \
+         WHERE e.org_id = ? AND e.store_id = ? AND e.ref = ? \
+          AND e.region = json_extract(s.config, '$.region')",
+    )
+    .bind(org)
+    .bind(&r.store)
+    .bind(&r.reference)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((confirmed, _, Some(refs))) = row else {
+        return Ok(false);
+    };
+    // Credentials whose value can change without the account changing, read
+    // from an external store or an unpinned built-in secret another object may
+    // write, can reach another AWS account.
+    let refs: std::collections::BTreeMap<String, SecretRef> = serde_json::from_str(&refs)?;
+    Ok(confirmed == 1
+        && refs
+            .values()
+            .all(|r| r.store == BUILTIN_STORE && r.version.is_some()))
 }

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use openporch_core::model::SecretRef;
-use openporch_store::SecretStoreRecord;
 use openporch_store::secrets::{BoxFuture, SecretError, SecretStore, SecretValue};
+use openporch_store::{AccountStore, ExternalSecretRecord, SecretStoreRecord, StoreError};
 use serde_json::Value;
 
 use super::{AwsCredentials, AwsSecret, CloudError, CredentialResolver, SecretService};
@@ -61,7 +61,7 @@ pub fn external_name(service: SecretService, org: &str, name: &str) -> Result<St
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.');
     if name.is_empty() || !name.chars().all(allowed) || name.contains("//") {
         return Err(format!(
-            "secret `{name}` cannot be written to an AWS store: names use letters, digits,              `/`, `_`, `-` and `.`"
+            "secret `{name}` cannot be written to an AWS store: names use letters, digits, `/`, `_`, `-` and `.`"
         ));
     }
     Ok(match service {
@@ -70,28 +70,123 @@ pub fn external_name(service: SecretService, org: &str, name: &str) -> Result<St
     })
 }
 
+/// The tag a create puts on a secret, holding the random ID of its record.
+pub const CREATE_ID_TAG: &str = "openporch:create-id";
+
+/// The record of which secrets openporch created in external stores.
+pub trait CreatedSecrets: Send + Sync {
+    /// What openporch recorded about creating `name` in `store`.
+    fn state<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ExternalSecretRecord>, StoreError>>;
+
+    /// Records a pending or finished create of `name` if its record still has
+    /// create ID `expected` (`None`: there is none) and the store is still at
+    /// `generation`; `false` when either changed.
+    fn record<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+        record: &'a ExternalSecretRecord,
+        expected: Option<&'a str>,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Forgets the record of `name` if it still has `create_id`.
+    fn forget<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+        create_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+impl<S: AccountStore> CreatedSecrets for S {
+    fn state<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ExternalSecretRecord>, StoreError>> {
+        Box::pin(self.external_secret(org, store, name))
+    }
+
+    fn record<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+        record: &'a ExternalSecretRecord,
+        expected: Option<&'a str>,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(self.record_external_secret(org, store, name, record, expected, generation))
+    }
+
+    fn forget<'a>(
+        &'a self,
+        org: &'a str,
+        store: &'a str,
+        name: &'a str,
+        create_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(self.forget_external_secret(org, store, name, create_id))
+    }
+}
+
+/// A fresh random create ID.
+fn create_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// An AWS store, opened with fresh credentials of its cloud account.
+///
+/// A write records a pending create with a random ID, creates the secret at
+/// its generated name tagged with that ID, and confirms the record; later
+/// writes add versions to it while it still carries the tag, in the AWS
+/// account and region it was created in. A secret someone else put at that
+/// name is refused, never written over. A create retried while its record is
+/// pending, because its answer or the confirmation was lost, recognizes the
+/// secret it created by the tag. Records are replaced only by a writer that
+/// read them, so concurrent writers never undo each other's.
 pub struct ExternalStore {
     cloud: Arc<CredentialResolver>,
     credentials: AwsCredentials,
     record: SecretStoreRecord,
     org: String,
+    created: Arc<dyn CreatedSecrets>,
+    /// The AWS account STS reported for the credentials.
+    aws_account: String,
 }
 
 impl ExternalStore {
-    /// Opens `record` with `credentials` of its cloud account.
-    pub fn new(
+    /// Opens `record` with `credentials` of its cloud account, asking STS who
+    /// they belong to, so credentials AWS refuses fail here, before anything
+    /// is changed.
+    pub async fn open(
         cloud: Arc<CredentialResolver>,
         credentials: AwsCredentials,
         record: SecretStoreRecord,
         org: impl Into<String>,
-    ) -> Self {
-        Self {
+        created: Arc<dyn CreatedSecrets>,
+    ) -> Result<Self, CloudError> {
+        let aws_account = cloud.identity(&credentials).await?.account;
+        Ok(Self {
             cloud,
             credentials,
             record,
             org: org.into(),
-        }
+            created,
+            aws_account,
+        })
     }
 
     /// The store's cloud account, from its configuration.
@@ -138,11 +233,117 @@ impl SecretStore for ExternalStore {
             )
             .map_err(refused)?;
             secret.name = external_name(secret.service, &self.org, name).map_err(refused)?;
-            let version = self
-                .cloud
-                .write_secret(&self.credentials, &secret, value, &self.org)
-                .await
-                .map_err(|e| self.failed(e))?;
+            let store = self.record.id.as_str();
+            let org = self.org.as_str();
+            let cloud = |e| self.failed(e);
+            let aws_account = self.aws_account.clone();
+            let generation = self.record.generation;
+            let tag = || {
+                self.cloud
+                    .secret_tag(&self.credentials, &secret, CREATE_ID_TAG)
+            };
+            let write = |create_id| {
+                self.cloud
+                    .write_secret(&self.credentials, &secret, value, org, create_id)
+            };
+            // A record elsewhere, or of a secret that no longer carries its
+            // create ID, says nothing about the secret at this name.
+            let recorded = self.created.state(org, store, &secret.name).await?;
+            let prior = recorded.as_ref().map(|r| r.create_id.clone());
+            let mut known =
+                recorded.filter(|r| r.aws_account == aws_account && r.region == secret.region);
+            // Another writer replaced the record since it was read, or the
+            // store was repointed since it was opened.
+            let raced = || SecretError::Unavailable {
+                store: self.record.id.clone(),
+                reason: format!("{secret} or its store changed during the write; try again"),
+            };
+            if let Some(r) = known.as_ref().filter(|r| r.confirmed)
+                && tag().await.map_err(cloud)?.as_deref() != Some(r.create_id.as_str())
+            {
+                known = None;
+            }
+            let version = match known {
+                Some(r) if r.confirmed => {
+                    let version = write(None).await.map_err(cloud)?;
+                    // Re-confirm against the handle's generation: if the store
+                    // was repointed meanwhile, the value went to the old
+                    // destination and no reference may be returned for it.
+                    if !self
+                        .created
+                        .record(org, store, &secret.name, &r, Some(&r.create_id), generation)
+                        .await?
+                    {
+                        return Err(raced());
+                    }
+                    version
+                }
+                _ => {
+                    let record = match known {
+                        Some(pending) => pending,
+                        None => {
+                            let pending = ExternalSecretRecord {
+                                aws_account,
+                                region: secret.region.clone(),
+                                create_id: create_id(),
+                                confirmed: false,
+                            };
+                            if !self
+                                .created
+                                .record(
+                                    org,
+                                    store,
+                                    &secret.name,
+                                    &pending,
+                                    prior.as_deref(),
+                                    generation,
+                                )
+                                .await?
+                            {
+                                return Err(raced());
+                            }
+                            pending
+                        }
+                    };
+                    let version = match write(Some(&record.create_id)).await.map_err(cloud)? {
+                        Some(version) => Some(version),
+                        // The pending create happened if the secret carries
+                        // its ID; otherwise someone else made it.
+                        None if tag().await.map_err(cloud)?.as_deref()
+                            == Some(record.create_id.as_str()) =>
+                        {
+                            write(None).await.map_err(cloud)?
+                        }
+                        None => {
+                            self.created
+                                .forget(org, store, &secret.name, &record.create_id)
+                                .await?;
+                            None
+                        }
+                    };
+                    if version.is_some() {
+                        let id = record.create_id.clone();
+                        let confirmed = ExternalSecretRecord {
+                            confirmed: true,
+                            ..record
+                        };
+                        if !self
+                            .created
+                            .record(org, store, &secret.name, &confirmed, Some(&id), generation)
+                            .await?
+                        {
+                            return Err(raced());
+                        }
+                    }
+                    version
+                }
+            }
+            .ok_or_else(|| {
+                refused(format!(
+                    "{secret} already exists and was not created by openporch, so it is not \
+                     written over"
+                ))
+            })?;
             Ok(SecretRef {
                 store: self.record.id.clone(),
                 reference: secret.name,

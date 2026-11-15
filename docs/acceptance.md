@@ -278,7 +278,7 @@ none is open.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Configure from environment | covered | `provider/internal/provider/provider_test.go::TestConfigureFromEnvironment`, `provider/scripts/smoke.sh` |
-| Secret store | deferred | `openporch_secret_store` and `aws-ssm` adapters are tasks 13.3 / 13.2 |
+| Secret store | deferred | `openporch_secret_store` is task 13.3 (the `aws-ssm` adapter exists since 13.2) |
 | Definition with criteria | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
 | Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment` |
 | Placeholder escaping | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
@@ -380,7 +380,7 @@ none is open.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Register an AWS store | covered | `crates/server/src/tests/accounts.rs::register_an_aws_store` (registration, granted references), `crates/server/src/tests/accounts.rs::a_store_check_reads_a_test_secret_with_the_stores_account` (fake AWS); the signed Secrets Manager and SSM reads run against Floci in CI: `crates/engine/src/cloud/tests.rs::real_secret_read` |
-| Change primary | deferred | Task 13.2 (explicitly moved there by task 3.9) |
+| Change primary | covered | `crates/server/src/tests/accounts.rs::change_primary` (fake AWS: a definition's new secret goes to `prod-sm`, the earlier one keeps its `openporch` reference, account secrets stay built-in), `crates/engine/src/executor/tests.rs::secret_outputs_go_to_an_external_primary_store`; writes run against Floci in CI: `crates/engine/src/cloud/tests.rs::real_secret_read` |
 | Pinned version | covered | `crates/store/src/secrets/tests.rs::versions_are_kept_and_pinned` |
 | Placeholder in a reference | covered | `crates/server/src/secret_inputs.rs::placeholder_in_reference_is_rejected` |
 | Definition with references from two stores | covered | `crates/engine/src/executor/tests.rs::a_definition_reads_secrets_from_two_stores` (one reference in `openporch`, one in a Secrets Manager store read with its cloud account; both reach the driver, neither the log) |
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 242 covered, 10 manual, 22 deferred, 0 gaps.
+274 scenarios: 243 covered, 10 manual, 21 deferred, 0 gaps.

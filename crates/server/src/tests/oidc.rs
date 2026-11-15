@@ -384,7 +384,7 @@ async fn role_assumption_without_standing_credentials() {
         .unwrap()
         .unwrap()
         .account;
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let credentials = s
         .state
         .cloud

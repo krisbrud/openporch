@@ -12,13 +12,21 @@ use openporch_core::placeholder::{Dialect, Expr, Part, Template};
 use openporch_store::secrets::{
     BuiltinSecretStore, SecretError, SecretInput, SecretStore, SecretValue, validate_reference,
 };
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::http::StatusCode;
+use openporch_engine::cloud::{CloudError, ExternalStore};
+use openporch_store::secrets::BUILTIN_STORE;
+use openporch_store::{AccountStore, SecretStoreRecord};
 use serde_json::{Map, Value};
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, code};
 use crate::state::AppState;
 
-/// The primary secret store. External primary stores are task 13.2.
-pub fn primary(state: &AppState) -> ApiResult<BuiltinSecretStore> {
+/// The built-in secret store. Cloud account secrets are always kept here, so
+/// opening an external store never depends on an external store.
+pub fn builtin(state: &AppState) -> ApiResult<BuiltinSecretStore> {
     let keyring = state
         .keyring
         .clone()
@@ -26,8 +34,123 @@ pub fn primary(state: &AppState) -> ApiResult<BuiltinSecretStore> {
     Ok(BuiltinSecretStore::new(&state.store, keyring, state.org()))
 }
 
+/// The store new secrets are written to.
+pub enum Primary {
+    /// The built-in store.
+    Builtin(BuiltinSecretStore),
+    /// An AWS store, opened with its cloud account.
+    External(Box<ExternalStore>),
+}
+
+impl Primary {
+    /// The store, to write to.
+    pub fn store(&self) -> &dyn SecretStore {
+        match self {
+            Self::Builtin(s) => s,
+            Self::External(s) => s.as_ref(),
+        }
+    }
+}
+
+/// How long the credentials an external primary store is opened with must
+/// stay valid.
+const OPEN_WINDOW: Duration = Duration::from_secs(60);
+
+/// The primary secret store, where `{value}` secrets are written. An external
+/// one is opened with fresh credentials of its cloud account.
+pub async fn primary(state: &AppState) -> ApiResult<Primary> {
+    let builtin = builtin(state)?;
+    let stores = state.store.secret_stores(state.org()).await?;
+    let Some(record) = stores
+        .into_iter()
+        .find(|s| s.primary && s.id != BUILTIN_STORE)
+    else {
+        return Ok(Primary::Builtin(builtin));
+    };
+    open_external(state, &builtin, record)
+        .await
+        .map(|s| Primary::External(Box::new(s)))
+}
+
+/// Opens an external store with fresh credentials of its cloud account, whose
+/// secrets are in the built-in store.
+pub async fn open_external(
+    state: &AppState,
+    builtin: &BuiltinSecretStore,
+    record: SecretStoreRecord,
+) -> ApiResult<ExternalStore> {
+    let id = record.id.clone();
+    let account_id = ExternalStore::account_of(&record)
+        .unwrap_or_default()
+        .to_owned();
+    let read_at = state.cloud.generation();
+    let account = state
+        .store
+        .account(state.org(), &account_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "cloud account `{account_id}` of secret store `{id}` is gone"
+            ))
+        })?
+        .account;
+    let credentials = state
+        .cloud
+        .resolve(&account, read_at, builtin, OPEN_WINDOW)
+        .await
+        .map_err(|e| {
+            cloud_error(
+                e,
+                &format!("secret store `{id}` could not use cloud account `{account_id}`"),
+            )
+        })?;
+    ExternalStore::open(
+        state.cloud.clone(),
+        credentials,
+        record,
+        state.org(),
+        Arc::new(state.store.clone()),
+    )
+    .await
+    .map_err(|e| {
+        cloud_error(
+            e,
+            &format!("secret store `{id}` could not use cloud account `{account_id}`"),
+        )
+    })
+}
+
+/// The API error for a failed cloud call about `what`.
+pub fn cloud_error(e: CloudError, what: &str) -> ApiError {
+    match e {
+        CloudError::Invalid(m) | CloudError::Expiring(m) => {
+            ApiError::invalid(format!("{what}: {m}"))
+        }
+        CloudError::Rejected(m) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code::CLOUD_REJECTED,
+            format!("{what}: {m}"),
+        ),
+        CloudError::Unavailable(m) | CloudError::Throttled { message: m, .. } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            code::CLOUD_UNAVAILABLE,
+            format!("{what}: {m}"),
+        ),
+    }
+}
+
 fn store_error(e: SecretError) -> ApiError {
     match e {
+        SecretError::Unavailable { .. } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            code::CLOUD_UNAVAILABLE,
+            e.to_string(),
+        ),
+        SecretError::Refused { .. } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code::CLOUD_REJECTED,
+            e.to_string(),
+        ),
         SecretError::InvalidReference { .. } => ApiError::invalid(e.to_string()),
         other => ApiError::internal(other),
     }
@@ -68,9 +191,23 @@ pub fn parse_body<T: serde::de::DeserializeOwned>(body: Value) -> ApiResult<T> {
     })
 }
 
-/// Deletes versions written for a change that was then rejected, so no secret is
-/// left behind that no accepted object refers to.
-pub async fn discard(primary: &BuiltinSecretStore, written: Vec<SecretRef>) {
+/// Deletes versions written to the built-in store for a change that was then
+/// rejected, so no secret is left behind that no accepted object refers to.
+/// Versions written to an external store are left in place: openporch never
+/// deletes from one, and a later write supersedes them.
+pub async fn discard(primary: &Primary, written: Vec<SecretRef>) {
+    let primary = match primary {
+        Primary::Builtin(s) => s,
+        Primary::External(_) => {
+            for r in written {
+                tracing::warn!(store = %r.store, reference = %r.reference,
+                    version = ?r.version,
+                    "a secret version written to an external store for a rejected change is \
+                     left in place");
+            }
+            return;
+        }
+    };
     for r in written {
         if let Err(e) = primary.discard(&r).await {
             tracing::warn!(store = %r.store, reference = %r.reference, error = %e,

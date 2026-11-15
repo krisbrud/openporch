@@ -224,3 +224,33 @@ fn keyrings_load_from_text_and_owner_only_files() {
             .is_none()
     );
 }
+
+#[test]
+fn written_names_are_relative_to_the_organization() {
+    let r = |store: &str, reference: &str| SecretRef {
+        store: store.into(),
+        reference: reference.into(),
+        version: None,
+    };
+    assert_eq!(
+        written_name("acme", &r("openporch", "defs/pg/x")),
+        Some("defs/pg/x")
+    );
+    assert_eq!(
+        written_name("acme", &r("sm", "openporch/acme/defs/pg/x")),
+        Some("defs/pg/x")
+    );
+    assert_eq!(
+        written_name("acme", &r("ssm", "/openporch/acme/defs/pg/x")),
+        Some("defs/pg/x")
+    );
+    assert_eq!(
+        written_name("acme", &r("sm", "openporch/other/defs/pg/x")),
+        None
+    );
+    assert_eq!(
+        written_name("acme", &r("sm", "openporch/acmecorp/defs/pg/x")),
+        None
+    );
+    assert_eq!(written_name("acme", &r("sm", "defs/pg/x")), None);
+}

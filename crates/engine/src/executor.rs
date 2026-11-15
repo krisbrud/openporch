@@ -28,8 +28,8 @@ use serde_json::{Map, Value};
 use tokio::time::Instant;
 
 use crate::cloud::{
-    AwsCredentials, AwsSecret, CHECK_WINDOW, CloudError, CredentialResolver, EcrDigest, EcrImage,
-    Latest, S3Object, S3Version, SecretService, pinned_image,
+    AwsCredentials, AwsSecret, CHECK_WINDOW, CREATE_ID_TAG, CloudError, CredentialResolver,
+    EcrDigest, EcrImage, ExternalStore, Latest, S3Object, S3Version, external_secret, pinned_image,
 };
 use crate::planner::{
     ArtifactCheck, ArtifactPin, DeprovisionJob, DestructiveAction, ExecFailure, Executor, ImagePin,
@@ -175,10 +175,10 @@ where
                 let failed = |f: ExecFailure| {
                     prefixed(f, &format!("the token of driver `{id}` could not be used"))
                 };
-                self.authorize(&job.context, &[SecretOwner::Driver(id)], r)
+                let value = self
+                    .authorized_read(&job.context, &[SecretOwner::Driver(id)], r, log)
                     .await
                     .map_err(failed)?;
-                let value = self.read(&job.context, r, log).await.map_err(failed)?;
                 log.secret([value.expose()]);
                 Some(value.expose().to_owned())
             }
@@ -323,9 +323,9 @@ where
         let definition = job.definition_id.as_str();
         let mut read = BTreeMap::new();
         for r in &definition_refs {
-            self.authorize(&job.context, &[SecretOwner::Definition(definition)], r)
+            let value = self
+                .authorized_read(&job.context, &[SecretOwner::Definition(definition)], r, log)
                 .await?;
-            let value = self.read(&job.context, r, log).await?;
             log.secret([value.expose()]);
             read.insert(r.clone(), value);
         }
@@ -348,8 +348,7 @@ where
                     r.reference, r.store
                 )));
             }
-            self.authorize(&job.context, &owners, r).await?;
-            let value = self.read(&job.context, r, log).await?;
+            let value = self.authorized_read(&job.context, &owners, r, log).await?;
             log.secret([value.expose()]);
             read.insert(r.clone(), value);
         }
@@ -424,6 +423,23 @@ where
         })))
     }
 
+    /// Authorizes `r` for one of `owners`, reads it, and authorizes it again:
+    /// what made it usable, such as openporch's record of creating it in an
+    /// external store, may be gone by the time it was read, for example when
+    /// the store was repointed in between. The value is dropped then.
+    async fn authorized_read(
+        &self,
+        c: &JobContext,
+        owners: &[SecretOwner<'_>],
+        r: &SecretRef,
+        log: &mut RedactingLog,
+    ) -> Result<SecretValue, ExecFailure> {
+        self.authorize(c, owners, r).await?;
+        let value = self.read(c, r, log).await?;
+        self.authorize(c, owners, r).await?;
+        Ok(value)
+    }
+
     /// Reads `r` from its store: the built-in store directly, an AWS store with
     /// fresh credentials of the store's cloud account. The account's own secrets
     /// are authorized for the job like any other.
@@ -489,6 +505,8 @@ where
                     ),
                 )
             })?;
+        self.check_still_created(c, r, &credentials, &secret)
+            .await?;
         let read = self.cloud.read_secret(&credentials, &secret).await;
         match read {
             Ok(Some(value)) => Ok(value),
@@ -508,6 +526,99 @@ where
                 ),
             )),
         }
+    }
+
+    /// A secret openporch created in an external store is its owner's own
+    /// only while it still carries its create ID: one someone replaced is not,
+    /// so its record is forgotten and the read refused, and a retry needs a
+    /// grant like any other.
+    async fn check_still_created(
+        &self,
+        c: &JobContext,
+        r: &SecretRef,
+        credentials: &AwsCredentials,
+        secret: &AwsSecret,
+    ) -> Result<(), ExecFailure> {
+        let org = c.org.as_str();
+        let record = self
+            .store
+            .external_secret(org, &r.store, &r.reference)
+            .await
+            .map_err(|e| store_failure(e, "the record of external secrets could not be read"))?;
+        let Some(record) = record.filter(|r| r.confirmed) else {
+            return Ok(());
+        };
+        let tag = self
+            .cloud
+            .secret_tag(credentials, secret, CREATE_ID_TAG)
+            .await
+            .map_err(cloud_failure)?;
+        if tag.as_deref() == Some(record.create_id.as_str()) {
+            return Ok(());
+        }
+        self.store
+            .forget_external_secret(org, &r.store, &r.reference, &record.create_id)
+            .await
+            .map_err(|e| store_failure(e, "the record of external secrets could not be changed"))?;
+        Err(ExecFailure::Retryable {
+            error: format!(
+                "{secret} was replaced outside openporch, so it is no longer treated as \
+                 openporch's; using it now needs a grant"
+            ),
+            retry_after: None,
+        })
+    }
+
+    /// The primary store, where secret outputs are written: the built-in
+    /// store, or an AWS store opened with fresh credentials of its account.
+    async fn primary_store(
+        &self,
+        c: &JobContext,
+        log: &mut RedactingLog,
+    ) -> Result<Arc<dyn SecretStore>, ExecFailure> {
+        let stores = self
+            .store
+            .secret_stores(c.org.as_str())
+            .await
+            .map_err(|e| store_failure(e, "the secret stores could not be read"))?;
+        let Some(primary) = stores
+            .into_iter()
+            .find(|s| s.primary && s.id != self.secrets.id())
+        else {
+            return Ok(self.secrets.clone());
+        };
+        let id = primary.id.clone();
+        let account = ExternalStore::account_of(&primary)
+            .and_then(|a| AccountId::new(a).ok())
+            .ok_or_else(|| {
+                ExecFailure::Permanent(format!(
+                    "primary secret store `{id}` names no valid `cloud_account`"
+                ))
+            })?;
+        let credentials = self
+            .account_credentials(c, &account, SECRET_READ_WINDOW, log)
+            .await
+            .map_err(|f| {
+                prefixed(
+                    f,
+                    &format!("primary secret store `{id}` could not use cloud account `{account}`"),
+                )
+            })?;
+        let opened = ExternalStore::open(
+            self.cloud.clone(),
+            credentials,
+            primary,
+            c.org.as_str(),
+            self.store.clone(),
+        )
+        .await
+        .map_err(|e| {
+            prefixed(
+                cloud_failure(e),
+                &format!("primary secret store `{id}` could not use cloud account `{account}`"),
+            )
+        })?;
+        Ok(Arc::new(opened))
     }
 
     /// Fresh credentials for the job's cloud account and what they resolve to,
@@ -726,6 +837,9 @@ where
             }
             Plan::Unknown => {}
         }
+        // A primary store that cannot be opened fails the job before the
+        // driver changes anything, rather than after.
+        self.primary_store(&job.context, log).await?;
         let timeout = timeout.min(job.deadline.saturating_duration_since(Instant::now()));
         let target = match self.refresh(job, &mut req, timeout, log).await? {
             Some(refreshed) => Some(refreshed),
@@ -805,10 +919,15 @@ where
             secret_texts(value, &mut texts);
         }
         log.secret(texts);
+        let primary = if secrets.is_empty() {
+            None
+        } else {
+            Some(self.primary_store(&job.context, log).await?)
+        };
         for (key, value) in secrets {
             let name = format!("resources/{}/outputs/{key}", job.guresid);
-            let reference = self
-                .secrets
+            let Some(primary) = &primary else { break };
+            let reference = primary
                 .write(&name, &SecretValue::new(secret_text(value)))
                 .await
                 .map_err(|e| {
@@ -1598,53 +1717,6 @@ fn store_failure(e: StoreError, what: &str) -> ExecFailure {
 
 /// How long credentials used to read an external secret must stay valid.
 const SECRET_READ_WINDOW: Duration = Duration::from_secs(60);
-
-/// The AWS secret that `r` names in `store`.
-pub fn external_secret(
-    store: &openporch_store::SecretStoreRecord,
-    r: &SecretRef,
-) -> Result<AwsSecret, String> {
-    let service = SecretService::of_store_type(&store.ty).ok_or_else(|| {
-        format!(
-            "secret store `{}` has type `{}`, which cannot be read",
-            store.id, store.ty
-        )
-    })?;
-    let region = store
-        .config
-        .get("region")
-        .and_then(Value::as_str)
-        .filter(|r| {
-            !r.is_empty()
-                && r.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        .ok_or_else(|| format!("secret store `{}` has no valid `config.region`", store.id))?;
-    if r.reference.is_empty() {
-        return Err(format!(
-            "a reference into secret store `{}` names no secret",
-            store.id
-        ));
-    }
-    if service == SecretService::Ssm
-        && r.version
-            .as_deref()
-            .is_some_and(|v| v.parse::<u64>().is_err())
-    {
-        return Err(format!(
-            "secret `{}` in store `{}` pins version `{}`, but SSM parameter versions are numbers",
-            r.reference,
-            store.id,
-            r.version.as_deref().unwrap_or_default()
-        ));
-    }
-    Ok(AwsSecret {
-        service,
-        region: region.to_owned(),
-        name: r.reference.clone(),
-        version: r.version.clone(),
-    })
-}
 
 fn secret_failure(e: SecretError) -> ExecFailure {
     match e {

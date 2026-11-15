@@ -157,11 +157,13 @@ async fn write(
                 .await?
         }
         Err(secret) => {
-            let primary = secret_inputs::primary(state)?;
+            let primary = secret_inputs::primary(state).await?;
             let mut written = Vec::new();
             let result: ApiResult<()> = async {
                 let name = format!("{}{key}", value_secret_prefix(app, env));
-                let r = secret.materialize(&primary, &name, &mut written).await?;
+                let r = secret
+                    .materialize(primary.store(), &name, &mut written)
+                    .await?;
                 state
                     .store
                     .put_value(org, app, env, put(ValueContent::SecretRef(r)), audit)

@@ -37,7 +37,7 @@ async fn secret(s: &Server, key: &str, value: &str) -> openporch_core::model::Se
 }
 
 async fn read(s: &Server, r: &openporch_core::model::SecretRef) -> Option<String> {
-    let primary = crate::secret_inputs::primary(&s.state).ok()?;
+    let primary = crate::secret_inputs::builtin(&s.state).ok()?;
     primary.read(r).await.ok().map(|v| v.expose().to_owned())
 }
 

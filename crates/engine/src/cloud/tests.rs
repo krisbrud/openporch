@@ -831,8 +831,8 @@ async fn identity_accounts_need_the_issuer() {
     ));
 }
 
-/// Reads a Secrets Manager secret and an SSM parameter through the hand-signed
-/// JSON calls, with the host's static keys. CI runs it against Floci: the job
+/// Reads and writes Secrets Manager secrets and SSM parameters through the
+/// hand-signed JSON calls, with the host's static keys. CI runs it against Floci: the job
 /// creates secret `OPENPORCH_TEST_SM_SECRET` and SecureString parameter
 /// `OPENPORCH_TEST_SSM_PARAMETER`, both holding `OPENPORCH_TEST_SECRET_VALUE`.
 #[tokio::test]
@@ -891,5 +891,79 @@ async fn real_secret_read() {
             .await
             .unwrap_or_else(|e| panic!("{service} `{name}-missing`: {e}"));
         assert!(missing.is_none(), "{service} `{name}-missing`");
+    }
+
+    // Writing creates a secret, then adds versions; each version reads back.
+    for (service, name) in [
+        (
+            SecretService::SecretsManager,
+            format!("{}-written", var("OPENPORCH_TEST_SM_SECRET")),
+        ),
+        (
+            SecretService::Ssm,
+            format!("{}-written", var("OPENPORCH_TEST_SSM_PARAMETER")),
+        ),
+    ] {
+        let mut versions = Vec::new();
+        let create_id = format!("test-{}", std::process::id());
+        for (value, create) in [
+            ("first-value", Some(create_id.as_str())),
+            ("second-value", None),
+        ] {
+            let version = resolver
+                .write_secret(
+                    &credentials,
+                    &secret(service, name.clone(), None),
+                    &SecretValue::new(value),
+                    "acme",
+                    create,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("writing {service} `{name}`: {e}"));
+            versions.push((version.expect("written"), value));
+        }
+        assert_ne!(versions[0].0, versions[1].0, "{service} `{name}`");
+        // Creating it again leaves it as it is.
+        let again = resolver
+            .write_secret(
+                &credentials,
+                &secret(service, name.clone(), None),
+                &SecretValue::new("third-value"),
+                "acme",
+                Some("another"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("creating {service} `{name}` again: {e}"));
+        assert_eq!(again, None, "{service} `{name}`");
+        // The secret carries the ID of the create that made it.
+        let tag = resolver
+            .secret_tag(
+                &credentials,
+                &secret(service, name.clone(), None),
+                crate::cloud::CREATE_ID_TAG,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("tags of {service} `{name}`: {e}"));
+        assert_eq!(
+            tag.as_deref(),
+            Some(create_id.as_str()),
+            "{service} `{name}`"
+        );
+        let none = resolver
+            .secret_tag(
+                &credentials,
+                &secret(service, format!("{name}-missing"), None),
+                crate::cloud::CREATE_ID_TAG,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("tags of {service} `{name}-missing`: {e}"));
+        assert_eq!(none, None, "{service} `{name}-missing`");
+        for (version, value) in &versions {
+            let read = resolver
+                .read_secret(&credentials, &secret(service, name.clone(), Some(version)))
+                .await
+                .unwrap_or_else(|e| panic!("{service} `{name}` version {version}: {e}"));
+            assert_eq!(read.expect("found").expose(), *value, "{service} `{name}`");
+        }
     }
 }

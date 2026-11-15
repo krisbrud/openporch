@@ -227,8 +227,22 @@ references are read with. That account needs, on the secrets it will read:
 
 - Secrets Manager: `secretsmanager:GetSecretValue`.
 - SSM Parameter Store: `ssm:GetParameter`.
+- For secrets openporch created there, also `secretsmanager:DescribeSecret` or
+  `ssm:ListTagsForResource`, to check their `openporch:create-id` tag.
 - Both: `kms:Decrypt` on the key that encrypts them, unless it is the AWS
   managed key.
+
+A primary store's account also writes, under `openporch/<org>/*` (Secrets
+Manager) or `/openporch/<org>/*` (SSM):
+
+- Secrets Manager: `secretsmanager:CreateSecret`, `secretsmanager:PutSecretValue`,
+  `secretsmanager:TagResource` and `secretsmanager:DescribeSecret` (to read
+  the `openporch:create-id` tag).
+- SSM Parameter Store: `ssm:PutParameter`, `ssm:AddTagsToResource` and
+  `ssm:ListTagsForResource`.
+- `sts:GetCallerIdentity`, which needs no permission, to learn which AWS
+  account the secrets are written in.
+- Both: `kms:GenerateDataKey` and `kms:Encrypt` on a customer managed key.
 
 A store's account must keep its own secrets in the built-in store, so reading
 a store never needs that same store. `POST /orgs/{org}/secretstores/{store}/check`
@@ -238,8 +252,11 @@ reports whether it could, never the value.
 ### The real secret store check
 
 `real_secret_read` reads a Secrets Manager secret and an SSM SecureString
-parameter (current and pinned version 1) with the host's static keys, and
-checks that missing names read as not found. CI runs it against Floci in the
+parameter (current and pinned version 1) with the host's static keys, checks
+that missing names read as not found, then writes two versions of
+`<name>-written` in each service, checks the create ID tag the first write put
+on it, and reads each version back. It leaves the
+written secrets behind. CI runs it against Floci in the
 `account check against Floci` job. Against a real account, create both with the
 same value and run:
 

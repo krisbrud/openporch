@@ -144,7 +144,7 @@ async fn secret_values_are_references() {
         .await;
     assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
     use openporch_store::secrets::SecretStore as _;
-    let primary = crate::secret_inputs::primary(&s.state).unwrap();
+    let primary = crate::secret_inputs::builtin(&s.state).unwrap();
     let rejected = serde_json::from_value(
         json!({"store": "openporch", "ref": "apps/shop/envs/production/values/DB_PASSWORD"}),
     )

@@ -47,6 +47,22 @@ pub struct SecretStoreRecord {
     pub primary: bool,
     /// Creation time.
     pub created_at: i64,
+    /// Raised whenever the store may reach another AWS account or region.
+    #[serde(skip)]
+    pub generation: i64,
+}
+
+/// A secret openporch creates, or created, in an external store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSecretRecord {
+    /// The AWS account, as STS reported it for the store's credentials.
+    pub aws_account: String,
+    /// The region.
+    pub region: String,
+    /// The random ID the create tags the secret with.
+    pub create_id: String,
+    /// Whether the create finished; `false` while it is pending.
+    pub confirmed: bool,
 }
 
 /// A secret-use grant: the scope allowed to use one reference.
@@ -119,10 +135,14 @@ pub trait AccountStore: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Replaces a cloud account's name, configuration and secrets. The type stays.
+    /// When its credentials or configuration change, the secrets openporch
+    /// created through stores that read with it are forgotten, except those in
+    /// `verified`: the AWS account STS reported for the new credentials.
     fn update_account(
         &self,
         org: &str,
         account: &CloudAccount,
+        verified: Option<&str>,
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -164,8 +184,52 @@ pub trait AccountStore: Send + Sync {
         audit: AuditIntent,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// What openporch recorded about creating `reference` in external store
+    /// `store`.
+    fn external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+    ) -> impl Future<Output = Result<Option<ExternalSecretRecord>>> + Send;
+
+    /// Records that openporch is about to create `reference` in external store
+    /// `store`, or created it, if the record still has create ID `expected`
+    /// (`None`: there is none) and the store is still at `generation`. Returns
+    /// whether it did, so concurrent writers never replace each other's
+    /// records, and a write racing a repointing records nothing.
+    fn record_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+        record: &ExternalSecretRecord,
+        expected: Option<&str>,
+        generation: i64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+
+    /// Forgets the record of `reference` in external store `store` if it still
+    /// has create ID `create_id`.
+    fn forget_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+        create_id: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Makes `id` the primary store, where new secrets are written. References
+    /// to the previous primary store are unchanged.
+    fn set_primary_secret_store(
+        &self,
+        org: &str,
+        id: &str,
+        audit: AuditIntent,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Deletes a store nothing references: not the built-in or primary store, and
-    /// not one named by definitions, accounts, drivers or grants.
+    /// not one named by definitions, accounts, drivers, grants, shared values, or
+    /// the secret outputs of active or detached resources.
     fn delete_secret_store(
         &self,
         org: &str,
@@ -212,6 +276,59 @@ impl std::fmt::Display for Node {
             Node::Store(s) => write!(f, "store `{s}`"),
         }
     }
+}
+
+/// Forgets the secrets openporch created through stores that read with
+/// `account` when its configuration or credentials change, other than its
+/// session length, unless they are in `verified`, the AWS account the new
+/// credentials belong to. Elsewhere they may be someone else's, so they are
+/// neither written over nor used as an object's own.
+async fn forget_if_repointed(
+    tx: &mut SqliteConnection,
+    org: &str,
+    account: &CloudAccount,
+    verified: Option<&str>,
+) -> Result<()> {
+    let old: Option<(String, String)> = sqlx::query_as(
+        "SELECT config, secret_refs FROM cloud_accounts WHERE org_id = ? AND id = ?",
+    )
+    .bind(org)
+    .bind(account.id.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((old, old_refs)) = old else {
+        return Ok(());
+    };
+    let mut old: Map<String, Value> = serde_json::from_str(&old)?;
+    let old_refs: BTreeMap<String, SecretRef> = serde_json::from_str(&old_refs)?;
+    let mut new = account.config.clone();
+    old.remove("session_duration");
+    new.remove("session_duration");
+    if old == new && old_refs == account.secret_refs {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM external_secrets WHERE org_id = ? AND store_id IN \
+         (SELECT id FROM secret_stores WHERE org_id = ? \
+          AND json_extract(config, '$.cloud_account') = ?) \
+         AND (? IS NULL OR aws_account != ?)",
+    )
+    .bind(org)
+    .bind(org)
+    .bind(account.id.as_str())
+    .bind(verified)
+    .bind(verified)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE secret_stores SET generation = generation + 1 WHERE org_id = ? \
+         AND json_extract(config, '$.cloud_account') = ?",
+    )
+    .bind(org)
+    .bind(account.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }
 
 /// The external stores an account reads its secrets from.
@@ -372,8 +489,8 @@ async fn store_row(
     org: &str,
     id: &str,
 ) -> Result<Option<SecretStoreRecord>> {
-    let row: Option<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, type, config, is_primary, created_at FROM secret_stores \
+    let row: Option<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, type, config, is_primary, created_at, generation FROM secret_stores \
          WHERE org_id = ? AND id = ?",
     )
     .bind(org)
@@ -384,7 +501,7 @@ async fn store_row(
 }
 
 fn store_from_row(
-    (id, ty, config, primary, created_at): (String, String, String, i64, i64),
+    (id, ty, config, primary, created_at, generation): (String, String, String, i64, i64, i64),
 ) -> Result<SecretStoreRecord> {
     Ok(SecretStoreRecord {
         id,
@@ -392,6 +509,7 @@ fn store_from_row(
         config: serde_json::from_str(&config)?,
         primary: primary != 0,
         created_at,
+        generation,
     })
 }
 
@@ -562,12 +680,14 @@ impl AccountStore for SqliteStore {
         &self,
         org: &str,
         account: &CloudAccount,
+        verified: Option<&str>,
         audit: AuditIntent,
     ) -> Result<()> {
         self.check_org(org)?;
         let mut tx = self.begin().await?;
         check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
         check_account_in(&mut tx, org, account, false).await?;
+        forget_if_repointed(&mut tx, org, account, verified).await?;
         sqlx::query(
             "UPDATE cloud_accounts SET name = ?, config = ?, secret_refs = ? \
              WHERE org_id = ? AND id = ?",
@@ -644,8 +764,8 @@ impl AccountStore for SqliteStore {
 
     async fn secret_stores(&self, org: &str) -> Result<Vec<SecretStoreRecord>> {
         self.check_org(org)?;
-        let rows: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
-            "SELECT id, type, config, is_primary, created_at FROM secret_stores \
+        let rows: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT id, type, config, is_primary, created_at, generation FROM secret_stores \
              WHERE org_id = ? ORDER BY id",
         )
         .bind(org)
@@ -710,11 +830,147 @@ impl AccountStore for SqliteStore {
                     "the built-in store has no configuration to change".to_owned(),
                 ));
             }
-            Some(_) => {}
+            Some(old) => {
+                // Secrets openporch created elsewhere may be someone else's.
+                let at = |c: &Map<String, Value>| {
+                    (c.get("cloud_account").cloned(), c.get("region").cloned())
+                };
+                if at(&old.config) != at(config) {
+                    sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ?")
+                        .bind(org)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "UPDATE secret_stores SET generation = generation + 1 \
+                         WHERE org_id = ? AND id = ?",
+                    )
+                    .bind(org)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
         check_store_config(&mut tx, org, id, config).await?;
         sqlx::query("UPDATE secret_stores SET config = ? WHERE org_id = ? AND id = ?")
             .bind(serde_json::to_string(config)?)
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::insert(&mut tx, &audit, None, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+    ) -> Result<Option<ExternalSecretRecord>> {
+        self.check_org(org)?;
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT aws_account, region, create_id, confirmed FROM external_secrets \
+             WHERE org_id = ? AND store_id = ? AND ref = ?",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(
+            |(aws_account, region, create_id, confirmed)| ExternalSecretRecord {
+                aws_account,
+                region,
+                create_id,
+                confirmed: confirmed == 1,
+            },
+        ))
+    }
+
+    async fn record_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+        record: &ExternalSecretRecord,
+        expected: Option<&str>,
+        generation: i64,
+    ) -> Result<bool> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        let current = store_row(&mut tx, org, store)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("secret store `{store}`")))?;
+        if current.generation != generation {
+            return Ok(false);
+        }
+        let done = sqlx::query(
+            "INSERT INTO external_secrets \
+             (org_id, store_id, ref, aws_account, region, create_id, confirmed, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (org_id, store_id, ref) DO UPDATE SET \
+             aws_account = excluded.aws_account, region = excluded.region, \
+             create_id = excluded.create_id, confirmed = excluded.confirmed \
+             WHERE external_secrets.create_id = ?",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .bind(&record.aws_account)
+        .bind(&record.region)
+        .bind(&record.create_id)
+        .bind(i64::from(record.confirmed))
+        .bind(now_ms())
+        .bind(expected)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(done)
+    }
+
+    async fn forget_external_secret(
+        &self,
+        org: &str,
+        store: &str,
+        reference: &str,
+        create_id: &str,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        sqlx::query(
+            "DELETE FROM external_secrets \
+             WHERE org_id = ? AND store_id = ? AND ref = ? AND create_id = ?",
+        )
+        .bind(org)
+        .bind(store)
+        .bind(reference)
+        .bind(create_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn set_primary_secret_store(
+        &self,
+        org: &str,
+        id: &str,
+        audit: AuditIntent,
+    ) -> Result<()> {
+        self.check_org(org)?;
+        let mut tx = self.begin().await?;
+        check_admin_authority(&mut tx, org, audit.actor.as_deref()).await?;
+        if store_row(&mut tx, org, id).await?.is_none() {
+            return Err(StoreError::NotFound(format!("secret store `{id}`")));
+        }
+        sqlx::query("UPDATE secret_stores SET is_primary = 0 WHERE org_id = ? AND is_primary = 1")
+            .bind(org)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE secret_stores SET is_primary = 1 WHERE org_id = ? AND id = ?")
             .bind(org)
             .bind(id)
             .execute(&mut *tx)
@@ -779,6 +1035,23 @@ impl AccountStore for SqliteStore {
                 .fetch_all(&mut *tx)
                 .await?
             }),
+            ("resources", {
+                // Secret outputs of active resources, and of detached ones a
+                // later adoption restores.
+                sqlx::query_scalar(
+                    "SELECT DISTINCT guresid FROM ( \
+                       SELECT r.guresid FROM active_resources r, json_each(r.secret_outputs) e \
+                         WHERE r.org_id = ?1 AND json_extract(e.value, '$.store') = ?2 \
+                       UNION SELECT t.guresid FROM tombstones t, \
+                         json_each(COALESCE(t.secret_outputs, '{}')) e \
+                         WHERE t.org_id = ?1 AND json_extract(e.value, '$.store') = ?2) \
+                     ORDER BY 1 LIMIT 5",
+                )
+                .bind(org)
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?
+            }),
             ("grants", {
                 sqlx::query_scalar(
                     "SELECT id FROM secret_grants WHERE org_id = ? AND store_id = ? \
@@ -802,6 +1075,12 @@ impl AccountStore for SqliteStore {
             )));
         }
         sqlx::query("DELETE FROM secret_stores WHERE org_id = ? AND id = ?")
+            .bind(org)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // A store registered later under the same ID owns none of these.
+        sqlx::query("DELETE FROM external_secrets WHERE org_id = ? AND store_id = ?")
             .bind(org)
             .bind(id)
             .execute(&mut *tx)

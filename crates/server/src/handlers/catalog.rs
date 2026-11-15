@@ -463,12 +463,12 @@ async fn write_driver(
         .store
         .check_driver(org, &record, change, Some(&ctx.principal.id))
         .await?;
-    let primary = secret_inputs::primary(state)?;
+    let primary = secret_inputs::primary(state).await?;
     let mut written = Vec::new();
     let result = async {
         if let Some(t) = token {
             let name = format!("drivers/{id}/token");
-            record.token = Some(t.materialize(&primary, &name, &mut written).await?);
+            record.token = Some(t.materialize(primary.store(), &name, &mut written).await?);
         }
         match based_on {
             None => {
@@ -620,11 +620,11 @@ pub async fn create_definition(
     }
     // Values are written under the definition; versions written for a rejected
     // change are discarded.
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::primary(&state).await?;
     let mut written = Vec::new();
     let result = async {
         def.driver_inputs = planned
-            .write(&primary, &format!("defs/{id}"), &mut written)
+            .write(primary.store(), &format!("defs/{id}"), &mut written)
             .await?;
         state
             .store
@@ -691,11 +691,11 @@ pub async fn update_definition(
         .store
         .check_definition(org, &check, Some(&ctx.principal.id))
         .await?;
-    let primary = secret_inputs::primary(&state)?;
+    let primary = secret_inputs::primary(&state).await?;
     let mut written = Vec::new();
     let result = async {
         update.driver_inputs = planned
-            .write(&primary, &format!("defs/{id}"), &mut written)
+            .write(primary.store(), &format!("defs/{id}"), &mut written)
             .await?;
         state
             .store

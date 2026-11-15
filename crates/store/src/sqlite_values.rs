@@ -13,7 +13,6 @@ use sqlx::SqliteConnection;
 
 use crate::audit::{self, AuditIntent};
 use crate::identity::check_values_authority;
-use crate::secrets::BUILTIN_STORE;
 use crate::sqlite::SqliteStore;
 use crate::sqlite_catalog::check_ref_stores;
 use crate::{Result, StoreError, now_ms};
@@ -203,12 +202,14 @@ pub(crate) async fn check_secret_use(
     let mut refs = Map::new();
     refs.insert("ref".into(), serde_json::to_value(r)?);
     check_ref_stores(conn, org, &refs).await?;
-    if r.store == BUILTIN_STORE {
+    if let Some(name) = crate::secrets::written_name(org, r) {
         let mut prefixes = vec![value_secret_prefix(app, None)];
         if env.is_some() {
             prefixes.push(value_secret_prefix(app, env));
         }
-        if prefixes.iter().any(|p| r.reference.starts_with(p.as_str())) {
+        if prefixes.iter().any(|p| name.starts_with(p.as_str()))
+            && crate::secret_use::created_externally(conn, org, r).await?
+        {
             return Ok(());
         }
     }
