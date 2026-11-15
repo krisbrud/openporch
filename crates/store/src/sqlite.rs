@@ -87,7 +87,7 @@ impl SqliteStore {
     async fn init_installation(&self) -> Result<()> {
         let ownership = &*self.ownership;
         let now = now_ms();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = begin_immediate(&self.pool).await?;
         let existing: Option<String> =
             sqlx::query_scalar("SELECT org_id FROM installation WHERE id = 1")
                 .fetch_optional(&mut *tx)
@@ -197,9 +197,7 @@ impl SqliteStore {
     }
 
     pub(crate) async fn begin(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-        // IMMEDIATE takes the write lock up front, so read-then-write checks in the
-        // transaction cannot be invalidated by a concurrent writer.
-        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
+        Ok(begin_immediate(&self.pool).await?)
     }
 
     pub(crate) fn check_org(&self, org: &str) -> Result<()> {
@@ -214,6 +212,24 @@ impl SqliteStore {
 /// The schema version this build reads and writes: its newest migration. It
 /// migrates older databases forward and refuses newer ones.
 pub const SCHEMA_VERSION: i64 = 11;
+
+/// Begins a transaction that holds the write lock from its start, so
+/// read-then-write checks in it cannot be invalidated by a concurrent writer.
+///
+/// The transaction begins in a task of its own, so dropping the caller cannot
+/// interrupt it: sqlx starts the transaction and only then creates the
+/// `Transaction` that rolls it back on drop, and a caller dropped in between
+/// would return a connection to the pool that keeps the write lock, blocking
+/// every later write. Dropped here, the finished `Transaction` rolls back.
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+) -> std::result::Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+    let pool = pool.clone();
+    match tokio::spawn(async move { pool.begin_with("BEGIN IMMEDIATE").await }).await {
+        Ok(tx) => tx,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
 
 pub(crate) fn connect_options(path: &std::path::Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()

@@ -1447,3 +1447,37 @@ async fn a_driver_replacement_keeps_definitions_and_unknown_operations_whole() {
         Some(moved_again)
     );
 }
+
+/// A request dropped while its transaction begins, as when a client
+/// disconnects, must not leave the write lock behind. sqlx starts the
+/// transaction, then waits on the connection's worker once more before it
+/// creates the `Transaction` that would roll it back; the request is dropped
+/// in that wait.
+#[tokio::test]
+async fn a_transaction_dropped_while_it_begins_releases_the_lock() {
+    let f = Fixture::new().await;
+    fn poll<F: Future>(begin: &mut std::pin::Pin<&mut F>) -> bool {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        begin.as_mut().poll(&mut cx).is_ready()
+    }
+    // Each poll takes one step with the worker; one of these counts stops
+    // right after `BEGIN` was answered.
+    for steps in 1..=6 {
+        let begin = f.store.begin();
+        let mut begin = std::pin::pin!(begin);
+        let mut polls = 0;
+        while polls < steps && !poll(&mut begin) {
+            polls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let write = tokio::time::timeout(std::time::Duration::from_secs(10), f.store.begin()).await;
+    let mut tx = write
+        .expect("timed out")
+        .expect("the write lock was left held");
+    sqlx::query("UPDATE installation SET id = id")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
