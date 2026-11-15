@@ -31,21 +31,26 @@ fn provider(state: &AppState, id: &str) -> ApiResult<Arc<OidcLogin>> {
     })
 }
 
-/// The cookie that binds a login to the browser that started it.
-fn cookie_name(id: &str) -> String {
-    format!("openporch_oidc_{id}")
+/// The cookie that binds a login to the browser that started it. Its name
+/// comes from the login's `state`, so logins a browser runs at the same time
+/// each keep their own cookie.
+fn cookie_name(id: &str, state: &str) -> String {
+    format!(
+        "openporch_oidc_{id}_{}",
+        &crate::auth::hash_token(state)[..16]
+    )
 }
 
 /// The login cookie: sent back only to this provider's callback, never readable
 /// by scripts, and only over TLS when the callback uses it. `Lax` lets it ride
 /// the provider's redirect.
-fn login_cookie(provider: &OidcLogin, value: &str, max_age: i64) -> HeaderValue {
+fn login_cookie(provider: &OidcLogin, state: &str, value: &str, max_age: i64) -> HeaderValue {
     let config = provider.config();
     let https = Url::parse(&config.callback_url).is_ok_and(|u| u.scheme() == "https");
     let secure = if https { "; Secure" } else { "" };
     let cookie = format!(
         "{}={value}; Max-Age={max_age}; Path={}; HttpOnly; SameSite=Lax{secure}",
-        cookie_name(&config.id),
+        cookie_name(&config.id, state),
         crate::config::oidc_callback_path(&config.id),
     );
     HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -75,13 +80,18 @@ pub async fn authorize(
         .browser_logins
         .start(&id, &return_to, Some(secrets.clone()), now)
         .ok_or_else(|| ApiError::rate_limited(60))?;
-    let url = provider
-        .authorize_url(&started.state, &secrets, now)
-        .await?;
+    let url = match provider.authorize_url(&started.state, &secrets, now).await {
+        Ok(url) => url,
+        Err(e) => {
+            // The browser never gets this login, so it must not hold a slot.
+            state.browser_logins.abandon(&started.state);
+            return Err(e.into());
+        }
+    };
     let max_age = crate::browser_login::PENDING_TTL_MS / 1000;
     redirect(
         url.as_str(),
-        login_cookie(&provider, &started.binding, max_age),
+        login_cookie(&provider, &started.state, &started.binding, max_age),
     )
 }
 
@@ -110,12 +120,13 @@ pub async fn callback(
     state.login_limit.check(&addr)?;
     let provider = provider(&state, &id)?;
     let now = openporch_store::now_ms();
+    let login_state = query.state.as_deref().unwrap_or_default();
     let resumed = state
         .browser_logins
         .callback(
             &id,
-            query.state.as_deref().unwrap_or_default(),
-            cookie_value(&headers, &cookie_name(&id)),
+            login_state,
+            cookie_value(&headers, &cookie_name(&id, login_state)),
             now,
         )
         .map_err(|e| {
@@ -129,7 +140,7 @@ pub async fn callback(
             })
         })?;
     let return_to = resumed.return_to;
-    let clear = login_cookie(&provider, "", 0);
+    let clear = login_cookie(&provider, login_state, "", 0);
     let fail = |reason: &str| redirect(&returning(&return_to, "error", reason)?, clear.clone());
     let Some(secrets) = resumed.secrets else {
         return fail("login_failed");

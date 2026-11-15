@@ -119,6 +119,12 @@ impl BrowserLogins {
         Some(started)
     }
 
+    /// Drops the login `state` names, which its browser never received.
+    pub fn abandon(&self, state: &str) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.remove(&auth::hash_token(state));
+    }
+
     /// Ends the login `state` names, which `binding` from the browser's cookie must
     /// have started through `provider`, and resumes it. A state is accepted once,
     /// even when the binding or provider is wrong, so a guessed or replayed callback

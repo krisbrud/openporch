@@ -308,8 +308,12 @@ async fn start(s: &Server, idp: &Issuer, return_to: &str) -> (Request, String) {
     assert_eq!(q["code_challenge"].len(), 43);
     assert!(q["nonce"].len() >= 32 && q["state"].len() >= 32);
     assert!(!location.contains("client+secret") && !location.contains("client%20secret"));
+    let name = format!(
+        "openporch_oidc_corp_{}=",
+        &crate::auth::hash_token(&q["state"])[..16]
+    );
+    assert!(cookie.starts_with(&name), "{cookie}");
     for attr in [
-        "openporch_oidc_corp=",
         "HttpOnly",
         "SameSite=Lax",
         "Path=/auth/oidc/corp/callback",
@@ -643,6 +647,45 @@ async fn forged_callbacks_unknown_providers_and_return_urls_are_refused() {
         let (status, b) = s.call(method, path, None, body).await;
         assert_error(status, &b, StatusCode::NOT_FOUND, "API-001");
     }
+}
+
+#[tokio::test]
+async fn logins_a_browser_runs_at_the_same_time_keep_their_own_cookies() {
+    let idp = Issuer::start().await;
+    let s = idp.server().await;
+    let (_, invitation) = s
+        .invite(json!({"email": "heidi@example.com", "role": "member"}))
+        .await;
+    let (first, first_cookie) = start(&s, &idp, PORTAL).await;
+    let (second, second_cookie) = start(&s, &idp, PORTAL).await;
+    assert_ne!(
+        first_cookie.split('=').next(),
+        second_cookie.split('=').next()
+    );
+    // The browser sends both cookies to the callback.
+    let both = format!("{first_cookie}; {second_cookie}");
+    for req in [&first, &second] {
+        let code = idp.approve(req, "heidi");
+        let (_, location) = callback(&s, req, &code, &both).await;
+        let login_code = query(&location)
+            .get("login_code")
+            .cloned()
+            .unwrap_or_else(|| panic!("{location}"));
+        let (status, b) = exchange(&s, &login_code, Some(&invitation)).await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+    }
+}
+
+#[test]
+fn a_login_whose_redirect_failed_holds_no_slot() {
+    let logins = crate::browser_login::BrowserLogins::default();
+    let started = logins.start("corp", PORTAL, None, 0).unwrap();
+    logins.abandon(&started.state);
+    assert!(
+        logins
+            .callback("corp", &started.state, Some(&started.binding), 1)
+            .is_err()
+    );
 }
 
 #[tokio::test]
