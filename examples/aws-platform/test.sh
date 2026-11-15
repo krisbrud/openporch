@@ -44,7 +44,14 @@ mkdir -p "$mirror" "$work/data"
 
 # Below Linux's ephemeral port range, so the port is rarely taken.
 port=$((20000 + RANDOM % 12000))
-OPENPORCH_ORG=acme OPENPORCH_DATA_DIR="$work/data" OPENPORCH_LISTEN="127.0.0.1:$port" \
+# `public_url` turns the OIDC issuer on, for the `aws-identity` variant. The
+# issuer is not reachable from AWS here; the variant is applied, not checked.
+cat >"$work/openporch.toml" <<TOML
+org = "acme"
+data_dir = "$work/data"
+public_url = "https://porch.example.com"
+TOML
+OPENPORCH_CONFIG="$work/openporch.toml" OPENPORCH_LISTEN="127.0.0.1:$port" \
   "$server_bin" serve >"$work/server.log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 100); do
@@ -164,4 +171,32 @@ tofu destroy -no-color -input=false -auto-approve "${vars[@]}" >/dev/null || fai
 applying=
 left=$(api resources/defs | jq length) || fail "could not list definitions"
 [ "$left" = 0 ] || fail "definitions are left after destroy"
+
+echo "== the aws-identity variant: no external ID, no host identity, no secret"
+vars=(
+  -var "credentials=aws-identity"
+  -var "oidc_issuer_url=https://porch.example.com/oidc"
+  -var "org=acme"
+  -var "aws_region=${AWS_REGION:-us-east-1}"
+)
+applying=1
+tofu apply -no-color -input=false -auto-approve "${vars[@]}" || fail "the aws-identity variant did not apply"
+account=$(api resources/accounts/aws) || fail "could not read the cloud account"
+[ "$(jq -r .type <<<"$account")" = aws-identity ] || fail "the cloud account is not an identity account: $account"
+[ "$(jq -c '.config | keys' <<<"$account")" = '["region","role_arn"]' ] || fail "the identity account's configuration: $account"
+[ "$(jq -c '.secret_refs // {}' <<<"$account")" = '{}' ] || fail "the identity account holds secrets: $account"
+setup=$(api oidc/aws-identity/aws) || fail "could not read the account's setup"
+role_arn=$(jq -r .config.role_arn <<<"$account")
+[ "$(jq -r '.trust_policy.Statement[0].Condition.StringEquals["porch.example.com/oidc:sub"]' <<<"$setup")" = acme/aws ] ||
+  fail "the setup's trust policy: $setup"
+aws_account=$(cut -d: -f5 <<<"$role_arn")
+[ "$(jq -r .provider_arn <<<"$setup")" = "arn:aws:iam::$aws_account:oidc-provider/porch.example.com/oidc" ] ||
+  fail "the setup's identity provider: $setup"
+set +e
+tofu plan -no-color -input=false -detailed-exitcode "${vars[@]}" >"$work/plan.log"
+status=$?
+set -e
+[ "$status" -eq 0 ] || { cat "$work/plan.log" >&2; fail "the aws-identity variant's second plan wants changes (exit $status)"; }
+tofu destroy -no-color -input=false -auto-approve "${vars[@]}" >/dev/null || fail "the aws-identity variant did not destroy"
+applying=
 echo "== ok"

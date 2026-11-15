@@ -521,6 +521,65 @@ Behind a reverse proxy (`tls_terminated_by_proxy = true`), the client address is
 the last `X-Forwarded-For` entry, the one the proxy added, so the server must be
 reachable only through that proxy. IPv6 clients are limited per /64 network.
 
+## Keyless AWS access
+
+A cloud account of type `aws-identity` lets openporch reach AWS without holding
+any AWS credential, and without its host having an AWS identity. With
+`public_url` set, the server is an OpenID Connect issuer at
+`<public_url>/oidc` (see [Operating openporch](operations.md#oidc-issuer)).
+Immediately before a driver needs credentials, the executor signs a token
+with `iss` that issuer, `sub` `<org>/<account-id>` and `aud`
+`sts.amazonaws.com`, valid for five minutes, and exchanges it with
+`sts:AssumeRoleWithWebIdentity` for a session of the account's role. The token
+is never stored, logged or returned through the API, and the session is kept in
+memory only while it is valid.
+
+What AWS checks, and therefore what the trust policy must say:
+
+- **Who issued the token.** The role trusts the IAM OIDC identity provider for
+  the issuer URL. AWS fetches the issuer's JWKS from
+  `<public_url>/oidc/jwks` over HTTPS and verifies the token's RS256
+  signature; it checks the server's certificate against the certificate
+  authorities it trusts, so use a certificate from a public CA.
+- **Which account it is for.** The condition `<issuer host>/oidc:sub` names
+  exactly one subject, `<org>/<account-id>`. Another account's token, from the
+  same server, names another subject and is refused. Never use a wildcard in
+  this condition: it would let every `aws-identity` account in the
+  organization assume the role.
+- **Who it is for.** The condition `<issuer host>/oidc:aud` is
+  `sts.amazonaws.com`, or the account's `audience`, and the identity provider
+  lists the same client ID.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Federated": "arn:aws:iam::111122223333:oidc-provider/porch.example.com/oidc"},
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {"StringEquals": {
+      "porch.example.com/oidc:sub": "acme/aws-prod",
+      "porch.example.com/oidc:aud": "sts.amazonaws.com"
+    }}
+  }]
+}
+```
+
+`porch cloud-accounts setup aws-identity <account>` prints this policy, the
+identity provider to create, and the AWS CLI command that creates it; the
+[reference platform](../examples/aws-platform#without-any-aws-credential-aws-identity)
+creates both with `credentials = "aws-identity"`. Setting up an account step
+by step is in [cloud accounts](cloud-accounts.md#setting-up-an-identity-account).
+
+The issuer's private keys are what AWS trusts, so they are as sensitive as the
+master key: they are sealed with it in the database, never leave the server,
+and a backup holds them sealed. Anyone holding a key could assume every role
+that trusts the issuer, until it is rotated out. Rotate with
+`POST /orgs/{org}/oidc/keys/rotate` after a suspected leak; the replaced key
+stays published for `[oidc] key_grace_minutes`, so lower it beforehand if the
+old key must stop being trusted quickly. Without `public_url` there is no
+issuer, and `aws-role` with an external ID remains the way to reach AWS.
+
 ## Master keys
 
 The built-in secret store, the session signing key and other protected records

@@ -18,17 +18,59 @@ locals {
 
 # --- The role openporch assumes ---------------------------------------------
 
+locals {
+  identity = var.credentials == "aws-identity"
+  # The issuer without its scheme, as IAM names the provider and its condition
+  # keys.
+  issuer_host  = local.identity ? trimprefix(coalesce(var.oidc_issuer_url, "https://unset/oidc"), "https://") : ""
+  provider_arn = "${local.arn}:iam::${local.account}:oidc-provider/${local.issuer_host}"
+}
+
+# With `aws-identity`, AWS trusts openporch's issuer. AWS checks the issuer's
+# certificate against the authorities it trusts, so no thumbprint is kept.
+resource "aws_iam_openid_connect_provider" "openporch" {
+  count          = local.identity && var.create_oidc_provider ? 1 : 0
+  url            = var.oidc_issuer_url
+  client_id_list = ["sts.amazonaws.com"]
+}
+
 data "aws_iam_policy_document" "trust" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "AWS"
-      identifiers = [var.trusted_principal_arn]
+  # `aws-role`: the server's own identity, with the external ID.
+  dynamic "statement" {
+    for_each = local.identity ? [] : [1]
+    content {
+      actions = ["sts:AssumeRole"]
+      principals {
+        type        = "AWS"
+        identifiers = [var.trusted_principal_arn]
+      }
+      condition {
+        test     = "StringEquals"
+        variable = "sts:ExternalId"
+        values   = [var.external_id]
+      }
     }
-    condition {
-      test     = "StringEquals"
-      variable = "sts:ExternalId"
-      values   = [var.external_id]
+  }
+  # `aws-identity`: tokens from openporch's issuer for the cloud account `aws`
+  # alone; another account's token names another subject.
+  dynamic "statement" {
+    for_each = local.identity ? [1] : []
+    content {
+      actions = ["sts:AssumeRoleWithWebIdentity"]
+      principals {
+        type        = "Federated"
+        identifiers = [local.provider_arn]
+      }
+      condition {
+        test     = "StringEquals"
+        variable = "${local.issuer_host}:sub"
+        values   = ["${var.org}/aws"]
+      }
+      condition {
+        test     = "StringEquals"
+        variable = "${local.issuer_host}:aud"
+        values   = ["sts.amazonaws.com"]
+      }
     }
   }
 }
@@ -37,6 +79,18 @@ resource "aws_iam_role" "openporch" {
   name                 = "${var.name_prefix}-platform"
   assume_role_policy   = data.aws_iam_policy_document.trust.json
   max_session_duration = 3600
+  depends_on           = [aws_iam_openid_connect_provider.openporch]
+
+  lifecycle {
+    precondition {
+      condition     = local.identity || (var.trusted_principal_arn != null && var.external_id != null)
+      error_message = "With `credentials = \"aws-role\"`, set `trusted_principal_arn` and `external_id`."
+    }
+    precondition {
+      condition     = !local.identity || (var.oidc_issuer_url != null && var.org != null)
+      error_message = "With `credentials = \"aws-identity\"`, set `oidc_issuer_url` and `org`."
+    }
+  }
 }
 
 # What the modules in `examples/modules` create and change. The account
