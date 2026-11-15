@@ -175,10 +175,10 @@ where
                 let failed = |f: ExecFailure| {
                     prefixed(f, &format!("the token of driver `{id}` could not be used"))
                 };
-                self.authorize(&job.context, &[SecretOwner::Driver(id)], r)
+                let value = self
+                    .authorized_read(&job.context, &[SecretOwner::Driver(id)], r, log)
                     .await
                     .map_err(failed)?;
-                let value = self.read(&job.context, r, log).await.map_err(failed)?;
                 log.secret([value.expose()]);
                 Some(value.expose().to_owned())
             }
@@ -323,9 +323,9 @@ where
         let definition = job.definition_id.as_str();
         let mut read = BTreeMap::new();
         for r in &definition_refs {
-            self.authorize(&job.context, &[SecretOwner::Definition(definition)], r)
+            let value = self
+                .authorized_read(&job.context, &[SecretOwner::Definition(definition)], r, log)
                 .await?;
-            let value = self.read(&job.context, r, log).await?;
             log.secret([value.expose()]);
             read.insert(r.clone(), value);
         }
@@ -348,8 +348,7 @@ where
                     r.reference, r.store
                 )));
             }
-            self.authorize(&job.context, &owners, r).await?;
-            let value = self.read(&job.context, r, log).await?;
+            let value = self.authorized_read(&job.context, &owners, r, log).await?;
             log.secret([value.expose()]);
             read.insert(r.clone(), value);
         }
@@ -422,6 +421,23 @@ where
         Err(ExecFailure::Permanent(refused.unwrap_or_else(|| {
             format!("secret `{}` may not be used here", r.reference)
         })))
+    }
+
+    /// Authorizes `r` for one of `owners`, reads it, and authorizes it again:
+    /// what made it usable, such as openporch's record of creating it in an
+    /// external store, may be gone by the time it was read, for example when
+    /// the store was repointed in between. The value is dropped then.
+    async fn authorized_read(
+        &self,
+        c: &JobContext,
+        owners: &[SecretOwner<'_>],
+        r: &SecretRef,
+        log: &mut RedactingLog,
+    ) -> Result<SecretValue, ExecFailure> {
+        self.authorize(c, owners, r).await?;
+        let value = self.read(c, r, log).await?;
+        self.authorize(c, owners, r).await?;
+        Ok(value)
     }
 
     /// Reads `r` from its store: the built-in store directly, an AWS store with

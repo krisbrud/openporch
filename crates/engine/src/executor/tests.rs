@@ -289,6 +289,9 @@ struct FakeSts {
     written: Mutex<BTreeMap<String, String>>,
     /// The create ID tag of secrets in AWS stores, by name.
     tags: Mutex<BTreeMap<String, String>>,
+    /// When set, a read forgets every record of external secrets first, as a
+    /// store repointed between authorization and the read would.
+    repoint_on_read: Mutex<Option<sqlx::SqlitePool>>,
 }
 
 impl Sts for FakeSts {
@@ -434,7 +437,16 @@ impl Sts for FakeSts {
         } else {
             Ok((secret.name == "prod/db-password").then(|| SecretValue::new(EXTERNAL)))
         };
-        Box::pin(async move { found })
+        let repoint = self.repoint_on_read.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some(pool) = repoint {
+                sqlx::query("DELETE FROM external_secrets")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            found
+        })
     }
     /// Every digest exists except one of zeros.
     fn image_exists<'a>(
@@ -560,6 +572,7 @@ impl Fixture {
             objects: Mutex::new(Vec::new()),
             written: Mutex::new(BTreeMap::new()),
             tags: Mutex::new(BTreeMap::new()),
+            repoint_on_read: Mutex::new(None),
         });
         let cloud = Arc::new(CredentialResolver::new(sts.clone()));
         Self {
@@ -2514,6 +2527,33 @@ async fn a_primary_store_with_refused_credentials_fails_before_the_driver() {
     let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
     let failure = format!("{outcomes:?}");
     assert!(failure.contains("InvalidClientTokenId"), "{failure}");
+    assert!(f.driver.puts().is_empty());
+}
+
+/// A secret whose ownership is forgotten between its authorization and its
+/// read, as when its store is repointed, is authorized again after the read
+/// and not handed to the driver.
+#[tokio::test]
+async fn ownership_lost_during_a_read_is_noticed_before_the_driver() {
+    let f = Fixture::new().await;
+    f.aws_store(&[]).await;
+    let name = "openporch/acme/defs/pg/master";
+    f.record(name, true, "id").await;
+    f.plant(name, "created", Some("id"));
+    let pg = def(
+        "pg",
+        "postgres",
+        "test/fake",
+        json!({"secret_refs": {"master": {"store": "sm", "ref": name}}}),
+    );
+    let defs = f.define(pg, "openporch/none").await;
+    *f.sts.repoint_on_read.lock().unwrap() = Some(f.store.pool().clone());
+    let (_, outcomes) = f.deploy(&defs, Arc::new(NoPermits)).await;
+    let failure = format!("{outcomes:?}");
+    assert!(
+        failure.contains("no grant lets definition `pg` use"),
+        "{failure}"
+    );
     assert!(f.driver.puts().is_empty());
 }
 
