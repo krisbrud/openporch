@@ -3,6 +3,7 @@
 //! [`run`] takes its environment, standard input and output as arguments, so tests
 //! run commands in-process against a dev server.
 
+mod browser_login;
 pub mod config;
 pub mod deploys;
 pub mod members;
@@ -116,7 +117,11 @@ pub struct LoginArgs {
     /// Store an API token, read from standard input or a hidden prompt.
     #[arg(long)]
     pub token: bool,
-    /// The invitation code, on a first GitHub login.
+    /// Sign in through the browser with this OpenID Connect provider of the
+    /// server, instead of with GitHub.
+    #[arg(long, value_name = "ID", conflicts_with = "token")]
+    pub provider: Option<String>,
+    /// The invitation code, on a first login.
     #[arg(long, value_name = "CODE", conflicts_with = "token")]
     pub invitation: Option<String>,
 }
@@ -259,6 +264,11 @@ async fn execute(cli: Cli, io: &mut Io<'_>) -> Result<(), String> {
     };
     match cli.command {
         Command::Login(args) if args.token => login_token(&session, io).await,
+        Command::Login(LoginArgs {
+            provider: Some(provider),
+            invitation,
+            ..
+        }) => login_browser(&session, &provider, invitation.as_deref(), io).await,
         Command::Login(args) => login_device(&session, args.invitation.as_deref(), io).await,
         Command::Logout => logout(&session, io).await,
         Command::Get(args) => objects::get(&session, args, io).await,
@@ -374,6 +384,42 @@ async fn login_device(
             DevicePoll::Session(s) => break s,
         }
     };
+    remember(
+        session,
+        Credential {
+            token: login.token.expose().to_owned(),
+            kind: "session".into(),
+            user: Some(login.user.clone()),
+            expires_at: Some(login.expires_at),
+        },
+    )?;
+    writeln!(
+        io.out,
+        "Logged in to {} as {}.",
+        url_key(client.url()),
+        login.user
+    )
+    .map_err(|e| e.to_string())
+}
+
+async fn login_browser(
+    session: &Session,
+    provider: &str,
+    invitation: Option<&str>,
+    io: &mut Io<'_>,
+) -> Result<(), String> {
+    let (url, org) = (session.url()?, session.org()?);
+    let client = Client::new(url, org, None).map_err(|e| e.to_string())?;
+    let err = &mut *io.err;
+    let login = browser_login::login(&client, provider, invitation, |authorize| {
+        writeln!(
+            err,
+            "Open this address in a browser on this computer to sign in:\n\n  {authorize}\n"
+        )
+        .and_then(|()| err.flush())
+        .map_err(|e| e.to_string())
+    })
+    .await?;
     remember(
         session,
         Credential {

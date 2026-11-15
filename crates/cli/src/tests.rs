@@ -702,3 +702,161 @@ async fn setup_prints_an_aws_identity_trust_policy() {
     assert_eq!(setup["issuer"], "https://porch.example.com/oidc");
     assert_eq!(setup["subject"], "acme/aws-prod");
 }
+
+/// Standard error that hands what is written to a channel as it is written.
+struct Forward(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl Write for Forward {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.send(String::from_utf8_lossy(buf).into_owned());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A server whose OpenID Connect login returns at once to `return_to` with
+/// login code `lc-1`, which it exchanges for a session.
+async fn oidc_server() -> (String, Arc<Mutex<Vec<Value>>>) {
+    type Exchanges = Arc<Mutex<Vec<Value>>>;
+    let exchanges = Exchanges::default();
+    let contract = [("openporch-contract", "1")];
+    let app = Router::new()
+        .route(
+            "/auth/oidc/{provider}/authorize",
+            get(
+                move |UrlPath(provider): UrlPath<String>,
+                      axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>| async move {
+                    assert_eq!(provider, "corp");
+                    let back = format!("{}?login_code=lc-1", q["return_to"]);
+                    (StatusCode::FOUND, contract, [("location", back)])
+                },
+            ),
+        )
+        .route(
+            "/auth/oidc/{provider}/session",
+            post(
+                move |State(ex): State<Exchanges>, Json(body): Json<Value>| async move {
+                    ex.lock().unwrap().push(body.clone());
+                    if body["login_code"] != "lc-1" {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            contract,
+                            Json(json!({"error": "AUTH-001", "message": "the login code is unknown"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        contract,
+                        Json(json!({"token": "ses_oidc-session", "user": "alice", "expires_at": 4102444800000_i64})),
+                    )
+                },
+            ),
+        )
+        .with_state(exchanges.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (format!("http://{addr}"), exchanges)
+}
+
+/// `porch login --provider`: the browser returns to a loopback listener, which
+/// ignores other paths, and the CLI stores the session.
+#[tokio::test]
+async fn browser_login_through_an_oidc_provider_stores_a_session() {
+    let (url, exchanges) = oidc_server().await;
+    let m = Machine::new();
+    let env = |k: &str| m.env.get(k).cloned();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut out, mut err) = (Vec::new(), Forward(tx));
+    let mut input: &[u8] = b"";
+    let mut io = Io {
+        env: &env,
+        stdin: &mut input,
+        stdin_is_terminal: false,
+        out: &mut out,
+        err: &mut err,
+    };
+    let browser = async {
+        let mut shown = String::new();
+        let authorize = loop {
+            shown.push_str(&rx.recv().await.unwrap());
+            if let Some(line) = shown.lines().find(|l| l.trim().starts_with("http")) {
+                break line.trim().to_owned();
+            }
+        };
+        assert!(
+            authorize.starts_with(&format!("{url}/auth/oidc/corp/authorize?return_to=")),
+            "{authorize}"
+        );
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let res = http.get(&authorize).send().await.unwrap();
+        let back = res.headers()["location"].to_str().unwrap().to_owned();
+        let parsed = reqwest::Url::parse(&back).unwrap();
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert!(parsed.path().starts_with("/callback/") && parsed.path().len() > 30);
+        // A page that only knows the port cannot hand the CLI a login code.
+        let mut guess = parsed.clone();
+        guess.set_path("/callback");
+        guess.set_query(Some("login_code=forged"));
+        let res = http.get(guess).send().await.unwrap();
+        assert_eq!(res.status(), 404);
+        let res = http.get(&back).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(res.text().await.unwrap().contains("signed in"));
+    };
+    let args = [
+        "porch",
+        "login",
+        "--url",
+        &url,
+        "--org",
+        "acme",
+        "--provider",
+        "corp",
+        "--invitation",
+        "inv-1",
+    ];
+    let (code, ()) = tokio::join!(run(args, &mut io), browser);
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("as alice"), "{out}");
+    assert!(!out.contains("ses_oidc-session"));
+    assert_eq!(
+        *exchanges.lock().unwrap(),
+        vec![json!({"login_code": "lc-1", "invitation_code": "inv-1"})]
+    );
+    let creds: Credentials =
+        toml::from_str(&std::fs::read_to_string(m.dir().join("credentials.toml")).unwrap())
+            .unwrap();
+    let stored = &creds.servers[&url];
+    assert_eq!(stored.kind, "session");
+    assert_eq!(stored.token, "ses_oidc-session");
+    assert_eq!(stored.user.as_deref(), Some("alice"));
+}
+
+#[tokio::test]
+async fn browser_login_refuses_a_malformed_provider_id() {
+    let m = Machine::new();
+    let r = m
+        .porch(
+            &[
+                "login",
+                "--url",
+                "https://porch.example.com",
+                "--org",
+                "acme",
+                "--provider",
+                "../users",
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.err.contains("not a provider ID"), "{r:?}");
+}

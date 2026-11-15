@@ -56,6 +56,23 @@ fn login_cookie(provider: &OidcLogin, state: &str, value: &str, max_age: i64) ->
     HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
+/// Whether `url` is a page on a loopback listener, as a command-line client
+/// opens one: `http://127.0.0.1:<port>/<path>` or `http://[::1]:<port>/<path>`,
+/// with an explicit port and no credentials, query or fragment. `localhost` is
+/// left out, since a name can resolve elsewhere (RFC 8252, section 8.3).
+pub(crate) fn is_loopback_return(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]"))
+        && parsed.port().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
 #[derive(Deserialize)]
 pub struct Authorize {
     /// The page to return to: one of the provider's return URLs. It may be left
@@ -73,7 +90,11 @@ pub async fn authorize(
 ) -> ApiResult<Response> {
     state.login_limit.check(&addr)?;
     let provider = provider(&state, &id)?;
-    let return_to = pick_return_to(query.return_to.as_deref(), &provider.config().return_urls)?;
+    let config = provider.config();
+    let return_to = match query.return_to.as_deref() {
+        Some(url) if config.loopback_return && is_loopback_return(url) => url.to_owned(),
+        requested => pick_return_to(requested, &config.return_urls)?,
+    };
     let secrets = OidcLogin::new_secrets();
     let now = openporch_store::now_ms();
     let started = state
@@ -216,4 +237,32 @@ pub async fn exchange(
     )
     .await?;
     Ok(Json(session))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_return;
+
+    #[test]
+    fn loopback_returns_name_a_loopback_address_and_port() {
+        for url in [
+            "http://127.0.0.1:53682/callback/abc",
+            "http://[::1]:53682/callback",
+        ] {
+            assert!(is_loopback_return(url), "{url}");
+        }
+        for url in [
+            "http://localhost:53682/callback",
+            "http://127.0.0.1/callback",
+            "https://127.0.0.1:53682/callback",
+            "http://127.0.0.2:53682/callback",
+            "http://127.0.0.1:53682/callback?x=1",
+            "http://127.0.0.1:53682/callback#x",
+            "http://user@127.0.0.1:53682/callback",
+            "http://127.0.0.1.evil.example:53682/",
+            "not a url",
+        ] {
+            assert!(!is_loopback_return(url), "{url}");
+        }
+    }
 }

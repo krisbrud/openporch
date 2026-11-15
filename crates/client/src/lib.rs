@@ -7,14 +7,14 @@
 use std::fmt;
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
-pub use reqwest::Method;
+pub use reqwest::{Method, Url};
 
 #[cfg(test)]
 mod tests;
@@ -460,6 +460,41 @@ impl Client {
         serde_json::from_value(value)
             .map(DevicePoll::Session)
             .map_err(|e| Error::Decode(e.to_string()))
+    }
+
+    /// Where a browser starts a login through the OpenID Connect provider
+    /// `provider` that returns to `return_to`.
+    pub fn oidc_authorize_url(&self, provider: &str, return_to: &str) -> Result<Url, Error> {
+        let mut url = Url::parse(&format!(
+            "{}/auth/oidc/{}/authorize",
+            url_key(&self.base),
+            segment(provider)
+        ))
+        .map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        url.query_pairs_mut().append_pair("return_to", return_to);
+        Ok(url)
+    }
+
+    /// Exchanges the one-time code of a login through the OpenID Connect
+    /// provider `provider` for a session.
+    pub async fn oidc_session(
+        &self,
+        provider: &str,
+        login_code: &str,
+        invitation_code: Option<&str>,
+    ) -> Result<Session, Error> {
+        let mut body = serde_json::json!({"login_code": login_code});
+        if let Some(code) = invitation_code {
+            body["invitation_code"] = Value::String(code.to_owned());
+        }
+        let value = self
+            .request(
+                Method::POST,
+                &format!("/auth/oidc/{}/session", segment(provider)),
+                Some(&body),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|e| Error::Decode(e.to_string()))
     }
 }
 

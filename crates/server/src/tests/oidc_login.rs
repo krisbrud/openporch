@@ -186,6 +186,7 @@ impl Issuer {
             client_secret_file: Some(secret.to_owned()),
             callback_url: CALLBACK_URL.into(),
             return_urls: vec![PORTAL.into(), "https://portal.example.com/done".into()],
+            loopback_return: true,
             scopes: vec!["openid".into(), "email".into(), "profile".into()],
             algorithms: vec!["RS256".into()],
         }
@@ -625,6 +626,24 @@ async fn forged_callbacks_unknown_providers_and_return_urls_are_refused() {
     assert_eq!(query(&location)["error"], "access_denied");
     assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
+    // A loopback listener, as `porch login --provider` opens, is a return URL
+    // when the provider allows it; a name for it is not.
+    let (status, location, _) = navigate(
+        &s,
+        "/auth/oidc/corp/authorize?return_to=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback%2Fabc",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND, "{location}");
+    let (status, b) = s
+        .call(
+            Method::GET,
+            "/auth/oidc/corp/authorize?return_to=http%3A%2F%2Flocalhost%3A53682%2Fcallback",
+            None,
+            None,
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
     let (status, b) = s
         .call(
             Method::GET,
@@ -758,6 +777,7 @@ fn oidc_login_configuration_is_checked() {
         client_secret_file: None,
         callback_url: "https://porch.example.com/auth/oidc/corp/callback".into(),
         return_urls: vec!["https://portal.example.com/done".into()],
+        loopback_return: false,
         scopes: vec!["openid".into()],
         algorithms: vec!["RS256".into(), "ES256".into()],
     };
@@ -767,6 +787,15 @@ fn oidc_login_configuration_is_checked() {
         config.validate().err().map(|e| e.to_string())
     };
     assert_eq!(check(vec![base.clone()]), None);
+    // A provider only `porch login` uses needs no return page.
+    assert_eq!(
+        check(vec![OidcLoginConfig {
+            return_urls: vec![],
+            loopback_return: true,
+            ..base.clone()
+        }]),
+        None
+    );
     let cases: Vec<(OidcLoginConfig, &str)> = vec![
         (
             OidcLoginConfig {
