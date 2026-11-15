@@ -1673,7 +1673,10 @@ written; the built-in store `openporch` is primary until another store is
 marked with `PATCH {"primary": true}`. Existing references keep naming the
 store they were written to, and a store stays primary until another one is
 marked. Cloud account secrets are always written to the built-in store, so
-opening an external store never depends on an external store.
+opening an external store never depends on an external store. A store cannot be deleted
+while it is primary or anything still references it: definitions, cloud
+accounts, driver tokens, grants, shared values and their versions, or the
+secret outputs of active or detached resources (`409`, naming them).
 
 External stores of type `aws-secrets-manager` (a reference names a secret, a
 version is its `VersionId`) and `aws-ssm` (a reference names a parameter, a

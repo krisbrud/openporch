@@ -2202,6 +2202,22 @@ async fn secret_outputs_go_to_an_external_primary_store() {
     for plaintext in [PASSWORD, ACCOUNT_KEY] {
         assert!(!recorded.contains(plaintext), "{plaintext}: {recorded}");
     }
+
+    // The store holds the resource's outputs, so it stays even once it is no
+    // longer primary.
+    let patch = audit("PATCH", "/orgs/acme/secretstores/openporch");
+    f.store
+        .set_primary_secret_store(ORG, "openporch", patch)
+        .await
+        .unwrap();
+    let error = f
+        .store
+        .delete_secret_store(ORG, "sm", audit("DELETE", "/orgs/acme/secretstores/sm"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("referenced by resources"), "{error}");
+    assert!(error.contains(db.guresid.as_str()), "{error}");
 }
 
 /// A definition's own name in an external store is its own only once

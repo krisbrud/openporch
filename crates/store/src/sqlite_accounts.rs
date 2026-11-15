@@ -218,7 +218,8 @@ pub trait AccountStore: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Deletes a store nothing references: not the built-in or primary store, and
-    /// not one named by definitions, accounts, drivers or grants.
+    /// not one named by definitions, accounts, drivers, grants, shared values, or
+    /// the secret outputs of active or detached resources.
     fn delete_secret_store(
         &self,
         org: &str,
@@ -981,6 +982,23 @@ impl AccountStore for SqliteStore {
                        UNION SELECT v.app_id, v.env_id FROM value_set_versions v, \
                          json_each(v.content) e WHERE v.org_id = ?1 \
                          AND json_extract(e.value, '$.secret_ref.store') = ?2) \
+                     ORDER BY 1 LIMIT 5",
+                )
+                .bind(org)
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?
+            }),
+            ("resources", {
+                // Secret outputs of active resources, and of detached ones a
+                // later adoption restores.
+                sqlx::query_scalar(
+                    "SELECT DISTINCT guresid FROM ( \
+                       SELECT r.guresid FROM active_resources r, json_each(r.secret_outputs) e \
+                         WHERE r.org_id = ?1 AND json_extract(e.value, '$.store') = ?2 \
+                       UNION SELECT t.guresid FROM tombstones t, \
+                         json_each(COALESCE(t.secret_outputs, '{}')) e \
+                         WHERE t.org_id = ?1 AND json_extract(e.value, '$.store') = ?2) \
                      ORDER BY 1 LIMIT 5",
                 )
                 .bind(org)
