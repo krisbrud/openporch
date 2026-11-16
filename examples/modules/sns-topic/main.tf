@@ -11,8 +11,8 @@
 #         fifo: true                       # ordered, deduplicated delivery
 #         contentBasedDeduplication: true  # FIFO only: deduplicate by body
 #
-# `kmsKey` encrypts messages at rest with a key ID, ARN or alias, such as
-# `alias/aws/sns`; publishers then also need to use that key.
+# Topics are not encrypted with a KMS key: publishers would also need to use the
+# key, which the co-provisioned policy and the platform's boundary do not grant.
 
 terraform {
   required_version = ">= 1.8"
@@ -53,7 +53,6 @@ resource "aws_sns_topic" "this" {
   name                        = local.fifo ? "${var.name}.fifo" : var.name
   fifo_topic                  = local.fifo
   content_based_deduplication = local.fifo ? local.dedup : null
-  kms_master_key_id           = try(tostring(local.params.kmsKey), null)
   tags                        = var.tags
 
   lifecycle {

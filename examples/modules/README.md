@@ -13,7 +13,7 @@ execution role attaches.
 | `dynamodb-table/policy` | `aws-policy` | `arn` | |
 | `sqs` | `sqs` | `arn`, `url`, `region` | `fifo`, `visibilityTimeout`, `messageRetention`, `maxReceiveCount` |
 | `sqs/policy` | `aws-policy` | `arn` | |
-| `sns-topic` | `sns-topic` | `arn`, `name`, `region` | `fifo`, `contentBasedDeduplication`, `kmsKey` |
+| `sns-topic` | `sns-topic` | `arn`, `name`, `region` | `fifo`, `contentBasedDeduplication` |
 | `sns-topic/policy` | `aws-policy` | `arn` | |
 | `s3` | `s3` | `bucket`, `region`, `arn` | `versioning`, `expireAfterDays` |
 | `s3/policy` | `aws-policy` | `arn` | |
