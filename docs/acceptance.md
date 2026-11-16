@@ -280,7 +280,7 @@ none is open.
 | Configure from environment | covered | `provider/internal/provider/provider_test.go::TestConfigureFromEnvironment`, `provider/scripts/smoke.sh` |
 | Secret store | deferred | `openporch_secret_store` is task 13.3 (the `aws-ssm` adapter exists since 13.2) |
 | Definition with criteria | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
-| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment` |
+| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment`, `provider/internal/provider/acc_catalog_test.go::TestAccResourceType`, `provider/internal/provider/acc_catalog_test.go::TestAccSecretStore` (custom types, secret stores and grants) |
 | Placeholder escaping | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
 | Secret value changed | covered | `provider/internal/provider/acc_catalog_test.go::TestAccValue` |
 | Service user token | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |

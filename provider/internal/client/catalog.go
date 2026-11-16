@@ -222,3 +222,139 @@ func (c *Client) Driver(ctx context.Context, id string) (*Driver, error) {
 func (c *Client) DeleteDriver(ctx context.Context, id string) error {
 	return c.Do(ctx, http.MethodDelete, c.OrgPath("resources", "drivers", id), nil, nil)
 }
+
+// ResourceType is a resource type, built-in or custom.
+type ResourceType struct {
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Use           string         `json:"use"`
+	Category      string         `json:"category"`
+	InputsSchema  map[string]any `json:"inputs_schema"`
+	OutputsSchema map[string]any `json:"outputs_schema"`
+}
+
+// ResourceTypeWrite is the body that creates or replaces a custom type. Fields
+// left out take the server's defaults; a nil Name is the ID, an empty one stays
+// empty.
+type ResourceTypeWrite struct {
+	ID            string  `json:"id,omitempty"`
+	Name          *string `json:"name,omitempty"`
+	Use           string  `json:"use"`
+	Category      string  `json:"category"`
+	InputsSchema  any     `json:"inputs_schema,omitempty"`
+	OutputsSchema any     `json:"outputs_schema,omitempty"`
+}
+
+// CreateType creates a custom resource type.
+func (c *Client) CreateType(ctx context.Context, body ResourceTypeWrite) (*ResourceType, error) {
+	var t ResourceType
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("resources", "types"), body, &t)
+	return &t, err
+}
+
+// ReplaceType replaces a custom resource type.
+func (c *Client) ReplaceType(ctx context.Context, id string, body ResourceTypeWrite) (*ResourceType, error) {
+	var t ResourceType
+	body.ID = ""
+	err := c.Do(ctx, http.MethodPut, c.OrgPath("resources", "types", id), body, &t)
+	return &t, err
+}
+
+// Type reads a resource type.
+func (c *Client) Type(ctx context.Context, id string) (*ResourceType, error) {
+	var t ResourceType
+	err := c.Do(ctx, http.MethodGet, c.OrgPath("resources", "types", id), nil, &t)
+	return &t, err
+}
+
+// DeleteType deletes a custom resource type no definition uses.
+func (c *Client) DeleteType(ctx context.Context, id string) error {
+	return c.Do(ctx, http.MethodDelete, c.OrgPath("resources", "types", id), nil, nil)
+}
+
+// SecretStore is a secret store registration.
+type SecretStore struct {
+	ID      string            `json:"id"`
+	Type    string            `json:"type"`
+	Config  map[string]string `json:"config"`
+	Primary bool              `json:"primary"`
+}
+
+// CreateSecretStore registers an external secret store.
+func (c *Client) CreateSecretStore(ctx context.Context, id, storeType string, config map[string]string) (*SecretStore, error) {
+	var s SecretStore
+	body := map[string]any{"id": id, "type": storeType, "config": config}
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("secretstores"), body, &s)
+	return &s, err
+}
+
+// UpdateSecretStore changes a store's configuration when config is not nil, and
+// marks it primary when primary is true.
+func (c *Client) UpdateSecretStore(ctx context.Context, id string, config map[string]string, primary bool) (*SecretStore, error) {
+	var s SecretStore
+	body := map[string]any{}
+	if config != nil {
+		body["config"] = config
+	}
+	if primary {
+		body["primary"] = true
+	}
+	err := c.Do(ctx, http.MethodPatch, c.OrgPath("secretstores", id), body, &s)
+	return &s, err
+}
+
+// SecretStore reads a secret store.
+func (c *Client) SecretStore(ctx context.Context, id string) (*SecretStore, error) {
+	var s SecretStore
+	err := c.Do(ctx, http.MethodGet, c.OrgPath("secretstores", id), nil, &s)
+	return &s, err
+}
+
+// DeleteSecretStore deletes a store that is not primary and that nothing references.
+func (c *Client) DeleteSecretStore(ctx context.Context, id string) error {
+	return c.Do(ctx, http.MethodDelete, c.OrgPath("secretstores", id), nil, nil)
+}
+
+// Grant is a secret-use grant.
+type Grant struct {
+	ID      string `json:"id"`
+	Store   string `json:"store"`
+	Ref     string `json:"ref"`
+	AppID   string `json:"app_id,omitempty"`
+	EnvID   string `json:"env_id,omitempty"`
+	OrgWide bool   `json:"org_wide"`
+}
+
+// CreateGrant grants use of a reference in a store.
+func (c *Client) CreateGrant(ctx context.Context, g Grant) (*Grant, error) {
+	var out Grant
+	body := map[string]any{"ref": g.Ref, "org_wide": g.OrgWide}
+	if g.AppID != "" {
+		body["app_id"] = g.AppID
+	}
+	if g.EnvID != "" {
+		body["env_id"] = g.EnvID
+	}
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("secretstores", g.Store, "grants"), body, &out)
+	return &out, err
+}
+
+// Grant reads a grant; a missing one is an *Error with status 404.
+func (c *Client) Grant(ctx context.Context, store, id string) (*Grant, error) {
+	var grants []Grant
+	if err := c.Do(ctx, http.MethodGet, c.OrgPath("secretstores", store, "grants"), nil, &grants); err != nil {
+		return nil, err
+	}
+	for i := range grants {
+		if grants[i].ID == id {
+			return &grants[i], nil
+		}
+	}
+	return nil, &Error{Status: http.StatusNotFound, Code: "API-001",
+		Message: fmt.Sprintf("secret store `%s` has no grant `%s`", store, id)}
+}
+
+// DeleteGrant deletes a grant.
+func (c *Client) DeleteGrant(ctx context.Context, store, id string) error {
+	return c.Do(ctx, http.MethodDelete, c.OrgPath("secretstores", store, "grants", id), nil, nil)
+}

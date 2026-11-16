@@ -580,3 +580,379 @@ resource "openporch_resource_definition" "d" {
 		},
 	})
 }
+
+func TestAccResourceType(t *testing.T) {
+	c := apiClient(t)
+	id := os.Getenv(EnvOrg) + "/" + randomID("acc-flags")
+	defID := randomID("acc-def")
+	config := func(name, inputs string) string {
+		return fmt.Sprintf(`
+resource "openporch_resource_type" "flags" {
+  id       = %q
+  %s
+  use      = "direct"
+  category = "config"
+  %s
+  outputs_schema = {
+    type = "object"
+    properties = {
+      values  = { type = "object", properties = { url = { type = "string" } } }
+      secrets = { type = "object", properties = { sdk_key = { type = "string" } } }
+    }
+  }
+}
+
+# A class and a definition of the type stay through changes to it.
+resource "openporch_resource_class" "large" {
+  resource_type = openporch_resource_type.flags.id
+  id            = "large"
+}
+
+resource "openporch_resource_definition" "flags" {
+  id          = %q
+  type        = openporch_resource_type.flags.id
+  driver_type = "openporch/echo"
+}
+`, id, name, inputs, defID)
+	}
+	kept := []plancheck.PlanCheck{
+		plancheck.ExpectResourceAction("openporch_resource_type.flags", plancheck.ResourceActionUpdate),
+		plancheck.ExpectResourceAction("openporch_resource_class.large", plancheck.ResourceActionNoop),
+		plancheck.ExpectResourceAction("openporch_resource_definition.flags", plancheck.ResourceActionNoop),
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		CheckDestroy: func(*terraform.State) error {
+			if _, err := c.Type(context.Background(), id); !client.IsNotFound(err) {
+				return fmt.Errorf("resource type %s still exists: %v", id, err)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				// Left out, the name is the ID and the inputs schema the server's default.
+				Config: config("", ""),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_resource_type.flags", tfjsonpath.New("name"),
+						knownvalue.StringExact(id)),
+					statecheck.ExpectKnownValue("openporch_resource_type.flags", tfjsonpath.New("inputs_schema"),
+						knownvalue.Null()),
+				},
+			},
+			{
+				Config: config(`name = "Feature flags"`,
+					`inputs_schema = { type = "object", properties = { project = { type = "string" } } }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
+				Check: func(*terraform.State) error {
+					ty, err := c.Type(context.Background(), id)
+					if err != nil {
+						return err
+					}
+					if ty.Name != "Feature flags" || ty.InputsSchema["properties"] == nil {
+						return fmt.Errorf("unexpected type %+v", ty)
+					}
+					return nil
+				},
+			},
+			{
+				// A change outside OpenTofu is planned back.
+				PreConfig: func() {
+					err := c.Do(context.Background(), http.MethodPut, c.OrgPath("resources", "types", id),
+						map[string]any{"name": "Changed", "use": "direct"}, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+				},
+				Config: config(`name = "Feature flags"`,
+					`inputs_schema = { type = "object", properties = { project = { type = "string" } } }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
+			},
+			{
+				// Removing the inputs schema returns it to the default; the name
+				// left out keeps the name the type has.
+				Config:           config("", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
+				Check: func(*terraform.State) error {
+					ty, err := c.Type(context.Background(), id)
+					if err != nil {
+						return err
+					}
+					if ty.Name != "Feature flags" || ty.InputsSchema["properties"] != nil {
+						return fmt.Errorf("unexpected type %+v", ty)
+					}
+					return nil
+				},
+			},
+			{
+				// An explicitly empty name stays empty.
+				Config:           config(`name = ""`, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_resource_type.flags", tfjsonpath.New("name"),
+						knownvalue.StringExact("")),
+				},
+			},
+			{
+				ResourceName:      "openporch_resource_type.flags",
+				ImportState:       true,
+				ImportStateId:     id,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestAccResourceTypeRefusesBuiltIns(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "openporch_resource_type" "pg" {
+  id  = "postgres"
+  use = "direct"
+}
+`,
+			ExpectError: regexp.MustCompile("built-in type `postgres`"),
+		}, {
+			Config: `
+resource "openporch_resource_type" "bad" {
+  id  = "acme/bad"
+  use = "sometimes"
+}
+`,
+			ExpectError: regexp.MustCompile("Invalid use"),
+		}},
+	})
+}
+
+func TestAccSecretStore(t *testing.T) {
+	c := apiClient(t)
+	app := randomID("acc-grants")
+	account := randomID("acc-sm")
+	store := randomID("acc-vault")
+	config := func(region, primary string) string {
+		return fmt.Sprintf(`
+resource "openporch_application" "app" {
+  id = %q
+}
+
+resource "openporch_cloud_account" "aws" {
+  id      = %q
+  type    = "aws"
+  config  = { access_key_id = "AKIAIOSFODNN7EXAMPLE", region = "eu-north-1" }
+  secrets = { secret_access_key = "secret" }
+}
+
+resource "openporch_secret_store" "vault" {
+  id            = %q
+  type          = "aws-secrets-manager"
+  region        = %q
+  cloud_account = openporch_cloud_account.aws.id
+  %s
+}
+
+resource "openporch_secret_grant" "app" {
+  store  = openporch_secret_store.vault.id
+  ref    = "shop/stripe-key"
+  app_id = openporch_application.app.id
+  env_id = "development"
+}
+
+resource "openporch_secret_grant" "platform" {
+  store    = "openporch"
+  ref      = "platform/%[1]s"
+  org_wide = true
+}
+`, app, account, store, region, primary)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		CheckDestroy: func(*terraform.State) error {
+			if _, err := c.SecretStore(context.Background(), store); !client.IsNotFound(err) {
+				return fmt.Errorf("secret store %s still exists: %v", store, err)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: config("eu-north-1", ""),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_secret_store.vault", tfjsonpath.New("primary"),
+						knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue("openporch_secret_store.vault", tfjsonpath.New("is_primary"),
+						knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue("openporch_secret_grant.app", tfjsonpath.New("org_wide"),
+						knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue("openporch_secret_grant.platform", tfjsonpath.New("app_id"),
+						knownvalue.Null()),
+				},
+			},
+			{
+				// The region changes in place and the grant on the store stays.
+				Config: config("eu-west-1", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("openporch_secret_store.vault", plancheck.ResourceActionUpdate),
+						plancheck.ExpectResourceAction("openporch_secret_grant.app", plancheck.ResourceActionNoop),
+					},
+				},
+				Check: func(*terraform.State) error {
+					s, err := c.SecretStore(context.Background(), store)
+					if err != nil {
+						return err
+					}
+					if s.Config["region"] != "eu-west-1" {
+						return fmt.Errorf("unexpected store %+v", s)
+					}
+					return nil
+				},
+			},
+			{
+				// A grant deleted outside OpenTofu is created again.
+				PreConfig: func() {
+					ctx := context.Background()
+					var grants []client.Grant
+					if err := c.Do(ctx, http.MethodGet, c.OrgPath("secretstores", store, "grants"), nil, &grants); err != nil {
+						t.Fatal(err)
+					}
+					for _, g := range grants {
+						if err := c.DeleteGrant(ctx, store, g.ID); err != nil {
+							t.Fatal(err)
+						}
+					}
+				},
+				Config: config("eu-west-1", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("openporch_secret_grant.app", plancheck.ResourceActionCreate),
+					},
+				},
+			},
+			{
+				ResourceName:      "openporch_secret_store.vault",
+				ImportState:       true,
+				ImportStateId:     store,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName: "openporch_secret_grant.app",
+				ImportState:  true,
+				ImportStateIdFunc: func(s *terraform.State) (string, error) {
+					return store + "/" + s.RootModule().Resources["openporch_secret_grant.app"].Primary.ID, nil
+				},
+				ImportStateVerify: true,
+			},
+			{
+				// Promotion opens the store with its account first; with keys AWS
+				// refuses, nothing changes.
+				Config:      config("eu-west-1", "primary = true"),
+				ExpectError: regexp.MustCompile(`CLD-00[12]`),
+			},
+		},
+	})
+}
+
+func TestAccSecretGrantNeedsAScope(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{{
+			Config: `
+resource "openporch_secret_grant" "g" {
+  store = "openporch"
+  ref   = "platform/x"
+}
+`,
+			ExpectError: regexp.MustCompile("Missing scope"),
+		}, {
+			Config: `
+resource "openporch_secret_grant" "g" {
+  store    = "openporch"
+  ref      = "platform/x"
+  app_id   = "shop"
+  org_wide = true
+}
+`,
+			ExpectError: regexp.MustCompile("Conflicting scope"),
+		}, {
+			Config: `
+resource "openporch_secret_grant" "g" {
+  store  = "openporch"
+  ref    = "platform/x"
+  app_id = "shop"
+  env_id = ""
+}
+`,
+			ExpectError: regexp.MustCompile("Empty scope"),
+		}, {
+			// An empty environment known only at apply would otherwise widen the
+			// grant to the whole application.
+			Config: `
+resource "terraform_data" "env" {
+  input = ""
+}
+
+resource "openporch_secret_grant" "g" {
+  store  = "openporch"
+  ref    = "platform/x"
+  app_id = "shop"
+  env_id = terraform_data.env.output
+}
+`,
+			ExpectError: regexp.MustCompile("Empty scope"),
+		}},
+	})
+}
+
+// An imported type whose configuration leaves out the name keeps its name.
+func TestAccResourceTypeImportKeepsTheName(t *testing.T) {
+	c := apiClient(t)
+	id := os.Getenv(EnvOrg) + "/" + randomID("acc-imported")
+	err := c.Do(context.Background(), http.MethodPost, c.OrgPath("resources", "types"),
+		map[string]any{"id": id, "name": "Imported", "use": "indirect"}, nil)
+	if err != nil {
+		t.Fatalf("creating type %s: %v", id, err)
+	}
+	t.Cleanup(func() { _ = c.DeleteType(context.Background(), id) })
+	// Import with a persisted state needs the provider's source spelled out.
+	config := fmt.Sprintf(`
+terraform {
+  required_providers {
+    openporch = { source = "openporch/openporch" }
+  }
+}
+
+resource "openporch_resource_type" "t" {
+  id  = %q
+  use = "indirect"
+}
+`, id)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       "openporch_resource_type.t",
+				ImportState:        true,
+				ImportStateId:      id,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_resource_type.t", tfjsonpath.New("name"),
+						knownvalue.StringExact("Imported")),
+				},
+			},
+		},
+	})
+}
