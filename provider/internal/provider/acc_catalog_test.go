@@ -782,6 +782,8 @@ resource "openporch_secret_grant" "platform" {
 				ConfigStateChecks: []statecheck.StateCheck{
 					statecheck.ExpectKnownValue("openporch_secret_store.vault", tfjsonpath.New("primary"),
 						knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue("openporch_secret_store.vault", tfjsonpath.New("is_primary"),
+						knownvalue.Bool(false)),
 					statecheck.ExpectKnownValue("openporch_secret_grant.app", tfjsonpath.New("org_wide"),
 						knownvalue.Bool(false)),
 					statecheck.ExpectKnownValue("openporch_secret_grant.platform", tfjsonpath.New("app_id"),

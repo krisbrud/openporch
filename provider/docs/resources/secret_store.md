@@ -33,7 +33,11 @@ resource "openporch_secret_store" "vault" {
 
 ### Optional
 
-- `primary` (Boolean) Whether new `{value}` secrets and drivers' secret outputs are written to this store. Setting it first opens the store with its account, so the change fails while AWS refuses the account's credentials. `false` does not unmark the store: a store stays primary until another store is marked, so switch by setting `primary` on the other store (or marking the built-in store with `PATCH /orgs/{org}/secretstores/openporch`). A store set to `true` that lost the mark is marked again.
+- `primary` (Boolean) Marks the store primary, so new `{value}` secrets and drivers' secret outputs are written to it, when the store is created with `true` or changed to `true`. Marking first opens the store with its account, so it fails while AWS refuses the account's credentials. Only one store is primary: marking another store, here or outside OpenTofu, takes the mark away without this store being marked again, and `is_primary` shows it. `false` never unmarks a store, which stays primary until another one is marked; to switch, set the old store to `false` and the new one to `true` in the same change (or mark the built-in store with `PATCH /orgs/{org}/secretstores/openporch`).
+
+### Read-Only
+
+- `is_primary` (Boolean) Whether the store is the primary store now.
 
 ## Import
 

@@ -36,6 +36,7 @@ type secretStoreModel struct {
 	Region       types.String `tfsdk:"region"`
 	CloudAccount types.String `tfsdk:"cloud_account"`
 	Primary      types.Bool   `tfsdk:"primary"`
+	IsPrimary    types.Bool   `tfsdk:"is_primary"`
 }
 
 var secretStoreTypes = []string{"aws-secrets-manager", "aws-ssm"}
@@ -65,12 +66,16 @@ func (r *secretStore) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				MarkdownDescription: "The cloud account that reads and writes the store."},
 			"primary": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
-				MarkdownDescription: "Whether new `{value}` secrets and drivers' secret outputs are written to " +
-					"this store. Setting it first opens the store with its account, so the change fails while " +
-					"AWS refuses the account's credentials. `false` does not unmark the store: a store stays " +
-					"primary until another store is marked, so switch by setting `primary` on the other store " +
-					"(or marking the built-in store with `PATCH /orgs/{org}/secretstores/openporch`). A store " +
-					"set to `true` that lost the mark is marked again."},
+				MarkdownDescription: "Marks the store primary, so new `{value}` secrets and drivers' secret " +
+					"outputs are written to it, when the store is created with `true` or changed to `true`. " +
+					"Marking first opens the store with its account, so it fails while AWS refuses the " +
+					"account's credentials. Only one store is primary: marking another store, here or outside " +
+					"OpenTofu, takes the mark away without this store being marked again, and `is_primary` " +
+					"shows it. `false` never unmarks a store, which stays primary until another one is marked; " +
+					"to switch, set the old store to `false` and the new one to `true` in the same change (or " +
+					"mark the built-in store with `PATCH /orgs/{org}/secretstores/openporch`)."},
+			"is_primary": schema.BoolAttribute{Computed: true,
+				MarkdownDescription: "Whether the store is the primary store now."},
 		},
 	}
 }
@@ -98,17 +103,19 @@ func (m *secretStoreModel) config() map[string]string {
 	return map[string]string{"region": m.Region.ValueString(), "cloud_account": m.CloudAccount.ValueString()}
 }
 
-// apply records the server's store in m. A store configured as primary records
-// whether it still is; one configured as not primary stays false, since it
-// does not ask to be unmarked.
+// apply records the server's store in m. `primary` is the configured intent and
+// is kept: a store that lost the mark to another one is not marked again, which
+// would undo the switch, and `is_primary` records the mark it has. An import
+// takes `primary` from the server.
 func (m *secretStoreModel) apply(s *client.SecretStore) {
 	m.ID = types.StringValue(s.ID)
 	m.Type = types.StringValue(s.Type)
 	m.Region = types.StringValue(s.Config["region"])
 	m.CloudAccount = types.StringValue(s.Config["cloud_account"])
-	if m.Primary.ValueBool() || m.Primary.IsNull() || m.Primary.IsUnknown() {
+	if m.Primary.IsNull() || m.Primary.IsUnknown() {
 		m.Primary = types.BoolValue(s.Primary)
 	}
+	m.IsPrimary = types.BoolValue(s.Primary)
 }
 
 func (r *secretStore) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -170,9 +177,10 @@ func (r *secretStore) Update(ctx context.Context, req resource.UpdateRequest, re
 	if !plan.Region.Equal(state.Region) || !plan.CloudAccount.Equal(state.CloudAccount) {
 		config = plan.config()
 	}
-	// The server opens the store as configured before it marks it, and changes
-	// nothing if that fails.
-	s, err := r.client.UpdateSecretStore(ctx, plan.ID.ValueString(), config, plan.Primary.ValueBool())
+	// Only a change to `true` marks the store. The server opens the store as
+	// configured before it marks it, and changes nothing if that fails.
+	promote := plan.Primary.ValueBool() && !state.Primary.ValueBool()
+	s, err := r.client.UpdateSecretStore(ctx, plan.ID.ValueString(), config, promote)
 	if err != nil {
 		apiError(&resp.Diagnostics, "updating the secret store", err)
 		return

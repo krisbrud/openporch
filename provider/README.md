@@ -90,12 +90,15 @@ imported as its reference.
 ## Secret stores and grants
 
 `openporch_secret_store` registers an AWS Secrets Manager or SSM Parameter
-Store store with the cloud account that reads and writes it. `primary = true`
-makes it the store new secret values are written to; the server opens the
-store with its account first, so the apply fails while AWS refuses the
-account's credentials. `primary = false` never unmarks a store: switch by
-setting `primary = true` on another store. A store that is primary, or that
-anything still references, cannot be deleted.
+Store store with the cloud account that reads and writes it. Creating it with
+`primary = true`, or changing `primary` to `true`, makes it the store new
+secret values are written to; the server opens the store with its account
+first, so the apply fails while AWS refuses the account's credentials. Only one
+store is primary, and `primary = false` never unmarks one: to switch, set the
+old store to `false` and the new one to `true` in the same change. A store
+that lost the mark to another one is not marked again; `is_primary` shows the
+mark it has now. A store that is primary, or that anything still references,
+cannot be deleted.
 
 `openporch_secret_grant` lets an application, one of its environments or the
 whole organization use one reference it did not write. Grants are checked
