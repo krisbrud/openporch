@@ -30,6 +30,8 @@ It creates, with the [openporch provider](../../provider) and the AWS provider:
 | `dynamodb-table`, `sqs`, `sns-topic`, `s3` | the same | class `default` | `openporch/opentofu`, co-provisioning an `aws-policy` of the same class |
 | `dynamodb-table-policy`, `sqs-policy`, `sns-topic-policy`, `s3-policy` | `aws-policy` | class `dynamodb-table`, `sqs`, `sns-topic`, `s3` | `openporch/opentofu`, the module's `policy/` |
 | `dns` | `dns` | every `dns` | `openporch/echo`: `<app>-<env>.<dns_zone>`, without creating a record |
+| `aws-lambda-vpc-workload` | `workload` | class `aws-lambda-vpc`, with [`database`](#postgresql) | `openporch/opentofu`, [`aws-lambda-workload`](../modules/aws-lambda-workload) in the database subnets |
+| `postgres` | `postgres` | class `default`, with [`database`](#postgresql) | `openporch/opentofu`, [`postgres`](../modules/postgres): an RDS instance |
 
 A workload of class `aws-lambda` that declares a table, queue or bucket gets
 it, a policy for it, and an execution role with that policy attached. The
@@ -144,6 +146,46 @@ being current, which saves storage but makes the deployments that ran it fail
 on replay, before they change anything. Incomplete uploads are removed after 7
 days.
 
+## PostgreSQL
+
+Set `database` to a VPC's ID and private subnets in at least two
+availability zones to offer `postgres`:
+
+```sh
+tofu apply ... -var 'database={vpc_id="vpc-0abc...",subnet_ids=["subnet-0aaa...","subnet-0bbb..."]}'
+```
+
+The platform then creates a DB subnet group, a security group for functions and
+one for databases that accepts PostgreSQL only from the functions' group, and
+gives its role the RDS and network permissions this needs. Each `postgres`
+resource is an RDS for PostgreSQL instance named `<prefix>-<guresid>`, by
+default `db.t4g.micro` with 20 GiB; its `host`, `port` and `name` are outputs,
+its `username` and `password` secret outputs, which reach a function as
+references to SSM SecureString parameters. Deleting one keeps a final
+snapshot.
+
+Only functions in the VPC reach the instances, so a workload that uses
+`postgres` takes `class: aws-lambda-vpc`:
+
+```yaml
+metadata:
+  name: orders-api
+  class: aws-lambda-vpc
+function:
+  variables:
+    DB_HOST: ${resources.db.host}
+    DB_NAME: ${resources.db.name}
+    DB_USER: ${resources.db.username}       # secret: the function gets DB_USER_SECRET_REF
+    DB_PASSWORD: ${resources.db.password}   # secret: the function gets DB_PASSWORD_SECRET_REF
+resources:
+  db:
+    type: postgres
+```
+
+A function in the VPC reaches the internet and AWS APIs, such as its other
+dependencies, only through the VPC's NAT gateway or VPC endpoints, which the VPC
+must provide.
+
 ## Cost
 
 Lambda, DynamoDB on-demand, SQS, EventBridge Scheduler and SSM standard
@@ -159,6 +201,9 @@ costing:
 - Secrets Manager secrets, if a workload asks for them instead of SSM
   parameters;
 - provisioned concurrency, if a workload sets it;
+- RDS instances, storage and snapshots, if `database` is set: an instance is
+  billed for every hour it runs, and final snapshots are kept after a
+  `postgres` resource is deleted;
 - the openporch server itself, and the OpenTofu state if kept in S3.
 
 **Delete every environment before destroying this configuration.** It does not

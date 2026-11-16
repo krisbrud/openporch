@@ -176,6 +176,20 @@ applying=
 left=$(api resources/defs | jq length) || fail "could not list definitions"
 [ "$left" = 0 ] || fail "definitions are left after destroy"
 
+echo "== the database variant plans"
+# The emulator has no RDS, so the variant is planned, not applied.
+db_vars=("${vars[@]}" -var 'database={vpc_id="vpc-0123456789abcdef0",subnet_ids=["subnet-0aaaaaaaaaaaaaaaa","subnet-0bbbbbbbbbbbbbbbb"]}')
+tofu plan -no-color -input=false "${db_vars[@]}" >"$work/db-plan.log" || { cat "$work/db-plan.log" >&2; fail "the database variant does not plan"; }
+for address in 'aws_db_subnet_group.databases[0]' 'aws_security_group.functions[0]' 'aws_vpc_security_group_ingress_rule.databases[0]' \
+  'aws_iam_role_policy.databases[0]' 'openporch_resource_definition.postgres[0]' 'openporch_resource_definition.lambda_vpc[0]'; do
+  grep -qF "# $address will be created" "$work/db-plan.log" || { cat "$work/db-plan.log" >&2; fail "the database variant does not create $address"; }
+done
+
+if tofu plan -no-color -input=false "${db_vars[@]}" -var name_prefix=1a >"$work/db-plan.log" 2>&1; then
+  fail "the database variant plans with a prefix RDS refuses"
+fi
+grep -qF "must start with a letter" "$work/db-plan.log" || { cat "$work/db-plan.log" >&2; fail "the database variant's prefix error"; }
+
 echo "== the aws-identity variant: no external ID, no host identity, no secret"
 vars=(
   -var "credentials=aws-identity"

@@ -17,6 +17,8 @@
 #   `target.lambda.secrets: secretsmanager`) that the function may read, and
 #   the environment has `NAME_SECRET_REF` with its name instead. Secrets
 #   anywhere else in the workload's spec are refused, never dropped.
+# - With `subnet_ids` and `security_group_ids`, the function runs in that VPC,
+#   and its role may manage the network interfaces Lambda creates there.
 # - The execution role attaches the `arn` of every `aws-policy` among the
 #   workload's dependencies, which the definitions of its tables, queues and
 #   buckets co-provision.
@@ -189,6 +191,14 @@ resource "aws_lambda_function" "this" {
     }
   }
 
+  dynamic "vpc_config" {
+    for_each = length(var.subnet_ids) > 0 ? [1] : []
+    content {
+      subnet_ids         = var.subnet_ids
+      security_group_ids = var.security_group_ids
+    }
+  }
+
   logging_config {
     log_format = "Text"
     log_group  = aws_cloudwatch_log_group.this.name
@@ -205,6 +215,10 @@ resource "aws_lambda_function" "this" {
     precondition {
       condition     = local.id != "" && can(regex("^[A-Za-z0-9_-]{1,64}$", local.name))
       error_message = "The function name `${local.name}` must be 1 to 64 letters, digits, `-` and `_`; shorten the application, environment or workload ID."
+    }
+    precondition {
+      condition     = (length(var.subnet_ids) > 0) == (length(var.security_group_ids) > 0)
+      error_message = "Give `subnet_ids` and `security_group_ids` together, or neither."
     }
     precondition {
       condition     = local.is_function != (length(local.containers) > 0)

@@ -83,6 +83,43 @@ resource "openporch_resource_definition_criteria" "lambda" {
   class                  = openporch_resource_class.aws_lambda.id
 }
 
+# With `database`, `class: aws-lambda-vpc` workloads run in its subnets, where
+# they reach `postgres` resources.
+resource "openporch_resource_class" "aws_lambda_vpc" {
+  count         = local.databases ? 1 : 0
+  resource_type = "workload"
+  id            = "aws-lambda-vpc"
+  description   = "A function on AWS Lambda, in the VPC of the platform's databases"
+}
+
+resource "openporch_resource_definition" "lambda_vpc" {
+  count          = local.databases ? 1 : 0
+  id             = "aws-lambda-vpc-workload"
+  name           = "Lambda function in the VPC"
+  type           = "workload"
+  driver_type    = "openporch/opentofu"
+  driver_account = openporch_cloud_account.aws.id
+  driver_inputs = {
+    source = merge(local.module, { path = "examples/modules/aws-lambda-workload" })
+    variables = {
+      app                  = "$${context.app.id}"
+      env                  = "$${context.env.id}"
+      iam_path             = local.iam_path
+      permissions_boundary = aws_iam_policy.boundary.arn
+      subnet_ids           = var.database.subnet_ids
+      security_group_ids   = [aws_security_group.functions[0].id]
+      tags                 = local.tags
+    }
+  }
+  depends_on = [aws_iam_role_policy.databases]
+}
+
+resource "openporch_resource_definition_criteria" "lambda_vpc" {
+  count                  = local.databases ? 1 : 0
+  resource_definition_id = openporch_resource_definition.lambda_vpc[0].id
+  class                  = openporch_resource_class.aws_lambda_vpc[0].id
+}
+
 # Workloads of the default class run nowhere: their resolved document is
 # stored as their outputs, which suits trying a workload out.
 resource "openporch_resource_definition" "workload_none" {
@@ -187,6 +224,35 @@ resource "openporch_resource_definition_criteria" "policy" {
   for_each               = local.dependencies
   resource_definition_id = openporch_resource_definition.policy[each.key].id
   class                  = openporch_resource_class.policy[each.key].id
+}
+
+# --- PostgreSQL -------------------------------------------------------------
+
+# With `database`, a `postgres` resource is its own RDS instance, named
+# `<prefix>-<guresid>`, in the database subnets. Its `username` and `password`
+# are secret outputs, which a workload reads as `$${resources.db.outputs.password}`.
+resource "openporch_resource_definition" "postgres" {
+  count          = local.databases ? 1 : 0
+  id             = "postgres"
+  name           = "PostgreSQL on RDS"
+  type           = "postgres"
+  driver_type    = "openporch/opentofu"
+  driver_account = openporch_cloud_account.aws.id
+  driver_inputs = {
+    source = merge(local.module, { path = "examples/modules/postgres" })
+    variables = {
+      name               = "${var.name_prefix}-$${context.res.guresid}"
+      subnet_group       = aws_db_subnet_group.databases[0].name
+      security_group_ids = [aws_security_group.databases[0].id]
+      tags               = local.tags
+    }
+  }
+  depends_on = [aws_iam_role_policy.databases]
+}
+
+resource "openporch_resource_definition_criteria" "postgres" {
+  count                  = local.databases ? 1 : 0
+  resource_definition_id = openporch_resource_definition.postgres[0].id
 }
 
 # --- DNS --------------------------------------------------------------------
