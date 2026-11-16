@@ -219,6 +219,26 @@ pub enum StartupError {
     Io(String),
 }
 
+/// Refuses a configuration file provider whose ID a provider managed through the
+/// API already uses, which would hide the stored one from logins and the API.
+async fn check_login_provider_ids(
+    config: &Config,
+    store: &SqliteStore,
+) -> Result<(), StartupError> {
+    use openporch_store::LoginProviderStore;
+    for record in store.login_providers(&config.org).await? {
+        if config.oidc_login.iter().any(|c| c.id == record.id) {
+            return Err(StartupError::Io(format!(
+                "oidc_login provider `{0}` is also managed through the API; remove it from the \
+                 configuration file, or delete it with DELETE /orgs/{1}/identity-providers/{0} \
+                 before adding it there",
+                record.id, config.org
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Writes `contents` to a new owner-only file. Never follows or replaces an existing
 /// file or symlink.
 fn write_private(path: &Path, contents: &str) -> Result<(), StartupError> {
@@ -318,6 +338,7 @@ pub(crate) async fn start_with_drivers(
         .map_err(StartupError::Io)?;
     let ownership = Ownership::acquire(&config.data_dir)?;
     let store = SqliteStore::open(ownership, &config.org).await?;
+    check_login_provider_ids(&config, &store).await?;
     let keyring = load_keyring(&config, &store, env_key).await?.map(Arc::new);
 
     let mut not_ready = Vec::new();

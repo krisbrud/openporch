@@ -1079,3 +1079,42 @@ async fn providers_of_the_configuration_file_are_listed_and_cannot_be_changed() 
         .await;
     assert_error(status, &b, StatusCode::CONFLICT, "API-004");
 }
+
+#[tokio::test]
+async fn a_configuration_file_provider_may_not_reuse_an_api_providers_id() {
+    let idp = Issuer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new("acme", dir.path());
+    let s = server_with(dir, config).await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/identity-providers",
+            &s.admin,
+            api_provider(&idp, Value::Null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let Server {
+        dir, state, router, ..
+    } = s;
+    drop((state, router));
+
+    // Adding the same ID to the configuration file is refused at startup.
+    let secret = dir.path().join("oidc-secret");
+    std::fs::write(&secret, format!("{CLIENT_SECRET}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut config = Config::new("acme", dir.path());
+    config.oidc_login = vec![idp.config(&secret)];
+    let Err(err) = crate::state::start(config, None).await else {
+        panic!("startup accepted a configured ID an API provider uses");
+    };
+    assert!(
+        err.to_string()
+            .contains("`corp` is also managed through the API"),
+        "{err}"
+    );
+}
