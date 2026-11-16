@@ -23,12 +23,8 @@ use crate::oidc_login::OidcLogin;
 use crate::rate_limit::ClientAddr;
 use crate::state::AppState;
 
-fn provider(state: &AppState, id: &str) -> ApiResult<Arc<OidcLogin>> {
-    state.oidc_logins.get(id).cloned().ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no OpenID Connect provider `{id}` is configured on this server"
-        ))
-    })
+async fn provider(state: &AppState, id: &str) -> ApiResult<Arc<OidcLogin>> {
+    crate::login_providers::provider(state, id).await
 }
 
 /// The cookie that binds a login to the browser that started it. Its name
@@ -89,7 +85,7 @@ pub async fn authorize(
     QueryParams(query): QueryParams<Authorize>,
 ) -> ApiResult<Response> {
     state.login_limit.check(&addr)?;
-    let provider = provider(&state, &id)?;
+    let provider = provider(&state, &id).await?;
     let config = provider.config();
     let return_to = match query.return_to.as_deref() {
         Some(url) if config.loopback_return && is_loopback_return(url) => url.to_owned(),
@@ -139,7 +135,7 @@ pub async fn callback(
     QueryParams(query): QueryParams<Callback>,
 ) -> ApiResult<Response> {
     state.login_limit.check(&addr)?;
-    let provider = provider(&state, &id)?;
+    let provider = provider(&state, &id).await?;
     let now = openporch_store::now_ms();
     let login_state = query.state.as_deref().unwrap_or_default();
     let resumed = state
@@ -222,7 +218,7 @@ pub async fn exchange(
     JsonBody(body): JsonBody<Exchange>,
 ) -> ApiResult<Json<Session>> {
     state.login_limit.check(&addr)?;
-    provider(&state, &id)?;
+    provider(&state, &id).await?;
     let identity = state
         .browser_logins
         .exchange(&id, &body.login_code, openporch_store::now_ms())

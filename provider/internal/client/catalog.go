@@ -358,3 +358,59 @@ func (c *Client) Grant(ctx context.Context, store, id string) (*Grant, error) {
 func (c *Client) DeleteGrant(ctx context.Context, store, id string) error {
 	return c.Do(ctx, http.MethodDelete, c.OrgPath("secretstores", store, "grants", id), nil, nil)
 }
+
+// IdentityProvider is an OpenID Connect provider people sign in with.
+type IdentityProvider struct {
+	ID             string     `json:"id"`
+	Source         string     `json:"source"`
+	Issuer         string     `json:"issuer"`
+	ClientID       string     `json:"client_id"`
+	CallbackURL    string     `json:"callback_url"`
+	ReturnURLs     []string   `json:"return_urls"`
+	LoopbackReturn bool       `json:"loopback_return"`
+	Scopes         []string   `json:"scopes"`
+	Algorithms     []string   `json:"algorithms"`
+	ClientSecret   *SecretRef `json:"client_secret,omitempty"`
+	Confidential   bool       `json:"confidential"`
+}
+
+// IdentityProviderWrite is the body that creates or replaces an identity
+// provider. Scopes and algorithms left out take the server's defaults.
+type IdentityProviderWrite struct {
+	ID             string       `json:"id,omitempty"`
+	Issuer         string       `json:"issuer"`
+	ClientID       string       `json:"client_id"`
+	ClientSecret   *SecretWrite `json:"client_secret,omitempty"`
+	CallbackURL    string       `json:"callback_url"`
+	ReturnURLs     []string     `json:"return_urls"`
+	LoopbackReturn bool         `json:"loopback_return"`
+	Scopes         []string     `json:"scopes,omitempty"`
+	Algorithms     []string     `json:"algorithms,omitempty"`
+}
+
+// CreateIdentityProvider creates an identity provider.
+func (c *Client) CreateIdentityProvider(ctx context.Context, body IdentityProviderWrite) (*IdentityProvider, error) {
+	var p IdentityProvider
+	err := c.Do(ctx, http.MethodPost, c.OrgPath("identity-providers"), body, &p)
+	return &p, err
+}
+
+// ReplaceIdentityProvider replaces an identity provider's settings.
+func (c *Client) ReplaceIdentityProvider(ctx context.Context, id string, body IdentityProviderWrite) (*IdentityProvider, error) {
+	var p IdentityProvider
+	body.ID = ""
+	err := c.Do(ctx, http.MethodPut, c.OrgPath("identity-providers", id), body, &p)
+	return &p, err
+}
+
+// IdentityProvider reads an identity provider.
+func (c *Client) IdentityProvider(ctx context.Context, id string) (*IdentityProvider, error) {
+	var p IdentityProvider
+	err := c.Do(ctx, http.MethodGet, c.OrgPath("identity-providers", id), nil, &p)
+	return &p, err
+}
+
+// DeleteIdentityProvider deletes an identity provider.
+func (c *Client) DeleteIdentityProvider(ctx context.Context, id string) error {
+	return c.Do(ctx, http.MethodDelete, c.OrgPath("identity-providers", id), nil, nil)
+}

@@ -29,6 +29,7 @@ in `examples/`. It offers these resources, each importable, and the
 | `openporch_resource_type` (custom types) | `ORG/NAME` |
 | `openporch_secret_store` (AWS Secrets Manager and SSM) | `STORE` |
 | `openporch_secret_grant` (secret-use grants) | `STORE/GRANT_ID` |
+| `openporch_identity_provider` (OpenID Connect sign-in) | `PROVIDER` |
 
 A name left out of the configuration defaults to the ID when the object is
 created; an imported object keeps the name it has. `destroy_acknowledgements`
@@ -104,6 +105,15 @@ cannot be deleted.
 whole organization use one reference it did not write. Grants are checked
 right before a deployment reads a secret, so destroying a grant blocks later
 deployments, and replays, that need it.
+
+## Identity providers
+
+`openporch_identity_provider` adds an OpenID Connect provider people sign in
+with at `/auth/oidc/<id>/authorize`, like one under `[[oidc_login]]` in the
+server's configuration file, whose IDs it cannot use. Changes apply to the next
+login without a restart. Its `client_secret` is written to the built-in store
+like other secrets; left out, the provider is a public client. Deleting it
+stops sign-ins through it, and members keep their `<issuer>:<sub>` identity.
 
 ## Protecting the state
 

@@ -123,41 +123,39 @@ impl OidcLoginConfig {
                 "`oidc_login.id` `{id}` must be a lowercase ID other than `github`"
             )));
         }
-        let name = |field: &str| format!("oidc_login.{id}.{field}");
-        let issuer =
-            crate::identity::check_url(&name("issuer"), &self.issuer).map_err(ConfigError)?;
+        self.check(&|field| format!("oidc_login.{id}.{field}"))
+            .map_err(ConfigError)
+    }
+
+    /// Checks the settings other than the ID; `name` names a field in errors.
+    pub(crate) fn check(&self, name: &dyn Fn(&str) -> String) -> Result<(), String> {
+        let id = &self.id;
+        let issuer = crate::identity::check_url(&name("issuer"), &self.issuer)?;
         if issuer.query().is_some() {
-            return Err(ConfigError(format!(
-                "`{}` must not have a query",
-                name("issuer")
-            )));
+            return Err(format!("`{}` must not have a query", name("issuer")));
         }
         if self.client_id.trim().is_empty() {
-            return Err(ConfigError(format!("`{}` is empty", name("client_id"))));
+            return Err(format!("`{}` is empty", name("client_id")));
         }
-        let callback = crate::identity::check_url(&name("callback_url"), &self.callback_url)
-            .map_err(ConfigError)?;
+        let callback = crate::identity::check_url(&name("callback_url"), &self.callback_url)?;
         let path = oidc_callback_path(id);
         if callback.path() != path || callback.query().is_some() {
-            return Err(ConfigError(format!(
+            return Err(format!(
                 "`{}` must be this server's `{path}`, with no query",
                 name("callback_url")
-            )));
+            ));
         }
         if self.return_urls.is_empty() && !self.loopback_return {
-            return Err(ConfigError(format!(
+            return Err(format!(
                 "`{}` needs at least one page to return to, or `loopback_return = true`",
                 name("return_urls")
-            )));
+            ));
         }
         for url in &self.return_urls {
-            crate::identity::check_url(&name("return_urls"), url).map_err(ConfigError)?;
+            crate::identity::check_url(&name("return_urls"), url)?;
         }
         if !self.scopes.iter().any(|s| s == "openid") {
-            return Err(ConfigError(format!(
-                "`{}` must include `openid`",
-                name("scopes")
-            )));
+            return Err(format!("`{}` must include `openid`", name("scopes")));
         }
         if let Some(scope) = self.scopes.iter().find(|s| {
             s.is_empty()
@@ -165,24 +163,24 @@ impl OidcLoginConfig {
                     .bytes()
                     .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
         }) {
-            return Err(ConfigError(format!(
+            return Err(format!(
                 "`{}` has an invalid scope `{scope}`",
                 name("scopes")
-            )));
+            ));
         }
         if self.algorithms.is_empty() {
-            return Err(ConfigError(format!("`{}` is empty", name("algorithms"))));
+            return Err(format!("`{}` is empty", name("algorithms")));
         }
         if let Some(alg) = self
             .algorithms
             .iter()
             .find(|a| !crate::oidc_login::ALGORITHMS.contains(&a.as_str()))
         {
-            return Err(ConfigError(format!(
+            return Err(format!(
                 "`{}` names `{alg}`; supported are {}",
                 name("algorithms"),
                 crate::oidc_login::ALGORITHMS.join(", ")
-            )));
+            ));
         }
         Ok(())
     }

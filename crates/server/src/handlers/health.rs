@@ -56,9 +56,23 @@ pub async fn version(State(state): State<AppState>) -> Json<serde_json::Value> {
                 }
                 json!({"id": "github", "flows": flows})
             })
-            .chain(state.config.oidc_login.iter().map(
-                |o| json!({"id": o.id, "type": "oidc", "issuer": o.issuer, "flows": ["browser"]}),
-            ))
+            .chain(
+                crate::login_providers::all(&state)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = ?e, "could not list the identity providers");
+                        state
+                            .config
+                            .oidc_login
+                            .iter()
+                            .map(crate::login_providers::View::config)
+                            .collect()
+                    })
+                    .into_iter()
+                    .map(|o| {
+                        json!({"id": o.id, "type": "oidc", "issuer": o.settings.issuer, "flows": ["browser"]})
+                    }),
+            )
             .collect();
     Json(json!({
         "version": crate::VERSION,

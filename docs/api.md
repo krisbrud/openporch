@@ -237,6 +237,104 @@ Authorization: Bearer $ADMIN_TOKEN
 `DELETE /orgs/{org}/sessions/current` ends the session that makes the request.
 Tokens are revoked through the token routes instead.
 
+## Identity providers
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/orgs/{org}/identity-providers` | org read |
+| POST | `/orgs/{org}/identity-providers` | administer |
+| GET | `/orgs/{org}/identity-providers/{provider}` | org read |
+| PUT | `/orgs/{org}/identity-providers/{provider}` | administer |
+| DELETE | `/orgs/{org}/identity-providers/{provider}` | administer |
+
+OpenID Connect providers can also be managed through the API, with the same
+settings and checks as `[[oidc_login]]` and the same login routes. The list
+holds the configuration file's providers too, as `"source": "config"`; they
+cannot be changed here, and their IDs cannot be taken (`409`). `github` is not
+an allowed ID. A change applies to the next login; logins already started finish
+with the settings they find at the callback. `/version` lists these providers
+like the configuration file's.
+
+The client secret is given as `client_secret: {"value": "…"}` and written to the
+built-in store as `identity-providers/<id>/client_secret`; the server returns
+only its reference and `confidential: true`. Without a `client_secret` the
+provider is a public client, which PKCE alone protects. `PUT` replaces every
+setting: to keep the secret, send the reference the provider holds now; a
+reference to any other secret is refused (`400`), so a provider can never send
+another object's secret to an issuer. Deleting a provider stops sign-ins
+through it; members keep their `<issuer>:<sub>` identity, so a provider created
+again with the same issuer signs them in again.
+
+```http
+POST /orgs/acme/identity-providers
+Authorization: Bearer $ADMIN_TOKEN
+
+{
+  "id": "corp",
+  "issuer": "https://id.example.com",
+  "client_id": "openporch",
+  "client_secret": {"value": "s3cr3t"},
+  "callback_url": "https://openporch.example.com/auth/oidc/corp/callback",
+  "return_urls": ["https://portal.example.com/login/done"],
+  "loopback_return": true
+}
+```
+
+```http-response
+201 Created
+
+{
+  "id": "corp",
+  "source": "api",
+  "issuer": "https://id.example.com",
+  "client_id": "openporch",
+  "scopes": ["openid", "email", "profile"],
+  "algorithms": ["RS256"],
+  "client_secret": {"store": "openporch", "ref": "identity-providers/corp/client_secret", "version": "1"},
+  "confidential": true
+}
+```
+
+```http
+PUT /orgs/acme/identity-providers/corp
+Authorization: Bearer $ADMIN_TOKEN
+
+{
+  "issuer": "https://id.example.com",
+  "client_id": "openporch",
+  "client_secret": {"store": "openporch", "ref": "identity-providers/corp/client_secret", "version": "1"},
+  "callback_url": "https://openporch.example.com/auth/oidc/corp/callback",
+  "return_urls": ["https://portal.example.com/login/done"],
+  "scopes": ["openid", "email"]
+}
+```
+
+```http-response
+200 OK
+
+{"id": "corp", "scopes": ["openid", "email"], "loopback_return": false, "confidential": true}
+```
+
+```http
+GET /orgs/acme/identity-providers
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+200 OK
+
+[{"id": "corp", "source": "api"}]
+```
+
+```http
+DELETE /orgs/acme/identity-providers/corp
+Authorization: Bearer $ADMIN_TOKEN
+```
+
+```http-response
+204 No Content
+```
+
 ## Members
 
 | Method | Path | Permission |

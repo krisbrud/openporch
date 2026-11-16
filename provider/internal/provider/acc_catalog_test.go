@@ -753,6 +753,14 @@ resource "openporch_secret_store" "vault" {
   %s
 }
 
+# An SSM Parameter Store store beside it.
+resource "openporch_secret_store" "params" {
+  id            = "${openporch_application.app.id}-ssm"
+  type          = "aws-ssm"
+  region        = "eu-north-1"
+  cloud_account = openporch_cloud_account.aws.id
+}
+
 resource "openporch_secret_grant" "app" {
   store  = openporch_secret_store.vault.id
   ref    = "shop/stripe-key"
@@ -771,8 +779,10 @@ resource "openporch_secret_grant" "platform" {
 		PreCheck:                 func() { preCheck(t) },
 		ProtoV6ProviderFactories: providers,
 		CheckDestroy: func(*terraform.State) error {
-			if _, err := c.SecretStore(context.Background(), store); !client.IsNotFound(err) {
-				return fmt.Errorf("secret store %s still exists: %v", store, err)
+			for _, id := range []string{store, app + "-ssm"} {
+				if _, err := c.SecretStore(context.Background(), id); !client.IsNotFound(err) {
+					return fmt.Errorf("secret store %s still exists: %v", id, err)
+				}
 			}
 			return nil
 		},
@@ -784,6 +794,8 @@ resource "openporch_secret_grant" "platform" {
 						knownvalue.Bool(false)),
 					statecheck.ExpectKnownValue("openporch_secret_store.vault", tfjsonpath.New("is_primary"),
 						knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue("openporch_secret_store.params", tfjsonpath.New("type"),
+						knownvalue.StringExact("aws-ssm")),
 					statecheck.ExpectKnownValue("openporch_secret_grant.app", tfjsonpath.New("org_wide"),
 						knownvalue.Bool(false)),
 					statecheck.ExpectKnownValue("openporch_secret_grant.platform", tfjsonpath.New("app_id"),

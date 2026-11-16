@@ -48,8 +48,11 @@ pub struct Inner {
     pub not_ready: Vec<String>,
     /// The GitHub identity provider, when configured.
     pub github: Option<Arc<dyn IdentityProvider>>,
-    /// The OpenID Connect login providers, by ID.
+    /// The OpenID Connect login providers of the configuration file, by ID.
     pub oidc_logins: std::collections::HashMap<String, Arc<crate::oidc_login::OidcLogin>>,
+    /// Login providers managed through the API, built from their rows and kept
+    /// with the row version they were built from.
+    pub api_logins: crate::login_providers::ProviderCache,
     /// Resolves cloud accounts into credentials.
     pub cloud: Arc<CredentialResolver>,
     /// Browser logins in progress.
@@ -390,6 +393,7 @@ pub(crate) async fn start_with_drivers(
         not_ready,
         github,
         oidc_logins,
+        api_logins: Default::default(),
         cloud: Arc::new(cloud),
         browser_logins: Default::default(),
         login_limit,

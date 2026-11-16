@@ -278,9 +278,9 @@ none is open.
 | Scenario | Status | Verified by |
 |---|---|---|
 | Configure from environment | covered | `provider/internal/provider/provider_test.go::TestConfigureFromEnvironment`, `provider/scripts/smoke.sh` |
-| Secret store | deferred | `openporch_secret_store` is task 13.3 (the `aws-ssm` adapter exists since 13.2) |
+| Secret store | covered | `provider/internal/provider/acc_catalog_test.go::TestAccSecretStore` (an `aws-ssm` store beside an `aws-secrets-manager` one; every step ends with a no-op plan) |
 | Definition with criteria | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
-| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment`, `provider/internal/provider/acc_catalog_test.go::TestAccResourceType`, `provider/internal/provider/acc_catalog_test.go::TestAccSecretStore` (custom types, secret stores and grants) |
+| Import | covered | `provider/internal/provider/acc_test.go::TestAccImportKeepsTheName`, `provider/internal/provider/acc_test.go::TestAccApplicationAndEnvironment`, `provider/internal/provider/acc_catalog_test.go::TestAccResourceType`, `provider/internal/provider/acc_catalog_test.go::TestAccSecretStore`, `provider/internal/provider/acc_login_test.go::TestAccIdentityProvider` (custom types, secret stores, grants and identity providers) |
 | Placeholder escaping | covered | `provider/internal/provider/acc_definition_test.go::TestAccResourceDefinitionWithCriteria` |
 | Secret value changed | covered | `provider/internal/provider/acc_catalog_test.go::TestAccValue` |
 | Service user token | covered | `provider/internal/provider/acc_identity_test.go::TestAccServiceUserTokenAndRoles` |
@@ -434,4 +434,4 @@ none is open.
 
 ## Totals
 
-274 scenarios: 243 covered, 10 manual, 21 deferred, 0 gaps.
+274 scenarios: 244 covered, 10 manual, 20 deferred, 0 gaps.
