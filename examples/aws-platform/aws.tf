@@ -154,6 +154,11 @@ data "aws_iam_policy_document" "openporch" {
     resources = ["${local.arn}:sqs:*:${local.account}:*"]
   }
   statement {
+    sid       = "Topics"
+    actions   = ["sns:*"]
+    resources = ["${local.arn}:sns:*:${local.account}:*"]
+  }
+  statement {
     # Workloads' buckets are named `<prefix>-<guresid>`, 32 hex digits, which
     # the artifact bucket's name does not match.
     sid       = "Buckets"
@@ -232,7 +237,7 @@ data "aws_iam_policy_document" "boundary" {
   statement {
     sid = "Data"
     actions = [
-      "dynamodb:*", "sqs:*", "s3:*", "logs:CreateLogStream", "logs:PutLogEvents", "lambda:InvokeFunction",
+      "dynamodb:*", "sqs:*", "sns:*", "s3:*", "logs:CreateLogStream", "logs:PutLogEvents", "lambda:InvokeFunction",
       "ssm:GetParameter", "ssm:GetParameters", "secretsmanager:GetSecretValue", "kms:Decrypt",
       "xray:PutTraceSegments", "xray:PutTelemetryRecords",
     ]

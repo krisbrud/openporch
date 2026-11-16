@@ -27,8 +27,8 @@ It creates, with the [openporch provider](../../provider) and the AWS provider:
 | `base-env` | `base-env` | every environment | `openporch/none` |
 | `aws-lambda-workload` | `workload` | class `aws-lambda` | `openporch/opentofu`, [`aws-lambda-workload`](../modules/aws-lambda-workload) |
 | `workload-none` | `workload` | class `default` | `openporch/none`: stores the resolved workload, runs nothing |
-| `dynamodb-table`, `sqs`, `s3` | the same | class `default` | `openporch/opentofu`, co-provisioning an `aws-policy` of the same class |
-| `dynamodb-table-policy`, `sqs-policy`, `s3-policy` | `aws-policy` | class `dynamodb-table`, `sqs`, `s3` | `openporch/opentofu`, the module's `policy/` |
+| `dynamodb-table`, `sqs`, `sns-topic`, `s3` | the same | class `default` | `openporch/opentofu`, co-provisioning an `aws-policy` of the same class |
+| `dynamodb-table-policy`, `sqs-policy`, `sns-topic-policy`, `s3-policy` | `aws-policy` | class `dynamodb-table`, `sqs`, `sns-topic`, `s3` | `openporch/opentofu`, the module's `policy/` |
 | `dns` | `dns` | every `dns` | `openporch/echo`: `<app>-<env>.<dns_zone>`, without creating a record |
 
 A workload of class `aws-lambda` that declares a table, queue or bucket gets

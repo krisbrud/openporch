@@ -102,7 +102,7 @@ resource "openporch_resource_definition_criteria" "workload_none" {
 # type, after the resource exists; the workloads that use it wait for the
 # policy, whose ARN their execution role attaches.
 resource "openporch_resource_class" "policy" {
-  for_each      = toset(["dynamodb-table", "sqs", "s3"])
+  for_each      = toset(["dynamodb-table", "sqs", "sns-topic", "s3"])
   resource_type = "aws-policy"
   id            = each.key
   description   = "Access to a ${each.key} resource"
@@ -124,6 +124,12 @@ locals {
       # Queue names take no dots, and the readable name may be too long.
       resource_name = "${var.name_prefix}-$${context.res.guresid}"
       policy_arn    = { queue_arn = "$${resources.sqs.default.outputs.arn}" }
+    }
+    sns-topic = {
+      name          = "SNS topic"
+      module        = "examples/modules/sns-topic"
+      resource_name = "${var.name_prefix}-$${context.res.guresid}"
+      policy_arn    = { topic_arn = "$${resources.sns-topic.default.outputs.arn}" }
     }
     s3 = {
       name   = "S3 bucket"
