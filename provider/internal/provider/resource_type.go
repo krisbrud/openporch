@@ -69,7 +69,8 @@ func (r *resourceType) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				MarkdownDescription: "The type ID, `<org>/<name>`. Changing it replaces the type."},
 			"name": schema.StringAttribute{Optional: true, Computed: true,
-				MarkdownDescription: "The display name. Defaults to the ID."},
+				MarkdownDescription: "The display name. Left out, a new type is named after its ID, and an " +
+					"existing or imported one keeps the name it has."},
 			"use": schema.StringAttribute{Required: true,
 				MarkdownDescription: "How the type is used: `direct` (workloads request it), `indirect` (only " +
 					"other resources reference it) or `implicit` (one per environment)."},
@@ -105,7 +106,9 @@ func (r *resourceType) ValidateConfig(ctx context.Context, req resource.Validate
 		"`use` is one of `direct`, `indirect` and `implicit`.")
 }
 
-// ModifyPlan plans the server's default name, the ID, when none is configured.
+// ModifyPlan plans the name when none is configured: the server's default, the
+// ID, for a new type, and the name it has for an existing or imported one, which
+// keeps its name like other objects.
 func (r *resourceType) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return
@@ -116,7 +119,19 @@ func (r *resourceType) ModifyPlan(ctx context.Context, req resource.ModifyPlanRe
 	if resp.Diagnostics.HasError() || !config.Name.IsNull() {
 		return
 	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("name"), plan.ID)...)
+	name := plan.ID
+	if !req.State.Raw.IsNull() {
+		var state resourceTypeModel
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		// A changed ID replaces the type, so the new one is created.
+		if state.ID.Equal(plan.ID) && !state.Name.IsNull() {
+			name = state.Name
+		}
+	}
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("name"), name)...)
 }
 
 func (m *resourceTypeModel) body(ctx context.Context) (client.ResourceTypeWrite, diag.Diagnostics) {

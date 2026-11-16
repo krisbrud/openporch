@@ -43,7 +43,7 @@ resource "openporch_resource_type" "feature_flags" {
 
 - `category` (String) A grouping for display, such as `datastore`.
 - `inputs_schema` (Dynamic) JSON Schema of the resource inputs (a workload's `params`), an object. Left out, any object is accepted.
-- `name` (String) The display name. Defaults to the ID.
+- `name` (String) The display name. Left out, a new type is named after its ID, and an existing or imported one keeps the name it has.
 - `outputs_schema` (Dynamic) JSON Schema of the outputs: an object whose `properties` are the `values` and `secrets` schemas. Drivers' outputs are checked against it. Left out, any values and secrets are accepted.
 
 ## Import

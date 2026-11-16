@@ -669,7 +669,8 @@ resource "openporch_resource_definition" "flags" {
 				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
 			},
 			{
-				// Removing the name and inputs schema returns them to the defaults.
+				// Removing the inputs schema returns it to the default; the name
+				// left out keeps the name the type has.
 				Config:           config("", ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
 				Check: func(*terraform.State) error {
@@ -677,7 +678,7 @@ resource "openporch_resource_definition" "flags" {
 					if err != nil {
 						return err
 					}
-					if ty.Name != id || ty.InputsSchema["properties"] != nil {
+					if ty.Name != "Feature flags" || ty.InputsSchema["properties"] != nil {
 						return fmt.Errorf("unexpected type %+v", ty)
 					}
 					return nil
@@ -901,5 +902,55 @@ resource "openporch_secret_grant" "g" {
 `,
 			ExpectError: regexp.MustCompile("Empty scope"),
 		}},
+	})
+}
+
+// An imported type whose configuration leaves out the name keeps its name.
+func TestAccResourceTypeImportKeepsTheName(t *testing.T) {
+	c := apiClient(t)
+	id := os.Getenv(EnvOrg) + "/" + randomID("acc-imported")
+	err := c.Do(context.Background(), http.MethodPost, c.OrgPath("resources", "types"),
+		map[string]any{"id": id, "name": "Imported", "use": "indirect"}, nil)
+	if err != nil {
+		t.Fatalf("creating type %s: %v", id, err)
+	}
+	t.Cleanup(func() { _ = c.DeleteType(context.Background(), id) })
+	// Import with a persisted state needs the provider's source spelled out.
+	config := fmt.Sprintf(`
+terraform {
+  required_providers {
+    openporch = { source = "openporch/openporch" }
+  }
+}
+
+resource "openporch_resource_type" "t" {
+  id  = %q
+  use = "indirect"
+}
+`, id)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: providers,
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       "openporch_resource_type.t",
+				ImportState:        true,
+				ImportStateId:      id,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_resource_type.t", tfjsonpath.New("name"),
+						knownvalue.StringExact("Imported")),
+				},
+			},
+		},
 	})
 }
