@@ -13,15 +13,17 @@ execution role attaches.
 | `dynamodb-table/policy` | `aws-policy` | `arn` | |
 | `sqs` | `sqs` | `arn`, `url`, `region` | `fifo`, `visibilityTimeout`, `messageRetention`, `maxReceiveCount` |
 | `sqs/policy` | `aws-policy` | `arn` | |
+| `sns-topic` | `sns-topic` | `arn`, `name`, `region` | `fifo`, `contentBasedDeduplication`, `kmsKey` |
+| `sns-topic/policy` | `aws-policy` | `arn` | |
 | `s3` | `s3` | `bucket`, `region`, `arn` | `versioning`, `expireAfterDays` |
 | `s3/policy` | `aws-policy` | `arn` | |
 | `aws-lambda-workload` | `workload` | `function_name`, `function_arn`, `role_arn`, `region`, `url` with an `http` trigger | the workload document |
 
 Each module's header describes its params. The resource modules take the
 resource's name as the variable `name`; the policy modules take `name` and the
-resource's ARN (`table_arn`, `queue_arn` or `bucket_arn`), and `read_only` for
+resource's ARN (`table_arn`, `queue_arn`, `topic_arn` or `bucket_arn`), and `read_only` for
 tables and buckets or `access` (`send`, `consume` or `send-and-consume`) for
-queues. The table policy also reads the table's stream. Every module also takes `tags`, the policy modules `iam_path`, and
+queues and (`publish`, `subscribe` or `publish-and-subscribe`) for topics. The table policy also reads the table's stream. Every module also takes `tags`, the policy modules `iam_path`, and
 `aws-lambda-workload` `iam_path` and `permissions_boundary` for its roles, so a
 platform's role can be limited to the IAM objects openporch creates. The modules use the
 `hashicorp/aws` provider 6.x (6.28 or later for `aws-lambda-workload`) with the credentials the driver exports for the

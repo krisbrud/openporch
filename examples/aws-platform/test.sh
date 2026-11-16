@@ -118,6 +118,8 @@ expected='[
   {"id":"dynamodb-table-policy","type":"aws-policy","driver_type":"openporch/opentofu","driver_account":"aws"},
   {"id":"s3","type":"s3","driver_type":"openporch/opentofu","driver_account":"aws"},
   {"id":"s3-policy","type":"aws-policy","driver_type":"openporch/opentofu","driver_account":"aws"},
+  {"id":"sns-topic","type":"sns-topic","driver_type":"openporch/opentofu","driver_account":"aws"},
+  {"id":"sns-topic-policy","type":"aws-policy","driver_type":"openporch/opentofu","driver_account":"aws"},
   {"id":"sqs","type":"sqs","driver_type":"openporch/opentofu","driver_account":"aws"},
   {"id":"sqs-policy","type":"aws-policy","driver_type":"openporch/opentofu","driver_account":"aws"},
   {"id":"workload-none","type":"workload","driver_type":"openporch/none","driver_account":null}
@@ -133,13 +135,13 @@ jq -e 'any(.[]; .id == "production")' <<<"$env_types" >/dev/null || fail "no pro
 account=$(api resources/accounts/aws) || fail "could not read the cloud account"
 [ "$(jq -r .type <<<"$account")" = aws-role ] || fail "the cloud account is not a role: $account"
 
-echo "== a Lambda workload with a table, a queue and a bucket plans"
+echo "== a Lambda workload with a table, a queue, a topic and a bucket plans"
 post apps '{"id": "shop"}' >/dev/null || fail "could not create the application"
 delta=$(post apps/shop/deltas '{"modules": {"add": {"order-worker": {
   "class": "aws-lambda",
   "spec": {"function": {"package": {"type": "zip", "runtime": "python3.12", "handler": "app.handler",
     "artifact": "s3://artifacts/order-worker.zip?versionId=v1"}}},
-  "externals": {"orders": {"type": "dynamodb-table"}, "inbox": {"type": "sqs"},
+  "externals": {"orders": {"type": "dynamodb-table"}, "inbox": {"type": "sqs"}, "events": {"type": "sns-topic"},
     "files": {"type": "s3"}, "dns": {"type": "dns"}}
 }}}}' | jq -r .id) || fail "could not create the delta"
 generation=$(api apps/shop/envs/development | jq .generation) || fail "could not read the environment"
@@ -149,11 +151,13 @@ matched=$(jq -c '[.resources[] | [.descriptor, .definition]] | sort' <<<"$plan")
 expected='[
   ["aws-policy.dynamodb-table#modules.order-worker.externals.orders","dynamodb-table-policy"],
   ["aws-policy.s3#modules.order-worker.externals.files","s3-policy"],
+  ["aws-policy.sns-topic#modules.order-worker.externals.events","sns-topic-policy"],
   ["aws-policy.sqs#modules.order-worker.externals.inbox","sqs-policy"],
   ["base-env.default#base-env","base-env"],
   ["dns.default#modules.order-worker.externals.dns","dns"],
   ["dynamodb-table.default#modules.order-worker.externals.orders","dynamodb-table"],
   ["s3.default#modules.order-worker.externals.files","s3"],
+  ["sns-topic.default#modules.order-worker.externals.events","sns-topic"],
   ["sqs.default#modules.order-worker.externals.inbox","sqs"],
   ["workload.aws-lambda#modules.order-worker","aws-lambda-workload"]
 ]'
