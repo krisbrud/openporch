@@ -18,6 +18,13 @@ resource "aws_db_subnet_group" "databases" {
   name        = "${var.name_prefix}-databases"
   description = "Where openporch's postgres resources run"
   subnet_ids  = var.database.subnet_ids
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("^[a-z]([a-z0-9]|-[a-z0-9])*$", var.name_prefix))
+      error_message = "With `database`, `name_prefix` must start with a letter and have no `-` at its end or twice in a row, since RDS instances are named `<prefix>-<guresid>`."
+    }
+  }
 }
 
 # The functions' group: outbound only.

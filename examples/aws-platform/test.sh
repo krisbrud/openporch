@@ -185,6 +185,11 @@ for address in 'aws_db_subnet_group.databases[0]' 'aws_security_group.functions[
   grep -qF "# $address will be created" "$work/db-plan.log" || { cat "$work/db-plan.log" >&2; fail "the database variant does not create $address"; }
 done
 
+if tofu plan -no-color -input=false "${db_vars[@]}" -var name_prefix=1a >"$work/db-plan.log" 2>&1; then
+  fail "the database variant plans with a prefix RDS refuses"
+fi
+grep -qF "must start with a letter" "$work/db-plan.log" || { cat "$work/db-plan.log" >&2; fail "the database variant's prefix error"; }
+
 echo "== the aws-identity variant: no external ID, no host identity, no secret"
 vars=(
   -var "credentials=aws-identity"
