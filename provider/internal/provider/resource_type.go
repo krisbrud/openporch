@@ -127,7 +127,8 @@ func (m *resourceTypeModel) body(ctx context.Context) (client.ResourceTypeWrite,
 		Category: m.Category.ValueString(),
 	}
 	if !m.Name.IsNull() && !m.Name.IsUnknown() {
-		w.Name = m.Name.ValueString()
+		name := m.Name.ValueString()
+		w.Name = &name
 	}
 	for _, s := range []struct {
 		name string

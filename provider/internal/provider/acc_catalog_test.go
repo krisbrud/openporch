@@ -684,6 +684,15 @@ resource "openporch_resource_definition" "flags" {
 				},
 			},
 			{
+				// An explicitly empty name stays empty.
+				Config:           config(`name = ""`, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: kept},
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("openporch_resource_type.flags", tfjsonpath.New("name"),
+						knownvalue.StringExact("")),
+				},
+			},
+			{
 				ResourceName:      "openporch_resource_type.flags",
 				ImportState:       true,
 				ImportStateId:     id,

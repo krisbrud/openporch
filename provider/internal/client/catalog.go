@@ -234,14 +234,15 @@ type ResourceType struct {
 }
 
 // ResourceTypeWrite is the body that creates or replaces a custom type. Fields
-// left out take the server's defaults.
+// left out take the server's defaults; a nil Name is the ID, an empty one stays
+// empty.
 type ResourceTypeWrite struct {
-	ID            string `json:"id,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Use           string `json:"use"`
-	Category      string `json:"category"`
-	InputsSchema  any    `json:"inputs_schema,omitempty"`
-	OutputsSchema any    `json:"outputs_schema,omitempty"`
+	ID            string  `json:"id,omitempty"`
+	Name          *string `json:"name,omitempty"`
+	Use           string  `json:"use"`
+	Category      string  `json:"category"`
+	InputsSchema  any     `json:"inputs_schema,omitempty"`
+	OutputsSchema any     `json:"outputs_schema,omitempty"`
 }
 
 // CreateType creates a custom resource type.
