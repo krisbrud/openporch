@@ -64,6 +64,9 @@ resource "openporch_identity_provider" "corp" {
 		Steps: []resource.TestStep{
 			{
 				Config: config("first-secret", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
 				ConfigStateChecks: []statecheck.StateCheck{
 					written("1"),
 					statecheck.ExpectKnownValue(name, tfjsonpath.New("written_client_secret_ref").AtMapKey("ref"),
@@ -134,8 +137,12 @@ resource "openporch_identity_provider" "corp" {
 			},
 			{
 				// Without a secret it is a public client.
-				Config:           configFor(renamed, "", `["openid", "email"]`),
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: updated},
+				Config: configFor(renamed, "", `["openid", "email"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: updated,
+					// Nothing, the computed reference included, plans again.
+					PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
 				ConfigStateChecks: []statecheck.StateCheck{
 					statecheck.ExpectKnownValue(name, tfjsonpath.New("written_client_secret_ref"), knownvalue.Null()),
 				},
