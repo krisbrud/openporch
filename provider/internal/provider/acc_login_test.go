@@ -18,8 +18,13 @@ import (
 func TestAccIdentityProvider(t *testing.T) {
 	c := apiClient(t)
 	id := randomID("acc-idp")
+	renamed := id + "-2"
+	var configFor func(id, secret, scopes string) string
 	name := "openporch_identity_provider.corp"
 	config := func(secret, scopes string) string {
+		return configFor(id, secret, scopes)
+	}
+	configFor = func(id, secret, scopes string) string {
 		s := ""
 		if secret != "" {
 			s = fmt.Sprintf("client_secret = %q", secret)
@@ -49,8 +54,10 @@ resource "openporch_identity_provider" "corp" {
 		PreCheck:                 func() { preCheck(t) },
 		ProtoV6ProviderFactories: providers,
 		CheckDestroy: func(*terraform.State) error {
-			if _, err := c.IdentityProvider(context.Background(), id); !client.IsNotFound(err) {
-				return fmt.Errorf("identity provider %s still exists: %v", id, err)
+			for _, id := range []string{id, renamed} {
+				if _, err := c.IdentityProvider(context.Background(), id); !client.IsNotFound(err) {
+					return fmt.Errorf("identity provider %s still exists: %v", id, err)
+				}
 			}
 			return nil
 		},
@@ -112,14 +119,28 @@ resource "openporch_identity_provider" "corp" {
 				ImportStateVerifyIgnore: []string{"client_secret"},
 			},
 			{
+				// A new ID replaces the provider and writes its secret under the new ID.
+				Config: configFor(renamed, "second-secret", `["openid", "email"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(name, plancheck.ResourceActionReplace),
+					},
+				},
+				ConfigStateChecks: []statecheck.StateCheck{
+					written("1"),
+					statecheck.ExpectKnownValue(name, tfjsonpath.New("written_client_secret_ref").AtMapKey("ref"),
+						knownvalue.StringExact("identity-providers/"+renamed+"/client_secret")),
+				},
+			},
+			{
 				// Without a secret it is a public client.
-				Config:           config("", `["openid", "email"]`),
+				Config:           configFor(renamed, "", `["openid", "email"]`),
 				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: updated},
 				ConfigStateChecks: []statecheck.StateCheck{
 					statecheck.ExpectKnownValue(name, tfjsonpath.New("written_client_secret_ref"), knownvalue.Null()),
 				},
 				Check: func(*terraform.State) error {
-					p, err := c.IdentityProvider(context.Background(), id)
+					p, err := c.IdentityProvider(context.Background(), renamed)
 					if err != nil {
 						return err
 					}

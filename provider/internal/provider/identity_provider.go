@@ -123,7 +123,7 @@ func (r *identityProvider) Configure(_ context.Context, req resource.ConfigureRe
 
 // ModifyPlan plans the written reference: none without a secret, which also
 // shows a secret the server holds that the configuration leaves out, and a new
-// one when the secret changes.
+// one when the secret or the ID changes.
 func (r *identityProvider) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() || req.State.Raw.IsNull() {
 		return
@@ -137,7 +137,8 @@ func (r *identityProvider) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	written := path.Root("written_client_secret_ref")
 	if plan.ClientSecret.IsNull() {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, written, types.ObjectNull(secretRefAttrTypes))...)
-	} else if !plan.ClientSecret.Equal(state.ClientSecret) {
+	} else if !plan.ClientSecret.Equal(state.ClientSecret) || !plan.ID.Equal(state.ID) {
+		// A new ID replaces the provider, whose secret is written under the new ID.
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, written, types.ObjectUnknown(secretRefAttrTypes))...)
 	}
 }
