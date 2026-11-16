@@ -46,6 +46,23 @@ data "aws_iam_policy_document" "this" {
     }
   }
   dynamic "statement" {
+    # What AWSLambdaVPCAccessExecutionRole grants, which Lambda needs to attach
+    # the function to the VPC; these actions take no resource.
+    for_each = length(var.subnet_ids) > 0 ? [1] : []
+    content {
+      sid = "NetworkInterfaces"
+      actions = [
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:CreateNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSubnets",
+        "ec2:UnassignPrivateIpAddresses",
+      ]
+      resources = ["*"]
+    }
+  }
+  dynamic "statement" {
     for_each = length(local.queue_triggers) > 0 ? [1] : []
     content {
       sid = "TriggerQueues"

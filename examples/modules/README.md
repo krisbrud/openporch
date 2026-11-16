@@ -15,6 +15,7 @@ execution role attaches.
 | `sqs/policy` | `aws-policy` | `arn` | |
 | `sns-topic` | `sns-topic` | `arn`, `name`, `region` | `fifo`, `contentBasedDeduplication` |
 | `sns-topic/policy` | `aws-policy` | `arn` | |
+| `postgres` | `postgres` | `host`, `port`, `name`; secret `username`, `password` | `instanceClass`, `storage`, `maxStorage`, `database`, `engineVersion`, `backupRetention`, `multiAz`, `finalSnapshot` |
 | `s3` | `s3` | `bucket`, `region`, `arn` | `versioning`, `expireAfterDays` |
 | `s3/policy` | `aws-policy` | `arn` | |
 | `aws-lambda-workload` | `workload` | `function_name`, `function_arn`, `role_arn`, `region`, `url` with an `http` trigger | the workload document |
@@ -24,10 +25,12 @@ resource's name as the variable `name`; the policy modules take `name` and the
 resource's ARN (`table_arn`, `queue_arn`, `topic_arn` or `bucket_arn`), and `read_only` for
 tables and buckets or `access` (`send`, `consume` or `send-and-consume`) for
 queues and (`publish`, `subscribe` or `publish-and-subscribe`) for topics. The table policy also reads the table's stream. Every module also takes `tags`, the policy modules `iam_path`, and
-`aws-lambda-workload` `iam_path` and `permissions_boundary` for its roles, so a
+`aws-lambda-workload` `iam_path` and `permissions_boundary` for its roles (and
+`subnet_ids` and `security_group_ids` to run in a VPC), so a
 platform's role can be limited to the IAM objects openporch creates. The modules use the
 `hashicorp/aws` provider 6.x (6.28 or later for `aws-lambda-workload`) with the credentials the driver exports for the
-definition's cloud account. Deleting an `s3` resource deletes its objects too,
+definition's cloud account. `postgres` takes the platform's `subnet_group` and `security_group_ids`, and
+needs the `hashicorp/random` provider too. Deleting an `s3` resource deletes its objects too,
 so, like every deletion the driver plans, it needs an acknowledgement.
 
 A `dynamodb-table` definition that uses the module from this repository, and

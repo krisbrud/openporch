@@ -240,6 +240,9 @@ data "aws_iam_policy_document" "boundary" {
       "dynamodb:*", "sqs:*", "sns:*", "s3:*", "logs:CreateLogStream", "logs:PutLogEvents", "lambda:InvokeFunction",
       "ssm:GetParameter", "ssm:GetParameters", "secretsmanager:GetSecretValue", "kms:Decrypt",
       "xray:PutTraceSegments", "xray:PutTelemetryRecords",
+      # Functions in a VPC (the `aws-lambda-vpc` class).
+      "ec2:AssignPrivateIpAddresses", "ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface",
+      "ec2:DescribeNetworkInterfaces", "ec2:DescribeSubnets", "ec2:UnassignPrivateIpAddresses",
     ]
     resources = ["*"]
   }

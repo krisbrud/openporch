@@ -89,6 +89,20 @@ variable "modules_rev" {
   description = "The branch, tag or commit of `modules_source`; pin a tag or commit in a real platform."
 }
 
+variable "database" {
+  type = object({
+    vpc_id     = string
+    subnet_ids = list(string)
+  })
+  default     = null
+  description = "A VPC for PostgreSQL: set, `postgres` resources are RDS instances in these private subnets (at least two, in different zones), which functions of the `aws-lambda-vpc` class reach from the same subnets. RDS is billed while it runs."
+
+  validation {
+    condition     = var.database == null || try(length(var.database.subnet_ids) >= 2, false)
+    error_message = "RDS needs subnets in at least two availability zones."
+  }
+}
+
 variable "dns_zone" {
   type        = string
   default     = "apps.example.com"

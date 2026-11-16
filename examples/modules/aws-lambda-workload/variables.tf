@@ -46,6 +46,20 @@ variable "permissions_boundary" {
   description = "The ARN of a managed policy that bounds the function's roles, which a platform's role may be required to set."
 }
 
+variable "subnet_ids" {
+  type        = list(string)
+  default     = []
+  nullable    = false
+  description = "Subnets to run the function in, so it reaches resources inside a VPC such as a `postgres` instance. Left empty, the function runs outside any VPC. A function in a VPC reaches the internet and AWS APIs only through the VPC's NAT gateway or endpoints."
+}
+
+variable "security_group_ids" {
+  type        = list(string)
+  default     = []
+  nullable    = false
+  description = "The function's security groups, with `subnet_ids`."
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

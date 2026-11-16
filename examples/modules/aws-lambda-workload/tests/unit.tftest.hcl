@@ -792,3 +792,39 @@ run "bounded_roles" {
     error_message = "Both roles are created under the path, with the boundary."
   }
 }
+
+run "in_a_vpc" {
+  command = plan
+
+  variables {
+    subnet_ids         = ["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"]
+    security_group_ids = ["sg-0123456789abcdef0"]
+  }
+
+  assert {
+    condition = (
+      aws_lambda_function.this.vpc_config[0].subnet_ids == toset(["subnet-0aaaaaaaaaaaaaaaa", "subnet-0bbbbbbbbbbbbbbbb"]) &&
+      aws_lambda_function.this.vpc_config[0].security_group_ids == toset(["sg-0123456789abcdef0"])
+    )
+    error_message = "With subnets and security groups the function runs in the VPC."
+  }
+}
+
+run "outside_a_vpc" {
+  command = plan
+
+  assert {
+    condition     = length(aws_lambda_function.this.vpc_config) == 0
+    error_message = "Without subnets the function runs outside any VPC."
+  }
+}
+
+run "subnets_without_security_groups" {
+  command = plan
+
+  variables {
+    subnet_ids = ["subnet-0aaaaaaaaaaaaaaaa"]
+  }
+
+  expect_failures = [aws_lambda_function.this]
+}
