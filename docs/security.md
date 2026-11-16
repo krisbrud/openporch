@@ -127,6 +127,14 @@ loopback_return = true
 # algorithms = ["RS256"]
 ```
 
+An administrator can also add the provider through the API, with the same
+settings and the client secret as a value the server keeps in the built-in
+store: `POST /orgs/{org}/identity-providers` (see
+[Identity providers](api.md#identity-providers)), or the OpenTofu provider's
+`openporch_identity_provider`. Those take effect without a restart. An ID is
+either the configuration file's or the API's: the server refuses to start when
+the file names a provider the API manages, until one of them is removed.
+
 `issuer` must match the `issuer` of the provider's discovery document
 (`<issuer>/.well-known/openid-configuration`) exactly. A public client, which has
 no secret, leaves `client_secret_file` out; PKCE then protects the code on its

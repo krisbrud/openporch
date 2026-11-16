@@ -10,6 +10,7 @@ mod envs;
 mod health;
 
 pub use health::CONTRACT_VERSION;
+mod identity_providers;
 mod login;
 mod members;
 mod metrics;
@@ -87,6 +88,37 @@ pub fn api(state: AppState) -> Api {
             "/auth/oidc/{provider}/session",
             Public,
             oidc_login::exchange,
+        )
+        // Identity providers managed through the API.
+        .route(
+            get(),
+            "/orgs/{org}/identity-providers",
+            Org(OrgPerm::ReadMembers),
+            identity_providers::list,
+        )
+        .route(
+            post(),
+            "/orgs/{org}/identity-providers",
+            Org(OrgPerm::Administer),
+            identity_providers::create,
+        )
+        .route(
+            get(),
+            "/orgs/{org}/identity-providers/{provider}",
+            Org(OrgPerm::ReadMembers),
+            identity_providers::get,
+        )
+        .route(
+            put(),
+            "/orgs/{org}/identity-providers/{provider}",
+            Org(OrgPerm::Administer),
+            identity_providers::replace,
+        )
+        .route(
+            delete(),
+            "/orgs/{org}/identity-providers/{provider}",
+            Org(OrgPerm::Administer),
+            identity_providers::delete,
         )
         // Members.
         .route(

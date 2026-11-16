@@ -151,6 +151,7 @@ func (p *openporchProvider) Resources(context.Context) []func() resource.Resourc
 		newApplication, newEnvironmentType, newEnvironment, newResourceClass, newValue, newCloudAccount,
 		newUser, newServiceUserToken, newApplicationUser, newEnvironmentTypeUser,
 		newResourceDefinition, newDefinitionCriterion, newDriver, newResourceType, newSecretStore, newSecretGrant,
+		newIdentityProvider,
 	}
 }
 

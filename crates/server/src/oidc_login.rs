@@ -230,6 +230,15 @@ impl OidcLogin {
             )?),
             None => None,
         };
+        Self::with_secret(config, client_secret)
+    }
+
+    /// A provider whose client secret, if any, is given rather than read from
+    /// `client_secret_file`, as for providers managed through the API.
+    pub fn with_secret(
+        config: &OidcLoginConfig,
+        client_secret: Option<Zeroizing<String>>,
+    ) -> Result<Self, String> {
         // `ring` is the crypto provider; installing it twice is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let https = Url::parse(&config.issuer).is_ok_and(|u| u.scheme() == "https");

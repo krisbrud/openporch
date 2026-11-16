@@ -889,3 +889,232 @@ async fn a_member_who_signed_in_with_github_cannot_sign_in_through_oidc_by_email
         "{b}"
     );
 }
+
+/// The body that registers the test issuer as `corp` through the API.
+fn api_provider(idp: &Issuer, secret: Value) -> Value {
+    json!({
+        "id": "corp",
+        "issuer": idp.url,
+        "client_id": CLIENT_ID,
+        "client_secret": secret,
+        "callback_url": CALLBACK_URL,
+        "return_urls": [PORTAL],
+        "loopback_return": true,
+    })
+}
+
+#[tokio::test]
+async fn identity_providers_managed_through_the_api_sign_people_in() {
+    let idp = Issuer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new("acme", dir.path());
+    let s = server_with(dir, config).await;
+    let path = "/orgs/acme/identity-providers";
+
+    // Unknown until registered.
+    let (status, location, _) = navigate(&s, "/auth/oidc/corp/authorize", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{location}");
+
+    let (status, created) = s
+        .post(
+            path,
+            &s.admin,
+            api_provider(&idp, json!({"value": CLIENT_SECRET})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["source"], "api");
+    assert_eq!(created["confidential"], true);
+    assert_eq!(created["scopes"], json!(["openid", "email", "profile"]));
+    assert_eq!(
+        created["client_secret"],
+        json!({"store": "openporch", "ref": "identity-providers/corp/client_secret", "version": "1"})
+    );
+    assert!(!created.to_string().contains(CLIENT_SECRET));
+    let (_, version) = s.call(Method::GET, "/version", None, None).await;
+    assert_eq!(
+        version["capabilities"]["identity_providers"],
+        json!([{"id": "corp", "type": "oidc", "issuer": idp.url, "flows": ["browser"]}])
+    );
+
+    // People sign in through it like through one of the configuration file.
+    let (_, invitation) = s
+        .invite(json!({"email": "alice@example.com", "role": "member"}))
+        .await;
+    let (status, session) = login(&s, &idp, "alice", Some(&invitation)).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert_eq!(session["user"], "alice");
+    assert!(
+        idp.idp
+            .lock()
+            .unwrap()
+            .clients
+            .iter()
+            .all(|c| c == "openporch-test:oidc+client+secret")
+    );
+
+    // A member cannot change it.
+    let member = session["token"].as_str().unwrap().to_owned();
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/identity-providers/corp",
+            Some(&member),
+            Some(api_provider(&idp, json!({"value": "x"}))),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::FORBIDDEN, "AUTH-002");
+
+    // A replacement keeps the secret by naming it, and may not name another one.
+    let keep = created["client_secret"].clone();
+    let (status, b) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/identity-providers/corp",
+            Some(&s.admin),
+            Some(api_provider(
+                &idp,
+                json!({"store": "openporch", "ref": "accounts/aws/secret_access_key"}),
+            )),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    let mut body = api_provider(&idp, keep.clone());
+    body["scopes"] = json!(["openid", "email"]);
+    let (status, replaced) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/identity-providers/corp",
+            Some(&s.admin),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    assert_eq!(replaced["client_secret"], keep);
+    let (req, _) = {
+        let path = format!("/auth/oidc/corp/authorize?return_to={}", escape(PORTAL));
+        let (status, location, cookie) = navigate(&s, &path, None).await;
+        assert_eq!(status, StatusCode::FOUND, "{location}");
+        (query(&location), cookie)
+    };
+    assert_eq!(req["scope"], "openid email", "the change is used at once");
+
+    // A wrong secret is sent once it is replaced, so the provider refuses it.
+    let (status, _) = s
+        .call(
+            Method::PUT,
+            "/orgs/acme/identity-providers/corp",
+            Some(&s.admin),
+            Some(api_provider(&idp, json!({"value": "wrong"}))),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (req, cookie) = start(&s, &idp, PORTAL).await;
+    let code = idp.approve(&req, "alice");
+    let (_, location) = callback(&s, &req, &code, &cookie).await;
+    assert!(query(&location).contains_key("error"), "{location}");
+    assert_eq!(
+        idp.idp.lock().unwrap().clients.last().unwrap(),
+        "openporch-test:wrong"
+    );
+
+    // Settings are checked like the configuration file's.
+    let mut bad = api_provider(&idp, Value::Null);
+    bad["id"] = json!("other");
+    let (status, b) = s.post(path, &s.admin, bad).await;
+    assert_error(status, &b, StatusCode::BAD_REQUEST, "API-003");
+    assert!(
+        b["message"].as_str().unwrap().contains("callback_url"),
+        "{b}"
+    );
+    let mut github = api_provider(&idp, Value::Null);
+    github["id"] = json!("github");
+    let (status, _) = s.post(path, &s.admin, github).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Deleted, it signs nobody in.
+    let (status, _) = s
+        .delete("/orgs/acme/identity-providers/corp", &s.admin)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = navigate(&s, "/auth/oidc/corp/authorize", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, page) = s.get("/orgs/acme/audit-logs", &s.admin).await;
+    let actions: Vec<&str> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .filter(|a| a.starts_with("identity_provider."))
+        .collect();
+    for action in [
+        "identity_provider.create",
+        "identity_provider.update",
+        "identity_provider.delete",
+    ] {
+        assert!(actions.contains(&action), "{actions:?}");
+    }
+}
+
+#[tokio::test]
+async fn providers_of_the_configuration_file_are_listed_and_cannot_be_changed() {
+    let idp = Issuer::start().await;
+    let s = idp.server().await;
+    let (status, list) = s.get("/orgs/acme/identity-providers", &s.admin).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list[0]["id"], "corp");
+    assert_eq!(list[0]["source"], "config");
+    assert_eq!(list[0]["confidential"], true);
+    assert!(list[0].get("client_secret").is_none());
+    let (status, b) = s
+        .post(
+            "/orgs/acme/identity-providers",
+            &s.admin,
+            api_provider(&idp, Value::Null),
+        )
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+    let (status, b) = s
+        .delete("/orgs/acme/identity-providers/corp", &s.admin)
+        .await;
+    assert_error(status, &b, StatusCode::CONFLICT, "API-004");
+}
+
+#[tokio::test]
+async fn a_configuration_file_provider_may_not_reuse_an_api_providers_id() {
+    let idp = Issuer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new("acme", dir.path());
+    let s = server_with(dir, config).await;
+    let (status, b) = s
+        .post(
+            "/orgs/acme/identity-providers",
+            &s.admin,
+            api_provider(&idp, Value::Null),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let Server {
+        dir, state, router, ..
+    } = s;
+    drop((state, router));
+
+    // Adding the same ID to the configuration file is refused at startup.
+    let secret = dir.path().join("oidc-secret");
+    std::fs::write(&secret, format!("{CLIENT_SECRET}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut config = Config::new("acme", dir.path());
+    config.oidc_login = vec![idp.config(&secret)];
+    let Err(err) = crate::state::start(config, None).await else {
+        panic!("startup accepted a configured ID an API provider uses");
+    };
+    assert!(
+        err.to_string()
+            .contains("`corp` is also managed through the API"),
+        "{err}"
+    );
+}

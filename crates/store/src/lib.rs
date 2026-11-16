@@ -20,6 +20,7 @@ mod sqlite_audit_retention;
 mod sqlite_catalog;
 mod sqlite_diagnostics;
 mod sqlite_identity;
+mod sqlite_login_providers;
 mod sqlite_permits;
 mod sqlite_restore;
 mod sqlite_values;
@@ -50,6 +51,7 @@ pub use sqlite_catalog::{
 };
 pub use sqlite_diagnostics::{AuditSummary, OperationSummary};
 pub use sqlite_identity::{AppRecord, EnvTypeRecord, IdentityStore};
+pub use sqlite_login_providers::{LoginProviderRecord, LoginProviderStore};
 pub use sqlite_permits::{
     ApprovalRequest, NewPermit, NewPlan, PERMIT_TTL_MS, PermitBinding, PermitRecord, PermitStore,
     PermitUse, PlanRecord,
