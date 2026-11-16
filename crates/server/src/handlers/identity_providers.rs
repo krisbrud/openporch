@@ -47,7 +47,7 @@ fn parse(mut body: Map<String, Value>) -> ApiResult<(Option<String>, Settings, O
 }
 
 /// Writes the client secret if a new one is given, then stores the provider;
-/// a version written for a rejected change is discarded.
+/// a version written for a change the store refused is discarded.
 async fn write(
     state: &AppState,
     ctx: &Ctx,
@@ -73,7 +73,7 @@ async fn write(
     let org = state.org();
     let primary = secret_inputs::Primary::Builtin(secret_inputs::builtin(state)?);
     let mut written = Vec::new();
-    let result: ApiResult<View> = async {
+    let result: ApiResult<()> = async {
         let client_secret = match planned {
             Some(p) => Some(
                 p.materialize(
@@ -99,19 +99,23 @@ async fn write(
                 .update_login_provider(org, &record, audit)
                 .await?;
         }
-        state.api_logins.forget(id);
-        let stored = state
-            .store
-            .login_provider(org, id)
-            .await?
-            .ok_or_else(|| ApiError::not_found(format!("identity provider `{id}`")))?;
-        View::api(&stored)
+        Ok(())
     }
     .await;
-    if result.is_err() {
+    if let Err(e) = result {
+        // The provider row was not changed, so nothing references the version.
         secret_inputs::discard(&primary, written).await;
+        return Err(e);
     }
-    result
+    // The row now references the version written, which stays even if this read
+    // fails.
+    state.api_logins.forget(id);
+    let stored = state
+        .store
+        .login_provider(org, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("identity provider `{id}`")))?;
+    View::api(&stored)
 }
 
 pub async fn create(
