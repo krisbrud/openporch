@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -261,6 +262,7 @@ func (r *secretGrant) ValidateConfig(ctx context.Context, req resource.ValidateC
 	if resp.Diagnostics.HasError() || config.AppID.IsUnknown() || config.EnvID.IsUnknown() || config.OrgWide.IsUnknown() {
 		return
 	}
+	resp.Diagnostics.Append(emptyScope(config)...)
 	app, env, org := !config.AppID.IsNull(), !config.EnvID.IsNull(), config.OrgWide.ValueBool()
 	switch {
 	case env && !app:
@@ -271,6 +273,22 @@ func (r *secretGrant) ValidateConfig(ctx context.Context, req resource.ValidateC
 	case !app && !org:
 		resp.Diagnostics.AddError("Missing scope", "Set `app_id` (and optionally `env_id`) or `org_wide = true`.")
 	}
+}
+
+// emptyScope refuses an empty `app_id` or `env_id`: the request would leave it
+// out, so the grant would cover more than configured.
+func emptyScope(m secretGrantModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+	for _, a := range []struct {
+		name  string
+		value types.String
+	}{{"app_id", m.AppID}, {"env_id", m.EnvID}} {
+		if !a.value.IsNull() && !a.value.IsUnknown() && a.value.ValueString() == "" {
+			diags.AddAttributeError(path.Root(a.name), "Empty scope",
+				fmt.Sprintf("`%s` must not be empty; leave it out instead.", a.name))
+		}
+	}
+	return diags
 }
 
 func optionalString(s string) types.String {
@@ -294,6 +312,11 @@ func grantModel(g *client.Grant) secretGrantModel {
 func (r *secretGrant) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan secretGrantModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// Values known only at apply were not validated with the configuration.
+	resp.Diagnostics.Append(emptyScope(plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}

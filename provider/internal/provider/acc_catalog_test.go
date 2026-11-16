@@ -874,6 +874,32 @@ resource "openporch_secret_grant" "g" {
 }
 `,
 			ExpectError: regexp.MustCompile("Conflicting scope"),
+		}, {
+			Config: `
+resource "openporch_secret_grant" "g" {
+  store  = "openporch"
+  ref    = "platform/x"
+  app_id = "shop"
+  env_id = ""
+}
+`,
+			ExpectError: regexp.MustCompile("Empty scope"),
+		}, {
+			// An empty environment known only at apply would otherwise widen the
+			// grant to the whole application.
+			Config: `
+resource "terraform_data" "env" {
+  input = ""
+}
+
+resource "openporch_secret_grant" "g" {
+  store  = "openporch"
+  ref    = "platform/x"
+  app_id = "shop"
+  env_id = terraform_data.env.output
+}
+`,
+			ExpectError: regexp.MustCompile("Empty scope"),
 		}},
 	})
 }
